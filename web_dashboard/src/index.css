@@ -1,0 +1,445 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --color-surface: #ffffff;
+  --color-base: #f4f5f7;
+  --color-border: #e2e5ea;
+  --color-border-strong: #c8ccd4;
+
+  --color-text-primary: #111827;
+  --color-text-secondary: #4b5563;
+  --color-text-muted: #9ca3af;
+
+  --color-status-green: #16a34a;
+  --color-status-green-bg: #f0fdf4;
+  --color-status-amber: #d97706;
+  --color-status-amber-bg: #fffbeb;
+  --color-status-red: #dc2626;
+  --color-status-red-bg: #fef2f2;
+  --color-status-blue: #2563eb;
+  --color-status-blue-bg: #eff6ff;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+}
+
+/* ── Dark mode overrides ──────────────────────────────────── */
+html.dark {
+  --color-surface: #1e2128;
+  --color-base: #161920;
+  --color-border: #2d3139;
+  --color-border-strong: #3d4149;
+
+  --color-text-primary: #f0f2f5;
+  --color-text-secondary: #9ba3b0;
+  --color-text-muted: #5a6272;
+
+  --color-status-green: #22c55e;
+  --color-status-green-bg: #052e16;
+  --color-status-amber: #f59e0b;
+  --color-status-amber-bg: #1c1100;
+  --color-status-red: #f87171;
+  --color-status-red-bg: #1f0a0a;
+  --color-status-blue: #60a5fa;
+  --color-status-blue-bg: #0c1629;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  font-family: var(--font-sans);
+  background-color: var(--color-base);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden; /* prevent the root from scrolling; each page scrolls internally */
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* ── Scrollbar ───────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border-strong); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+/* ── Typography helpers ───────────────────────────────────── */
+.font-mono { font-family: var(--font-mono); }
+
+/* ── Status color utilities ───────────────────────────────── */
+.text-status-green { color: var(--color-status-green); }
+.text-status-amber { color: var(--color-status-amber); }
+.text-status-red   { color: var(--color-status-red); }
+.text-status-blue  { color: var(--color-status-blue); }
+.bg-status-green   { background-color: var(--color-status-green-bg); }
+.bg-status-amber   { background-color: var(--color-status-amber-bg); }
+.bg-status-red     { background-color: var(--color-status-red-bg); }
+.bg-status-blue    { background-color: var(--color-status-blue-bg); }
+
+/* ── Panel ────────────────────────────────────────────────── */
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  /* Critical: prevents panel from blowing out its grid cell */
+  min-width: 0;
+  min-height: 0;
+  /* overflow: visible so Recharts tooltips are not clipped.
+     Use .panel-clipped on panels that need hard clipping. */
+}
+
+/* Use on panels that must clip overflow (topology SVG, log console, scrollable tables) */
+.panel-clipped {
+  overflow: hidden;
+}
+
+.panel-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.panel-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+/* ── Pulse animation ─────────────────────────────────────── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+.pulse-dot { animation: pulse-dot 1.8s ease-in-out infinite; }
+
+/* ── Recharts overrides ───────────────────────────────────── */
+.recharts-cartesian-axis-tick-value {
+  font-family: var(--font-mono) !important;
+  font-size: 10px !important;
+  fill: var(--color-text-muted) !important;
+}
+.recharts-tooltip-wrapper { outline: none !important; }
+
+/*
+ * Clip SVG drawing at the SVG element boundary.
+ * Recharts SVG has overflow:visible by default which causes area chart
+ * paths and axis labels to paint outside the chart container and bleed
+ * over adjacent panels. The DOM-based tooltip is a sibling div of the
+ * SVG (not inside it) so it is unaffected by this rule.
+ */
+svg.recharts-surface { overflow: hidden; }
+
+/* ════════════════════════════════════════════════════════════
+   OVERVIEW PAGE LAYOUT — ASCII blueprint:
+   [Status bar — 7 cols full width]
+   [Live Traffic        | Prediction Summary ]
+   [Topology | Forecast |                    ]
+   [Attack Progression  | Recent Events      ]
+   [Anomaly | Explainability | Console       ]
+   ════════════════════════════════════════════════════════════ */
+
+/* Outer scrollable area — flex column with padding/gap */
+.overview-scroll {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+/* Status bar: 7 metric cards, full width */
+.ov-status {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Main 2-column area: left (Live Traffic + middle row + Attack) | right (Prediction + Events) */
+.ov-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 10px;
+  /* stretch so both columns are the same height */
+  align-items: stretch;
+  min-height: 0;
+}
+
+/* Left column — stacked flex */
+.ov-left {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* Middle row: Network Topology | 30m Forecast */
+.ov-mid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+/* Right column — Prediction Summary at top, Recent Events fills remaining */
+.ov-right {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* Recent Events fills leftover height in right column */
+.ov-events {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Bottom row: Anomaly | Explainability | Console */
+.ov-bottom {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.8fr) minmax(0, 1fr);
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* ── Responsive breakpoints ──────────────────────────────── */
+
+@media (max-width: 1280px) {
+  .ov-main {
+    grid-template-columns: minmax(0, 1fr) 256px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .ov-main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ov-right {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .ov-right > * {
+    flex: 1 1 280px;
+  }
+  .ov-events {
+    flex: 1 1 280px;
+    min-height: 200px;
+  }
+  .ov-status {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .ov-bottom {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .ov-status {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .ov-mid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ov-bottom {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════
+   PREDICTIONS PAGE LAYOUT
+   ════════════════════════════════════════════════════════════ */
+
+.predictions-scroll {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.predictions-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 272px;
+  gap: 10px;
+  padding: 12px;
+  align-items: start;
+}
+
+.predictions-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.predictions-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  position: sticky;
+  top: 0;
+}
+
+@media (max-width: 1100px) {
+  .predictions-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .predictions-sidebar {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .predictions-sidebar > * {
+    flex: 1 1 280px;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════
+   EVENTS PAGE LAYOUT
+   ════════════════════════════════════════════════════════════ */
+
+.events-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  padding: 12px;
+  gap: 10px;
+}
+
+.events-table-panel {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.events-log-panel {
+  flex: 0 0 200px;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ════════════════════════════════════════════════════════════
+   CONTROLS PAGE LAYOUT
+   ════════════════════════════════════════════════════════════ */
+
+/* Full-height flex column: body + pinned console */
+.controls-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  padding: 12px;
+  gap: 10px;
+}
+
+/* Main 2-col body (scrolls internally) */
+.controls-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 10px;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Left: command groups, scrollable */
+.controls-left {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
+}
+
+/* Right: SOAR + status, scrollable */
+.controls-right {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
+}
+
+/* Pinned console at bottom */
+.controls-console {
+  flex-shrink: 0;
+  height: 220px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+@media (max-width: 1000px) {
+  .controls-body {
+    grid-template-columns: minmax(0, 1fr);
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  .controls-right {
+    overflow: visible;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════
+   NETWORK PAGE LAYOUT
+   ════════════════════════════════════════════════════════════ */
+
+.network-page {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+}
+
+.network-canvas-area {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.network-detail-panel {
+  width: 256px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--color-border);
+  background: var(--color-surface);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+@media (max-width: 900px) {
+  .network-detail-panel {
+    width: 200px;
+  }
+}

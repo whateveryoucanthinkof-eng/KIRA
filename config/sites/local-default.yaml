@@ -1,0 +1,35 @@
+# Generic local SPAN site profile (no Containerlab assumptions).
+# Point sensor.interface at the NIC that receives your mirror/SPAN.
+
+site_id: local-default
+display_name: Local SPAN
+lab_mode: false
+
+# Adjust these CIDRs to match the real enterprise / lab under observation.
+enterprise_cidrs:
+  - 10.0.0.0/8
+  - 192.168.0.0/16
+  - 172.16.0.0/12
+
+# Leave empty to treat "not in enterprise_cidrs" as external.
+external_cidrs: []
+
+zones: {}
+
+# Optional: list IPs you care about most when they appear in a window.
+assets_of_interest: []
+
+sensor:
+  mode: local
+  interface: eth1
+  container: null
+
+topology:
+  node_ttl_sec: 120
+  edge_ttl_sec: 60
+  max_nodes: 500
+
+operator_hints:
+  external_traffic: >
+    External hosts appear automatically when SPAN sees traffic involving IPs
+    outside enterprise_cidrs. No hardcoded attacker node is required.

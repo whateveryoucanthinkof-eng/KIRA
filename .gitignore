@@ -1,0 +1,152 @@
+# ==============================================================================
+# CyberWorld — .gitignore
+# Excludes datasets, PCAPs, caches, secrets, node_modules, and local planning docs
+# ==============================================================================
+
+# --- Local planning / private docs (not for remote) ---
+implementation.md
+
+# --- Python Environment, Bytecode & Tooling Caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+# Root/Python dist only — do not blanket-ignore web_dashboard/dist if needed locally
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.ipynb_checkpoints
+.cache/
+
+# --- Virtual Environments ---
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# --- Node / frontend ---
+node_modules/
+web_dashboard/node_modules/
+web_dashboard/dist/
+**/npm-debug.log*
+yarn-error.log
+
+# --- Containerlab Deployment & Runtime State ---
+clab-*/
+**/clab-*/
+containerlab/clab-*/
+.state.clab.yaml
+*.state.clab.yaml
+topology-data.json
+ansible-inventory.yml
+nornir-simple-inventory.yml
+
+# --- Datasets & Heavy Telemetry ---
+DATA/
+CTU-13-Dataset/
+data/
+datasets/
+raw_data/
+raw_pcaps/
+processed/
+*.csv.gz
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.zarr
+data_processed/
+telemetry_cache/
+pcap_cache/
+*.pcap
+*.pcapng
+*.pcap_ISCX.csv
+!captures/live.pcap
+
+# --- Model Weights, Checkpoints & Serialization ---
+models/
+model/models/
+_deprecated_v31_model/
+checkpoints/
+checkpoints/*
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
+*.pkl
+*.pickle
+# Keep live Dual-Branch / DeepOP / TGNE checkpoints
+!saved_models/**/*.pt
+!saved_models/**/*.manifest.json
+!bita/saved_models/**/*.pth
+
+# --- Logs, Temp & Scratch Directories ---
+logs/
+*.log
+scratch/
+artifacts/
+temp/
+tmp/
+*.tmp
+*.sqlite
+*.db
+/tmp/cyberworld_*
+
+# --- Secrets & TLS Certificates ---
+*.pem
+*.key
+*.cert
+*.crt
+
+# --- OS & IDE Metadata ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.#*
+\#*#
+.~lock.*#
+.~lock.*
+
+# --- Media & Screen Recordings ---
+*.mp4
+*.webm
+*.mov
+*.mkv

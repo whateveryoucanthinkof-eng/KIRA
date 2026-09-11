@@ -1,0 +1,281 @@
+"""
+Training pipeline for Branch A (MultiTaskLSTM Attack-Sequence Model).
+Trains on unified host trajectories extracted from CIC-IDS2017, CTU-13, and Warden.
+"""
+
+import os
+import sys
+import argparse
+from typing import Dict, Any, Optional
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+# Add paths
+sys.path.insert(0, os.path.abspath("."))
+sys.path.insert(0, os.path.abspath("bita"))
+
+from data_unification.cic2017_adapter import CIC2017Adapter
+from data_unification.ctu13_adapter import CTU13Adapter
+from data_unification.warden_adapter import WardenAdapter
+from data_unification.flow_to_temporal_event import FlowToTemporalEventAdapter
+from data_unification.multi_dataset_stream import HostTrajectoryExtractor
+from model.extentedtgn import ExtendedTGN
+from utils.utils import NeighborFinder
+from branch_a_gnn_lstm.sequence_dataset import (
+    HostSequenceDataset,
+    create_host_sequence_samples,
+    TECHNIQUE_VOCAB,
+)
+from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
+
+
+def load_sample_multi_dataset_records(max_per_source: int = 500):
+    """Loads a balanced sample of flow records across all available datasets."""
+    records = []
+
+    # 1. CIC-IDS2017 PortScan and DDoS
+    cic_adapter = CIC2017Adapter()
+    for f in [
+        "cic2017csv/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv",
+        "cic2017csv/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
+    ]:
+        if os.path.exists(f):
+            records.extend(list(cic_adapter.parse_file(f, max_rows=max_per_source)))
+
+    # 2. CTU-13 Parquet
+    ctu_adapter = CTU13Adapter()
+    ctu_path = "data/ctu13/test_ctu13_states_2s_pcap.parquet"
+    if os.path.exists(ctu_path):
+        records.extend(list(ctu_adapter.parse_parquet(ctu_path, max_rows=max_per_source)))
+
+    # 3. Warden
+    warden_adapter = WardenAdapter()
+    warden_path = "bita/Dataset/11March_e.csv"
+    if os.path.exists(warden_path):
+        records.extend(list(warden_adapter.parse_file(warden_path, max_rows=max_per_source)))
+
+    return records
+
+
+def build_or_load_tgne_ta(
+    config_path: str = "bita/saved_models/bita_config.json",
+    checkpoint_path: Optional[str] = None,
+):
+    """
+    Builds and loads pre-trained TGNE-TA model adhering strictly to serialized configuration.
+    Fails loudly if checkpoint or configuration differs.
+    """
+    checkpoint_path = checkpoint_path or os.environ.get("TGNE_CHECKPOINT_PATH")
+    ckpt_path = checkpoint_path or "bita/saved_models/bita_bigru_transformer-warden_alerts.pth"
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"TGNE-TA checkpoint not found at: {ckpt_path}")
+
+    config = {
+        "n_layers": 1,
+        "n_heads": 2,
+        "dropout": 0.0,
+        "use_memory": False,
+        "message_dimension": 12,
+        "memory_dimension": 12,
+        "embedding_module_type": "graph_attention",
+        "message_function": "identity",
+        "aggregator_type": "bigru_transformer",
+        "memory_updater_type": "gru",
+        "num_categories": 4,
+        "edge_feat_dim": 12,
+        "node_feat_dim": 12,
+    }
+    if checkpoint_path:
+        config_path = os.path.splitext(checkpoint_path)[0] + "_config.json"
+    if os.path.exists(config_path):
+        import json
+        with open(config_path, "r") as f:
+            loaded_cfg = json.load(f)
+            config.update({k: v for k, v in loaded_cfg.items() if k in config})
+            if loaded_cfg.get("feature_schema_version") != "1.0.0":
+                raise ValueError("TGNE checkpoint has no supported canonical feature schema")
+            if loaded_cfg.get("edge_feat_dim") != 12 or loaded_cfg.get("node_feat_dim") != 12:
+                raise ValueError("TGNE checkpoint dimensions do not match the canonical 12-D contract")
+
+    n_nodes = 5000
+    adj_list = [[] for _ in range(n_nodes)]
+    ngh_finder = NeighborFinder(adj_list, uniform=True)
+
+    node_feats = np.zeros((n_nodes, config["node_feat_dim"]), dtype=np.float32)
+    edge_feats = np.zeros((10000, config["edge_feat_dim"]), dtype=np.float32)
+
+    tgn = ExtendedTGN(
+        neighbor_finder=ngh_finder,
+        node_features=node_feats,
+        edge_features=edge_feats,
+        device="cpu",
+        n_layers=config["n_layers"],
+        n_heads=config["n_heads"],
+        dropout=config["dropout"],
+        use_memory=config["use_memory"],
+        message_dimension=config["message_dimension"],
+        memory_dimension=config["memory_dimension"],
+        embedding_module_type=config["embedding_module_type"],
+        message_function=config["message_function"],
+        aggregator_type=config["aggregator_type"],
+        memory_updater_type=config["memory_updater_type"],
+        num_categories=config["num_categories"],
+    )
+
+    state_dict = torch.load(ckpt_path, map_location="cpu")
+    tgn.load_state_dict(state_dict, strict=True)
+    tgn.eval()
+    return tgn
+
+
+
+from data_unification.split_manager import get_split_manager
+
+
+def train_branch_a(
+    epochs: int = 5,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    save_path: str = "saved_models/branch_a/branch_a_lstm.pt",
+) -> Dict[str, Any]:
+    print("Loading scientific disjoint train & val multi-dataset flow records...")
+    sm = get_split_manager()
+    train_records = sm.get_train_records(max_per_source=1000)
+    val_records = sm.get_val_records(max_per_source=500)
+    print(f"Total loaded train records: {len(train_records)}, val records: {len(val_records)}")
+
+    # Extract dynamic graph & host trajectories for train partition
+    tgn = build_or_load_tgne_ta()
+    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=60.0)
+    print("Extracting per-host trajectories with TGNE-TA embeddings for train partition...")
+    train_trajectories = extractor.extract_trajectories(train_records)
+    print(f"Active train hosts tracked: {len(train_trajectories)}")
+
+    train_samples = create_host_sequence_samples(train_trajectories, seq_len=5, min_trajectory_len=1)
+    print(f"Total train sequence samples: {len(train_samples)}")
+    if len(train_samples) < 10:
+        print("Warning: Few train samples created. Duplicating for robust mini-batch training.")
+        train_samples = train_samples * 5
+
+    # Extract dynamic graph & host trajectories for disjoint validation partition
+    print("Extracting per-host trajectories with TGNE-TA embeddings for val partition...")
+    val_trajectories = extractor.extract_trajectories(val_records)
+    print(f"Active val hosts tracked: {len(val_trajectories)}")
+
+    val_samples = create_host_sequence_samples(val_trajectories, seq_len=5, min_trajectory_len=1)
+    print(f"Total val sequence samples: {len(val_samples)}")
+    if len(val_samples) < 5:
+        val_samples = val_samples * 5
+
+    train_set = HostSequenceDataset(train_samples, seq_len=5)
+    val_set = HostSequenceDataset(val_samples, seq_len=5)
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = MultiTaskLSTM(
+        input_dim=27,
+        hidden_dim=64,
+        num_layers=2,
+        num_techniques=len(TECHNIQUE_VOCAB),
+        num_gradations=4,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    best_val_loss = float("inf")
+    metrics_history = []
+
+    print(f"Starting Branch A training on {device}...")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_losses = []
+        for batch in train_loader:
+            x = batch["features"].to(device)
+            b_targets = {
+                "risk": batch["risk"].to(device),
+                "technique": batch["technique"].to(device),
+                "gradation": batch["gradation"].to(device),
+            }
+
+            optimizer.zero_grad()
+            preds = model(x)
+            loss, m = model.compute_loss(preds, b_targets)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        # Evaluation phase
+        model.eval()
+        val_losses = []
+        correct_tech = 0
+        correct_grad = 0
+        total_eval = 0
+        risk_errors = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch["features"].to(device)
+                b_targets = {
+                    "risk": batch["risk"].to(device),
+                    "technique": batch["technique"].to(device),
+                    "gradation": batch["gradation"].to(device),
+                }
+                preds = model(x)
+                loss, _ = model.compute_loss(preds, b_targets)
+                val_losses.append(loss.item())
+
+                pred_tech = preds["technique_logits"].argmax(dim=-1)
+                pred_grad = preds["gradation_logits"].argmax(dim=-1)
+                correct_tech += (pred_tech == b_targets["technique"]).sum().item()
+                correct_grad += (pred_grad == b_targets["gradation"]).sum().item()
+                total_eval += len(b_targets["technique"])
+                risk_errors.extend(
+                    (preds["risk_score"] - b_targets["risk"]).abs().cpu().numpy()
+                )
+
+        val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+        tech_acc = correct_tech / max(1, total_eval)
+        grad_acc = correct_grad / max(1, total_eval)
+        risk_mae = float(np.mean(risk_errors)) if risk_errors else 0.0
+
+        epoch_stats = {
+            "epoch": epoch,
+            "train_loss": float(np.mean(train_losses)),
+            "val_loss": val_loss,
+            "tech_acc": tech_acc,
+            "grad_acc": grad_acc,
+            "risk_mae": risk_mae,
+        }
+        metrics_history.append(epoch_stats)
+
+        print(
+            f"Epoch {epoch:02d} | Train: {epoch_stats['train_loss']:.4f} | "
+            f"Val: {val_loss:.4f} | Tech Acc: {tech_acc*100:.1f}% | "
+            f"Grad Acc: {grad_acc*100:.1f}% | Risk MAE: {risk_mae:.4f}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "epoch": epoch,
+                    "metrics": epoch_stats,
+                },
+                save_path,
+            )
+
+    print(f"Model saved to {save_path}")
+    return {
+        "best_val_loss": best_val_loss,
+        "history": metrics_history,
+        "save_path": save_path,
+    }
+
+
+if __name__ == "__main__":
+    train_branch_a(epochs=3)

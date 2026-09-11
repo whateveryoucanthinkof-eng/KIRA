@@ -1,0 +1,32 @@
+{
+  "n_layers": 1,
+  "n_heads": 2,
+  "dropout": 0.0,
+  "use_memory": false,
+  "message_dimension": 12,
+  "memory_dimension": 12,
+  "embedding_module_type": "graph_attention",
+  "message_function": "identity",
+  "aggregator_type": "bigru_transformer",
+  "memory_updater_type": "gru",
+  "num_categories": 81,
+  "edge_feat_dim": 12,
+  "node_feat_dim": 12,
+  "feature_schema_version": "1.0.0",
+  "edge_feature_names": [
+    "log1p_fwd_bytes",
+    "log1p_bwd_bytes",
+    "log1p_fwd_packets",
+    "log1p_bwd_packets",
+    "duration_norm_300s",
+    "log1p_byte_rate_norm",
+    "log1p_packet_rate_norm",
+    "is_tcp",
+    "is_udp",
+    "is_icmp",
+    "dst_port_norm_65535",
+    "directional_flow_asymmetry"
+  ],
+  "model_name": "tgne_canonical",
+  "dataset_name": "live_micro"
+}

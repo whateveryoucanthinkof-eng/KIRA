@@ -1,0 +1,40 @@
+{
+  "manifest_version": "1.0.0",
+  "model_name": "branch_b_host_wdt",
+  "model_version": "1.0.0",
+  "checkpoint_file": "host_wdt.pt",
+  "architecture": {
+    "model_type": "HostWorldDynamicsTransformer",
+    "d_latent": 12,
+    "d_model": 64,
+    "nhead": 4,
+    "num_encoder_layers": 2,
+    "dim_feedforward": 128,
+    "infiltration_head": {
+      "model_type": "InfiltrationRiskHead",
+      "d_latent": 12,
+      "hidden_dim": 32,
+      "aggregation": "peak_severity_max"
+    }
+  },
+  "feature_schema": {
+    "version": "1.0.0",
+    "tgne_latent_dim": 12,
+    "observable_only": true,
+    "zero_label_leakage": true
+  },
+  "temporal_contract": {
+    "mode": "live_micro",
+    "delta_t_sec": 2.0,
+    "history_steps": 5,
+    "forecast_horizon_steps": 8,
+    "stabilize_horizon": true
+  },
+  "training_metadata": {
+    "dataset": "unified_telemetry_v3",
+    "split_policy": "ScientificSplitManager_disjoint_scenarios",
+    "random_seed": 42,
+    "optimizer": "AdamW",
+    "lr": 0.0005
+  }
+}

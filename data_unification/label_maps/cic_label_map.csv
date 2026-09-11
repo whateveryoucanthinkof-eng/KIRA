@@ -1,0 +1,28 @@
+raw_label,coarse_category,attck_technique_ids,is_attack,description
+BENIGN,Benign,,0,Normal benign background traffic
+PortScan,Recon,T1046,1,Network Service Discovery scanning
+DDoS,Impact,T1498,1,Network Denial of Service flooding
+Bot,C2,T1071,1,Botnet communication / C2 traffic
+Infiltration,InitialAccess,T1190,1,Exploit Public-Facing Application infiltration
+Web Attack – Brute Force,InitialAccess,T1110,1,Password guessing / Brute Force
+Web Attack – XSS,InitialAccess,T1189,1,Drive-by compromise / Cross-site scripting
+Web Attack – Sql Injection,InitialAccess,T1190,1,SQL injection exploit
+FTP-Patator,InitialAccess,T1110,1,FTP credential brute force
+SSH-Patator,InitialAccess,T1110,1,SSH credential brute force
+DoS Hulk,Impact,T1498,1,HTTP flood DoS attack
+DoS GoldenEye,Impact,T1498,1,HTTP Keep-Alive DoS attack
+DoS slowloris,Impact,T1498.001,1,Slowloris low-bandwidth connection exhaustion
+DoS Slowhttptest,Impact,T1498.001,1,Slow HTTP test denial of service
+Heartbleed,Exfiltration,T1005,1,OpenSSL memory disclosure exploit
+DDoS attacks-LOIC-HTTP,Impact,T1498,1,LOIC HTTP flood DDoS (CIC-IDS2018)
+DDOS attack-HOIC,Impact,T1498,1,HOIC HTTP flood DDoS (CIC-IDS2018)
+DDOS attack-LOIC-UDP,Impact,T1498,1,LOIC UDP flood DDoS (CIC-IDS2018)
+DoS attacks-Slowloris,Impact,T1498.001,1,Slowloris DoS (CIC-IDS2018)
+DoS attacks-SlowHTTPTest,Impact,T1498.001,1,SlowHTTPTest DoS (CIC-IDS2018)
+DoS attacks-Hulk,Impact,T1498,1,Hulk DoS (CIC-IDS2018)
+DoS attacks-GoldenEye,Impact,T1498,1,GoldenEye DoS (CIC-IDS2018)
+Brute Force -Web,InitialAccess,T1110,1,Web brute force (CIC-IDS2018)
+Brute Force -XSS,InitialAccess,T1189,1,XSS attack (CIC-IDS2018)
+SQL Injection,InitialAccess,T1190,1,SQL injection (CIC-IDS2018)
+Infilteration,InitialAccess,T1190,1,Infiltration attempt (CIC-IDS2018)
+Botnet,C2,T1071,1,Botnet traffic (CIC-IDS2018)

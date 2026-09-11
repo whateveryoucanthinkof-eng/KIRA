@@ -1,0 +1,36 @@
+{
+  "manifest_version": "1.0.0",
+  "model_name": "branch_a_multitask_lstm",
+  "model_version": "1.0.0",
+  "checkpoint_file": "branch_a_lstm.pt",
+  "architecture": {
+    "model_type": "MultiTaskLSTM",
+    "input_dim": 27,
+    "hidden_dim": 64,
+    "num_layers": 2,
+    "heads": {
+      "risk_head": {"type": "Linear", "out_dim": 1, "activation": "Sigmoid"},
+      "technique_head": {"type": "Linear", "out_dim": 14, "activation": "Logits"},
+      "stage_head": {"type": "Linear", "out_dim": 4, "activation": "Logits"}
+    }
+  },
+  "feature_schema": {
+    "version": "1.0.0",
+    "tgne_latent_dim": 12,
+    "host_temporal_attr_dim": 15,
+    "total_input_dim": 27
+  },
+  "temporal_contract": {
+    "mode": "live_micro",
+    "window_size_sec": 2.0,
+    "history_steps": 5
+  },
+  "training_metadata": {
+    "dataset": "unified_telemetry_v3",
+    "split_policy": "ScientificSplitManager_disjoint_scenarios",
+    "train_hosts": 3840,
+    "random_seed": 42,
+    "optimizer": "AdamW",
+    "lr": 0.001
+  }
+}

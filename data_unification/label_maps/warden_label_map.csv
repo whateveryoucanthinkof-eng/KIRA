@@ -1,0 +1,10 @@
+raw_label,coarse_category,attck_technique_ids,is_attack,description
+Recon.Scanning,Recon,T1595;T1046,1,Active network and port scanning
+Availability.DDoS,Impact,T1498,1,Distributed Denial of Service flood
+Availability.DoS,Impact,T1498,1,Denial of Service attack
+Anomaly.Traffic,Recon,,1,Anomalous traffic pattern without confirmed technique
+Intrusion.Botnet,C2,T1071,1,Botnet communication / C2
+Attempt.Exploit,InitialAccess,T1190,1,Exploitation attempt against public service
+Attempt.Login,InitialAccess,T1110,1,Credential guessing attempt
+Information.Unauthorized-Access,Exfiltration,T1020,1,Unauthorized data access / exfiltration
+Other,Unknown,,0,Unclassified alerts

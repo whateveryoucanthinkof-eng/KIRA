@@ -1,0 +1,25 @@
+{
+  "contract_version": "1.0.0",
+  "timescales": {
+    "live_micro": {
+      "description": "Real-time streaming SOC alerting, micro-burst graph rollouts, and active incident response",
+      "delta_t_sec": 2.0,
+      "window_size_sec": 2.0,
+      "history_steps": 5,
+      "forecast_horizon_steps": 8,
+      "total_history_duration_sec": 10.0,
+      "total_forecast_duration_sec": 16.0
+    },
+    "macro_batch": {
+      "description": "Offline PCAP ingestion, macroscopic graph edge snapshotting, and multi-hour campaign compaction",
+      "delta_t_sec": 60.0,
+      "window_size_sec": 60.0,
+      "history_steps": 5,
+      "forecast_horizon_steps": 4,
+      "total_history_duration_sec": 300.0,
+      "total_forecast_duration_sec": 240.0
+    }
+  },
+  "default_mode": "live_micro",
+  "enforce_strict_timescale": true
+}

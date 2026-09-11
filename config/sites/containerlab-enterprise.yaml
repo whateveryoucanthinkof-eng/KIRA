@@ -1,0 +1,60 @@
+# Containerlab enterprise cyber-range site profile.
+# Used when lab_mode is enabled (deploy/destroy/workloads available).
+
+site_id: containerlab-enterprise
+display_name: Containerlab Enterprise Range
+lab_mode: true
+
+# IPs in these ranges are treated as enterprise/internal for scoring & topology.
+enterprise_cidrs:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+
+# Explicitly external (lab "attacker" / untrusted zone). Not a topology fixture —
+# external nodes still appear only when SPAN observes their traffic.
+external_cidrs:
+  - 192.168.100.0/24
+
+zones:
+  users: ["10.0.1.0/24"]
+  servers: ["10.0.2.0/24"]
+  dmz: ["10.0.3.0/24"]
+  perimeter_transit: ["172.16.0.0/30", "10.0.0.0/30"]
+  external: ["192.168.100.0/24"]
+
+# Optional preferred victims when present in a window (activity still wins among them).
+assets_of_interest:
+  - ip: 10.0.3.10
+    name: dmz-web
+    role: dmz
+  - ip: 10.0.2.40
+    name: srv-app
+    role: server
+  - ip: 10.0.2.30
+    name: srv-file
+    role: server
+  - ip: 10.0.2.20
+    name: srv-id
+    role: server
+  - ip: 10.0.2.10
+    name: srv-dns
+    role: server
+  - ip: 10.0.2.50
+    name: srv-db
+    role: server
+
+sensor:
+  mode: local
+  interface: eth_sensor
+  container: clab-enterprise-sensor
+
+topology:
+  node_ttl_sec: 120
+  edge_ttl_sec: 60
+  max_nodes: 500
+
+operator_hints:
+  external_traffic: >
+    Generate traffic from outside the enterprise CIDRs toward internal assets
+    (lab example: toward 10.0.3.10). External hosts appear on the topology only
+    when SPAN observes their flows.

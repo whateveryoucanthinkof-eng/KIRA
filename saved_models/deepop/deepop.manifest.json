@@ -1,0 +1,37 @@
+{
+  "manifest_version": "1.0.0",
+  "model_name": "deepop_cwa_forecast_decoder",
+  "model_version": "1.0.0",
+  "checkpoint_file": "cwa_forecast_decoder.pt",
+  "architecture": {
+    "model_type": "DeepOPForecastDecoder",
+    "d_latent": 12,
+    "d_model": 72,
+    "vocab_size": 24,
+    "num_decoder_layers": 2,
+    "nhead": 4,
+    "window_size_w": 3,
+    "attention_type": "CausalWindowAttention_ONW",
+    "direct_residual_head": true,
+    "prototype_matching_head": true,
+    "future_context_gate": true
+  },
+  "feature_schema": {
+    "version": "1.0.0",
+    "tgne_latent_dim": 12,
+    "future_state_conditioning": "WDT_predicted_and_oracle"
+  },
+  "temporal_contract": {
+    "mode": "live_micro",
+    "delta_t_sec": 2.0,
+    "forecast_horizon_steps": 8
+  },
+  "training_metadata": {
+    "dataset": "unified_telemetry_v3",
+    "split_policy": "ScientificSplitManager_disjoint_scenarios",
+    "wdt_noise_inoculation": true,
+    "random_seed": 42,
+    "optimizer": "AdamW",
+    "lr": 0.001
+  }
+}

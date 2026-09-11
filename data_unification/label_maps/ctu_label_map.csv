@@ -1,0 +1,13 @@
+raw_label,coarse_category,attck_technique_ids,is_attack,description
+Benign,Benign,,0,Normal traffic
+Normal,Benign,,0,Normal traffic
+Background,Benign,,0,Background traffic
+Rbot (IRC DDoS/Scan),C2,T1071.001;T1046;T1498,1,Rbot IRC botnet with scanning and DDoS capability
+Virut (Fast Flux P2P),C2,T1071;T1568.001,1,Virut P2P fast-flux domain resolution and C2
+Neris (IRC Spam/Click),C2,T1071.001,1,Neris IRC-controlled spamming/clickbot
+Qvod (P2P/Trojan),Execution,T1204,1,Qvod P2P trojan activity
+Donbot (P2P HTTP Spam),C2,T1071.001,1,Donbot HTTP/P2P spamming botnet
+Rbot (IRC DDoS),Impact,T1071.001;T1498,1,Rbot IRC DDoS attack
+From-Botnet,C2,T1071,1,General outbound botnet traffic
+To-Botnet,C2,T1071,1,General inbound botnet traffic
+Botnet,C2,T1071,1,Generic botnet traffic

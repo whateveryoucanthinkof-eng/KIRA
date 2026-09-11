@@ -1,0 +1,119 @@
+name: enterprise
+
+mgmt:
+  skip-when-unused: true
+
+topology:
+  defaults:
+    network-mode: none
+
+  nodes:
+    # -------------------------------------------------------------
+    # ROUTING & PERIMETER INFRASTRUCTURE
+    # -------------------------------------------------------------
+    router-edge:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    router-firewall:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    router-core:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    # -------------------------------------------------------------
+    # ENTERPRISE USERS (WORKSTATIONS)
+    # -------------------------------------------------------------
+    ws-office:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    ws-web:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    ws-file:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    ws-app:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    # -------------------------------------------------------------
+    # ENTERPRISE SERVERS
+    # -------------------------------------------------------------
+    srv-dns:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    srv-id:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    srv-file:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    srv-app:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    srv-db:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    # -------------------------------------------------------------
+    # DMZ SERVICES
+    # -------------------------------------------------------------
+    dmz-web:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    # -------------------------------------------------------------
+    # EXTERNAL ATTACKER (ISOLATED)
+    # -------------------------------------------------------------
+    attacker:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+    # -------------------------------------------------------------
+    # PASSIVE NETWORK SENSOR
+    # -------------------------------------------------------------
+    sensor:
+      kind: linux
+      image: localhost/cyberworld-node:latest
+
+  # ---------------------------------------------------------------
+  # NETWORK INTERCONNECTS (VETH LINKS)
+  # ---------------------------------------------------------------
+  links:
+    # External Network Link: Attacker -> Edge Router
+    - endpoints: ["attacker:eth1", "router-edge:eth1"]
+
+    # Point-to-Point Perimeter Transit: Edge Router -> Firewall Router
+    - endpoints: ["router-edge:eth2", "router-firewall:eth1"]
+
+    # Point-to-Point Core Transit: Firewall Router -> Core Router
+    - endpoints: ["router-firewall:eth2", "router-core:eth_fw"]
+
+    # DMZ Segment: Core Router -> DMZ Web
+    - endpoints: ["router-core:eth_dmz", "dmz-web:eth1"]
+
+    # Users Subnet: Core Router -> Workstations
+    - endpoints: ["router-core:eth_u1", "ws-office:eth1"]
+    - endpoints: ["router-core:eth_u2", "ws-web:eth1"]
+    - endpoints: ["router-core:eth_u3", "ws-file:eth1"]
+    - endpoints: ["router-core:eth_u4", "ws-app:eth1"]
+
+    # Servers Subnet: Core Router -> Servers
+    - endpoints: ["router-core:eth_s1", "srv-dns:eth1"]
+    - endpoints: ["router-core:eth_s2", "srv-id:eth1"]
+    - endpoints: ["router-core:eth_s3", "srv-file:eth1"]
+    - endpoints: ["router-core:eth_s4", "srv-app:eth1"]
+    - endpoints: ["router-core:eth_s5", "srv-db:eth1"]
+
+    # Passive SPAN Mirror Port: Core Router -> Passive Sensor
+    - endpoints: ["router-core:eth_sensor", "sensor:eth_sensor"]

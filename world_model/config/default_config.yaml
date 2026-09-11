@@ -1,0 +1,43 @@
+# Default Hyperparameters for World Dynamics Transformer (WDT)
+
+data:
+  parquet_path: "c:/Users/vyomk/OneDrive/Desktop/gnn/data/ctu13/test_ctu13_states_2s_pcap.parquet"
+  latent_cache_dir: "c:/Users/vyomk/OneDrive/Desktop/gnn/data/latent_cache"
+  history_len: 16       # H = 16 windows context (~32s)
+  horizon_k: 4          # K = 4 windows forward rollout (~8s)
+  train_ratio: 0.60
+  val_ratio: 0.15
+  test_ratio: 0.25
+  batch_size: 64
+  num_workers: 0
+
+model:
+  d_z: 128              # 114 structural + 14 statistical
+  d_model: 256          # Transformer width
+  n_heads: 4            # 64 dim per head
+  n_layers: 4           # Pre-LN causal Transformer blocks
+  d_ff: 512             # FFN expansion
+  d_time: 64            # Continuous TGAT time-delta encoding dim
+  max_len: 128          # Maximum sequence context
+  dropout: 0.1
+  default_horizon: 4
+
+training:
+  epochs: 30
+  lr: 0.0003            # 3e-4 AdamW
+  weight_decay: 0.01
+  min_lr: 0.00001
+  warmup_epochs: 3
+  grad_clip: 1.0
+  use_amp: true
+  save_dir: "c:/Users/vyomk/OneDrive/Desktop/gnn/saved_models/world_model"
+  patience: 8           # Early stopping patience
+
+loss_weights:
+  lambda_dyn: 1.0       # Primary latent MSE loss
+  lambda_direct: 0.1    # Auxiliary direct prediction head
+  lambda_reg: 0.01      # Diversity and smoothness regularizers
+  lambda_state: 0.1     # State reconstruction (active in Stage 4)
+  lambda_attack: 0.5    # MITRE ATT&CK focal loss (Stage 5)
+  lambda_risk: 0.5      # Risk infiltration BCE (Stage 6)
+  gamma_dyn: 0.95       # Temporal discount factor across horizon K

@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0.0",
+  "fitted_on_split": "train_only",
+  "features": {
+    "log1p_fwd_bytes": {"mean": 6.8421, "std": 3.1415, "min": 0.0, "max": 18.4206},
+    "log1p_bwd_bytes": {"mean": 7.1294, "std": 3.8920, "min": 0.0, "max": 19.8512},
+    "log1p_fwd_packets": {"mean": 2.1054, "std": 1.4521, "min": 0.0, "max": 12.6102},
+    "log1p_bwd_packets": {"mean": 2.0118, "std": 1.5893, "min": 0.0, "max": 12.8941},
+    "duration_norm_300s": {"mean": 0.0842, "std": 0.2105, "min": 0.0, "max": 1.0},
+    "log1p_byte_rate_norm": {"mean": 0.3241, "std": 0.1872, "min": 0.0, "max": 1.0},
+    "log1p_packet_rate_norm": {"mean": 0.2814, "std": 0.1654, "min": 0.0, "max": 1.0},
+    "dst_port_norm_65535": {"mean": 0.1852, "std": 0.2910, "min": 0.0, "max": 1.0},
+    "directional_flow_asymmetry": {"mean": 0.0214, "std": 0.5481, "min": -1.0, "max": 1.0}
+  },
+  "categorical_encodings": {
+    "protocols": {"tcp": 6, "udp": 17, "icmp": 1},
+    "coarse_categories": {
+      "Benign": 0,
+      "Recon": 1,
+      "CredentialAccess": 2,
+      "C2": 3,
+      "Impact": 4
+    }
+  }
+}

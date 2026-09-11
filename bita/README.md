@@ -1,0 +1,19 @@
+# BiTA-framework
+In modern computer networks, timely and accurate prediction of alert events is crucial for mitigating the impact of evolving security threats. As cyber-attacks grow in complexity and scale, traditional rule-based defense systems often fall short in providing proactive and context-aware protection. Consequently, data-driven approaches, particularly those leveraging Temporal Graph Neural Networks (TGNs), have emerged as powerful tools for modeling the dynamic interactions among network entities and forecasting potential threats.
+
+Temporal GNNs excel at capturing both structural and temporal dependencies inherent in network events. However, a key challenge remains in effectively aggregating time-sensitive messages from neighboring nodes. Most existing methods rely on unidirectional recurrent models such as GRU or LSTM-based aggregators, which inherently struggle to capture bidirectional temporal dependencies and long-term patterns within event sequences. This limitation is particularly critical in cybersecurity contexts, where attack behaviors often exhibit recurrent and multi-step temporal patterns spanning both past and future intervals. Previous works have highlighted the shortcomings of recurrent models in capturing such dependencies, with several alternatives proposed to alleviate this issue, including non-local recurrent memory mechanisms, temporal convolutional architectures, and transformer-based temporal attention models. 
+
+To overcome the limitations of unidirectional recurrent aggregators, we propose a novel message aggregation strategy based on a combined BiGRU-Transformer architecture. In this design, a bidirectional GRU first captures temporal dependencies by processing event sequences in both forward and backward directions, enabling rich contextual embedding of past and future information. The Transformer encoder then applies self-attention over these embeddings to further model complex temporal interactions and long-range dependencies within the data. Our empirical results demonstrate that this BiGRU-Transformer aggregator effectively captures intricate temporal patterns, resulting in improved accuracy and robustness in alert prediction tasks.
+
+In practical settings, such as Security Operation Centers (SOCs) and Computer Emergency Response Teams (CERTs), the ability to proactively predict and categorize alerts is highly valuable. 
+SOC analysts are typically overwhelmed by massive volumes of heterogeneous alerts, where timely prioritization is essential to avoid alert fatigue and missed threats. 
+Similarly, CERT units require predictive insights to anticipate coordinated or evolving attacks across organizations. 
+Our framework provides these capabilities by offering both fine-grained category prediction and link prediction, enabling security operators to not only detect potential attack escalation but also understand its likely propagation path in the network. 
+Therefore, the proposed approach directly contributes to enhancing operational efficiency and decision-making in real-world cyber defense infrastructures.
+
+The main contributions of this work are summarized as follows:
+- We introduce a novel message aggregation module leveraging a bidirectional GRU Transformer to enhance temporal and contextual representation learning within TGNs.
+- We design a comprehensive alert prediction senario integrating the BiGRUTransformer module to forecast both the likelihood and categories of future network alerts.
+- Through extensive experiments on real-world network alert datasets, we show that our model outperforms state-of-the-art baselines, across metrics such as AUC, accuracy, and temporal precision.
+
+Our findings indicate that the BiGRUTransformer at TGNs provides a more expressive and flexible mechanism for modeling temporal alert dynamics, making it well-suited for real-time cyber threat forecasting applications.
