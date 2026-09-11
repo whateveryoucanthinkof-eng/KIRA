@@ -10,6 +10,14 @@ import type {
   MitigationPayload,
   WSHandlers,
 } from "./types";
+import { 
+  mockFetchStatus, 
+  mockFetchSite, 
+  mockFetchTopology, 
+  mockSendCommand, 
+  mockSendMitigate, 
+  MockWebSocket 
+} from "./mock";
 
 export const BASE_URL = "/api";
 export const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
@@ -153,24 +161,39 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export async function fetchStatus(): Promise<SystemStatus> {
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    return mockFetchStatus();
+  }
   const raw = await apiFetch<any>("/status");
   return mapSystemStatus(raw);
 }
 
 export async function fetchSite(): Promise<SiteInfo> {
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    return mockFetchSite();
+  }
   return apiFetch<SiteInfo>("/site");
 }
 
 export async function fetchTopology(): Promise<Topology> {
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    return mockFetchTopology();
+  }
   const raw = await apiFetch<any>("/topology");
   return mapTopology(raw);
 }
 
 export async function sendCommand(command: string): Promise<void> {
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    return mockSendCommand(command);
+  }
   await apiFetch<void>(`/command/${command}`, { method: "POST" });
 }
 
 export async function sendMitigate(payload: MitigationPayload): Promise<void> {
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    return mockSendMitigate(payload);
+  }
   await apiFetch<void>("/mitigate", {
     method: "POST",
     body: JSON.stringify(payload),
@@ -179,7 +202,10 @@ export async function sendMitigate(payload: MitigationPayload): Promise<void> {
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
-export function connectWebSocket(handlers: WSHandlers): WebSocket {
+export function connectWebSocket(handlers: WSHandlers): any {
+  if (import.meta.env.VITE_DEMO_MODE === 'true') {
+    return new MockWebSocket(handlers);
+  }
   const ws = new WebSocket(WS_URL);
 
   ws.onopen = () => handlers.onOpen?.();
