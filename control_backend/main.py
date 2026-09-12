@@ -278,4 +278,11 @@ if os.path.exists(FRONTEND_DIST_PATH):
         file_path = os.path.join(FRONTEND_DIST_PATH, full_path)
         if full_path and os.path.exists(file_path) and os.path.isfile(file_path):
             return FileResponse(file_path)
-        return FileResponse(os.path.join(FRONTEND_DIST_PATH, "index.html"))
+        return FileResponse(
+            os.path.join(FRONTEND_DIST_PATH, "index.html"),
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )

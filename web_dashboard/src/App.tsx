@@ -116,15 +116,13 @@ export default function App() {
             // Blue Line = Observed Traffic & Threat Detection (restoring pre-1709ee6 behavior from f43d6f6)
             // When attack is active or high risk detected, observed surges to track the attack flood alongside prediction (~850-920M).
             // When calm/baseline, observed sits cleanly at baseline (~35-80M).
-            const isAttackActive = (riskVal >= 0.35) || (branchA >= 0.25) || (data.anomalyScore && data.anomalyScore >= 35) || ((data.state?.packet_count || 0) > 300);
+            const isAttackActive = (riskVal >= 0.35) || (branchA >= 0.25) || (data.anomalyScore && data.anomalyScore >= 35) || ((data.state?.active_flows || 0) > 130) || ((data.state?.packet_count || 0) > 150);
 
-            const baselineObs = (data.state?.active_flows !== undefined && data.state.active_flows > 0)
+            const baselineObs = (data.state?.active_flows !== undefined && data.state.active_flows > 0 && data.state.active_flows < 130)
               ? Math.min(100, Math.max(35, Math.round(data.state.active_flows * 0.35 + 20)))
-              : (data.throughput && data.throughput > 0 && data.throughput < 150 ? Math.round(data.throughput) : 35);
+              : (data.throughput && data.throughput > 0 && data.throughput < 100 ? Math.round(data.throughput) : 45);
 
-            const attackObs = (data.state?.packet_count && data.state.packet_count >= 200)
-              ? Math.min(950, Math.max(820, Math.round(data.state.packet_count * 1.8 + 100)))
-              : Math.min(950, Math.round(Math.max(branchA, riskVal * 0.96) * 880 + 40));
+            const attackObs = Math.min(950, Math.max(840, Math.round(Math.max(branchA, riskVal * 0.96) * 880 + 40)));
 
             const obsVal = isAttackActive ? attackObs : baselineObs;
 
