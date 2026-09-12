@@ -237,6 +237,8 @@ export function connectWebSocket(handlers: WSHandlers): any {
             horizon: p.horizon || 30,
             value: p.prediction.risk || 0,
             confidence: p.prediction.malicious_confidence || 0,
+            branch_a_risk: p.prediction.risk ?? 0,
+            branch_b_risk: p.prediction.max_future_risk ?? p.prediction.risk ?? 0,
             model: "CyberWorld Ensemble",
             signals: [
               { name: "Hazard Score", weight: p.prediction.hazard_score || 0, direction: "positive" },

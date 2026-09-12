@@ -37,6 +37,8 @@ export interface PredictionResult {
   model: string;
   signals: ContributingSignal[];
   stage_provenance?: Record<string, string>;
+  branch_a_risk?: number;
+  branch_b_risk?: number;
 }
 
 export interface ContributingSignal {

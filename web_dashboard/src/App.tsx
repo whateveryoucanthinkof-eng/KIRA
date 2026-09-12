@@ -100,28 +100,28 @@ export default function App() {
         onPrediction: (data: any) => {
           if (data.prediction) {
             setPrediction(data.prediction);
-            const riskVal = data.prediction.value || 0;
-            const anomalyScore = Math.round(riskVal * 100);
-            const rawAlert = String(data.prediction.alert_level || (riskVal >= 0.85 ? "critical" : riskVal >= 0.65 ? "high" : riskVal >= 0.4 ? "medium" : "low")).toLowerCase();
+            const branchA = data.prediction.branch_a_risk ?? data.prediction.risk ?? data.prediction.value ?? 0;
+            const branchB = data.prediction.branch_b_risk ?? data.prediction.max_future_risk ?? branchA;
+
+            const anomalyScore = Math.round(branchA * 100);
+            const rawAlert = String(data.prediction.alert_level || (branchA >= 0.85 ? "critical" : branchA >= 0.65 ? "high" : branchA >= 0.4 ? "medium" : "low")).toLowerCase();
             const normThreat = rawAlert === "critical" ? "critical" : (rawAlert === "high" || rawAlert === "elevated") ? "high" : (rawAlert === "medium" || rawAlert === "warning") ? "medium" : "low";
 
-            // Use backend wire throughput (Mbps)
-            const obsThroughput = (data.throughput && data.throughput > 0)
-              ? Math.round(data.throughput)
-              : (data.state?.active_flows !== undefined
-                  ? Math.min(950, Math.round(data.state.active_flows * 0.35 + 20))
-                  : 35);
+            // Blue Line = Branch A Observed (shows if attack is actually happening!)
+            const obsVal = Math.min(950, Math.round(branchA * 880 + 35));
 
-            // Prediction surges when risk is elevated, otherwise tracks baseline observed traffic
-            const predThroughput = (riskVal >= 0.40)
-              ? Math.min(950, Math.round(Math.max(obsThroughput, riskVal * 900 + 40)))
-              : obsThroughput;
+            // Orange Line = Branch B Predicted (forecast of future risk)
+            const predVal = Math.min(950, Math.round(Math.max(branchB, branchA) * 880 + 35));
+
+            const wireThroughput = (data.throughput && data.throughput > 0)
+              ? Math.round(data.throughput)
+              : (data.state?.active_flows ? Math.round(data.state.active_flows * 0.35 + 20) : 35);
 
             setStatus((prev) => (prev ? {
               ...prev,
               anomalyScore,
               threatLevel: normThreat,
-              throughput: obsThroughput,
+              throughput: wireThroughput,
               activeConnections: data.state?.active_flows || prev.activeConnections,
             } : prev));
 
@@ -131,10 +131,10 @@ export default function App() {
 
               const pt = {
                 timestamp: ts,
-                observed: obsThroughput,
-                predicted: predThroughput,
-                lowerBound: Math.max(0, predThroughput - 60),
-                upperBound: Math.min(1000, predThroughput + 60),
+                observed: obsVal,
+                predicted: predVal,
+                lowerBound: Math.max(0, predVal - 60),
+                upperBound: Math.min(1000, predVal + 60),
                 anomalyScore
               };
               return [...prev, pt].slice(-60);
