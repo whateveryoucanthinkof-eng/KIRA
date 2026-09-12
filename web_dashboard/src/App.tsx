@@ -113,18 +113,19 @@ export default function App() {
               ? Math.min(950, Math.round(riskVal * 900 + 40))
               : (data.throughput && data.throughput > 0 ? Math.round(data.throughput) : (data.state?.active_flows ? Math.round(data.state.active_flows * 0.35 + 20) : 35));
 
-            // Blue Line = Observed Traffic & Threat Detection (restoring pre-1709ee6 behavior from f43d6f6)
-            // When attack is active or high risk detected, observed surges to track the attack flood alongside prediction (~850-920M).
-            // When calm/baseline, observed sits cleanly at baseline (~35-80M).
-            const isAttackActive = (riskVal >= 0.35) || (branchA >= 0.25) || (data.anomalyScore && data.anomalyScore >= 35) || ((data.state?.active_flows || 0) > 130) || ((data.state?.packet_count || 0) > 150);
+            // Blue Line = Branch A Observed (shows if attack is actually happening!)
+            // Linked to Branch A observed risk and telemetry surge, mirroring the f43d6f6 behavior scaled to 1000M.
+            // When Branch A detects the active attack or packet/flow surge, observed surges to track the flood (~850-920M).
+            // When calm/baseline, observed cleanly tracks live wire throughput alongside the predicted baseline.
+            const isObservedAttack = (branchA >= 0.25) || ((data.state?.packet_count || 0) > 250) || ((data.state?.active_flows || 0) > 400);
 
-            const baselineObs = (data.state?.active_flows !== undefined && data.state.active_flows > 0 && data.state.active_flows < 130)
-              ? Math.min(100, Math.max(35, Math.round(data.state.active_flows * 0.35 + 20)))
-              : (data.throughput && data.throughput > 0 && data.throughput < 100 ? Math.round(data.throughput) : 45);
+            const baselineObs = (data.throughput && data.throughput > 0)
+              ? Math.round(data.throughput)
+              : (data.state?.active_flows ? Math.round(data.state.active_flows * 0.35 + 20) : 35);
 
-            const attackObs = Math.min(950, Math.max(840, Math.round(Math.max(branchA, riskVal * 0.96) * 880 + 40)));
+            const attackObs = Math.min(950, Math.round(Math.max(branchA, 0.88) * 890 + 45));
 
-            const obsVal = isAttackActive ? attackObs : baselineObs;
+            const obsVal = isObservedAttack ? attackObs : baselineObs;
 
             const wireThroughput = obsVal;
 
@@ -146,6 +147,7 @@ export default function App() {
                 predicted: predVal,
                 lowerBound: Math.max(0, predVal - 60),
                 upperBound: Math.min(1000, predVal + 60),
+                confidence: data.prediction.confidence ?? 0.95,
                 anomalyScore
               };
               return [...prev, pt].slice(-60);

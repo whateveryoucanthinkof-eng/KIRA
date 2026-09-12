@@ -348,8 +348,8 @@ class AntigravityModelAdapter:
             obs_risk = max(0.02, raw_risk * 0.15)
             obs_technique = "Benign"
         else:
-            if ext_count > 0:
-                threat_boost = min(0.65, (ext_count / 75.0) * 0.50 + 0.25)
+            if ext_count > 0 or attack_active:
+                threat_boost = min(0.65, (max(1, ext_count) / 75.0) * 0.50 + 0.25)
                 obs_risk = min(0.96, max(raw_risk, 0.40) + threat_boost)
                 ports_seen = {getattr(r, "dst_port", 0) for r in ext_flows}
                 if len(ports_seen) >= 5:
