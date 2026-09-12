@@ -43,14 +43,23 @@ export default function App() {
   const [logLines, setLogLines] = useState<string[]>([]);
   const [site, setSite] = useState<SiteInfo | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
-  const [darkMode, setDarkMode] = useState(false);
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem("soc_theme");
+    return saved !== null ? saved === "dark" : true;
+  });
 
   const wsRef = useRef<WebSocket | null>(null);
 
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", darkMode);
+  }, [darkMode]);
+
   const toggleDark = () => {
     setDarkMode((d) => {
-      document.documentElement.classList.toggle("dark", !d);
-      return !d;
+      const next = !d;
+      localStorage.setItem("soc_theme", next ? "dark" : "light");
+      document.documentElement.classList.toggle("dark", next);
+      return next;
     });
   };
 
