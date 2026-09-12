@@ -337,6 +337,11 @@ class AntigravityModelAdapter:
             r for r in host_flows 
             if site.classify_ip(getattr(r, "src_ip", "")) == "external"
         ]
+        if not ext_flows:
+            ext_flows = [
+                r for r in flows 
+                if site.classify_ip(getattr(r, "src_ip", "")) == "external"
+            ]
         ext_count = len(ext_flows)
 
         if is_mitigated:

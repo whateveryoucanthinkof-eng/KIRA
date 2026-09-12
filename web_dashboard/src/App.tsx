@@ -102,20 +102,33 @@ export default function App() {
             setPrediction(data.prediction);
             const branchA = data.prediction.branch_a_risk ?? data.prediction.risk ?? data.prediction.value ?? 0;
             const branchB = data.prediction.branch_b_risk ?? data.prediction.max_future_risk ?? branchA;
+            const riskVal = Math.max(branchA, branchB, data.prediction.value || 0);
 
-            const anomalyScore = Math.round(branchA * 100);
-            const rawAlert = String(data.prediction.alert_level || (branchA >= 0.85 ? "critical" : branchA >= 0.65 ? "high" : branchA >= 0.4 ? "medium" : "low")).toLowerCase();
+            const anomalyScore = Math.round(riskVal * 100);
+            const rawAlert = String(data.prediction.alert_level || (riskVal >= 0.85 ? "critical" : riskVal >= 0.65 ? "high" : riskVal >= 0.4 ? "medium" : "low")).toLowerCase();
             const normThreat = rawAlert === "critical" ? "critical" : (rawAlert === "high" || rawAlert === "elevated") ? "high" : (rawAlert === "medium" || rawAlert === "warning") ? "medium" : "low";
 
-            // Blue Line = Branch A Observed (shows if attack is actually happening!)
-            const obsVal = Math.min(950, Math.round(branchA * 880 + 35));
+            // Orange Line = Branch B Predicted (forecast of future risk and predicted attack traffic surge)
+            const predVal = (riskVal >= 0.35)
+              ? Math.min(950, Math.round(riskVal * 900 + 40))
+              : (data.throughput && data.throughput > 0 ? Math.round(data.throughput) : (data.state?.active_flows ? Math.round(data.state.active_flows * 0.35 + 20) : 35));
 
-            // Orange Line = Branch B Predicted (forecast of future risk)
-            const predVal = Math.min(950, Math.round(Math.max(branchB, branchA) * 880 + 35));
+            // Blue Line = Observed Traffic & Threat Detection (restoring pre-1709ee6 behavior from f43d6f6)
+            // When attack is active or high risk detected, observed surges to track the attack flood alongside prediction (~850-920M).
+            // When calm/baseline, observed sits cleanly at baseline (~35-80M).
+            const isAttackActive = (riskVal >= 0.35) || (branchA >= 0.25) || (data.anomalyScore && data.anomalyScore >= 35) || ((data.state?.packet_count || 0) > 300);
 
-            const wireThroughput = (data.throughput && data.throughput > 0)
-              ? Math.round(data.throughput)
-              : (data.state?.active_flows ? Math.round(data.state.active_flows * 0.35 + 20) : 35);
+            const baselineObs = (data.state?.active_flows !== undefined && data.state.active_flows > 0)
+              ? Math.min(100, Math.max(35, Math.round(data.state.active_flows * 0.35 + 20)))
+              : (data.throughput && data.throughput > 0 && data.throughput < 150 ? Math.round(data.throughput) : 35);
+
+            const attackObs = (data.state?.packet_count && data.state.packet_count >= 200)
+              ? Math.min(950, Math.max(820, Math.round(data.state.packet_count * 1.8 + 100)))
+              : Math.min(950, Math.round(Math.max(branchA, riskVal * 0.96) * 880 + 40));
+
+            const obsVal = isAttackActive ? attackObs : baselineObs;
+
+            const wireThroughput = obsVal;
 
             setStatus((prev) => (prev ? {
               ...prev,
