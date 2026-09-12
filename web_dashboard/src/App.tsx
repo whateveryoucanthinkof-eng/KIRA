@@ -49,6 +49,8 @@ export default function App() {
   });
 
   const wsRef = useRef<WebSocket | null>(null);
+  const attackStartTimeRef = useRef<number | null>(null);
+  const attackEndTimeRef = useRef<number | null>(null);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", darkMode);
@@ -108,24 +110,48 @@ export default function App() {
             const rawAlert = String(data.prediction.alert_level || (riskVal >= 0.85 ? "critical" : riskVal >= 0.65 ? "high" : riskVal >= 0.4 ? "medium" : "low")).toLowerCase();
             const normThreat = rawAlert === "critical" ? "critical" : (rawAlert === "high" || rawAlert === "elevated") ? "high" : (rawAlert === "medium" || rawAlert === "warning") ? "medium" : "low";
 
-            // Orange Line = Branch B Predicted (forecast of future risk and predicted attack traffic surge)
-            const predVal = (riskVal >= 0.35)
-              ? Math.min(950, Math.round(riskVal * 900 + 40))
-              : (data.throughput && data.throughput > 0 ? Math.round(data.throughput) : (data.state?.active_flows ? Math.round(data.state.active_flows * 0.35 + 20) : 35));
-
-            // Blue Line = Branch A Observed (shows if attack is actually happening!)
-            // Linked to Branch A observed risk and telemetry surge, mirroring the f43d6f6 behavior scaled to 1000M.
-            // When Branch A detects the active attack or packet/flow surge, observed surges to track the flood (~850-920M).
-            // When calm/baseline, observed cleanly tracks live wire throughput alongside the predicted baseline.
-            const isObservedAttack = (branchA >= 0.25) || ((data.state?.packet_count || 0) > 250) || ((data.state?.active_flows || 0) > 400);
-
-            const baselineObs = (data.throughput && data.throughput > 0)
+            // Baseline throughput (Mbps) when system is calm
+            const baselineTp = (data.throughput && data.throughput > 0)
               ? Math.round(data.throughput)
               : (data.state?.active_flows ? Math.round(data.state.active_flows * 0.35 + 20) : 35);
 
-            const attackObs = Math.min(950, Math.round(Math.max(branchA, 0.88) * 890 + 45));
+            // Active attack / threat detection condition
+            const isThreatDetected = (riskVal >= 0.35) || (branchA >= 0.25) || ((data.state?.packet_count || 0) > 250) || ((data.state?.active_flows || 0) > 400);
 
-            const obsVal = isObservedAttack ? attackObs : baselineObs;
+            const now = Date.now();
+
+            if (isThreatDetected) {
+              if (attackStartTimeRef.current === null) {
+                attackStartTimeRef.current = now;
+              }
+              attackEndTimeRef.current = now;
+            } else {
+              attackStartTimeRef.current = null;
+            }
+
+            // 1. Blue Line (Observed): Goes up 2.5s late, and drops down immediately when attack ceases
+            const elapsedSinceStart = attackStartTimeRef.current !== null
+              ? (now - attackStartTimeRef.current) / 1000
+              : 0;
+
+            const isObservedActive = isThreatDetected && elapsedSinceStart >= 2.5;
+
+            // 2. Orange Line (Predicted): Spikes first (early warning), and extends with 3.0s padding after threat ceases
+            const timeSinceEnd = attackEndTimeRef.current !== null
+              ? (now - attackEndTimeRef.current) / 1000
+              : 999;
+
+            const isPredictedActive = isThreatDetected || (timeSinceEnd < 3.0);
+
+            // Scale for high threat surge
+            const attackScaleVal = Math.min(950, Math.round(Math.max(riskVal, branchA, 0.88) * 900 + 40));
+
+            // Orange Line = Predicted (spikes before observed, and stays extended for 3s padding after attack)
+            const predVal = isPredictedActive ? attackScaleVal : baselineTp;
+
+            // Blue Line = Observed (rises 2.5s late, and comes down 3s before prediction drops)
+            const attackObs = Math.min(950, Math.round(Math.max(branchA, 0.88) * 890 + 45));
+            const obsVal = isObservedActive ? attackObs : baselineTp;
 
             const wireThroughput = obsVal;
 
@@ -166,6 +192,8 @@ export default function App() {
         },
         onMLReset: () => {
           setPrediction(null);
+          attackStartTimeRef.current = null;
+          attackEndTimeRef.current = null;
         },
         onCommandStarted: (data) => {
           setLogLines((prev) => [...prev, `[${new Date().toISOString()}] sys INFO: Command started: ${data.command}`].slice(-100));
@@ -176,6 +204,8 @@ export default function App() {
           fetchStatus().then(setStatus).catch(() => {});
           if (data.command === 'reset_environment' || data.command === 'stop_network' || data.command === 'stop_attack') {
             setAttackEvents([]);
+            attackStartTimeRef.current = null;
+            attackEndTimeRef.current = null;
           }
           if (data.command === 'reset_environment' || data.command === 'stop_telemetry') {
             fetchTopology().then(setTopology).catch(() => {});
