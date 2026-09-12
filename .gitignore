@@ -1,5 +1,5 @@
 # ==============================================================================
-# CyberWorld — .gitignore
+# CyberFortress — .gitignore
 # Excludes datasets, PCAPs, caches, secrets, node_modules, and local planning docs
 # ==============================================================================
 
@@ -118,7 +118,7 @@ tmp/
 *.tmp
 *.sqlite
 *.db
-/tmp/cyberworld_*
+/tmp/CyberFortress_*
 
 # --- Secrets & TLS Certificates ---
 *.pem

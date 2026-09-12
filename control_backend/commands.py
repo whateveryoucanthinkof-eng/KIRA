@@ -26,7 +26,7 @@ logger = logging.getLogger("antigravity.commands")
 
 ALLOWED_COMMANDS = {
     "build_environment": {
-        "description": "Build CyberWorld node container image",
+        "description": "Build CyberFortress node container image",
         "cmd": ["./scripts/build.sh"],
     },
     "start_network": {
@@ -142,7 +142,7 @@ class CommandExecutor:
             raise RuntimeError(
                 f"Command '{cmd_name}' requires Lab Mode "
                 f"(site '{site.site_id}' has lab_mode=false). "
-                "Set CYBERWORLD_SITE=containerlab-enterprise for Containerlab orchestration."
+                "Set CyberFortress_SITE=containerlab-enterprise for Containerlab orchestration."
             )
 
         with self.lock:

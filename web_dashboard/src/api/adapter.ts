@@ -10,13 +10,13 @@ import type {
   MitigationPayload,
   WSHandlers,
 } from "./types";
-import { 
-  mockFetchStatus, 
-  mockFetchSite, 
-  mockFetchTopology, 
-  mockSendCommand, 
-  mockSendMitigate, 
-  MockWebSocket 
+import {
+  mockFetchStatus,
+  mockFetchSite,
+  mockFetchTopology,
+  mockSendCommand,
+  mockSendMitigate,
+  MockWebSocket
 } from "./mock";
 
 export const BASE_URL = "/api";
@@ -56,10 +56,10 @@ const edgeStatsCache = new Map<string, { lastBytes: number; lastTime: number; cu
 
 function mapTopology(backendTopo: any): Topology {
   const nodes = backendTopo.nodes || [];
-  
+
   const extNodes = nodes.filter((n: any) => n.role === "external" || n.zone === "external");
   const dmzNodes = nodes.filter((n: any) => n.role === "sensor" || n.zone === "dmz");
-  const intNodes = nodes.filter((n: any) => 
+  const intNodes = nodes.filter((n: any) =>
     !extNodes.includes(n) && !dmzNodes.includes(n)
   );
 
@@ -77,15 +77,15 @@ function mapTopology(backendTopo: any): Topology {
         const row = Math.floor(i / nodesPerRow);
         const col = i % nodesPerRow;
         const rowCount = Math.ceil(group.length / nodesPerRow);
-        const currentGroupSize = row === rowCount - 1 && group.length % nodesPerRow !== 0 
-          ? group.length % nodesPerRow 
+        const currentGroupSize = row === rowCount - 1 && group.length % nodesPerRow !== 0
+          ? group.length % nodesPerRow
           : Math.min(group.length, nodesPerRow);
-          
+
         const spacing = currentGroupSize > 1 ? (width - 2 * padding) / (currentGroupSize - 1) : 0;
         const x = currentGroupSize === 1 ? width / 2 : padding + (col * spacing);
-        
+
         // Stagger rows
-        const y = baseY + (row * ySpread) + (Math.random() * 20 - 10); 
+        const y = baseY + (row * ySpread) + (Math.random() * 20 - 10);
         n.x = x;
         n.y = y;
         nodeLayoutCache.set(n.id, { x, y });
@@ -99,7 +99,7 @@ function mapTopology(backendTopo: any): Topology {
       else if (n.risk >= 0.5) n.status = "warning";
       else if (n.stale) n.status = "offline";
       else n.status = "online";
-      
+
       if (!n.label) n.label = n.ip || n.id;
     });
   }
@@ -117,7 +117,7 @@ function mapTopology(backendTopo: any): Topology {
   const mappedEdges = (backendTopo.edges || []).map((e: any) => {
     const id = `${e.src}-${e.dst}-${e.protocol}-${e.dst_port || 0}`;
     const currentBytes = e.bytes || 0;
-    
+
     let mbps = 0;
     if (edgeStatsCache.has(id)) {
       const prev = edgeStatsCache.get(id)!;
@@ -129,7 +129,7 @@ function mapTopology(backendTopo: any): Topology {
       } else {
         mbps = prev.currentMbps; // Keep previous if time delta is too small (e.g., immediate re-renders)
       }
-      
+
       // Cache the new values
       edgeStatsCache.set(id, { lastBytes: currentBytes, lastTime: now, currentMbps: mbps });
     } else {
@@ -226,7 +226,7 @@ export function connectWebSocket(handlers: WSHandlers): any {
     } catch {
       return;
     }
-    
+
     // The backend sends events flattened, not inside a 'payload' wrapper
     const p = parsed;
     switch (parsed.type) {
@@ -239,7 +239,7 @@ export function connectWebSocket(handlers: WSHandlers): any {
             confidence: p.prediction.malicious_confidence || 0,
             branch_a_risk: p.prediction.risk ?? 0,
             branch_b_risk: p.prediction.max_future_risk ?? p.prediction.risk ?? 0,
-            model: "CyberWorld Ensemble",
+            model: "CyberFortress Ensemble",
             signals: [
               { name: "Hazard Score", weight: p.prediction.hazard_score || 0, direction: "positive" },
               { name: "Forecast Error", weight: p.prediction.forecast_error || 0, direction: "negative" },

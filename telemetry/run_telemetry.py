@@ -115,7 +115,7 @@ def _emit_window(state: dict, recorder: AsyncStateRecorder | None) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CyberWorld Live SPAN Telemetry (capture for Dual-Branch/DeepOP)"
+        description="CyberFortress Live SPAN Telemetry (capture for Dual-Branch/DeepOP)"
     )
     parser.add_argument("--interface", default="eth1", help="Observation interface")
     parser.add_argument("--replay", "--pcap", dest="replay", default=None, help="Replay PCAP")
@@ -135,7 +135,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print("CYBERWORLD LIVE SPAN TELEMETRY (CAPTURE ONLY)")
+    print("CyberFortress LIVE SPAN TELEMETRY (CAPTURE ONLY)")
     print(f"  Interface:            {args.interface}")
     print(f"  Window Resolution:    2.0 seconds")
     print(f"  Output:               5-tuple flows + window metadata → Dual-Branch/DeepOP")

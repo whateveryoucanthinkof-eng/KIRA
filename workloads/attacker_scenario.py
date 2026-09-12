@@ -2,7 +2,7 @@
 """
 workloads/attacker_scenario_aggressive.py
 
-AGGRESSIVE but CONTAINED ContainerLab workload for CyberWorld prediction testing.
+AGGRESSIVE but CONTAINED ContainerLab workload for CyberFortress prediction testing.
 
 Goals:
 - Generate substantially higher telemetry variance.
@@ -762,7 +762,7 @@ def execute_full_attack_campaign(
 
     log_event(
         "CAMPAIGN",
-        "AGGRESSIVE CYBERWORLD TEST CAMPAIGN STARTED"
+        "AGGRESSIVE CyberFortress TEST CAMPAIGN STARTED"
     )
 
     log_event(

@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 echo "================================================================="
-echo "CYBERWORLD LAB DEMO"
+echo "CyberFortress LAB DEMO"
 echo "  Live: python run_dashboard.py"
 echo "  Demo: python run_dashboard.py --replay <sample.pcap>"
 echo "================================================================="

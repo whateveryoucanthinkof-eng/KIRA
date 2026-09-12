@@ -21,13 +21,13 @@ for arg in "$@"; do
 done
 
 if [ "$IS_REPLAY" -eq 1 ]; then
-    echo "[*] Running CyberWorld SPAN telemetry in REPLAY Mode (capture only)..."
+    echo "[*] Running CyberFortress SPAN telemetry in REPLAY Mode (capture only)..."
     exec "$PYTHON_BIN" telemetry/run_telemetry.py --no-inference "$@"
 fi
 
 # Default: Live Mode from Sensor node (SPAN capture; ML runs in control_backend)
 echo "================================================================="
-echo "STARTING CYBERWORLD LIVE SPAN TELEMETRY (CAPTURE ONLY)"
+echo "STARTING CyberFortress LIVE SPAN TELEMETRY (CAPTURE ONLY)"
 echo "================================================================="
 
 if ! podman ps --filter "name=clab-enterprise-sensor" --format "{{.Names}}" | grep -q "clab-enterprise-sensor"; then

@@ -1,12 +1,12 @@
 """
 run_dashboard.py
-Launcher for the CyberWorld SOC console (local SPAN or Containerlab Lab Mode).
+Launcher for the CyberFortress SOC console (local SPAN or Containerlab Lab Mode).
 
   python run_dashboard.py --site local-default --interface eth1
   python run_dashboard.py --site containerlab-enterprise
 
 Env:
-  CYBERWORLD_SITE, CYBERWORLD_SITE_CONFIG, CYBERWORLD_SENSOR_IFACE
+  CyberFortress_SITE, CyberFortress_SITE_CONFIG, CyberFortress_SENSOR_IFACE
 """
 
 import argparse
@@ -45,7 +45,7 @@ def open_browser(port: int):
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="CyberWorld SOC dashboard")
+    p = argparse.ArgumentParser(description="CyberFortress SOC dashboard")
     p.add_argument("--site", default=None, help="Site id under config/sites/")
     p.add_argument("--site-config", default=None, help="Path to a site YAML file")
     p.add_argument("--interface", default=None, help="Override SPAN capture interface")
@@ -59,13 +59,13 @@ def _parse_args():
 if __name__ == "__main__":
     args = _parse_args()
     if args.site_config:
-        os.environ["CYBERWORLD_SITE_CONFIG"] = args.site_config
+        os.environ["CyberFortress_SITE_CONFIG"] = args.site_config
     if args.site:
-        os.environ["CYBERWORLD_SITE"] = args.site
+        os.environ["CyberFortress_SITE"] = args.site
     if args.interface:
-        os.environ["CYBERWORLD_SENSOR_IFACE"] = args.interface
+        os.environ["CyberFortress_SENSOR_IFACE"] = args.interface
     if args.replay:
-        os.environ["CYBERWORLD_REPLAY_PCAP"] = args.replay
+        os.environ["CyberFortress_REPLAY_PCAP"] = args.replay
 
     from control_backend.site_config import get_site_config, reload_site_config
 
@@ -73,7 +73,7 @@ if __name__ == "__main__":
     site = get_site_config()
 
     print("=" * 70)
-    print("  CYBERWORLD SOC — SPAN DISCOVERY + DUAL-BRANCH / DEEPOP")
+    print("  CyberFortress SOC — SPAN DISCOVERY + DUAL-BRANCH / DEEPOP")
     print("=" * 70)
     print(f"[+] Repo root:     {REPO_ROOT}")
     print(f"[+] Site:          {site.site_id} (lab_mode={site.lab_mode})")

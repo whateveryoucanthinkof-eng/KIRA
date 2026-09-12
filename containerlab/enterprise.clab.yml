@@ -13,78 +13,78 @@ topology:
     # -------------------------------------------------------------
     router-edge:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     router-firewall:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     router-core:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     # -------------------------------------------------------------
     # ENTERPRISE USERS (WORKSTATIONS)
     # -------------------------------------------------------------
     ws-office:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     ws-web:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     ws-file:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     ws-app:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     # -------------------------------------------------------------
     # ENTERPRISE SERVERS
     # -------------------------------------------------------------
     srv-dns:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     srv-id:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     srv-file:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     srv-app:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     srv-db:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     # -------------------------------------------------------------
     # DMZ SERVICES
     # -------------------------------------------------------------
     dmz-web:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     # -------------------------------------------------------------
     # EXTERNAL ATTACKER (ISOLATED)
     # -------------------------------------------------------------
     attacker:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
     # -------------------------------------------------------------
     # PASSIVE NETWORK SENSOR
     # -------------------------------------------------------------
     sensor:
       kind: linux
-      image: localhost/cyberworld-node:latest
+      image: localhost/CyberFortress-node:latest
 
   # ---------------------------------------------------------------
   # NETWORK INTERCONNECTS (VETH LINKS)

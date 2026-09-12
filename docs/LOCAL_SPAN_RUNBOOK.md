@@ -1,9 +1,9 @@
-# Local SPAN bring-up (CyberWorld)
+# Local SPAN bring-up (CyberFortress)
 
 ## Lab (Containerlab)
 
 ```bash
-export CYBERWORLD_SITE=containerlab-enterprise
+export CyberFortress_SITE=containerlab-enterprise
 ./scripts/deploy.sh
 python run_dashboard.py --site containerlab-enterprise
 # UI: START NETWORK (if needed) → START SENSOR → START ML
@@ -25,7 +25,7 @@ sudo -E python run_dashboard.py --site local-default --interface eth1
 Or:
 
 ```bash
-export CYBERWORLD_SITE=local-default
+export CyberFortress_SITE=local-default
 sudo -E python run_dashboard.py --interface eth1
 ```
 

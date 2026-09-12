@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 echo "================================================================="
-echo "CYBERWORLD TELEMETRY VERIFICATION"
+echo "CyberFortress TELEMETRY VERIFICATION"
 echo "================================================================="
 
 # 1. Verify clab-enterprise-sensor container is up
