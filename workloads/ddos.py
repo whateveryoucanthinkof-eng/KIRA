@@ -9,7 +9,16 @@ def trigger_fake_dashboard():
     try:
         url = "http://localhost:8001/api/trigger?attack_type=DDoS"
         req = urllib.request.Request(url, method="POST")
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=2) as response:
+            pass
+    except Exception:
+        pass
+
+def cancel_fake_dashboard():
+    try:
+        url = "http://localhost:8001/api/cancel"
+        req = urllib.request.Request(url, method="POST")
+        with urllib.request.urlopen(req, timeout=2) as response:
             pass
     except Exception:
         pass
@@ -20,11 +29,11 @@ def main():
     print("[*] Target: 10.0.3.10 (DMZ Web Server)")
     time.sleep(1)
     
-    # Trigger the dashboard visualization
+    # Trigger the dashboard visualization (predicted line spikes first!)
     trigger_fake_dashboard()
     
     print("[+] Attack launched successfully.")
-    print("[*] Sending packets...")
+    print("[*] Generating packet flood across port 80/443 (Press Ctrl+C to cancel/stop)...")
     
     try:
         while True:
@@ -32,7 +41,9 @@ def main():
             sys.stdout.flush()
             time.sleep(0.1)
     except KeyboardInterrupt:
-        print("\n[*] Attack stopped.")
+        print("\n[*] Stopping attack...")
+        cancel_fake_dashboard()
+        print("[+] Attack cancelled. Dashboard returning to baseline.")
 
 if __name__ == "__main__":
     main()

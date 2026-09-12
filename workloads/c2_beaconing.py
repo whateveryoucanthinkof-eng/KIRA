@@ -9,7 +9,16 @@ def trigger_fake_dashboard():
     try:
         url = "http://localhost:8001/api/trigger?attack_type=C2Beaconing"
         req = urllib.request.Request(url, method="POST")
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=2) as response:
+            pass
+    except Exception:
+        pass
+
+def cancel_fake_dashboard():
+    try:
+        url = "http://localhost:8001/api/cancel"
+        req = urllib.request.Request(url, method="POST")
+        with urllib.request.urlopen(req, timeout=2) as response:
             pass
     except Exception:
         pass
@@ -24,7 +33,7 @@ def main():
     trigger_fake_dashboard()
     
     print("[+] Establishing encrypted tunnel via HTTPS...")
-    print("[*] Sending keep-alive beacons...")
+    print("[*] Sending keep-alive beacons (Press Ctrl+C to stop)...")
     
     try:
         while True:
@@ -32,6 +41,8 @@ def main():
             time.sleep(2)
     except KeyboardInterrupt:
         print("\n[*] C2 connection closed.")
+        cancel_fake_dashboard()
+        print("[+] Attack cancelled. Dashboard returning to baseline.")
 
 if __name__ == "__main__":
     main()
