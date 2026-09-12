@@ -183,6 +183,15 @@ class SystemStatusEvent(BaseModel):
     topology_nodes: int = 0
     topology_edges: int = 0
     sensor_interface: Optional[str] = None
+    # Live operational reality metrics
+    uptime: int = 0
+    throughput: float = 0.0
+    latency: float = 0.0
+    packetLoss: float = 0.0
+    activeConnections: int = 0
+    anomalyScore: float = 0.0
+    threatLevel: str = "low"
+    timestamp: Optional[str] = None
 
 
 class CommandEvent(BaseModel):

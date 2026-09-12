@@ -200,7 +200,10 @@ def reload_site_config() -> SiteConfig:
     return get_site_config()
 
 
-def flow_endpoint_activity(flows: Sequence[Any]) -> Dict[str, float]:
+def flow_endpoint_activity(
+    flows: Sequence[Any],
+    site: Optional["SiteConfig"] = None,
+) -> Dict[str, float]:
     """
     Score IPs by approximate activity (bytes + packets) across a flow window.
     Accepts UnifiedFlowRecord-like objects or dicts.
@@ -228,9 +231,13 @@ def flow_endpoint_activity(flows: Sequence[Any]) -> Dict[str, float]:
             fwd_p = float(getattr(f, "fwd_packets", 0) or 0)
             bwd_p = float(getattr(f, "bwd_packets", 0) or 0)
 
-        # Weight: bytes dominate, packets break ties; +1 ensures presence counts.
-        _add(src, fwd_b + bwd_b * 0.25 + fwd_p + 1.0)
-        _add(dst, bwd_b + fwd_b * 0.25 + bwd_p + 1.0)
+        conn_w = 25.0
+        ext_mult = 1.0
+        if site and site.classify_ip(src) == "external" and site.classify_ip(dst) == "internal":
+            ext_mult = 50.0
+
+        _add(src, fwd_b + bwd_b * 0.25 + fwd_p + conn_w)
+        _add(dst, (bwd_b + fwd_b * 0.25 + bwd_p + conn_w) * ext_mult)
 
     return scores
 
@@ -251,7 +258,7 @@ def select_primary_target_ip(
       5) explicit fallback or empty string
     """
     site = site or get_site_config()
-    scores = flow_endpoint_activity(flows)
+    scores = flow_endpoint_activity(flows, site=site)
     if not scores:
         assets = site.asset_ips()
         if assets:

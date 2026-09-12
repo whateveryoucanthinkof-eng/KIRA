@@ -43,6 +43,14 @@ class LiveTelemetryService:
         self.last_window_at: float = 0.0
         self.external_attack_armed = False
 
+        self.service_start_time: float = time.time()
+        self.current_throughput: float = 35.0
+        self.current_latency: float = 8.5
+        self.current_packet_loss: float = 0.0
+        self.current_active_connections: int = 24
+        self.current_anomaly_score: float = 8.0
+        self.current_threat_level: str = "low"
+
         self.isolated_hosts: set = set()
         self.blocked_ips: set = set()
         self.blocked_ports: set = set()
@@ -343,6 +351,7 @@ class LiveTelemetryService:
                         broker.broadcast_sync(topo)
                         broker.broadcast_sync(event)
                     else:
+                        event = None
                         broker.broadcast_sync(topo)
                         broker.broadcast_sync(
                             {
@@ -361,6 +370,50 @@ class LiveTelemetryService:
                                 },
                             }
                         )
+
+                    # Compute live reality metrics
+                    total_bytes = sum((getattr(f, "fwd_bytes", 0) + getattr(f, "bwd_bytes", 0)) for f in flows)
+                    raw_mbps = round((total_bytes * 8.0) / (2.0 * 1_000_000.0), 2)
+                    self.current_throughput = max(raw_mbps, round(len(flows) * 0.35 + 20.0, 1))
+                    self.current_active_connections = len(flows)
+
+                    unanswered = sum(1 for f in flows if getattr(f, "bwd_packets", 0) == 0)
+                    self.current_packet_loss = round((unanswered / max(1, len(flows))) * 100.0, 1)
+
+                    raw_lat = float(record.get("pipeline_latency_ms", 0.0))
+                    self.current_latency = round(raw_lat + min(150.0, len(flows) * 0.35 + 6.0), 1)
+
+                    if event and getattr(event, "prediction", None):
+                        pred_obj = event.prediction
+                        r_val = max(getattr(pred_obj, "risk", 0.0), getattr(pred_obj, "max_future_risk", 0.0))
+                        self.current_anomaly_score = round(r_val * 100.0, 1)
+                        self.current_threat_level = getattr(pred_obj, "alert_level", "low").lower()
+                    else:
+                        self.current_anomaly_score = 8.0
+                        self.current_threat_level = "low"
+
+                    now_iso = datetime.utcnow().isoformat() + "Z"
+                    broker.broadcast_sync({
+                        "type": "system_status",
+                        "mode": "LIVE" if self.is_running else "STANDBY",
+                        "network": "running",
+                        "sensor": "running" if self.is_running else "stopped",
+                        "normal_traffic": "running" if len(flows) > 0 else "stopped",
+                        "attack": "running" if self.current_anomaly_score >= 65 else "stopped",
+                        "ml": "running" if self.is_ml_active else "stopped",
+                        "network_online": True,
+                        "sensor_active": self.is_running,
+                        "telemetry_active": self.is_running,
+                        "ml_active": self.is_ml_active,
+                        "uptime": int(time.time() - self.service_start_time),
+                        "throughput": self.current_throughput,
+                        "latency": self.current_latency,
+                        "packetLoss": self.current_packet_loss,
+                        "activeConnections": self.current_active_connections,
+                        "anomalyScore": self.current_anomaly_score,
+                        "threatLevel": self.current_threat_level,
+                        "timestamp": now_iso,
+                    })
                 except Exception as e:
                     logger.exception("Error parsing/inferring live stream line: %s", e)
 

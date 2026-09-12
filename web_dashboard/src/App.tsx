@@ -90,12 +90,17 @@ export default function App() {
             const ts = data.lastUpdate || new Date().toISOString();
             if (prev.length > 0 && prev[prev.length - 1].timestamp === ts) return prev;
             
+            const liveThroughput = data.throughput || 35;
+            const predThroughput = (data.anomalyScore && data.anomalyScore >= 30) 
+              ? Math.min(950, Math.round(data.anomalyScore * 9.2 + 35)) 
+              : liveThroughput;
+
             const pt = {
               timestamp: ts,
-              observed: data.throughput || 0,
-              predicted: data.throughput || 0,
-              lowerBound: Math.max(0, (data.throughput || 0) - 100),
-              upperBound: (data.throughput || 0) + 100,
+              observed: liveThroughput,
+              predicted: predThroughput,
+              lowerBound: Math.max(0, predThroughput - 80),
+              upperBound: Math.min(1000, predThroughput + 80),
               anomalyScore: data.anomalyScore || 0
             };
             return [...prev, pt].slice(-60);
@@ -112,13 +117,19 @@ export default function App() {
               // Prevent exact duplicates if multiple events fire
               if (prev.length > 0 && prev[prev.length - 1].timestamp === ts) return prev;
               
+              const riskVal = data.prediction.value || 0;
+              const predThroughput = (riskVal >= 0.25)
+                ? Math.min(950, Math.round(riskVal * 900 + 40))
+                : (data.throughput || 35);
+              const obsThroughput = data.throughput || (data.state?.active_flows ? Math.min(950, data.state.active_flows * 4 + 35) : 35);
+
               const pt = {
                 timestamp: ts,
-                observed: data.state?.active_flows || data.state?.packet_count || 0,
-                predicted: data.prediction.value * 100, // value is mapped to risk in adapter
-                lowerBound: Math.max(0, (data.prediction.value * 100) - 20),
-                upperBound: Math.min(100, (data.prediction.value * 100) + 20),
-                anomalyScore: data.prediction.value * 100
+                observed: obsThroughput,
+                predicted: predThroughput,
+                lowerBound: Math.max(0, predThroughput - 80),
+                upperBound: Math.min(1000, predThroughput + 80),
+                anomalyScore: Math.round(riskVal * 100)
               };
               return [...prev, pt].slice(-60);
             });

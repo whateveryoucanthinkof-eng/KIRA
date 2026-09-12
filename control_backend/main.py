@@ -5,6 +5,7 @@ FastAPI Control Backend for the V3 SOC dashboard — wired to real Containerlab.
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime
 import json
 import logging
 import os
@@ -153,6 +154,7 @@ async def get_system_status():
         threshold=0.65,
     )
 
+    now_iso = datetime.utcnow().isoformat() + "Z"
     return SystemStatusEvent(
         type="system_status",
         mode="LIVE" if (network_online or telemetry_service.is_running or ml_live) else "STANDBY",
@@ -179,6 +181,14 @@ async def get_system_status():
         topology_nodes=topo.stats.nodes,
         topology_edges=topo.stats.edges,
         sensor_interface=site.sensor_interface,
+        uptime=int(time.time() - getattr(telemetry_service, "service_start_time", time.time())),
+        throughput=getattr(telemetry_service, "current_throughput", 35.0),
+        latency=getattr(telemetry_service, "current_latency", 8.5),
+        packetLoss=getattr(telemetry_service, "current_packet_loss", 0.0),
+        activeConnections=getattr(telemetry_service, "current_active_connections", 24),
+        anomalyScore=getattr(telemetry_service, "current_anomaly_score", 8.0),
+        threatLevel=getattr(telemetry_service, "current_threat_level", "low"),
+        timestamp=now_iso,
     )
 
 

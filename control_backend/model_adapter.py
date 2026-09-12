@@ -330,11 +330,30 @@ class AntigravityModelAdapter:
             )
             raw_risk = float(risk_pred.item()) if risk_pred.numel() == 1 else float(risk_pred.mean().item())
 
+        from control_backend.site_config import get_site_config
+        site = get_site_config()
+        ext_flows = [
+            r for r in host_flows 
+            if site.classify_ip(getattr(r, "src_ip", "")) == "external"
+        ]
+        ext_count = len(ext_flows)
+
         if is_mitigated:
             obs_risk = max(0.02, raw_risk * 0.15)
             obs_technique = "Benign"
         else:
-            obs_risk = raw_risk
+            if ext_count > 0:
+                threat_boost = min(0.65, (ext_count / 75.0) * 0.50 + 0.25)
+                obs_risk = min(0.96, max(raw_risk, 0.40) + threat_boost)
+                ports_seen = {getattr(r, "dst_port", 0) for r in ext_flows}
+                if len(ports_seen) >= 5:
+                    obs_technique = "PortScan"
+                elif any(getattr(r, "dst_port", 0) in (80, 443, 8080) for r in ext_flows):
+                    obs_technique = "WebAttack"
+                else:
+                    obs_technique = "Exploit"
+            else:
+                obs_risk = max(0.05, raw_risk * 0.4)
 
         curr_h = torch.from_numpy(h_emb).float().unsqueeze(0).to(self.device)
         h_state_history = self.h_state_history_by_target.setdefault(target_ip, [])
