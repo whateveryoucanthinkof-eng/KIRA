@@ -111,6 +111,7 @@ class PredictionEvent(BaseModel):
     focus_ips: List[str] = Field(default_factory=list)
     focus_edges: List[FocusEdge] = Field(default_factory=list)
     target_ip: Optional[str] = None
+    throughput: float = 0.0
 
 
 class TopologyNode(BaseModel):

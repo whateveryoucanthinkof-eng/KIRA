@@ -323,6 +323,22 @@ class LiveTelemetryService:
                         now=self.last_window_at,
                     )
 
+                    # Compute live reality metrics
+                    total_bytes = sum((getattr(f, "fwd_bytes", 0) + getattr(f, "bwd_bytes", 0)) for f in flows)
+                    raw_mbps = round((total_bytes * 8.0) / (2.0 * 1_000_000.0), 2)
+                    self.current_throughput = max(raw_mbps, round(len(flows) * 0.35 + 20.0, 1))
+                    self.current_active_connections = len(flows)
+
+                    unanswered = sum(1 for f in flows if getattr(f, "bwd_packets", 0) == 0)
+                    loss_pct = (unanswered / max(1, len(flows))) * 100.0
+                    if loss_pct == 0.0:
+                        loss_pct = round((int(time.time()) % 4) * 0.1, 1)
+                    self.current_packet_loss = round(min(100.0, loss_pct), 1)
+
+                    raw_lat = float(record.get("pipeline_latency_ms", 0.0))
+                    jitter = float((int(time.time() * 2) % 7) - 3) * 0.5
+                    self.current_latency = round(max(4.0, raw_lat + min(120.0, len(flows) * 0.25 + 8.0) + jitter), 1)
+
                     if self.is_ml_active:
                         self.windows_streamed += 1
                         event = self.adapter.predict_window(
@@ -335,6 +351,7 @@ class LiveTelemetryService:
                             packet_count=int(record.get("packet_count", 0)),
                             pipeline_latency_ms=float(record.get("pipeline_latency_ms", 0.0)),
                             active_flows=int(record.get("active_flows", len(flows)) or 0),
+                            throughput=self.current_throughput,
                         )
                         if target and event.prediction:
                             topology_service.attach_risks(
@@ -370,22 +387,6 @@ class LiveTelemetryService:
                                 },
                             }
                         )
-
-                    # Compute live reality metrics
-                    total_bytes = sum((getattr(f, "fwd_bytes", 0) + getattr(f, "bwd_bytes", 0)) for f in flows)
-                    raw_mbps = round((total_bytes * 8.0) / (2.0 * 1_000_000.0), 2)
-                    self.current_throughput = max(raw_mbps, round(len(flows) * 0.35 + 20.0, 1))
-                    self.current_active_connections = len(flows)
-
-                    unanswered = sum(1 for f in flows if getattr(f, "bwd_packets", 0) == 0)
-                    loss_pct = (unanswered / max(1, len(flows))) * 100.0
-                    if loss_pct == 0.0:
-                        loss_pct = round((int(time.time()) % 4) * 0.1, 1)
-                    self.current_packet_loss = round(min(100.0, loss_pct), 1)
-
-                    raw_lat = float(record.get("pipeline_latency_ms", 0.0))
-                    jitter = float((int(time.time() * 2) % 7) - 3) * 0.5
-                    self.current_latency = round(max(4.0, raw_lat + min(120.0, len(flows) * 0.25 + 8.0) + jitter), 1)
 
                     if event and getattr(event, "prediction", None):
                         pred_obj = event.prediction

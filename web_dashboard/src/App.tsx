@@ -93,25 +93,6 @@ export default function App() {
         },
         onSystemStatus: (data) => {
           setStatus(data);
-          setTelemetry((prev) => {
-            const ts = data.lastUpdate || new Date().toISOString();
-            if (prev.length > 0 && prev[prev.length - 1].timestamp === ts) return prev;
-            
-            const liveThroughput = data.throughput || 35;
-            const predThroughput = (data.anomalyScore && data.anomalyScore >= 30) 
-              ? Math.min(950, Math.round(data.anomalyScore * 9.2 + 35)) 
-              : liveThroughput;
-
-            const pt = {
-              timestamp: ts,
-              observed: liveThroughput,
-              predicted: predThroughput,
-              lowerBound: Math.max(0, predThroughput - 80),
-              upperBound: Math.min(1000, predThroughput + 80),
-              anomalyScore: data.anomalyScore || 0
-            };
-            return [...prev, pt].slice(-60);
-          });
         },
         onTopologyUpdate: (data) => {
           setTopology(data);
@@ -124,29 +105,36 @@ export default function App() {
             const rawAlert = String(data.prediction.alert_level || (riskVal >= 0.85 ? "critical" : riskVal >= 0.65 ? "high" : riskVal >= 0.4 ? "medium" : "low")).toLowerCase();
             const normThreat = rawAlert === "critical" ? "critical" : (rawAlert === "high" || rawAlert === "elevated") ? "high" : (rawAlert === "medium" || rawAlert === "warning") ? "medium" : "low";
 
+            // Use backend wire throughput (Mbps)
+            const obsThroughput = (data.throughput && data.throughput > 0)
+              ? Math.round(data.throughput)
+              : (data.state?.active_flows !== undefined
+                  ? Math.min(950, Math.round(data.state.active_flows * 0.35 + 20))
+                  : 35);
+
+            // Prediction surges when risk is elevated, otherwise tracks baseline observed traffic
+            const predThroughput = (riskVal >= 0.40)
+              ? Math.min(950, Math.round(Math.max(obsThroughput, riskVal * 900 + 40)))
+              : obsThroughput;
+
             setStatus((prev) => (prev ? {
               ...prev,
               anomalyScore,
               threatLevel: normThreat,
-              throughput: data.throughput || prev.throughput,
+              throughput: obsThroughput,
               activeConnections: data.state?.active_flows || prev.activeConnections,
             } : prev));
 
             setTelemetry((prev) => {
               const ts = data.timestamp || new Date().toISOString();
               if (prev.length > 0 && prev[prev.length - 1].timestamp === ts) return prev;
-              
-              const predThroughput = (riskVal >= 0.25)
-                ? Math.min(950, Math.round(riskVal * 900 + 40))
-                : (data.throughput || 35);
-              const obsThroughput = data.throughput || (data.state?.active_flows ? Math.min(950, data.state.active_flows * 4 + 35) : 35);
 
               const pt = {
                 timestamp: ts,
                 observed: obsThroughput,
                 predicted: predThroughput,
-                lowerBound: Math.max(0, predThroughput - 80),
-                upperBound: Math.min(1000, predThroughput + 80),
+                lowerBound: Math.max(0, predThroughput - 60),
+                upperBound: Math.min(1000, predThroughput + 60),
                 anomalyScore
               };
               return [...prev, pt].slice(-60);

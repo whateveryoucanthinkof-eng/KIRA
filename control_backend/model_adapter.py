@@ -270,6 +270,7 @@ class AntigravityModelAdapter:
         packet_count: int = 0,
         pipeline_latency_ms: float = 0.0,
         active_flows: Optional[int] = None,
+        throughput: float = 0.0,
     ) -> PredictionEvent:
         t0 = time.perf_counter()
 
@@ -518,6 +519,7 @@ class AntigravityModelAdapter:
             focus_ips=focus_ips,
             focus_edges=focus_edges,
             target_ip=target_ip or None,
+            throughput=round(float(throughput), 2),
         )
 
     @staticmethod
