@@ -22,6 +22,14 @@ import {
 export const BASE_URL = "/api";
 export const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 
+function normalizeThreatLevel(raw: any): ThreatLevel {
+  const s = String(raw || "low").toLowerCase();
+  if (s === "critical") return "critical";
+  if (s === "high" || s === "elevated") return "high";
+  if (s === "medium" || s === "warning") return "medium";
+  return "low";
+}
+
 // Map real backend status to the Figma UI status format
 function mapSystemStatus(backendStatus: any): SystemStatus {
   return {
@@ -29,11 +37,10 @@ function mapSystemStatus(backendStatus: any): SystemStatus {
     telemetryStatus: backendStatus.sensor || "stopped",
     predictionStatus: backendStatus.ml || "stopped",
     attackStatus: backendStatus.attack === "running" ? "active" : "none",
-    // These fields are visual sugar in the Figma UI, using 0/defaults if missing
     uptime: backendStatus.uptime || 0,
     lastUpdate: backendStatus.timestamp || new Date().toISOString(),
     anomalyScore: backendStatus.anomalyScore || 0,
-    threatLevel: backendStatus.threatLevel || "low",
+    threatLevel: normalizeThreatLevel(backendStatus.threatLevel),
     packetLoss: backendStatus.packetLoss || 0,
     latency: backendStatus.latency || 0,
     throughput: backendStatus.throughput || 0,

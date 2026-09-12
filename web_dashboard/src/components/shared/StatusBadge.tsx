@@ -55,7 +55,8 @@ const severityStyles: Record<EventSeverity, { bg: string; color: string }> = {
 };
 
 export function SeverityBadge({ severity, children }: SeverityBadgeProps) {
-  const s = severityStyles[severity];
+  const norm = String(severity || "info").toLowerCase();
+  const s = severityStyles[norm as EventSeverity] || severityStyles.info;
   return (
     <span
       style={{
@@ -76,18 +77,22 @@ export function SeverityBadge({ severity, children }: SeverityBadgeProps) {
 }
 
 interface ThreatBadgeProps {
-  level: ThreatLevel;
+  level?: string;
 }
 
-const threatStyles: Record<ThreatLevel, { bg: string; color: string }> = {
+const threatStyles: Record<string, { bg: string; color: string }> = {
   low:      { bg: "var(--color-status-green-bg)",  color: "var(--color-status-green)" },
+  nominal:  { bg: "var(--color-status-green-bg)",  color: "var(--color-status-green)" },
   medium:   { bg: "var(--color-status-amber-bg)",  color: "var(--color-status-amber)" },
+  warning:  { bg: "var(--color-status-amber-bg)",  color: "var(--color-status-amber)" },
   high:     { bg: "var(--color-status-red-bg)",    color: "var(--color-status-red)" },
+  elevated: { bg: "var(--color-status-red-bg)",    color: "var(--color-status-red)" },
   critical: { bg: "#fff0f0",                        color: "#b91c1c" },
 };
 
 export function ThreatBadge({ level }: ThreatBadgeProps) {
-  const s = threatStyles[level];
+  const norm = String(level || "low").toLowerCase();
+  const s = threatStyles[norm] || threatStyles.low;
   return (
     <span
       style={{
@@ -105,7 +110,7 @@ export function ThreatBadge({ level }: ThreatBadgeProps) {
         border: `1px solid ${s.color}22`,
       }}
     >
-      {level}
+      {level || "low"}
     </span>
   );
 }

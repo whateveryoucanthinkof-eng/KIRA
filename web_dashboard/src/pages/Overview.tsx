@@ -50,7 +50,10 @@ function fmtUptime(s: number): string {
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return `${d}d ${h}h ${m}m`;
+  const sec = Math.floor(s % 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${sec}s`;
+  return `${m}m ${sec}s`;
 }
 
 function ChartTip({ active, payload, label }: { active?: boolean; payload?: unknown[]; label?: string }) {
@@ -184,7 +187,7 @@ export default function Overview({
         <MetricCard label="Packet Loss" value={status.packetLoss.toFixed(1)} unit="%" sub="5m avg" accent={status.packetLoss > 1 ? "amber" : "default"} mono />
         <MetricCard label="Connections" value={status.activeConnections.toLocaleString()} sub="established TCP" mono />
         <MetricCard label="Anomaly Score" value={Math.round(status.anomalyScore)} unit="/ 100" accent={status.anomalyScore >= 70 ? "red" : status.anomalyScore >= 40 ? "amber" : "green"} mono />
-        <MetricCard label="Threat Level" value={status.threatLevel.toUpperCase()} sub="current" accent={status.threatLevel === "high" || status.threatLevel === "critical" ? "red" : "amber"} />
+        <MetricCard label="Threat Level" value={status.threatLevel.toUpperCase()} sub="current" accent={status.threatLevel === "high" || status.threatLevel === "critical" ? "red" : status.threatLevel === "medium" ? "amber" : "green"} />
         <MetricCard label="Uptime" value={fmtUptime(status.uptime)} sub="this session" />
       </div>
 

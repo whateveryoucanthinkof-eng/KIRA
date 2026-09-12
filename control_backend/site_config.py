@@ -251,13 +251,35 @@ def select_primary_target_ip(
     Choose which host to score for a window — site-aware, not lab-hardcoded.
 
     Priority:
-      1) assets_of_interest present in the window (highest activity among them)
-      2) most active internal (enterprise) IP
-      3) most active IP overall
-      4) first configured asset_of_interest
-      5) explicit fallback or empty string
+      1) Internal host receiving traffic from external/untrusted sources (potential victim under attack)
+      2) assets_of_interest present in the window (highest activity among them)
+      3) most active internal (enterprise) IP
+      4) most active IP overall
+      5) first configured asset_of_interest
+      6) explicit fallback or empty string
     """
     site = site or get_site_config()
+
+    # Step 1: Detect any internal destination host receiving external/untrusted inbound flows
+    ext_inbound_counts: Dict[str, int] = {}
+    for f in flows or []:
+        if isinstance(f, dict):
+            src = str(f.get("src_ip") or "")
+            dst = str(f.get("dst_ip") or "")
+        else:
+            src = str(getattr(f, "src_ip", "") or "")
+            dst = str(getattr(f, "dst_ip", "") or "")
+        if site.classify_ip(src) == "external" and site.classify_ip(dst) == "internal":
+            ext_inbound_counts[dst] = ext_inbound_counts.get(dst, 0) + 1
+
+    if ext_inbound_counts:
+        # Prioritize asset_of_interest if among external targets, else highest count
+        asset_set = set(site.asset_ips())
+        ext_assets = {ip: c for ip, c in ext_inbound_counts.items() if ip in asset_set}
+        if ext_assets:
+            return max(ext_assets.items(), key=lambda kv: kv[1])[0]
+        return max(ext_inbound_counts.items(), key=lambda kv: kv[1])[0]
+
     scores = flow_endpoint_activity(flows, site=site)
     if not scores:
         assets = site.asset_ips()

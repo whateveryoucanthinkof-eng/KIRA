@@ -64,6 +64,13 @@ export default function App() {
   };
 
   useEffect(() => {
+    const timer = setInterval(() => {
+      setStatus((prev) => (prev ? { ...prev, uptime: prev.uptime + 1 } : prev));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     // Initial fetch
     fetchStatus().then(setStatus).catch(console.warn);
     fetchSite().then(setSite).catch(console.warn);
@@ -112,12 +119,23 @@ export default function App() {
         onPrediction: (data: any) => {
           if (data.prediction) {
             setPrediction(data.prediction);
+            const riskVal = data.prediction.value || 0;
+            const anomalyScore = Math.round(riskVal * 100);
+            const rawAlert = String(data.prediction.alert_level || (riskVal >= 0.85 ? "critical" : riskVal >= 0.65 ? "high" : riskVal >= 0.4 ? "medium" : "low")).toLowerCase();
+            const normThreat = rawAlert === "critical" ? "critical" : (rawAlert === "high" || rawAlert === "elevated") ? "high" : (rawAlert === "medium" || rawAlert === "warning") ? "medium" : "low";
+
+            setStatus((prev) => (prev ? {
+              ...prev,
+              anomalyScore,
+              threatLevel: normThreat,
+              throughput: data.throughput || prev.throughput,
+              activeConnections: data.state?.active_flows || prev.activeConnections,
+            } : prev));
+
             setTelemetry((prev) => {
               const ts = data.timestamp || new Date().toISOString();
-              // Prevent exact duplicates if multiple events fire
               if (prev.length > 0 && prev[prev.length - 1].timestamp === ts) return prev;
               
-              const riskVal = data.prediction.value || 0;
               const predThroughput = (riskVal >= 0.25)
                 ? Math.min(950, Math.round(riskVal * 900 + 40))
                 : (data.throughput || 35);
@@ -129,7 +147,7 @@ export default function App() {
                 predicted: predThroughput,
                 lowerBound: Math.max(0, predThroughput - 80),
                 upperBound: Math.min(1000, predThroughput + 80),
-                anomalyScore: Math.round(riskVal * 100)
+                anomalyScore
               };
               return [...prev, pt].slice(-60);
             });

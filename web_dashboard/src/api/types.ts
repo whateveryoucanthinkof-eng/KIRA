@@ -1,5 +1,5 @@
 export type ServiceStatus = "running" | "stopped" | "error" | "unknown";
-export type ThreatLevel = "low" | "medium" | "high" | "critical";
+export type ThreatLevel = "low" | "medium" | "high" | "critical" | "nominal" | "warning" | "elevated";
 export type EventSeverity = "info" | "warning" | "error" | "critical";
 export type AttackStatus = "none" | "active" | "mitigated" | "contained";
 
