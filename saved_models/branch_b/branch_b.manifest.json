@@ -8,7 +8,7 @@
     "d_latent": 12,
     "d_model": 64,
     "nhead": 4,
-    "num_encoder_layers": 2,
+    "num_encoder_layers": 3,
     "dim_feedforward": 128,
     "infiltration_head": {
       "model_type": "InfiltrationRiskHead",

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.abspath("bita"))
 
 from control_backend.commands import executor, ALLOWED_COMMANDS
 from control_backend.event_broker import broker
+import model_contract
 from control_backend.lab_config import TOTAL_NODES, LAB_NAME_FILTER
 from control_backend.site_config import get_site_config
 from control_backend.schema import SystemStatusEvent, ModelMetadata
@@ -144,7 +145,7 @@ async def get_system_status():
     model_meta = ModelMetadata(
         name="Antigravity-DualBranch-DeepOP",
         version="3.3-SOC",
-        feature_count=27,
+        feature_count=model_contract.BRANCH_A_INPUT_DIM,
         history_steps=5,
         window_seconds=2.0,
         forecast_steps=8,

@@ -10,8 +10,10 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MONOREPO_ROOT = REPO_ROOT
 V3_ROOT = REPO_ROOT  # legacy alias after V3→root promotion
 
-STATE_STREAM_PATH = "/tmp/cyberworld_live_stream.jsonl"
-ML_TRIGGER_FILE = "/tmp/cyberworld_ml_enabled"
+import tempfile
+
+STATE_STREAM_PATH = os.path.join(tempfile.gettempdir(), "cyberworld_live_stream.jsonl")
+ML_TRIGGER_FILE = os.path.join(tempfile.gettempdir(), "cyberworld_ml_enabled")
 
 # Containerlab orchestration constants (only meaningful when site.lab_mode=true)
 TOTAL_NODES = 15

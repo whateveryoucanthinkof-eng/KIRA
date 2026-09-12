@@ -49,6 +49,7 @@ def _parse_args():
     p.add_argument("--site", default=None, help="Site id under config/sites/")
     p.add_argument("--site-config", default=None, help="Path to a site YAML file")
     p.add_argument("--interface", default=None, help="Override SPAN capture interface")
+    p.add_argument("--replay", default=None, help="Replay PCAP file (demo mode)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--no-browser", action="store_true")
@@ -63,6 +64,8 @@ if __name__ == "__main__":
         os.environ["CYBERWORLD_SITE"] = args.site
     if args.interface:
         os.environ["CYBERWORLD_SENSOR_IFACE"] = args.interface
+    if args.replay:
+        os.environ["CYBERWORLD_REPLAY_PCAP"] = args.replay
 
     from control_backend.site_config import get_site_config, reload_site_config
 

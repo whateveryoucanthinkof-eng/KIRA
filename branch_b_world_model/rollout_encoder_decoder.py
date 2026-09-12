@@ -20,18 +20,13 @@ class ContinuousTimeEncoding(nn.Module):
         super().__init__()
         self.d_time = d_time
         self.d_model = d_model
-        self.freq_linear = nn.Linear(1, d_time // 2)
-        self.proj = nn.Linear(d_time, d_model) if d_time != d_model else nn.Identity()
+        self.linear = nn.Linear(1, d_model)
 
     def forward(self, delta_t: torch.Tensor, is_delta: bool = True) -> torch.Tensor:
         # delta_t shape: [batch_size, seq_len] or [batch_size, seq_len, 1]
         if delta_t.dim() == 2:
             delta_t = delta_t.unsqueeze(-1)
-        freqs = self.freq_linear(delta_t.float())
-        sin_emb = torch.sin(freqs)
-        cos_emb = torch.cos(freqs)
-        emb = torch.cat([sin_emb, cos_emb], dim=-1)
-        return self.proj(emb)
+        return torch.cos(self.linear(delta_t.float()))
 
 from data_unification.temporal_config import (
     LIVE_WINDOW_SIZE_SEC,
@@ -144,9 +139,7 @@ class HostWorldDynamicsTransformer(nn.Module):
             d_latent=d_latent, n_heads=2, dropout=dropout
         )
 
-    def load_state_dict(self, state_dict, strict: bool = False, assign: bool = False):
-        """Allows graceful fallback when loading pre-trained checkpoints."""
-        return super().load_state_dict(state_dict, strict=False, assign=assign)
+
 
     def _generate_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1)

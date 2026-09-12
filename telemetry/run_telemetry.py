@@ -162,17 +162,57 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    if args.replay:
-        print(
-            "[-] PCAP replay via the old V3.1 package is removed. "
-            "Use live SPAN capture on eth_sensor instead."
-        )
-        sys.exit(1)
-
     def live_packet_callback(pkt):
         if pcap_recorder and "raw" in pkt:
             pcap_recorder.record(pkt["timestamp"], pkt["raw"])
         state_builder.ingest_packet(pkt)
+
+    if args.replay:
+        print(f"[*] Starting PCAP replay from {args.replay}")
+        if not os.path.exists(args.replay):
+            print(f"[!] PCAP file not found: {args.replay}")
+            sys.exit(1)
+            
+        windows_processed = 0
+        with open(args.replay, "rb") as f:
+            global_hdr = f.read(24)
+            while running:
+                hdr = f.read(16)
+                if len(hdr) < 16:
+                    break
+                ts_sec, ts_usec, incl_len, orig_len = struct.unpack("=IIII", hdr)
+                pkt_data = f.read(incl_len)
+                ts = ts_sec + (ts_usec / 1e6)
+                
+                pkt = StreamingPacketSniffer.parse_frame(pkt_data, ts)
+                if pkt:
+                    live_packet_callback(pkt)
+                
+                if state_builder.is_window_ready(current_time=ts):
+                    state = state_builder.close_window(close_ts=ts)
+                    windows_processed += 1
+                    pred_str = _emit_window(state, recorder)
+
+                    timestr = time.strftime("%H:%M:%S", time.localtime(state["window_end"]))
+                    print(
+                        f"[{timestr}] Window #{state['window_id']:04d} | "
+                        f"Packets: {state['packet_count']:4d} | "
+                        f"Pipe Latency: {state['pipeline_latency_ms']:.2f}ms"
+                        f"{pred_str}"
+                    )
+                    sys.stdout.flush()
+
+                    if args.max_windows and windows_processed >= args.max_windows:
+                        print(f"[*] Reached target {args.max_windows} windows. Exiting.")
+                        break
+        
+        if recorder:
+            recorder.stop()
+        if pcap_recorder:
+            pcap_recorder.stop()
+        sys.exit(0)
+
+
 
     sniffer = StreamingPacketSniffer(interface=args.interface)
     sniffer_thread = threading.Thread(

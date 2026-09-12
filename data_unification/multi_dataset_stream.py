@@ -223,28 +223,25 @@ class HostTrajectoryExtractor:
         all_auth_events: List[AuthEventRecord] = self.auth_events + (list(auth_events) if auth_events else [])
 
         if hasattr(self.tgn, "embedding_module") and len(event_stream.sources) > 0:
-            try:
-                from utils.utils import NeighborFinder
-                n_nodes = max(event_stream.n_nodes + 10, getattr(self.tgn, "n_nodes", 0))
-                adj_list = [[] for _ in range(n_nodes)]
-                for i in range(len(event_stream.sources)):
-                    u = int(event_stream.sources[i])
-                    v = int(event_stream.destinations[i])
-                    t = float(event_stream.timestamps[i])
-                    adj_list[u].append((v, i, t))
-                    adj_list[v].append((u, i, t))
-                nf = NeighborFinder(adj_list, uniform=False)
-                self.tgn.neighbor_finder = nf
-                self.tgn.embedding_module.neighbor_finder = nf
-                edge_feats_t = torch.from_numpy(event_stream.edge_features).float().to(self.tgn.device)
-                self.tgn.edge_raw_features = edge_feats_t
-                self.tgn.embedding_module.edge_features = edge_feats_t
-                node_feats_t = torch.zeros((n_nodes, 12), device=self.tgn.device)
-                self.tgn.node_raw_features = node_feats_t
-                self.tgn.embedding_module.node_features = node_feats_t
-                self.tgn.n_nodes = n_nodes
-            except Exception:
-                pass
+            from utils.utils import NeighborFinder
+            n_nodes = max(event_stream.n_nodes + 10, getattr(self.tgn, "n_nodes", 0))
+            adj_list = [[] for _ in range(n_nodes)]
+            for i in range(len(event_stream.sources)):
+                u = int(event_stream.sources[i])
+                v = int(event_stream.destinations[i])
+                t = float(event_stream.timestamps[i])
+                adj_list[u].append((v, i, t))
+                adj_list[v].append((u, i, t))
+            nf = NeighborFinder(adj_list, uniform=False)
+            self.tgn.neighbor_finder = nf
+            self.tgn.embedding_module.neighbor_finder = nf
+            edge_feats_t = torch.from_numpy(event_stream.edge_features).float().to(self.tgn.device)
+            self.tgn.edge_raw_features = edge_feats_t
+            self.tgn.embedding_module.edge_features = edge_feats_t
+            node_feats_t = torch.zeros((n_nodes, 12), device=self.tgn.device)
+            self.tgn.node_raw_features = node_feats_t
+            self.tgn.embedding_module.node_features = node_feats_t
+            self.tgn.n_nodes = n_nodes
 
         # Map window boundaries to lists of records
         window_snapshots_by_host: Dict[str, List[HostWindowSnapshot]] = {}
@@ -266,7 +263,8 @@ class HostTrajectoryExtractor:
                 if win_start <= aev.timestamp <= win_end:
                     active_ips.add(aev.host_ip)
 
-            active_host_ids = np.array([adapter.ip_to_id.get(ip, 0) for ip in active_ips], dtype=int)
+            active_ips_sorted = sorted(list(active_ips))
+            active_host_ids = np.array([adapter.ip_to_id.get(ip, 0) for ip in active_ips_sorted], dtype=int)
 
             # Compute TGNE-TA embeddings H_t
             with torch.no_grad():
@@ -275,7 +273,7 @@ class HostTrajectoryExtractor:
                 ).cpu().numpy()
 
             # For each active host, compute temporal attributes, auth indicators & labels
-            for idx, ip in enumerate(active_ips):
+            for idx, ip in enumerate(active_ips_sorted):
                 host_recs = [r for r in win_recs if r.src_ip == ip or r.dst_ip == ip]
                 attrs = self.compute_host_temporal_attributes(
                     ip, host_recs, self.window_size_sec

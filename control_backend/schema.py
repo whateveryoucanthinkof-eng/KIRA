@@ -70,6 +70,8 @@ class PredictionData(BaseModel):
     mitre_tactic_id: Optional[str] = None
     mitre_description: Optional[str] = None
     stage_probabilities: Optional[Dict[str, float]] = None
+    technique_confidence: Optional[float] = None
+    stage_provenance: Optional[Dict[str, str]] = None
 
 
 class LatencyData(BaseModel):

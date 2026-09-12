@@ -133,18 +133,20 @@ class AntigravityModelAdapter:
 
         self.branch_a = MultiTaskLSTM(input_dim=27, hidden_dim=64).to(self.device)
         ba_path = os.path.join(repo, "saved_models/branch_a/branch_a_lstm.pt")
-        if os.path.exists(ba_path):
-            ckpt = torch.load(ba_path, map_location=self.device)
-            self.branch_a.load_state_dict(ckpt["model_state_dict"])
+        if not os.path.exists(ba_path):
+            raise RuntimeError(f"Missing Branch A checkpoint: {ba_path}")
+        ckpt = torch.load(ba_path, map_location=self.device, weights_only=False)
+        self.branch_a.load_state_dict(ckpt["model_state_dict"])
         self.branch_a.eval()
 
         self.wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64).to(self.device)
         self.risk_head = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(self.device)
         bb_path = os.path.join(repo, "saved_models/branch_b/host_wdt.pt")
-        if os.path.exists(bb_path):
-            ckpt = torch.load(bb_path, map_location=self.device)
-            self.wdt.load_state_dict(ckpt["wdt_state_dict"])
-            self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
+        if not os.path.exists(bb_path):
+            raise RuntimeError(f"Missing Branch B checkpoint: {bb_path}")
+        ckpt = torch.load(bb_path, map_location=self.device, weights_only=False)
+        self.wdt.load_state_dict(ckpt["wdt_state_dict"])
+        self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
         self.wdt.eval()
         self.risk_head.eval()
 
@@ -154,9 +156,10 @@ class AntigravityModelAdapter:
             d_latent=12, d_model=72, vocab_size=self.vocab.vocab_size
         ).to(self.device)
         dp_path = os.path.join(repo, "saved_models/deepop/cwa_forecast_decoder.pt")
-        if os.path.exists(dp_path):
-            ckpt = torch.load(dp_path, map_location=self.device)
-            self.deepop.load_state_dict(ckpt["decoder_state_dict"])
+        if not os.path.exists(dp_path):
+            raise RuntimeError(f"Missing DeepOP checkpoint: {dp_path}")
+        ckpt = torch.load(dp_path, map_location=self.device, weights_only=False)
+        self.deepop.load_state_dict(ckpt["decoder_state_dict"])
         self.deepop.eval()
 
         logger.info(
@@ -293,7 +296,13 @@ class AntigravityModelAdapter:
             window_duration=self.window_seconds,
         )
         h_emb = self._build_embedding(target_ip, host_flows)
+        
+        import model_contract
+        model_contract.assert_shape(h_emb, (model_contract.TGNE_LATENT_DIM,), "TGNE Embedding")
+        
         feature_vector = np.concatenate([h_emb, temp_attrs]).astype(np.float32)
+        model_contract.assert_shape(feature_vector, (model_contract.BRANCH_A_INPUT_DIM,), "Branch A Input Vector")
+
         feature_history = self.feature_history_by_target.setdefault(target_ip, [])
         feature_history.append(
             torch.from_numpy(feature_vector).float().to(self.device)
@@ -307,11 +316,13 @@ class AntigravityModelAdapter:
         x_tensor = torch.stack(feature_history).unsqueeze(0)
 
         with torch.no_grad():
+            logger.debug("[TGNE] -> [BRANCH_A] -> [BRANCH_B] -> [DEEPOP]")
             branch_a_out = self.branch_a(x_tensor)
             risk_pred = branch_a_out["risk_score"]
             obs_logits = branch_a_out["technique_logits"]
             obs_probs = torch.softmax(obs_logits, dim=-1)
             pred_class_idx = int(obs_probs.argmax(dim=-1).item())
+            obs_technique_confidence = float(obs_probs[0, -1, pred_class_idx].item()) if obs_probs.dim() == 3 else float(obs_probs[0, pred_class_idx].item())
             obs_technique = (
                 self.technique_vocab[pred_class_idx]
                 if pred_class_idx < len(self.technique_vocab)
@@ -362,11 +373,13 @@ class AntigravityModelAdapter:
             obs_token_tensor = torch.tensor(
                 [obs_token_id], dtype=torch.long, device=self.device
             )
-            _, decoded_names = self.deepop.forecast_sequence(
+            _, decoded_names, _, step_token_probs = self.deepop.forecast_sequence(
                 h_future,
                 max_steps=self.forecast_steps,
                 observed_token=obs_token_tensor,
+                return_probs=True,
             )
+            deepop_confidences = step_token_probs[0] if step_token_probs else []
 
         forecast_techniques: List[str] = []
         if decoded_names and len(decoded_names) > 0:
@@ -404,8 +417,8 @@ class AntigravityModelAdapter:
             ForecastPoint(
                 horizon_seconds=(i + 1) * self.window_seconds,
                 risk=round(fut_risks[i], 4),
-                confidence=round(max(0.0, 1.0 - conf_radii[i]), 4)
-                if i < len(conf_radii)
+                confidence=round(deepop_confidences[i], 4)
+                if i < len(deepop_confidences)
                 else None,
                 predicted_stage=forecast_techniques[i],
             )
@@ -414,12 +427,7 @@ class AntigravityModelAdapter:
 
         stage_probs = None
         with torch.no_grad():
-            probs = torch.softmax(
-                self.branch_a(
-                    x_tensor
-                )["technique_logits"],
-                dim=-1,
-            )[0]
+            probs = obs_probs[0, -1] if obs_probs.dim() == 3 else obs_probs[0]
             stage_probs = {
                 self.technique_vocab[i]: round(float(probs[i].item()), 4)
                 for i in range(min(len(self.technique_vocab), probs.numel()))
@@ -465,6 +473,13 @@ class AntigravityModelAdapter:
                 mitre_tactic_id=mitre[2],
                 mitre_description=mitre[3],
                 stage_probabilities=stage_probs,
+                technique_confidence=round(obs_technique_confidence, 4),
+                stage_provenance={
+                    "TGNE": "h_emb(12)",
+                    "BRANCH_A": "risk+technique",
+                    "BRANCH_B": "H_hat trajectory",
+                    "DEEPOP": "technique sequence"
+                }
             ),
             forecast=forecast_points,
             explainability=explain,

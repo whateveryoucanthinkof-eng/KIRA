@@ -101,6 +101,8 @@ class LiveTelemetryService:
                 STATE_STREAM_PATH,
                 "--no-inference",
             ]
+            if "CYBERWORLD_REPLAY_PCAP" in os.environ:
+                cmd.extend(["--replay", os.environ["CYBERWORLD_REPLAY_PCAP"]])
 
         logger.info(
             "Launching SPAN telemetry (site=%s iface=%s lab=%s): %s",
@@ -360,7 +362,7 @@ class LiveTelemetryService:
                             }
                         )
                 except Exception as e:
-                    logger.error("Error parsing/inferring live stream line: %s", e)
+                    logger.exception("Error parsing/inferring live stream line: %s", e)
 
 
 telemetry_service = LiveTelemetryService()

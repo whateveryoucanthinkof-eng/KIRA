@@ -36,6 +36,7 @@ export interface PredictionResult {
   horizon: number; // minutes
   model: string;
   signals: ContributingSignal[];
+  stage_provenance?: Record<string, string>;
 }
 
 export interface ContributingSignal {

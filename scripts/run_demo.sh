@@ -8,8 +8,16 @@ cd "${ROOT_DIR}"
 
 echo "================================================================="
 echo "CYBERWORLD LAB DEMO"
-echo "  Use: python run_dashboard.py"
-echo "  Then: START NETWORK → SENSOR → ML → WORKLOADS → ARM EXTERNAL"
-echo "  Attack from outside toward 10.0.3.10 (DMZ) — SPAN observes it."
+echo "  Live: python run_dashboard.py"
+echo "  Demo: python run_dashboard.py --replay <sample.pcap>"
 echo "================================================================="
-exec python3 run_dashboard.py "$@"
+
+if [ "${1:-}" == "--replay" ] && [ -n "${2:-}" ]; then
+  PCAP="$2"
+  echo "[+] Booting dashboard in demo (replay) mode with: $PCAP"
+  exec python3 run_dashboard.py --replay "$PCAP"
+else
+  echo "[+] Booting dashboard in standard mode."
+  echo "[i] URL will be http://localhost:8000"
+  exec python3 run_dashboard.py "$@"
+fi

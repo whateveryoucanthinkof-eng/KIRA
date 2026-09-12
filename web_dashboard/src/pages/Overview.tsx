@@ -131,14 +131,7 @@ function TopologyMini({ topology }: { topology: Topology }) {
   );
 }
 
-const ATTACK_STAGES = [
-  { key: "Reconnaissance", color: "#9ca3af" },
-  { key: "Initial Access",  color: "var(--color-status-amber)" },
-  { key: "Exploitation",    color: "var(--color-status-red)" },
-  { key: "Pivot",           color: "#b91c1c" },
-  { key: "C2 Channel",      color: "#7c3aed" },
-  { key: "Exfiltration",    color: "#1d4ed8" },
-];
+
 
 function logLineColor(line: string): string {
   if (line.includes("CRITICAL") || line.includes("ALERT")) return "var(--color-status-red)";
@@ -179,7 +172,6 @@ export default function Overview({
   const forecastMin = forecastChartData.length ? Math.max(0, Math.min(...forecastChartData.map(d => d.lower)) - 60) : 0;
 
   const [explainExpanded, setExplainExpanded] = useState(true);
-  const activeAttackStages = new Set(attackEvents.map((e) => e.stage));
   const recentLogs = logLines.slice(-8);
 
   return (
@@ -313,35 +305,33 @@ export default function Overview({
             </div>
           </div>
 
-          {/* Attack Progression — full left-column width */}
+          {/* Model Inference Provenance & Active Threats — full left-column width */}
           <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
             <div className="panel-header">
-              <span className="panel-title">Attack Progression</span>
+              <span className="panel-title">Model Inference Provenance & Active Threats</span>
               <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-status-red)", flexShrink: 0 }}>
-                {attackEvents.filter((e) => !e.mitigated).length} active
+                {attackEvents.filter((e) => !e.mitigated).length} active threats
               </span>
             </div>
             <div style={{ padding: "10px 12px" }}>
-              {/* Kill-chain stage track */}
-              <div style={{ display: "flex", gap: 3, marginBottom: 10 }}>
-                {ATTACK_STAGES.map((stage) => {
-                  const active = activeAttackStages.has(stage.key);
-                  return (
-                    <div key={stage.key} style={{ flex: 1, textAlign: "center", minWidth: 0 }}>
-                      <div style={{ height: 5, borderRadius: 2, background: active ? stage.color : "var(--color-border)", marginBottom: 4 }} />
-                      <span style={{
-                        fontSize: 8,
-                        color: active ? stage.color : "var(--color-text-muted)",
-                        fontWeight: active ? 600 : 400,
-                        display: "block",
-                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      }}>
-                        {stage.key}
-                      </span>
+              {/* Dynamic Provenance Rendering */}
+              {prediction?.stage_provenance ? (
+                <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                  {Object.entries(prediction.stage_provenance).map(([key, val], idx, arr) => (
+                    <div key={key} style={{ flex: 1, display: "flex", alignItems: "center" }}>
+                      <div style={{ flex: 1, padding: "4px 8px", background: "var(--color-base)", borderRadius: 4, border: "1px solid var(--color-border)" }}>
+                        <div style={{ fontSize: 9, color: "var(--color-text-muted)", fontWeight: 600, textTransform: "uppercase", marginBottom: 2 }}>{key}</div>
+                        <div style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-status-blue)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{val}</div>
+                      </div>
+                      {idx < arr.length - 1 && (
+                        <div style={{ padding: "0 4px", color: "var(--color-text-muted)" }}>→</div>
+                      )}
                     </div>
-                  );
-                })}
-              </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 11, color: "var(--color-text-muted)", marginBottom: 12 }}>Provenance data unavailable</div>
+              )}
               {/* Attack event cards — horizontal when wide */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 6 }}>
                 {attackEvents.map((atk) => (

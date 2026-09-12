@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 import torch
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+import model_contract
+
 REQUIRED_CHECKPOINTS = {
     "Branch A (MultiTaskLSTM)": {
         "path": "saved_models/branch_a/branch_a_lstm.pt",
@@ -50,10 +53,24 @@ def verify_checkpoints() -> bool:
         try:
             ckpt = torch.load(p, map_location="cpu", weights_only=False)
             state_dict = ckpt[info["key"]] if info["key"] and isinstance(ckpt, dict) and info["key"] in ckpt else ckpt
+            
+            if info["expected_keys"]:
+                for key in info["expected_keys"]:
+                    if key not in state_dict:
+                        raise ValueError(f"Missing expected key: {key}")
+                    
+                    # Basic shape assertions against contract
+                    if "branch_a" in name.lower() and "lstm" in key:
+                        if state_dict[key].shape[1] != model_contract.BRANCH_A_INPUT_DIM:
+                            raise ValueError(f"Branch A dim mismatch: {state_dict[key].shape}")
+                    elif "branch_b" in name.lower() and "in_proj" in key:
+                        if state_dict[key].shape[1] != model_contract.TGNE_LATENT_DIM:
+                            raise ValueError(f"Branch B dim mismatch: {state_dict[key].shape}")
+
             n_params = sum(t.numel() for t in state_dict.values() if isinstance(t, torch.Tensor))
             print(f"[+] VERIFIED: {name:<35} | Size: {size_kb:>7.1f} KB | Tensors: {len(state_dict):>3} | Weights: {n_params:>7,}")
         except Exception as e:
-            print(f"[!] CORRUPTED: {name} at {p} ({e})")
+            print(f"[!] FAILED: {name} at {p} ({e})")
             all_ok = False
 
     print("=" * 70)
