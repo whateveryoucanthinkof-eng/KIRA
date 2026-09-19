@@ -1,10 +1,24 @@
 # cyberworld: Enterprise Cyber Range & Live Streaming Telemetry Architecture
 
 **Document ID:** `docs/ARCHITECTURE.md`  
-**System Version:** V3.1-Production  
-**Authoritative ML Model:** cyberworldModel V3.1-PCAP  
+**System Version:** V3.1 (RETIRED DESIGN)  
+**Authoritative ML Model:** superseded — see below
 
 ---
+
+> ## ⚠️ This document describes the retired V3.1 design, not the shipping system.
+>
+> It is kept for design history. The pipeline it describes — a 72-D normalized state vector, a
+> `[1, 15, 72]` rolling buffer, a "Dual-Branch Feature Transformer" doing sensor-side inference, and a
+> 7-stage ATT&CK classifier — is **not** what runs today. The 72-D vector was removed on 2026-09-19
+> after it was found to be computed and discarded.
+>
+> **The shipping architecture** is: 5-tuple flows → TGNE-TA/BiTA 12-D host latent + 15 host temporal
+> attributes = **27-D** → Branch A `MultiTaskLSTM` (risk / 14 techniques / 4 stages) → Branch B
+> `HostWorldDynamicsTransformer` K-step latent rollout + infiltration risk → DeepOP CWA decoder
+> (future ATT&CK tokens). Inference runs in `control_backend`, never in the sensor.
+>
+> For the current system see `TECHNICAL_REVIEW.md` and `saved_models/branch_a/branch_a.manifest.json`.
 
 ## 1. Executive Architectural Overview
 
@@ -45,7 +59,7 @@ The system is built around the **Network-First Principle**:
    │  Live Packet Stream (sensor eth1 via AF_PACKET)            │
    │     │                                                       │
    │     ├──► In-Memory Flow Table (5-tuple active flows, rates) │
-   │     └──► In-Memory PCAP Engine (28 behavioral features)     │
+   │     └──► In-Memory PCAP Engine (30 features; NOT wired to model)│
    │     │                                                       │
    │     ▼                                                       │
    │  Time Window Aggregator (2.0s non-overlapping boundaries)   │

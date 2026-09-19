@@ -51,7 +51,7 @@ The live temporal contract is approximately:
 | Forecast duration | About 16 seconds at 2-second windows |
 | Live labels | Not available; ground-truth labels are not used |
 
-The 72-D state assembled by `telemetry/state/state_builder.py` is a capture and recording artifact inherited from the earlier packet-feature pipeline. The live adapter primarily consumes normalized flow records and host trajectories, not the old V3.1 checkpoint contract.
+The 72-D state array that `telemetry/state/state_builder.py` used to assemble (42 flow + 30 packet features) was removed on 2026-09-19. It was written every window and read by nothing: `run_telemetry.py` stripped it before the JSONL stream, and its scaler was never fitted. The live adapter consumes normalized flow records and host trajectories.
 
 ## 3. End-to-End Runtime
 
@@ -160,19 +160,22 @@ The table emits flow dictionaries used by `flows_from_span_dicts()` and downstre
 
 It does not load a model checkpoint. It is a feature extractor only.
 
+**Wiring status: not connected.** Its 30 features reached the removed 72-D array and nothing else, so no model has ever consumed them. The module is retained because PS 26153 requires packet-level features (TTL variance, TCP window, retransmission counts, payload size distribution, port-scan signatures) and this is the only implementation of them in the repo. Feeding them to Branch A would widen its input from 27-D and require retraining.
+
 ### 4.4 Window state builder
 
 `telemetry/state/state_builder.py` closes non-overlapping two-second windows. It maintains:
 
 - The current packet list.
 - A live flow table.
-- A packet feature engine.
-- A rolling state buffer.
 - Window identifiers and latency measurements.
 
-It can emit raw and scaled state arrays and a list of active flows. `telemetry/run_telemetry.py` removes heavyweight arrays before writing the JSONL stream, so the backend receives practical flow-window records rather than a model inference result from the sensor.
+It emits the 5-tuple flow snapshot plus window metadata — exactly the keys the backend reads. No feature
+vector is built in the sensor; `control_backend` rebuilds host state from the flows and runs inference
+there.
 
-The module still exposes 70, 72, and 73 feature modes and a 72-feature canonical array because of historical compatibility. Those arrays are not the current production model input contract.
+`seek_to()` anchors the window clock to a capture timestamp. Live capture does not need it, but PCAP
+replay does: packet timestamps are historical, so without anchoring no window boundary is ever reached.
 
 ### 4.5 JSONL stream
 
