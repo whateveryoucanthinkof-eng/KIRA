@@ -242,3 +242,68 @@ and randomises source ports at `:75` (`np.random.randint(1024, 65535, ...)`). Si
 - I verified **headers and timestamps only**. I did **not** validate packet payload contents, checksums, or whether any individual capture actually contains attack traffic. Confirming that the published attack windows contain the expected traffic requires reading packet bodies and was out of budget.
 - Attack-window alignment is argued from the exact +4:00:00 offset measured on two days; I did not verify a labelled attack interval end-to-end against packet contents.
 - `/var/home/samito/Documents/SIH/processed/` was **not examined**, per instruction.
+
+---
+
+# Addendum — resolved with tshark/capinfos (2026-09-19, post-report)
+
+`wireshark-cli` 4.6.8 was installed into the `prism-dev` Fedora toolbox after this report was written
+(`toolbox run -c prism-dev sudo dnf install -y wireshark-cli`). Toolboxes share `$HOME`, so
+`capinfos`/`tshark` read `~/Documents/SIH/DATA/pcap/` directly. This closes the three items the report
+left open, and validates its method.
+
+## 1. The hand-rolled probe was accurate
+
+`capinfos` agreed with the report's header/tail probe on every file cross-checked:
+
+| File | capinfos duration | Packets | Report's claim |
+|---|---|---|---|
+| `fri_2/…-172.31.69.20` | **8.70 h** | 1,598 | within the 8.7–11.2 h band ✓ |
+| `thu_1/…-172.31.69.24` | **9.12 h** | 1,730 | median ~9.1 h ✓ |
+| `fri_2/…-172.31.69 - Copy.24` | **1.39 h** | 255 | stated as 1.39 h — **exact match** ✓ |
+
+The 3.2% sampling caveat still stands, but the measurement technique is now independently confirmed.
+
+## 2. The two pcapng files — resolved, and they confirm the fragment theory
+
+Both are genuine **pcapng v1.0** (not pcap), which is why the struct-based probe skipped them.
+
+| File | Span (UTC) | Duration | Packets |
+|---|---|---|---|
+| `fri_16/UCAP172.31.69.25-part1.pcap` | 17:56:55 → 23:28:22 | **5.52 h** | **18 M** |
+| `fri_16/UCAP172.31.69.25-part2.pcap` | 23:37:33 → 02:56:14 (+1d) | **3.31 h** | 5,077 |
+| **combined** | 17:56:55 → 02:56:14 | **8.99 h** | — |
+
+A 9-minute gap separates the parts. This is the fragment pattern again: two time-consecutive pieces of
+one host's day that reassemble to a full ~9 h capture. It is now confirmed on a second, independent
+fragment pair — and this one carries **18 million packets**, so the server-subnet (`UCAP*`) captures are
+high-volume, not thin.
+
+## 3. `wed_14/capDESKTOP-AN3U28N-172.31.67.15` — genuinely corrupt (upgrade from "may be damaged")
+
+The report hedged on this file. It is damaged, and worse than a truncated tail:
+
+```
+capinfos: An error occurred after reading 127898 packets ... appears to be damaged or corrupt.
+(pcap: File has 1312894288-byte packet, bigger than maximum of 262144)
+```
+
+A bogus 1.31 GB packet-length field — structural corruption mid-file, not a clipped final record. The
+readable prefix spans **2018-02-14 12:31:15 → 15:54:36 UTC = 3.39 h** across 127,898 packets, against
+the ~9 h expected for that day.
+
+**This is real coverage loss, so the count of files losing real coverage rises from 4 to 5** (still
+0.11% of 4,457). It does not change the verdict; it is one host-day on 14/02 that would need to be
+dropped or truncated at the damage point. `tshark` reads the prefix cleanly, so the first 3.39 h remain
+usable.
+
+## 4. What this changes
+
+Nothing in the verdict. The engineers' claim remains **false**: all 10 days present, per-host files
+spanning full ~9 h days, fragments reassembling to full days, integrity at 99.9%.
+
+Two practical notes for whoever builds the ingestion:
+- **Handle pcapng as well as pcap.** At least two files in `fri_16` are pcapng v1.0. A parser that only
+  accepts magic `0xa1b2c3d4` will silently skip them — and one holds 18 M packets.
+- **Expect at least one structurally corrupt file** and fail soft: read until the parser errors, keep
+  the prefix, log the file. Do not let one bad record abort a day's ingest.
