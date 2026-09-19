@@ -104,12 +104,7 @@ class AsyncPcapRecorder:
 def _emit_window(state: dict, recorder: AsyncStateRecorder | None) -> str:
     n_flows = len(state.get("flows") or [])
     if recorder:
-        slim = {
-            k: v
-            for k, v in state.items()
-            if k not in ("raw_state", "scaled_state")
-        }
-        recorder.record({**slim, "prediction": None})
+        recorder.record({**state, "prediction": None})
     return f" | Flows: {n_flows} | [SPAN CAPTURE → Dual-Branch/DeepOP]"
 
 
@@ -119,7 +114,6 @@ def main():
     )
     parser.add_argument("--interface", default="eth1", help="Observation interface")
     parser.add_argument("--replay", "--pcap", dest="replay", default=None, help="Replay PCAP")
-    parser.add_argument("--dim", type=int, default=72, choices=[70, 72, 73])
     parser.add_argument("--record-state", default=None, help="JSONL state stream path")
     parser.add_argument("--record-pcap", default=None, help="Optional raw PCAP path")
     parser.add_argument("--max-windows", type=int, default=None)
@@ -143,11 +137,7 @@ def main():
     print("=" * 80)
     sys.stdout.flush()
 
-    state_builder = LiveStateBuilder(
-        window_sec=2.0,
-        history_len=15,
-        dim_mode=args.dim,
-    )
+    state_builder = LiveStateBuilder(window_sec=2.0)
 
     recorder = AsyncStateRecorder(args.record_state) if args.record_state else None
     pcap_recorder = AsyncPcapRecorder(args.record_pcap) if args.record_pcap else None
@@ -174,6 +164,7 @@ def main():
             sys.exit(1)
             
         windows_processed = 0
+        anchored = False
         with open(args.replay, "rb") as f:
             f.read(24)  # skip 24-byte pcap global header
             while running:
@@ -183,7 +174,13 @@ def main():
                 ts_sec, ts_usec, incl_len, orig_len = struct.unpack("=IIII", hdr)
                 pkt_data = f.read(incl_len)
                 ts = ts_sec + (ts_usec / 1e6)
-                
+
+                # Capture timestamps are historical; anchor the window clock to the
+                # first packet or no window boundary is ever reached.
+                if not anchored:
+                    state_builder.seek_to(ts)
+                    anchored = True
+
                 pkt = StreamingPacketSniffer.parse_frame(pkt_data, ts)
                 if pkt:
                     live_packet_callback(pkt)

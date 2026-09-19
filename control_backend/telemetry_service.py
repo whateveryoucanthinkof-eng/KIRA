@@ -380,7 +380,6 @@ class LiveTelemetryService:
                                     "pipeline_latency_ms": float(
                                         record.get("pipeline_latency_ms", 0.0)
                                     ),
-                                    "buffer_length": int(record.get("buffer_length", 0)),
                                     "active_flows": record.get("active_flows"),
                                     "flow_export_count": len(raw_flows),
                                     "timestamp": float(record.get("timestamp", time.time())),
