@@ -4,7 +4,6 @@ Live Containerlab SPAN telemetry + Dual-Branch / DeepOP inference.
 SPAN capture via scripts/run_telemetry.sh (--no-inference); ML runs in-process.
 """
 
-from datetime import datetime
 import json
 import logging
 import os
@@ -26,7 +25,7 @@ from control_backend.model_adapter import (
     flows_from_span_dicts,
     select_primary_target,
 )
-from control_backend.schema import CommandEvent
+from control_backend.schema import CommandEvent, utc_now_iso
 from control_backend.topology_service import topology_service
 
 logger = logging.getLogger("antigravity.telemetry_service")
@@ -73,7 +72,7 @@ class LiveTelemetryService:
                 except Exception:
                     pass
 
-        from control_backend.site_config import get_site_config
+        from control_backend.site_config import env, get_site_config
 
         site = get_site_config()
         sensor_name = site.sensor_container or SENSOR_CONTAINER
@@ -109,8 +108,9 @@ class LiveTelemetryService:
                 STATE_STREAM_PATH,
                 "--no-inference",
             ]
-            if "cyberworld_REPLAY_PCAP" in os.environ:
-                cmd.extend(["--replay", os.environ["cyberworld_REPLAY_PCAP"]])
+            replay_pcap = env("REPLAY_PCAP")
+            if replay_pcap:
+                cmd.extend(["--replay", replay_pcap])
 
         logger.info(
             "Launching SPAN telemetry (site=%s iface=%s lab=%s): %s",
@@ -142,7 +142,7 @@ class LiveTelemetryService:
             CommandEvent(
                 type="command_output",
                 command="start_telemetry",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line=f"[+] Passive SPAN sensor active on {iface} (flows → Dual-Branch/DeepOP).",
             )
         )
@@ -167,7 +167,7 @@ class LiveTelemetryService:
             CommandEvent(
                 type="command_output",
                 command="stop_telemetry",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line="[-] Passive SPAN sensor stopped.",
             )
         )
@@ -185,7 +185,7 @@ class LiveTelemetryService:
             CommandEvent(
                 type="command_output",
                 command="start_ml",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line="[★] Antigravity Dual-Branch + DeepOP CWA LIVE on SPAN flows.",
             )
         )
@@ -199,7 +199,7 @@ class LiveTelemetryService:
             CommandEvent(
                 type="command_output",
                 command="stop_ml",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line="[■] Antigravity ML STOPPED — STANDBY (predictions cleared).",
             )
         )
@@ -252,7 +252,7 @@ class LiveTelemetryService:
             CommandEvent(
                 type="command_output",
                 command="mitigate_threat",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line=msg,
             )
         )
@@ -282,7 +282,7 @@ class LiveTelemetryService:
                     CommandEvent(
                         type="command_output",
                         command="telemetry",
-                        timestamp=datetime.utcnow().isoformat() + "Z",
+                        timestamp=utc_now_iso(),
                         line=cleaned,
                     )
                 )
@@ -405,7 +405,7 @@ class LiveTelemetryService:
                         self.current_anomaly_score = 8.0
                         self.current_threat_level = "low"
 
-                    now_iso = datetime.utcnow().isoformat() + "Z"
+                    now_iso = utc_now_iso()
                     broker.broadcast_sync({
                         "type": "system_status",
                         "mode": "LIVE" if self.is_running else "STANDBY",

@@ -9,16 +9,15 @@ Provides multi-modal attribution for security operations:
 5. Asynchronous Worker Queue: Non-blocking background worker for real-time SOC pipelines.
 """
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Any, Optional, Tuple
 import collections
 import concurrent.futures
 import threading
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from correlation.trajectory_assembler import TrajectoryEntry, HostAttackTrajectory
+from correlation.trajectory_assembler import HostAttackTrajectory
 from correlation.campaign_merge import AttackCampaign
 
 

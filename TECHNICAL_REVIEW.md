@@ -61,9 +61,13 @@ The 72-D state assembled by `telemetry/state/state_builder.py` is a capture and 
 
 Important environment variables include:
 
-- `cyberworld_SITE`: site profile name, normally `containerlab-enterprise` or `local-default`.
-- `cyberworld_SITE_CONFIG`: explicit YAML configuration path.
-- `cyberworld_SENSOR_IFACE`: override for the observed host interface.
+- `CYBERWORLD_SITE`: site profile name, normally `containerlab-enterprise` or `local-default`.
+- `CYBERWORLD_SITE_CONFIG`: explicit YAML configuration path.
+- `CYBERWORLD_SENSOR_IFACE`: override for the observed host interface.
+- `CYBERWORLD_REPLAY_PCAP`: replay a PCAP instead of sniffing a live NIC (local SPAN only).
+
+These are read through `control_backend.site_config.env()`, which prefers the `CYBERWORLD_` prefix and
+falls back to the deprecated lowercase `cyberworld_` spelling with a one-time warning per variable.
 
 The backend is started from `control_backend.main:app` and serves the built dashboard when `web_dashboard/dist` exists.
 
@@ -324,7 +328,7 @@ Supporting files:
 - `saved_models/branch_b/host_wdt.pt`: trained Branch B checkpoint.
 - `saved_models/branch_b/branch_b.manifest.json`: checkpoint metadata.
 
-Branch B imports `ContinuousTimeEncoding` from `world_model/models/time_encoding.py`. This shared import is why the otherwise offline `world_model/` package is still partially coupled to live Branch B.
+Branch B defines `ContinuousTimeEncoding` locally in `rollout_encoder_decoder.py`. It has no dependency on any other model package.
 
 ### 7.4 DeepOP / CWA forecast decoder
 
@@ -390,13 +394,6 @@ The live adapter computes input saliency for the Branch A risk output. Gradients
 
 `explainability/unified_explanation.py` defines a broader explanation object and asynchronous queue for combining trajectory and campaign explanations. It is a reusable analytical layer, while the live adapter currently uses its local saliency implementation for low-latency dashboard output.
 
-The offline `world_model/explainability/` modules provide a different set of tools:
-
-- Attention extraction.
-- Integrated gradients.
-- Trajectory visualization.
-
-Those tools target the offline research WDT, not the promoted live adapter.
 
 ## 10. Correlation and Campaign Analysis
 
@@ -533,46 +530,11 @@ The graph is discovery-driven. It does not generate a fixed 15-node topology or 
 
 ## 15. Offline and Research World Model
 
-The `world_model/` package is a separate research stack. It is not the promoted production model. It contains a larger latent-space world dynamics architecture, training utilities, baselines, evaluation, and explainability.
+Removed from this branch on 2026-09-19. The `world_model/` package was an incomplete research
+stack: every module imported `world_model.models.*` and `world_model.data.*`, neither of which
+was ever committed, so the package could not be imported. It had no live dependents.
 
-### Model modules
-
-- `models/world_dynamics_transformer.py`: research WDT with causal attention, residual dynamics, and KV-cache support.
-- `models/time_encoding.py`: continuous time-delta encoding; currently imported by live Branch B.
-- `models/readout.py`: graph/latent readout.
-- `models/state_decoder.py`: state reconstruction.
-- `models/attack_decoder.py`: attack-stage decoding.
-- `models/risk_head.py`: risk prediction.
-
-### Data and training
-
-- `data/ctu13_adapter.py`: CTU-13 preparation.
-- `data/feature_schema.py`: research feature dimensions and labels.
-- `data/graph_builder.py`: graph snapshot construction.
-- `data/latent_dataset.py`: latent sequence datasets.
-- `data/splits.py`: chronological and scenario splits.
-- `training/train_world_model.py`: research WDT training.
-- `training/train_downstream_heads.py`: downstream head training.
-- `training/losses.py`: world-model and detection losses.
-- `training/rollout.py`: rollout evaluation.
-- `training/scheduled_sampling.py`: scheduled sampling.
-- `training/checkpointing.py`: checkpoint persistence.
-
-### Evaluation, baselines, and explanation
-
-- `evaluation/run_evaluation.py`: full evaluation entrypoint.
-- `evaluation/detection_metrics.py`: detection and attack-stage metrics.
-- `evaluation/forecasting_metrics.py`: lead-time and forecast metrics.
-- `evaluation/dynamics_metrics.py`: dynamics metrics.
-- `evaluation/calibration.py`: calibration metrics and temperature scaling.
-- `baselines/`: logistic, LSTM, and static-GCN comparisons.
-- `scripts/generate_latent_dataset.py`: latent cache creation.
-- `scripts/run_ablations.py`: ablation execution.
-- `scripts/demo_explainability.py`: offline explanation demo.
-- `DESIGN_DECISIONS.md`: research design rationale.
-- `config/default_config.yaml`: research training configuration.
-
-This stack should be treated as offline research unless a deliberate future integration replaces the current live adapter.
+The full tree is preserved on the `archive/pre-cleanup-2026-09-19` branch (origin and sih).
 
 ## 16. Scripts and Operations
 
@@ -603,7 +565,6 @@ The frontend build is run from `web_dashboard/` with the package scripts, normal
 - `tests/test_site_config.py`: site loading, CIDR classification, target selection, and site/topology API contracts.
 - `tests/test_topology_service.py`: discovery graph creation, external/internal roles, TTL eviction, caps, API output, and Lab Mode gates.
 - `bita/test_pipeline.py`: BiTA pipeline test placeholder.
-- `world_model/models/test_wdt.py`: research WDT shape, masking, cache equivalence, and parameter tests.
 
 The production tests focus on contracts at the backend boundary rather than packet capture against a live interface.
 
@@ -713,10 +674,6 @@ The production tests focus on contracts at the backend boundary rather than pack
 - `correlation/__init__.py`: package exports.
 - `explainability/unified_explanation.py`: unified explanation object and queue.
 - `explainability/__init__.py`: package exports.
-
-### `world_model/`
-
-The package contains the offline research WDT, data adapters, feature schemas, graph builders, latent datasets, training losses, checkpointing, evaluation metrics, baselines, ablation scripts, and explanation tools described in Section 15. Its only direct live dependency is the shared time encoder imported by Branch B.
 
 ### `containerlab/`, `nodes/`, and `workloads/`
 

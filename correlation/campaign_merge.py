@@ -8,7 +8,6 @@ forensic inspection, dashboard rendering, and explainability.
 
 from typing import List, Tuple, Dict, Set, Any
 from dataclasses import dataclass, asdict
-import numpy as np
 
 from correlation.graph_compaction import CompactedAlertNode
 

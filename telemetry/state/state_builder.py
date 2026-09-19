@@ -8,7 +8,7 @@ Dual-Branch/DeepOP inference runs in control_backend, not in this module.
 
 from collections import deque
 import time
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 import numpy as np
 
 from telemetry.flow.flow_table import LiveFlowTable, FLOW_COLUMNS

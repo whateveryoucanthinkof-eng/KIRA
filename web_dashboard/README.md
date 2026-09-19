@@ -1,16 +1,45 @@
-# React + Vite
+# cyberworld dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The SOC console frontend: React 19 + Vite + Tailwind CSS v4, TypeScript throughout.
 
-Currently, two official plugins are available:
+It renders the live host graph and ATT&CK-aware risk forecasts produced by the backend. It holds no
+state of its own — everything arrives over `/api` and the `/ws` WebSocket from `control_backend/`.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Running
 
-## React Compiler
+From the repo root, the normal path builds and serves this automatically:
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+python run_dashboard.py --site local-default
+```
 
-## Expanding the Oxlint configuration
+To work on the frontend directly:
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+```bash
+npm install
+npm run dev      # HMR dev server; expects the backend on :8000
+npm run build    # production bundle → dist/ (what the backend serves)
+npm run demo     # mock data, no backend required (VITE_DEMO_MODE=true)
+```
+
+`npm` is the toolchain — `package-lock.json` is the lockfile.
+
+## Pages
+
+| Page | Shows |
+|------|-------|
+| Overview | Risk posture, key metrics, observed vs. predicted risk |
+| Network | Discovery-driven host graph — nodes appear only when SPAN observes them |
+| Predictions | Branch B forecast trajectory and ATT&CK technique attribution |
+| Events | Command, model, attack, and telemetry log stream |
+| Controls | Sensor/ML lifecycle, Lab Mode orchestration, mitigation actions |
+
+## Layout
+
+- `src/api/` — backend contract (`types.ts`), REST + WebSocket client (`adapter.ts`), demo fixtures (`mock.ts`)
+- `src/pages/` — one component per page above
+- `src/components/` — `layout/` shell pieces, `shared/` reusable UI
+- `src/index.css` — global styles and the Tailwind v4 import
+
+See `AGENTS.md` for the working notes, including the Figma Make plugins still present in
+`vite.config.ts`.

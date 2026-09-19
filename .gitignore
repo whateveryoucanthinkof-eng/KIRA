@@ -103,10 +103,13 @@ checkpoints/*
 *.safetensors
 *.pkl
 *.pickle
-# Keep live Dual-Branch / DeepOP / TGNE checkpoints
-!saved_models/**/*.pt
+# Keep only the checkpoints the live app loads (see control_backend/model_adapter.py).
+# Listed explicitly so retrain/backup artifacts cannot silently reappear in the tree.
+!saved_models/branch_a/branch_a_lstm.pt
+!saved_models/branch_b/host_wdt.pt
+!saved_models/deepop/cwa_forecast_decoder.pt
+!bita/saved_models/bita_bigru_transformer-warden_alerts.pth
 !saved_models/**/*.manifest.json
-!bita/saved_models/**/*.pth
 
 # --- Logs, Temp & Scratch Directories ---
 logs/

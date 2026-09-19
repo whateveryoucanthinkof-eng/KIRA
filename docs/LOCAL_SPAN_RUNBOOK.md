@@ -3,7 +3,7 @@
 ## Lab (Containerlab)
 
 ```bash
-export cyberworld_SITE=containerlab-enterprise
+export CYBERWORLD_SITE=containerlab-enterprise
 ./scripts/deploy.sh
 python run_dashboard.py --site containerlab-enterprise
 # UI: START NETWORK (if needed) → START SENSOR → START ML
@@ -25,7 +25,7 @@ sudo -E python run_dashboard.py --site local-default --interface eth1
 Or:
 
 ```bash
-export cyberworld_SITE=local-default
+export CYBERWORLD_SITE=local-default
 sudo -E python run_dashboard.py --interface eth1
 ```
 

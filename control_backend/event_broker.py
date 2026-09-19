@@ -8,7 +8,7 @@ import asyncio
 from collections import deque
 import json
 import logging
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, Optional, Set, Any
 from fastapi import WebSocket
 from pydantic import BaseModel
 

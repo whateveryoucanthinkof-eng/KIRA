@@ -5,7 +5,6 @@ FastAPI Control Backend for the V3 SOC dashboard — wired to real Containerlab.
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
 import json
 import logging
 import os
@@ -27,7 +26,7 @@ from control_backend.event_broker import broker
 import model_contract
 from control_backend.lab_config import TOTAL_NODES, LAB_NAME_FILTER
 from control_backend.site_config import get_site_config
-from control_backend.schema import SystemStatusEvent, ModelMetadata
+from control_backend.schema import SystemStatusEvent, ModelMetadata, utc_now_iso
 from control_backend.telemetry_service import telemetry_service
 from control_backend.topology_service import topology_service
 
@@ -154,7 +153,7 @@ async def get_system_status():
         threshold=0.65,
     )
 
-    now_iso = datetime.utcnow().isoformat() + "Z"
+    now_iso = utc_now_iso()
     return SystemStatusEvent(
         type="system_status",
         mode="LIVE" if (network_online or telemetry_service.is_running or ml_live) else "STANDBY",

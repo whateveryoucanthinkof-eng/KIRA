@@ -133,8 +133,6 @@ class AttackTrajectoryAssembler:
             for i, (_, snaps) in enumerate(chunk):
                 recent_a = snaps[-max_seq_len_a:]
                 recent_w = snaps[-max_seq_len_wdt:]
-                la = len(recent_a)
-                lw = len(recent_w)
                 for j, s in enumerate(recent_a):
                     x_batch[i, j] = np.concatenate([s.embedding, s.temporal_attrs])
                     mask_batch[i, j] = False

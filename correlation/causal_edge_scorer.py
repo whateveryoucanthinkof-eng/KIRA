@@ -7,11 +7,10 @@ Uses a learned classifier over temporal distance, transition plausibility,
 host identity, communication links, and risk deltas.
 """
 
-from typing import List, Tuple, Dict, Optional, Set
+from typing import List, Tuple, Optional, Set
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from correlation.trajectory_assembler import TrajectoryEntry, Provenance
 

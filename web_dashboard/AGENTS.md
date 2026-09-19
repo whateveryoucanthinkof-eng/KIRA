@@ -1,41 +1,51 @@
-# figma-make-app
+# cyberworld-dashboard
 
-React + Vite + Tailwind CSS project running inside Figma Make.
+React + Vite + Tailwind CSS v4 frontend for the cyberworld SOC console. It is served by the FastAPI
+backend in `control_backend/`, not deployed independently.
 
-## Development Server
+## Running it
 
-A Vite development server is **already running** on `$PORT` (default 8443). You don't need to start it manually.
+There is **no dev server already running** — start one yourself.
 
-- Preview URL: The user can access the running app through the preview panel
-- Hot reload: Changes to source files are reflected immediately
+```bash
+npm install           # first time
+npm run dev           # dev server with HMR
+npm run build         # production bundle → dist/, which the backend serves
+npm run demo          # dev server in demo mode (VITE_DEMO_MODE=true → mock data)
+```
 
-## Project Structure
+Normally you do not run any of these by hand: `python run_dashboard.py` from the repo root builds
+`dist/` when it is missing and then serves it. `scripts/run_control_panel.sh` does the same for the
+lab workflow. The toolchain is **npm** — the lockfile is `package-lock.json`.
 
-This is the canonical project structure. Start with task-relevant files below. Only follow imports or inspect other files when required, when a documented path is missing, or when the repository contradicts this guide.
+## Backend contract
 
-- `src/main.tsx` - React entrypoint; imports `src/index.css` and mounts `src/App.tsx` into the `#root` element
-- `src/App.tsx` - Primary application component and the usual starting point for UI work
-- `src/index.css` - Global CSS entrypoint and Tailwind CSS v4 import
-- `index.html` - Vite HTML shell containing the `#root` element and loading `src/main.tsx`
-- `package.json` - Project dependencies and the Vite build, development, preview, and formatting scripts
-- `vite.config.ts` - Vite configuration with React, Tailwind CSS v4, and Figma Make plugins plus the `@` alias for `src`
-- `.mise.toml` - Toolchain versions for Node.js and pnpm
+The dashboard talks to the backend and has no data of its own:
 
-## Dependencies
+- `src/api/types.ts` — the shared event/DTO contract. Mirrors `control_backend/schema.py`; change both together.
+- `src/api/adapter.ts` — REST calls against `/api` plus the `/ws` WebSocket. Single point of contact with the backend.
+- `src/api/mock.ts` — fixtures used only when `VITE_DEMO_MODE === 'true'`, dispatched from `adapter.ts`.
 
-- Runtime: React 19 and React DOM 19
-- Styling: Tailwind CSS v4 with the `@tailwindcss/vite` plugin
-- Build tooling: Vite 8, TypeScript 5.7, and `@vitejs/plugin-react`
-- Formatting: oxfmt
+Timestamps arrive as ISO-8601 with a `Z` suffix (`control_backend/schema.py:utc_now_iso`).
 
-## Styling
+## Structure
 
-This project uses **Tailwind CSS v4** through the `@tailwindcss/vite` plugin configured in `vite.config.ts`. `src/index.css` imports Tailwind with `@import 'tailwindcss';`. Use Tailwind utility classes directly in JSX and put global CSS or Tailwind v4 theme customization in `src/index.css`. This scaffold does not need a Tailwind config file or PostCSS config.
+- `src/main.tsx` — React entrypoint; imports `src/index.css`, mounts `src/App.tsx` into `#root`
+- `src/App.tsx` — shell: routing between pages, WebSocket lifecycle, shared state
+- `src/pages/` — `Overview`, `Network`, `Predictions`, `Events`, `Controls` (one per sidebar entry)
+- `src/components/layout/` — `Header`, `Sidebar`
+- `src/components/shared/` — `MetricCard`, `StatusBadge`
+- `src/index.css` — global CSS and the Tailwind v4 import
+- `index.html` — Vite shell. The `<title>` and head/body slots are filled by the
+  `figmaSiteConfiguration` plugin in `vite.config.ts`, so set the title there, not in the HTML.
 
-`src/main.tsx` imports `src/index.css`, so global font wiring belongs in `src/index.css`. Keep CSS `@import` statements first, then add any `@font-face` rules and font-family defaults there.
+## Notes
 
-## Code quality
-
-- Use double quotes for strings containing apostrophes (`"We're here to help"`), or escape them in single-quoted strings. An unescaped apostrophe in a single-quoted string breaks the build.
-- Ensure JSX tags are closed and braces are balanced.
+- Tailwind v4 via `@tailwindcss/vite`; no `tailwind.config` or PostCSS config is needed. Theme
+  customization belongs in `src/index.css`.
+- `@` is aliased to `src/`.
+- `vite.config.ts` still carries the Figma Make scaffolding plugins this project was generated from.
+  `figmaSiteConfiguration` runs on build and owns the document head; the others are `apply: 'serve'`
+  (dev-only). Leave them unless you are deliberately untangling the build.
+- The app is dark-mode only — `<html class="dark">`.
 - Export components as default exports.

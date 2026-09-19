@@ -4,8 +4,14 @@ Pydantic data models for the Antigravity Predictive Attack-Trajectory Event Cont
 Decouples React dashboard from specific model architectures, dimensions, or checkpoints.
 """
 
-from typing import Dict, List, Optional, Any
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
+
+
+def utc_now_iso() -> str:
+    """Current UTC time as the dashboard's wire format: ISO-8601 with a 'Z' suffix."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class ModelMetadata(BaseModel):

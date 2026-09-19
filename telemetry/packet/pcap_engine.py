@@ -7,7 +7,7 @@ Zero intermediate disk I/O.
 """
 
 import math
-from typing import List, Dict, Set, Tuple, Any, Optional
+from typing import List, Dict, Set, Tuple, Any
 import numpy as np
 
 PCAP_BEHAVIORAL_COLUMNS = [

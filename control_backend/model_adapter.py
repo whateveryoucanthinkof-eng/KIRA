@@ -373,15 +373,16 @@ class AntigravityModelAdapter:
 
         with torch.no_grad():
             if hasattr(self.wdt, "rollout_with_uncertainty"):
-                h_future, radii = self.wdt.rollout_with_uncertainty(
+                # NOTE: _radii holds per-step confidence bands. They are computed but
+                # not yet carried in the prediction payload; wire them into the
+                # PredictionEvent schema to draw confidence bands on the forecast.
+                h_future, _radii = self.wdt.rollout_with_uncertainty(
                     h_seq, K=self.forecast_steps, stabilize_horizon=True
                 )
-                conf_radii = [float(r.item()) if hasattr(r, "item") else float(r) for r in radii]
             else:
                 h_future = self.wdt.rollout(
                     h_seq, K=self.forecast_steps, stabilize_horizon=True
                 )
-                conf_radii = [0.05] * self.forecast_steps
 
             step_risks, _ = self.risk_head.forward_trajectory(h_future)
             fut_risks = [float(r) for r in step_risks.cpu().squeeze(0).numpy().tolist()]

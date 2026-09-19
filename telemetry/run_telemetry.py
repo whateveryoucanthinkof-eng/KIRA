@@ -137,9 +137,9 @@ def main():
     print("=" * 80)
     print("cyberworld LIVE SPAN TELEMETRY (CAPTURE ONLY)")
     print(f"  Interface:            {args.interface}")
-    print(f"  Window Resolution:    2.0 seconds")
-    print(f"  Output:               5-tuple flows + window metadata → Dual-Branch/DeepOP")
-    print(f"  Hot Path Storage:     Zero-Disk (Pure In-Memory)")
+    print("  Window Resolution:    2.0 seconds")
+    print("  Output:               5-tuple flows + window metadata → Dual-Branch/DeepOP")
+    print("  Hot Path Storage:     Zero-Disk (Pure In-Memory)")
     print("=" * 80)
     sys.stdout.flush()
 
@@ -175,7 +175,7 @@ def main():
             
         windows_processed = 0
         with open(args.replay, "rb") as f:
-            global_hdr = f.read(24)
+            f.read(24)  # skip 24-byte pcap global header
             while running:
                 hdr = f.read(16)
                 if len(hdr) < 16:

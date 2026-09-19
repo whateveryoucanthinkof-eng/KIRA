@@ -7,7 +7,6 @@ flow telemetry features per 2.0-second time window.
 Zero CSV or disk roundtrips.
 """
 
-import math
 from typing import Dict, List, Set, Tuple, Any
 import numpy as np
 

@@ -7,7 +7,6 @@ Decodes Ethernet, IPv4, IPv6, TCP, UDP layers into canonical packet dicts in mem
 Zero intermediate disk I/O.
 """
 
-import os
 import socket
 import struct
 import sys
@@ -62,7 +61,7 @@ class StreamingPacketSniffer:
                     packet_callback(pkt)
             except socket.timeout:
                 continue
-            except Exception as e:
+            except Exception:
                 if self.running:
                     time.sleep(0.01)
 

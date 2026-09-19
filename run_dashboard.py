@@ -6,7 +6,7 @@ Launcher for the cyberworld SOC console (local SPAN or Containerlab Lab Mode).
   python run_dashboard.py --site containerlab-enterprise
 
 Env:
-  cyberworld_SITE, cyberworld_SITE_CONFIG, cyberworld_SENSOR_IFACE
+  CYBERWORLD_SITE, CYBERWORLD_SITE_CONFIG, CYBERWORLD_SENSOR_IFACE
 """
 
 import argparse
@@ -20,6 +20,14 @@ import webbrowser
 REPO_ROOT = Path(__file__).resolve().parent
 bita_path = str(REPO_ROOT / "bita")
 
+# Why this path juggling exists: the vendored TGNE-TA code under bita/ imports its own
+# submodules by bare top-level names -- `from model.tgn import TGN`, `from modules.memory
+# import Memory`, `from utils.utils import ...`. That only resolves with bita/ itself on
+# sys.path, which puts a generic `model` package into the global namespace. Any other
+# `model.py` on PYTHONPATH (or a `model` already imported by something else) shadows it and
+# breaks checkpoint loading, so entries owning a model.py are dropped and a stale `model`
+# module is evicted below. Repackaging bita/ into a proper namespace would remove all of
+# this; it is left alone deliberately because the checkpoints are keyed to that layout.
 os.chdir(str(REPO_ROOT))
 clean_path = [str(REPO_ROOT), bita_path]
 for p in (os.environ.get("PYTHONPATH") or "").split(os.pathsep):
@@ -59,13 +67,13 @@ def _parse_args():
 if __name__ == "__main__":
     args = _parse_args()
     if args.site_config:
-        os.environ["cyberworld_SITE_CONFIG"] = args.site_config
+        os.environ["CYBERWORLD_SITE_CONFIG"] = args.site_config
     if args.site:
-        os.environ["cyberworld_SITE"] = args.site
+        os.environ["CYBERWORLD_SITE"] = args.site
     if args.interface:
-        os.environ["cyberworld_SENSOR_IFACE"] = args.interface
+        os.environ["CYBERWORLD_SENSOR_IFACE"] = args.interface
     if args.replay:
-        os.environ["cyberworld_REPLAY_PCAP"] = args.replay
+        os.environ["CYBERWORLD_REPLAY_PCAP"] = args.replay
 
     from control_backend.site_config import get_site_config, reload_site_config
 

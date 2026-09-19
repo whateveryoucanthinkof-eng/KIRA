@@ -3,8 +3,11 @@ control_backend/site_config.py
 Load per-deployment site profiles (CIDRs, sensor, lab_mode, assets of interest).
 
 Override with env:
-  cyberworld_SITE=containerlab-enterprise|local-default|<name>
-  cyberworld_SITE_CONFIG=/absolute/or/relative/path/to/site.yaml
+  CYBERWORLD_SITE=containerlab-enterprise|local-default|<name>
+  CYBERWORLD_SITE_CONFIG=/absolute/or/relative/path/to/site.yaml
+
+The legacy lowercase spellings (cyberworld_SITE, ...) are still honored, with a
+one-time warning per variable.
 """
 
 from __future__ import annotations
@@ -24,6 +27,34 @@ logger = logging.getLogger("antigravity.site_config")
 
 SITES_DIR = os.path.join(REPO_ROOT, "config", "sites")
 DEFAULT_SITE_ID = "containerlab-enterprise"
+
+_ENV_PREFIX = "CYBERWORLD_"
+_LEGACY_ENV_PREFIX = "cyberworld_"
+_legacy_env_warned: set = set()
+
+
+def env(suffix: str, default: Optional[str] = None) -> Optional[str]:
+    """Read CYBERWORLD_<suffix>, falling back to the legacy lowercase spelling."""
+    value = os.environ.get(_ENV_PREFIX + suffix)
+    if value is not None:
+        return value
+
+    legacy_name = _LEGACY_ENV_PREFIX + suffix
+    value = os.environ.get(legacy_name)
+    if value is not None:
+        if legacy_name not in _legacy_env_warned:
+            _legacy_env_warned.add(legacy_name)
+            logger.warning(
+                "%s is deprecated; use %s instead.", legacy_name, _ENV_PREFIX + suffix
+            )
+        return value
+
+    return default
+
+
+def env_is_set(suffix: str) -> bool:
+    """True when either spelling of CYBERWORLD_<suffix> is present."""
+    return env(suffix) is not None
 
 
 @dataclass(frozen=True)
@@ -139,12 +170,12 @@ def _parse_assets(raw: Any) -> Tuple[AssetOfInterest, ...]:
 
 
 def resolve_site_config_path() -> str:
-    explicit = os.environ.get("cyberworld_SITE_CONFIG")
+    explicit = env("SITE_CONFIG")
     if explicit:
         path = explicit if os.path.isabs(explicit) else os.path.join(REPO_ROOT, explicit)
         return os.path.abspath(path)
 
-    site_id = os.environ.get("cyberworld_SITE", DEFAULT_SITE_ID).strip() or DEFAULT_SITE_ID
+    site_id = (env("SITE") or DEFAULT_SITE_ID).strip() or DEFAULT_SITE_ID
     return os.path.abspath(os.path.join(SITES_DIR, f"{site_id}.yaml"))
 
 
@@ -170,7 +201,7 @@ def load_site_config(path: Optional[str] = None) -> SiteConfig:
         assets_of_interest=_parse_assets(raw.get("assets_of_interest")),
         sensor_mode=str(sensor.get("mode") or "local"),
         sensor_interface=str(
-            os.environ.get("cyberworld_SENSOR_IFACE")
+            env("SENSOR_IFACE")
             or sensor.get("interface")
             or "eth1"
         ),

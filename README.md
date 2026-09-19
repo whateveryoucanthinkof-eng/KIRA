@@ -160,11 +160,14 @@ Profiles live under `config/sites/`:
 Override with:
 
 ```bash
-export cyberworld_SITE=local-default
+export CYBERWORLD_SITE=local-default
 # or
-export cyberworld_SITE_CONFIG=/path/to/site.yaml
-export cyberworld_SENSOR_IFACE=eth1
+export CYBERWORLD_SITE_CONFIG=/path/to/site.yaml
+export CYBERWORLD_SENSOR_IFACE=eth1
 ```
+
+> The older lowercase spellings (`cyberworld_SITE`, …) still work but are deprecated — the backend
+> logs a warning naming the variable. Prefer the uppercase form.
 
 Minimal fields: `enterprise_cidrs`, `sensor.interface`, `topology.node_ttl_sec` / `edge_ttl_sec` / `max_nodes`, optional `assets_of_interest`.
 

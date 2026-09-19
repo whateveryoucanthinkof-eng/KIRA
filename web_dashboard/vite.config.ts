@@ -18,7 +18,11 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       tailwindcss(),
-      figmaSiteConfiguration({}),
+      figmaSiteConfiguration({
+        title: 'cyberworld SOC',
+        description: 'Predictive network SOC console — live host graph and ATT&CK-aware risk forecasts.',
+        icons: { icon: '/favicon.svg' },
+      }),
       figmaErrorOverlayReplay(),
       figmaReactRefreshBoundaryFallback(),
       figmaMakeKitPlugin({ storiesGlob: '/src/**/*.stories.{ts,tsx,js,jsx}' }),
