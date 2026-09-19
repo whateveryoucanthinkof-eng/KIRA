@@ -9,6 +9,24 @@ Assessment of this repo against **SIH PS 26153 (NTRO)** — *AI based Network At
 | 03 | [RL for training](03_rl_for_training.md) | Should reinforcement learning be applied at training time? |
 | 04 | [RL at inference + MIRAS](04_rl_at_inference_and_miras.md) | Test-time adaptation, online learning, MIRAS |
 | 05 | [CIC-2018 PCAP completeness](05_cic2018_pcap_completeness.md) | Is the claim "the PCAPs only hold 1–2 hours" true? |
+| 06 | [PCAP corruption scan](06_pcap_corruption_scan.md) | Full census: which files are corrupt and need re-downloading |
+
+## Corruption scan (report 06) — supersedes report 05's integrity claim
+
+A full `capinfos` census of all 4,456 capture files found **263 files (5.9%, 56.2 GB) with severe
+record-chain corruption** that need re-downloading, plus 75 with a merely truncated tail that need
+nothing. Report 05 had concluded "only 4 files lost real coverage" — that was wrong, because its two
+screens (`size % 4096`, tail-seek) are structurally blind to a bad length field mid-file: the tail bytes
+are still valid records, so a tail-seek lands cleanly.
+
+Re-download list: [`corrupt_files_redownload.txt`](corrupt_files_redownload.txt).
+
+Corruption clusters by day (1.1% on `tue_20` to 12.2% on `wed_14`) **and by host** — 19 hosts are corrupt
+on 5+ of the 10 days, which hints the damage may be upstream rather than transfer-related. Verify one
+file from the worst host before pulling 56 GB.
+
+Report 05's other conclusions stand: all 10 days present, per-host split, ~9 h captures, snaplen 65535,
+and the "only one or two hours" claim is still false.
 
 ## PCAP verdict (report 05)
 
