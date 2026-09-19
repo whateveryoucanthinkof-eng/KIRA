@@ -21,6 +21,15 @@ are still valid records, so a tail-seek lands cleanly.
 
 Re-download list: [`corrupt_files_redownload.txt`](corrupt_files_redownload.txt).
 
+**After re-downloading a day, verify it:** [`verify_pcap_day.sh`](verify_pcap_day.sh)
+
+```bash
+toolbox run -c prism-dev ./claude_latest_analysis/verify_pcap_day.sh wed_14_pcap
+```
+
+It walks every record chain in that day and diffs against the baseline, reporting fixed / still-corrupt
+/ newly-corrupt. If nothing was fixed, the damage is upstream and further re-downloading will not help.
+
 Corruption clusters by day (1.1% on `tue_20` to 12.2% on `wed_14`) **and by host** — 19 hosts are corrupt
 on 5+ of the 10 days, which hints the damage may be upstream rather than transfer-related. Verify one
 file from the worst host before pulling 56 GB.
