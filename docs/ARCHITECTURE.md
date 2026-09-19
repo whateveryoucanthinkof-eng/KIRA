@@ -1,14 +1,14 @@
-# CyberFortress: Enterprise Cyber Range & Live Streaming Telemetry Architecture
+# cyberworld: Enterprise Cyber Range & Live Streaming Telemetry Architecture
 
 **Document ID:** `docs/ARCHITECTURE.md`  
 **System Version:** V3.1-Production  
-**Authoritative ML Model:** CyberFortressModel V3.1-PCAP  
+**Authoritative ML Model:** cyberworldModel V3.1-PCAP  
 
 ---
 
 ## 1. Executive Architectural Overview
 
-**CyberFortress** is an integrated cyber-range and temporal world-model inference system designed to proactively forecast cyber intrusions before attacks transition into destructive or irreversible phases.
+**cyberworld** is an integrated cyber-range and temporal world-model inference system designed to proactively forecast cyber intrusions before attacks transition into destructive or irreversible phases.
 
 The system is built around the **Network-First Principle**:
 1. A believable, fully functional enterprise network is created in **Containerlab**.
@@ -194,7 +194,7 @@ The telemetry subsystem (`telemetry/`) ingests raw packets and computes normaliz
             │
             ▼ (When buffer has 15 states)
 [ V3.1 Model Adapter ] (telemetry/inference/adapter.py)
-  - Feeds tensor [1, 15, 72] to CyberFortressModelEXP14B(in_dim=72)
+  - Feeds tensor [1, 15, 72] to cyberworldModelEXP14B(in_dim=72)
   - Obtains multi-task forecast
   - Measures processing latency (packet -> state -> prediction)
 ```

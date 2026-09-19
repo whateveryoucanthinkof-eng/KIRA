@@ -3,8 +3,8 @@ control_backend/site_config.py
 Load per-deployment site profiles (CIDRs, sensor, lab_mode, assets of interest).
 
 Override with env:
-  CyberFortress_SITE=containerlab-enterprise|local-default|<name>
-  CyberFortress_SITE_CONFIG=/absolute/or/relative/path/to/site.yaml
+  cyberworld_SITE=containerlab-enterprise|local-default|<name>
+  cyberworld_SITE_CONFIG=/absolute/or/relative/path/to/site.yaml
 """
 
 from __future__ import annotations
@@ -139,12 +139,12 @@ def _parse_assets(raw: Any) -> Tuple[AssetOfInterest, ...]:
 
 
 def resolve_site_config_path() -> str:
-    explicit = os.environ.get("CyberFortress_SITE_CONFIG")
+    explicit = os.environ.get("cyberworld_SITE_CONFIG")
     if explicit:
         path = explicit if os.path.isabs(explicit) else os.path.join(REPO_ROOT, explicit)
         return os.path.abspath(path)
 
-    site_id = os.environ.get("CyberFortress_SITE", DEFAULT_SITE_ID).strip() or DEFAULT_SITE_ID
+    site_id = os.environ.get("cyberworld_SITE", DEFAULT_SITE_ID).strip() or DEFAULT_SITE_ID
     return os.path.abspath(os.path.join(SITES_DIR, f"{site_id}.yaml"))
 
 
@@ -170,7 +170,7 @@ def load_site_config(path: Optional[str] = None) -> SiteConfig:
         assets_of_interest=_parse_assets(raw.get("assets_of_interest")),
         sensor_mode=str(sensor.get("mode") or "local"),
         sensor_interface=str(
-            os.environ.get("CyberFortress_SENSOR_IFACE")
+            os.environ.get("cyberworld_SENSOR_IFACE")
             or sensor.get("interface")
             or "eth1"
         ),

@@ -24,20 +24,20 @@ from control_backend.commands import executor, LAB_ONLY_COMMANDS
 @pytest.fixture
 def local_site(monkeypatch):
     path = os.path.join(PROJECT_ROOT, "config", "sites", "local-default.yaml")
-    monkeypatch.setenv("CyberFortress_SITE_CONFIG", path)
+    monkeypatch.setenv("cyberworld_SITE_CONFIG", path)
     reload_site_config()
     yield get_site_config()
-    monkeypatch.delenv("CyberFortress_SITE_CONFIG", raising=False)
+    monkeypatch.delenv("cyberworld_SITE_CONFIG", raising=False)
     reload_site_config()
 
 
 @pytest.fixture
 def lab_site(monkeypatch):
     path = os.path.join(PROJECT_ROOT, "config", "sites", "containerlab-enterprise.yaml")
-    monkeypatch.setenv("CyberFortress_SITE_CONFIG", path)
+    monkeypatch.setenv("cyberworld_SITE_CONFIG", path)
     reload_site_config()
     yield get_site_config()
-    monkeypatch.delenv("CyberFortress_SITE_CONFIG", raising=False)
+    monkeypatch.delenv("cyberworld_SITE_CONFIG", raising=False)
     reload_site_config()
 
 

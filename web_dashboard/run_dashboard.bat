@@ -1,5 +1,5 @@
 @echo off
 cd /d "%~dp0\.."
-echo Starting CyberFortress SOC Console from repository root...
+echo Starting cyberworld SOC Console from repository root...
 python run_dashboard.py
 pause

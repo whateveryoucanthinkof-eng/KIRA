@@ -1,6 +1,6 @@
-# CyberFortress — Predictive Network SOC (SPAN → Topology → Dual-Branch / DeepOP)
+# cyberworld — Predictive Network SOC (SPAN → Topology → Dual-Branch / DeepOP)
 
-CyberFortress turns a **SPAN / port-mirror feed** into a **live host graph** and **ATT&CK-aware risk forecasts** for operators.
+cyberworld turns a **SPAN / port-mirror feed** into a **live host graph** and **ATT&CK-aware risk forecasts** for operators.
 
 > Passively watch live traffic → discover who is talking to whom → forecast near-future attack evolution → show it on a SOC console.
 
@@ -10,7 +10,7 @@ It is **not** an inline firewall/IPS, and it does **not** rely on a hardcoded at
 
 ## One-sentence product
 
-**CyberFortress turns a SPAN/mirror feed into a live host graph and predictive ATT&CK-aware risk forecasts for SOC operators.**
+**cyberworld turns a SPAN/mirror feed into a live host graph and predictive ATT&CK-aware risk forecasts for SOC operators.**
 
 ---
 
@@ -126,7 +126,7 @@ Retired: root `model/` V3.1 72-D PCAP transformer is **not** the live path.
 1. **Clone the repository:**
    ```bash
    git clone <repository_url>
-   cd CyberFortress
+   cd cyberworld
    ```
 
 2. **Install Python dependencies:**
@@ -160,10 +160,10 @@ Profiles live under `config/sites/`:
 Override with:
 
 ```bash
-export CyberFortress_SITE=local-default
+export cyberworld_SITE=local-default
 # or
-export CyberFortress_SITE_CONFIG=/path/to/site.yaml
-export CyberFortress_SENSOR_IFACE=eth1
+export cyberworld_SITE_CONFIG=/path/to/site.yaml
+export cyberworld_SENSOR_IFACE=eth1
 ```
 
 Minimal fields: `enterprise_cidrs`, `sensor.interface`, `topology.node_ttl_sec` / `edge_ttl_sec` / `max_nodes`, optional `assets_of_interest`.
@@ -202,7 +202,7 @@ Opens `http://localhost:8000` (builds `web_dashboard` if `dist/` is missing).
 ```bash
 # From dashboard: START SENSOR
 # Or manually (lab sensor netns):
-./scripts/run_telemetry.sh --record-state /tmp/CyberFortress_live_stream.jsonl --no-inference
+./scripts/run_telemetry.sh --record-state /tmp/cyberworld_live_stream.jsonl --no-inference
 ```
 
 Capture remains **`--no-inference`**. Dual-Branch / DeepOP runs in `control_backend`.

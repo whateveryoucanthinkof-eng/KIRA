@@ -19,7 +19,7 @@ for arg in "$@"; do
 done
 
 echo "================================================================="
-echo "STARTING CyberFortress SOC CONTROL PANEL (Dual-Branch + DeepOP)"
+echo "STARTING cyberworld SOC CONTROL PANEL (Dual-Branch + DeepOP)"
 echo "================================================================="
 
 # Ensure bita wins over ambient model.py shadows

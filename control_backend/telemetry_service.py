@@ -109,8 +109,8 @@ class LiveTelemetryService:
                 STATE_STREAM_PATH,
                 "--no-inference",
             ]
-            if "CyberFortress_REPLAY_PCAP" in os.environ:
-                cmd.extend(["--replay", os.environ["CyberFortress_REPLAY_PCAP"]])
+            if "cyberworld_REPLAY_PCAP" in os.environ:
+                cmd.extend(["--replay", os.environ["cyberworld_REPLAY_PCAP"]])
 
         logger.info(
             "Launching SPAN telemetry (site=%s iface=%s lab=%s): %s",

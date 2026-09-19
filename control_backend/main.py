@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     broker.set_loop(asyncio.get_running_loop())
     site = get_site_config()
     logger.info(
-        "CyberFortress SOC backend online — site=%s lab_mode=%s (discovery topology).",
+        "cyberworld SOC backend online — site=%s lab_mode=%s (discovery topology).",
         site.site_id,
         site.lab_mode,
     )
@@ -53,11 +53,11 @@ async def lifespan(app: FastAPI):
         telemetry_service.stop_sensor()
     except Exception:
         pass
-    logger.info("CyberFortress SOC backend shutting down.")
+    logger.info("cyberworld SOC backend shutting down.")
 
 
 app = FastAPI(
-    title="CyberFortress SOC — SPAN Discovery + Dual-Branch/DeepOP",
+    title="cyberworld SOC — SPAN Discovery + Dual-Branch/DeepOP",
     version="3.3.0-discovery",
     lifespan=lifespan,
 )

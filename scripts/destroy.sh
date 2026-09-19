@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 echo "================================================================="
-echo "TEARING DOWN CyberFortress ENTERPRISE RANGE"
+echo "TEARING DOWN cyberworld ENTERPRISE RANGE"
 echo "================================================================="
 
 cd "${ROOT_DIR}"
@@ -43,5 +43,5 @@ if [ -n "$LEFTOVERS" ]; then
 fi
 
 echo "================================================================="
-echo "CyberFortress TEARDOWN COMPLETE."
+echo "cyberworld TEARDOWN COMPLETE."
 echo "================================================================="

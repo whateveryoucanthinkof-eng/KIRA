@@ -1,8 +1,8 @@
-# CyberFortress Technical Review
+# cyberworld Technical Review
 
 ## 1. Purpose and Scope
 
-CyberFortress is a passive network-observation and predictive SOC system. It accepts traffic from a SPAN or port-mirror interface, discovers communicating hosts and edges, builds temporal flow features, runs a multi-model prediction stack, and presents forecasts and explanations in a web dashboard.
+cyberworld is a passive network-observation and predictive SOC system. It accepts traffic from a SPAN or port-mirror interface, discovers communicating hosts and edges, builds temporal flow features, runs a multi-model prediction stack, and presents forecasts and explanations in a web dashboard.
 
 The repository supports two deployment modes:
 
@@ -61,9 +61,9 @@ The 72-D state assembled by `telemetry/state/state_builder.py` is a capture and 
 
 Important environment variables include:
 
-- `CyberFortress_SITE`: site profile name, normally `containerlab-enterprise` or `local-default`.
-- `CyberFortress_SITE_CONFIG`: explicit YAML configuration path.
-- `CyberFortress_SENSOR_IFACE`: override for the observed host interface.
+- `cyberworld_SITE`: site profile name, normally `containerlab-enterprise` or `local-default`.
+- `cyberworld_SITE_CONFIG`: explicit YAML configuration path.
+- `cyberworld_SENSOR_IFACE`: override for the observed host interface.
 
 The backend is started from `control_backend.main:app` and serves the built dashboard when `web_dashboard/dist` exists.
 
@@ -748,7 +748,7 @@ The package contains the offline research WDT, data adapters, feature schemas, g
 Some historical files still describe the removed 72-D V3.1 transformer. The current live adapter does not use that model. In particular, older architecture documentation and comments may mention:
 
 - A root `model/` package.
-- `CyberFortressModel V3.1-PCAP`.
+- `cyberworldModel V3.1-PCAP`.
 - 72-D model input.
 - A 15-step, 30-second inference history.
 - A five-step forecast.
