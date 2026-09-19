@@ -530,11 +530,46 @@ The graph is discovery-driven. It does not generate a fixed 15-node topology or 
 
 ## 15. Offline and Research World Model
 
-Removed from this branch on 2026-09-19. The `world_model/` package was an incomplete research
-stack: every module imported `world_model.models.*` and `world_model.data.*`, neither of which
-was ever committed, so the package could not be imported. It had no live dependents.
+The `world_model/` package is a separate research stack. It is not the promoted production model. It contains a larger latent-space world dynamics architecture, training utilities, baselines, evaluation, and explainability.
 
-The full tree is preserved on the `archive/pre-cleanup-2026-09-19` branch (origin and sih).
+### Model modules
+
+- `models/world_dynamics_transformer.py`: research WDT with causal attention, residual dynamics, and KV-cache support.
+- `models/time_encoding.py`: continuous time-delta encoding; currently imported by live Branch B.
+- `models/readout.py`: graph/latent readout.
+- `models/state_decoder.py`: state reconstruction.
+- `models/attack_decoder.py`: attack-stage decoding.
+- `models/risk_head.py`: risk prediction.
+
+### Data and training
+
+- `data/ctu13_adapter.py`: CTU-13 preparation.
+- `data/feature_schema.py`: research feature dimensions and labels.
+- `data/graph_builder.py`: graph snapshot construction.
+- `data/latent_dataset.py`: latent sequence datasets.
+- `data/splits.py`: chronological and scenario splits.
+- `training/train_world_model.py`: research WDT training.
+- `training/train_downstream_heads.py`: downstream head training.
+- `training/losses.py`: world-model and detection losses.
+- `training/rollout.py`: rollout evaluation.
+- `training/scheduled_sampling.py`: scheduled sampling.
+- `training/checkpointing.py`: checkpoint persistence.
+
+### Evaluation, baselines, and explanation
+
+- `evaluation/run_evaluation.py`: full evaluation entrypoint.
+- `evaluation/detection_metrics.py`: detection and attack-stage metrics.
+- `evaluation/forecasting_metrics.py`: lead-time and forecast metrics.
+- `evaluation/dynamics_metrics.py`: dynamics metrics.
+- `evaluation/calibration.py`: calibration metrics and temperature scaling.
+- `baselines/`: logistic, LSTM, and static-GCN comparisons.
+- `scripts/generate_latent_dataset.py`: latent cache creation.
+- `scripts/run_ablations.py`: ablation execution.
+- `scripts/demo_explainability.py`: offline explanation demo.
+- `DESIGN_DECISIONS.md`: research design rationale.
+- `config/default_config.yaml`: research training configuration.
+
+This stack should be treated as offline research unless a deliberate future integration replaces the current live adapter.
 
 ## 16. Scripts and Operations
 
