@@ -10,6 +10,36 @@ Assessment of this repo against **SIH PS 26153 (NTRO)** — *AI based Network At
 | 04 | [RL at inference + MIRAS](04_rl_at_inference_and_miras.md) | Test-time adaptation, online learning, MIRAS |
 | 05 | [CIC-2018 PCAP completeness](05_cic2018_pcap_completeness.md) | Is the claim "the PCAPs only hold 1–2 hours" true? |
 
+## PCAP verdict (report 05)
+
+**The "PCAPs only have 1-2 hours" claim is FALSE.** 4,457 files, ~560 GB, **all 10 official capture days
+present** (dates confirmed from packet timestamps, not filenames). The corpus is split **per host, not per
+time slice**: ~445 files per day, one per victim machine, each spanning the full ~9-hour capture day.
+Across 143 probed files: 8.7-11.2 h, median ~9.1 h. Snaplen 65535 — full payloads, so every PS-required
+packet feature is physically recoverable.
+
+The claim came from ~8 fragment files (0.2%) that genuinely are short because they are *time-consecutive
+pieces of one host's day* — `…69.13 part1` (1.71 h) + `part2` (0.53 h) + `part3` (6.90 h) reassemble to
+9.22 h. They sort to conspicuous positions in a directory listing, which is exactly what a spot-check
+opens first.
+
+### The finding that matters more than the verdict
+
+**Only `tue_20_csv.csv` (84 cols) carries `Src IP`/`Dst IP`. The other nine CSVs are 80 cols with no IP
+columns at all** — verified. For those nine days `data_unification/cic2018_adapter.py:65,70` **fabricates
+host IPs by row index**:
+
+```python
+src_ips = np.array([f"192.168.10.{i % 250 + 1}" for i in range(len(chunk))])
+dst_ips = np.array([f"172.16.0.{i % 100 + 1}"  for i in range(len(chunk))])
+```
+
+Source ports are randomised at `:75`. This adapter is on the shipped path —
+`scripts/retrain_branch_a_live.py:25,31,36` — so **the host graph the TGNE learned over is synthetic for
+9 of 10 training days**. A "host trajectory" is every 250th row of a CSV. For a system whose thesis is
+per-host trajectory forecasting, that is a correctness problem independent of any packet-feature gain,
+and the PCAPs (one file per host) supply exactly what is missing.
+
 ## RL verdicts, in one line each
 
 **Training-time RL: no.** The system's output does not change its input — a predicted ATT&CK stage doesn't alter the attacker's next packet. Transitions are exogenous, so the MDP collapses to a contextual bandit; and because the dataset is fully labelled, every action's reward is computable offline, making it a *full-information* bandit, which is supervised learning. In every canonical world-model system (Ha & Schmidhuber, DreamerV3, MuZero, TD-MPC2) RL trains the **controller**, not the dynamics model — and this repo has no controller because the PS doesn't ask for one.
