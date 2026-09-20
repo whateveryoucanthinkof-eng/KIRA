@@ -59,6 +59,22 @@ def detection_metrics(
         out["pr_auc"] = out["roc_auc"] = out["brier"] = float("nan")
         out["note"] = "single class present; AUC undefined"
 
+    # PR-AUC is bounded below by the base rate. At an extreme base rate it is
+    # ~1.0 for any ranking whatsoever, including a constant one, so quoting it
+    # without the base rate beside it is misleading. Measured on a real run: a
+    # test split that was 99.97% positive gave PR-AUC 0.9998 for both the model
+    # AND persistence.
+    pr = out.get("pr_auc")
+    if pr == pr and (out["positive_rate"] > 0.95 or out["positive_rate"] < 0.05):
+        out["pr_auc_baseline"] = out["positive_rate"]
+        out["pr_auc_lift"] = float(pr - out["positive_rate"])
+        out["extreme_base_rate"] = True
+        out["note"] = (
+            f"base rate {out['positive_rate']:.4f} is extreme; PR-AUC {pr:.4f} is close to the "
+            f"rate a constant predictor achieves. Read pr_auc_lift ({pr - out['positive_rate']:+.4f}) "
+            f"and balanced_accuracy instead."
+        )
+
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     out.update(tn=int(tn), fp=int(fp), fn=int(fn), tp=int(tp))
     out["fpr"] = float(fp / (fp + tn)) if (fp + tn) else 0.0
