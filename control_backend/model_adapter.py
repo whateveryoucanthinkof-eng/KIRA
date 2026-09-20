@@ -57,6 +57,17 @@ TECHNIQUE_TO_MITRE = {
     "T1020": ("Exfiltration", "T1020 Automated Exfiltration", "TA0010", "Automated exfiltration"),
 }
 
+# The SOC rule layer emits its own coarse labels. They are not ATT&CK technique
+# ids, so TECHNIQUE_TO_MITRE used to miss and the dashboard rendered
+# "MITRE Unknown -> Exploit". Mapping them to the real technique each rule is
+# actually detecting keeps the displayed ATT&CK annotation meaningful; the
+# rules_applied flag still tells the operator the label came from a rule.
+RULE_TECHNIQUE_TO_ATTCK = {
+    "PortScan": "T1046",     # Network Service Discovery
+    "WebAttack": "T1190",    # Exploit Public-Facing Application
+    "Exploit": "T1190",      # Exploit Public-Facing Application
+}
+
 FEATURE_GROUP_MAP = {
     **{f"H_emb_{i}": "TGNE Latent" for i in range(12)},
     "flow_count": "Connectivity",
@@ -549,8 +560,10 @@ class AntigravityModelAdapter:
         fut_risks = [float(np.clip(r, 0.0, 1.0)) for r in fut_risks]
         max_future = max(fut_risks) if fut_risks else obs_risk
 
+        # Resolve rule-emitted labels to their real ATT&CK technique before lookup.
+        mitre_key = RULE_TECHNIQUE_TO_ATTCK.get(obs_technique, obs_technique)
         mitre = TECHNIQUE_TO_MITRE.get(
-            obs_technique,
+            mitre_key,
             ("Unknown", obs_technique, "TA0000", "Model-predicted technique"),
         )
         alert = (not is_mitigated) and (

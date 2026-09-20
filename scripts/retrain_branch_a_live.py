@@ -25,7 +25,8 @@ from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.cic2018_adapter import CIC2018Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
-from cyberworld_v4.config import get_contract
+from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
+from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
 def _load_records(cic_dir: Path, ctu_dir: Path, rows_per_file: int, files: List[Path]):
@@ -96,6 +97,16 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    _cfg = DEFAULT_CONFIG
+    _manifest = ExperimentManifest.create(
+        f"branch_a_v4_seed{args.seed}",
+        seed=args.seed,
+        config=_cfg,
+        repo=Path(__file__).resolve().parent.parent,
+        dataset_sources=[str(args.cic_dir), str(args.ctu_dir)],
+    )
+    set_all_seeds(args.seed)
 
     cic_files = sorted(args.cic_dir.glob("*.csv"))
     ctu_files = sorted(args.ctu_dir.glob("*/*.binetflow"))
@@ -181,12 +192,21 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
                     "metrics": metrics,
+                    # Written from the contract actually in force, not from
+                    # literals. These were hardcoded to 2.0/5 regardless of what
+                    # the run used, so the metadata could describe a model that
+                    # was never trained.
                     "training_contract": {
-                        "window_size_sec": 2.0,
-                        "history_steps": 5,
-                        "feature_dim": 27,
+                        "window_seconds": _c.window_seconds,
+                        "window_size_sec": _c.window_seconds,  # v3 key, kept readable
+                        "history_steps": _c.history_steps,
+                        "forecast_steps": _c.forecast_steps,
+                        "feature_dim": _cfg.state_dim,
                         "sources": [str(args.cic_dir), str(args.ctu_dir)],
                     },
+                    "config": _cfg.to_dict(),
+                    "manifest": _manifest.to_dict(),
+                    "fingerprint": _manifest.fingerprint(),
                 },
                 args.output,
             )
