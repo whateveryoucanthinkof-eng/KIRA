@@ -30,7 +30,6 @@ at the first bad record and keeps the valid prefix rather than aborting a day.
 
 from __future__ import annotations
 
-import os
 import re
 import struct
 from dataclasses import dataclass
