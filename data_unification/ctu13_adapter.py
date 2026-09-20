@@ -11,6 +11,8 @@ import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
 
+from cyberworld_v4.identity import stable_id
+
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
 
@@ -56,10 +58,25 @@ class CTU13Adapter:
                 family = malware_families[i]
                 coarse, attck, is_attack = self.resolver.resolve(family, source=LabelSource.CTU13)
 
-                # Consistent host IPs per scenario
-                bot_id = abs(hash(scen)) % 250 + 2
+                # Synthetic endpoints. This parquet holds pre-aggregated 2-second
+                # flow states, not the original 5-tuples, so topology has to be
+                # constructed. Two rules make that defensible:
+                #
+                #   1. Endpoints are derived ONLY from the scenario id, never from
+                #      is_attack. v3 used `"147.32.84.180" if is_attack else ...`,
+                #      which put the ground-truth label into the destination node —
+                #      i.e. into the graph edge the TGNE attends over — making the
+                #      topology trivially separable. That is label leakage, not a
+                #      workaround.
+                #   2. Ids come from SHA-256, not Python hash(), which is salted per
+                #      process and so produces different graphs on every run.
+                #
+                # A graph built this way still cannot support claims about learned
+                # network topology; it is a carrier for the flow statistics only.
+                bot_id = stable_id(scen, "src", modulo=250) + 2
+                svc_id = stable_id(scen, "dst", modulo=200) + 2
                 src_ip = f"10.0.2.{bot_id}"
-                dst_ip = "147.32.84.180" if is_attack else "147.32.80.1"
+                dst_ip = f"147.32.84.{svc_id}"
                 src_port = 1024 + (i % 60000)
                 dst_port = 6667 if "irc" in family.lower() else (80 if "http" in family.lower() else 443)
 
