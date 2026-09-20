@@ -25,6 +25,7 @@ from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.cic2018_adapter import CIC2018Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
+from cyberworld_v4.config import get_contract
 
 
 def _load_records(cic_dir: Path, ctu_dir: Path, rows_per_file: int, files: List[Path]):
@@ -109,19 +110,23 @@ def main():
     val_records = _load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, val_files)
 
     tgn = build_or_load_tgne_ta()
-    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=2.0)
-    train_samples = _make_samples(train_records, extractor, seq_len=5)
-    val_samples = _make_samples(val_records, extractor, seq_len=5)
+    # Contract-bound (v4). Previously 2.0s / seq_len=5 hardcoded, which matched
+    # the v3 contract by coincidence rather than by construction. Under v4 this
+    # produces history_steps=15, so it yields a v4 checkpoint, not a v3 one.
+    _c = get_contract()
+    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=_c.window_seconds)
+    train_samples = _make_samples(train_records, extractor, seq_len=_c.history_steps)
+    val_samples = _make_samples(val_records, extractor, seq_len=_c.history_steps)
     if not train_samples or not val_samples:
         raise RuntimeError("The 2-second pipeline produced no train/validation samples")
 
     train_loader = DataLoader(
-        HostSequenceDataset(train_samples, seq_len=5),
+        HostSequenceDataset(train_samples, seq_len=_c.history_steps),
         batch_size=args.batch_size,
         shuffle=True,
     )
     val_loader = DataLoader(
-        HostSequenceDataset(val_samples, seq_len=5),
+        HostSequenceDataset(val_samples, seq_len=_c.history_steps),
         batch_size=args.batch_size,
         shuffle=False,
     )

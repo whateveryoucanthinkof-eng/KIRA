@@ -89,9 +89,14 @@ class AntigravityModelAdapter:
         # Rules on by default so the operator console is unchanged; off for any
         # scientific run. CYBERWORLD_DISABLE_RULES=1 yields ML-only output.
         self.rules_enabled = os.environ.get("CYBERWORLD_DISABLE_RULES", "") not in ("1", "true", "True")
+        # Provisional; overwritten in _load_models by the contract the
+        # checkpoints actually carry. A model's temporal contract is a property
+        # of the model, not a global constant — hardcoding it here is how a v3
+        # checkpoint could be served under v4 settings without anything noticing.
         self.window_seconds = LIVE_WINDOW_SIZE_SEC
         self.forecast_steps = DEFAULT_ROLLOUT_HORIZON_LIVE
         self.history_steps = DEFAULT_HISTORY_STEPS
+        self.checkpoint_contract: Dict[str, Any] = {}
         self.fingerprinter = BehavioralFlowFingerprinter()
         self._load_models()
 
@@ -141,6 +146,7 @@ class AntigravityModelAdapter:
         ckpt = torch.load(ba_path, map_location=self.device, weights_only=False)
         self.branch_a.load_state_dict(ckpt["model_state_dict"])
         self.branch_a.eval()
+        self._adopt_contract(ckpt, "branch_a")
 
         self.wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64).to(self.device)
         self.risk_head = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(self.device)
@@ -148,6 +154,7 @@ class AntigravityModelAdapter:
         if not os.path.exists(bb_path):
             raise RuntimeError(f"Missing Branch B checkpoint: {bb_path}")
         ckpt = torch.load(bb_path, map_location=self.device, weights_only=False)
+        self._adopt_contract(ckpt, "branch_b")
         self.wdt.load_state_dict(ckpt["wdt_state_dict"])
         self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
         self.wdt.eval()
@@ -165,12 +172,63 @@ class AntigravityModelAdapter:
         self.deepop.load_state_dict(ckpt["decoder_state_dict"])
         self.deepop.eval()
 
-        logger.info(
-            "Antigravity models loaded (device=%s, K=%s, dt=%ss)",
-            self.device,
-            self.forecast_steps,
-            self.window_seconds,
+        from cyberworld_v4.config import get_contract
+
+        served = get_contract().matches(
+            {
+                "window_seconds": self.window_seconds,
+                "history_steps": self.history_steps,
+                "forecast_steps": self.forecast_steps,
+            }
         )
+        logger.info(
+            "Models loaded (device=%s) serving contract: %ss windows | %s history | %s forecast — %s",
+            self.device,
+            self.window_seconds,
+            self.history_steps,
+            self.forecast_steps,
+            "v4" if served else "v3 (pre-v4 checkpoints; retrain for the v4 contract)",
+        )
+
+    def _adopt_contract(self, ckpt: Dict[str, Any], name: str) -> None:
+        """Take the temporal contract from the checkpoint being loaded.
+
+        v3 weights carry window_size_sec/history_steps (or window_seconds/
+        history_steps/forecast_steps); v4 weights carry a `config.temporal`
+        block. Either way the served contract comes from the artefact rather
+        than from a constant that may no longer describe it.
+
+        Checkpoints that disagree with each other are a hard error: rolling a
+        5-step history against an 8-step decoder silently produces nonsense.
+        """
+        tc = ckpt.get("training_contract") or {}
+        cfg = (ckpt.get("config") or {}).get("temporal") or {}
+        src = cfg or tc or ckpt
+
+        found = {}
+        w = src.get("window_seconds", src.get("window_size_sec"))
+        if w:
+            found["window_seconds"] = float(w)
+        if src.get("history_steps"):
+            found["history_steps"] = int(src["history_steps"])
+        if src.get("forecast_steps"):
+            found["forecast_steps"] = int(src["forecast_steps"])
+        if not found:
+            return
+
+        for k, v in found.items():
+            prev = self.checkpoint_contract.get(k)
+            if prev is not None and prev != v:
+                raise RuntimeError(
+                    f"Checkpoint contract conflict on {k}: {name} says {v}, "
+                    f"an earlier checkpoint said {prev}. Checkpoints trained under "
+                    f"different temporal contracts cannot be composed."
+                )
+            self.checkpoint_contract[k] = v
+
+        self.window_seconds = self.checkpoint_contract.get("window_seconds", self.window_seconds)
+        self.history_steps = self.checkpoint_contract.get("history_steps", self.history_steps)
+        self.forecast_steps = self.checkpoint_contract.get("forecast_steps", self.forecast_steps)
 
     def reset_history(self):
         self.h_state_history.clear()

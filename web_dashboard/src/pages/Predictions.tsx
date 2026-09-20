@@ -27,6 +27,16 @@ function fmtTime(ts: string): string {
   } catch { return ts; }
 }
 
+/** True forecast horizon from the backend, in seconds (steps are window_seconds apart). */
+function fmtHorizon(seconds: number, prefix: string = "+"): string {
+  if (!Number.isFinite(seconds)) return "—";
+  if (Math.abs(seconds) < 60) {
+    return `${prefix}${seconds % 1 === 0 ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+  }
+  const m = seconds / 60;
+  return `${prefix}${m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)}m`;
+}
+
 function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: unknown[]; label?: string }) {
   if (!active || !payload?.length) return null;
   const items = payload as Array<{ name: string; value: number; color: string }>;
@@ -70,12 +80,24 @@ export default function Predictions({ telemetry, forecast, prediction }: Predict
 
   const combinedMin = combined.length ? Math.max(0, Math.min(...combined.map(d => d.lower)) - 80) : 0;
 
+  // Real Input x Gradient attributions (schema.py:ExplainabilityPayload.top_features).
+  // `weight` is the feature's share of total attribution; `value` is its group.
   const signalData = prediction?.signals.map((s) => ({
     name: s.name,
-    weight: Math.round(s.weight * 100),
+    weight: Number((s.weight * 100).toFixed(1)),
     direction: s.direction,
     value: s.value,
   })) ?? [];
+  const explainMethod = prediction?.explainability?.available ? prediction.explainability.method : null;
+  const explainGroups = prediction?.explainability?.available ? prediction.explainability.groups : [];
+
+  // Attack-stage distribution off the wire (schema.py:PredictionData.stage_probabilities).
+  const stageProbs = Object.entries(prediction?.stage_probabilities ?? {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4);
+
+  // True forecast span in SECONDS — the steps are window_seconds apart, not minutes.
+  const forecastSpan = forecast.length ? forecast[forecast.length - 1].horizonSeconds : null;
 
   const confidenceHistory = telemetry.slice(-60).map((p) => ({
     t: fmtTime(p.timestamp),
@@ -163,13 +185,13 @@ export default function Predictions({ telemetry, forecast, prediction }: Predict
           {/* Forecast table */}
           <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
             <div className="panel-header">
-              <span className="panel-title">30-Minute Forecast Table</span>
+              <span className="panel-title">{forecastSpan != null ? `Forecast Table — Next ${fmtHorizon(forecastSpan, "")}` : "Forecast Table"}</span>
             </div>
             <div style={{ overflowY: "auto" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
                 <thead>
                   <tr style={{ background: "var(--color-base)" }}>
-                    {["Time", "Horizon", "Predicted (Mbps)", "Lower", "Upper", "Confidence"].map((h) => (
+                    {["Time", "Horizon", "Predicted (Mbps)", "Lower", "Upper", "Confidence", "Predicted Stage"].map((h) => (
                       <th key={h} style={{
                         padding: "6px 12px", textAlign: "left", fontSize: 10, fontWeight: 600,
                         letterSpacing: "0.05em", textTransform: "uppercase", color: "var(--color-text-muted)",
@@ -185,7 +207,7 @@ export default function Predictions({ telemetry, forecast, prediction }: Predict
                   {forecast.map((f, i) => (
                     <tr key={i} style={{ borderBottom: "1px solid var(--color-border)", background: i % 2 === 0 ? "transparent" : "var(--color-base)" }}>
                       <td style={{ padding: "5px 12px", fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--color-text-muted)", whiteSpace: "nowrap" }}>{fmtTime(f.timestamp)}</td>
-                      <td style={{ padding: "5px 12px", fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)" }}>+{i + 1}m</td>
+                      <td style={{ padding: "5px 12px", fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)" }}>{fmtHorizon(f.horizonSeconds)}</td>
                       <td style={{ padding: "5px 12px", fontFamily: "var(--font-mono)", fontWeight: 600, color: "var(--color-text-primary)" }}>{f.predicted}</td>
                       <td style={{ padding: "5px 12px", fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>{f.lowerBound}</td>
                       <td style={{ padding: "5px 12px", fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>{f.upperBound}</td>
@@ -199,6 +221,9 @@ export default function Predictions({ telemetry, forecast, prediction }: Predict
                           </div>
                           <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--color-text-muted)", flexShrink: 0 }}>{(f.confidence * 100).toFixed(0)}%</span>
                         </div>
+                      </td>
+                      <td style={{ padding: "5px 12px", fontFamily: "var(--font-mono)", fontSize: 10, color: f.predictedStage ? "var(--color-status-amber)" : "var(--color-text-muted)", whiteSpace: "nowrap", maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {f.predictedStage || "—"}
                       </td>
                     </tr>
                   ))}
@@ -227,7 +252,7 @@ export default function Predictions({ telemetry, forecast, prediction }: Predict
                       accent: prediction.value >= 0.7 ? "var(--color-status-red)" : prediction.value >= 0.4 ? "var(--color-status-amber)" : "var(--color-status-green)",
                     },
                     { label: "Confidence",  value: `${(prediction.confidence * 100).toFixed(1)}%`, accent: "var(--color-text-primary)" },
-                    { label: "Horizon",     value: `${prediction.horizon}m`,                        accent: "var(--color-text-primary)" },
+                    { label: "Horizon",     value: fmtHorizon(prediction.horizon, ""),              accent: "var(--color-text-primary)" },
                     { label: "Model",       value: prediction.model.split("/")[0].trim(),            accent: "var(--color-text-secondary)" },
                   ].map(({ label, value, accent }) => (
                     <div key={label} style={{ background: "var(--color-base)", borderRadius: 6, padding: "8px 10px", minWidth: 0 }}>
@@ -236,6 +261,55 @@ export default function Predictions({ telemetry, forecast, prediction }: Predict
                     </div>
                   ))}
                 </div>
+                {/* Attack-stage annotation straight off the wire (PS 26153) */}
+                {(prediction.predicted_stage || prediction.mitre_tactic || prediction.mitre_technique) && (
+                  <div style={{ background: "var(--color-base)", borderRadius: 6, padding: "8px 10px", marginBottom: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 3 }}>
+                      <span style={{ fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--color-text-muted)" }}>
+                        Predicted Attack Stage
+                      </span>
+                      {prediction.technique_confidence != null && (
+                        <span style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", flexShrink: 0 }}>
+                          {(prediction.technique_confidence * 100).toFixed(0)}% conf
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 12, fontWeight: 700, fontFamily: "var(--font-mono)", color: "var(--color-status-amber)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {prediction.predicted_stage || "—"}
+                    </div>
+                    {(prediction.mitre_tactic || prediction.mitre_technique) && (
+                      <div style={{ fontSize: 10, color: "var(--color-text-secondary)", marginTop: 4 }}>
+                        <span style={{ color: "var(--color-text-muted)" }}>MITRE </span>
+                        {prediction.mitre_tactic_id ? `${prediction.mitre_tactic_id} · ` : ""}
+                        {prediction.mitre_tactic || "—"}
+                        {prediction.mitre_technique ? ` → ${prediction.mitre_technique}` : ""}
+                      </div>
+                    )}
+                    {prediction.mitre_description && (
+                      <div style={{ fontSize: 9, color: "var(--color-text-muted)", marginTop: 3, lineHeight: 1.45 }}>
+                        {prediction.mitre_description}
+                      </div>
+                    )}
+                    {stageProbs.length > 0 && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--color-text-muted)", marginBottom: 4 }}>
+                          Stage Probabilities
+                        </div>
+                        {stageProbs.map(([stage, prob]) => (
+                          <div key={stage} style={{ marginBottom: 5 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 2 }}>
+                              <span style={{ fontSize: 10, color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{stage}</span>
+                              <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", flexShrink: 0 }}>{(prob * 100).toFixed(0)}%</span>
+                            </div>
+                            <div style={{ height: 3, background: "var(--color-surface)", borderRadius: 2, overflow: "hidden" }}>
+                              <div style={{ width: `${Math.max(0, Math.min(100, prob * 100))}%`, height: "100%", borderRadius: 2, background: "var(--color-status-blue)" }} />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div style={{ fontSize: 10, color: "var(--color-text-muted)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {prediction.model}
                 </div>
@@ -246,16 +320,39 @@ export default function Predictions({ telemetry, forecast, prediction }: Predict
           {/* Contributing signals */}
           <div className="panel">
             <div className="panel-header">
-              <span className="panel-title">Contributing Signals</span>
+              <span className="panel-title">Feature Attributions</span>
+              {explainMethod && (
+                <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {explainMethod}
+                </span>
+              )}
             </div>
-            <div style={{ padding: "10px 8px 4px", height: 200 }}>
+            {signalData.length === 0 && (
+              <div style={{ padding: "12px 14px", fontSize: 11, color: "var(--color-text-muted)" }}>
+                {prediction ? "Feature attributions unavailable for this window" : "No prediction data"}
+              </div>
+            )}
+            {signalData.length > 0 && explainGroups.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 5, padding: "8px 14px 0" }}>
+                {explainGroups.slice(0, 4).map((g) => (
+                  <span key={g.name} style={{
+                    fontSize: 9, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)",
+                    background: "var(--color-base)", border: "1px solid var(--color-border)",
+                    borderRadius: 3, padding: "2px 6px", whiteSpace: "nowrap",
+                  }}>
+                    {g.name} <span style={{ color: "var(--color-text-secondary)" }}>{g.percentage.toFixed(1)}%</span>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div style={{ padding: "10px 8px 4px", height: 200, display: signalData.length ? "block" : "none" }}>
               <ResponsiveContainer width="100%" height={200}>
                 <BarChart data={signalData} layout="vertical" margin={{ top: 0, right: 16, left: 4, bottom: 0 }}>
-                  <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 9, fontFamily: "var(--font-mono)" }} tickLine={false} axisLine={false} unit="%" />
+                  <XAxis type="number" domain={[0, "dataMax"]} tick={{ fontSize: 9, fontFamily: "var(--font-mono)" }} tickLine={false} axisLine={false} unit="%" />
                   <YAxis type="category" dataKey="name" width={0} tick={false} axisLine={false} />
                   <Tooltip
                     cursor={{ fill: "var(--color-base)" }}
-                    formatter={(v: unknown) => [`${v}%`, "Weight"]}
+                    formatter={(v: unknown) => [`${v}%`, "Attribution"]}
                     contentStyle={{ fontSize: 11, fontFamily: "var(--font-mono)", border: "1px solid var(--color-border)", borderRadius: 6 }}
                   />
                   <Bar dataKey="weight" radius={[0, 3, 3, 0]}>

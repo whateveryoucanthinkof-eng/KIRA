@@ -79,6 +79,11 @@ export interface PredictionResult {
   stage_probabilities?: Record<string, number> | null;
   technique_confidence?: number | null;
   stage_provenance?: Record<string, string>;
+  // Provenance of the displayed risk (schema.py:PredictionData, spec 21/41):
+  // the SOC rule layer may blend model output with deterministic rules.
+  ml_risk?: number | null;
+  rule_risk?: number | null;
+  rules_applied?: boolean | null;
   branch_a_risk?: number;
   branch_b_risk?: number;
 }
