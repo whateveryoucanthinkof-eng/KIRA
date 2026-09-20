@@ -28,6 +28,7 @@ from branch_a_gnn_lstm.sequence_dataset import (
     TECHNIQUE_VOCAB,
 )
 from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
+from cyberworld_v4.config import get_contract
 
 
 def load_sample_multi_dataset_records(max_per_source: int = 500):
@@ -147,7 +148,12 @@ def train_branch_a(
 
     # Extract dynamic graph & host trajectories for train partition
     tgn = build_or_load_tgne_ta()
-    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=60.0)
+    # Contract-bound. This was hardcoded to 60.0 while the shipped checkpoints
+    # and live inference ran at 2.0s, so this trainer could not reproduce them.
+    # The window now comes from the single source of truth.
+    extractor = HostTrajectoryExtractor(
+        tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds
+    )
     print("Extracting per-host trajectories with TGNE-TA embeddings for train partition...")
     train_trajectories = extractor.extract_trajectories(train_records)
     print(f"Active train hosts tracked: {len(train_trajectories)}")

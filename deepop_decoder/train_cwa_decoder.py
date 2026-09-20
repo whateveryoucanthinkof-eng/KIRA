@@ -18,6 +18,7 @@ from branch_a_gnn_lstm.train_branch_a import load_sample_multi_dataset_records, 
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from deepop_decoder.joint_vocab import get_joint_vocab
 from deepop_decoder.forecast_decoder import DeepOPForecastDecoder
+from cyberworld_v4.config import get_contract
 
 
 class CWASequenceDataset(Dataset):
@@ -103,7 +104,12 @@ def train_cwa_decoder(
     val_records = sm.get_val_records(max_per_source=max(50, max_per_source // 2))
 
     tgn = build_or_load_tgne_ta()
-    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=60.0)
+    # Contract-bound. This was hardcoded to 60.0 while the shipped checkpoints
+    # and live inference ran at 2.0s, so this trainer could not reproduce them.
+    # The window now comes from the single source of truth.
+    extractor = HostTrajectoryExtractor(
+        tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds
+    )
     train_trajectories = extractor.extract_trajectories(train_records)
     val_trajectories = extractor.extract_trajectories(val_records)
 

@@ -175,16 +175,26 @@ context, NLL head), `forecast_decoder.py` (K=5, pos_embed), `infiltration_head.p
 
 ## G. Files safe to delete
 
-Verified as having zero importers on the promoted path:
+> **Corrected after verification.** The first version of this list was wrong. It reasoned "these
+> trainers are dead, therefore the files are dead" — but those files also hold shared
+> dataset-building code that live and working code imports. Checked with an explicit importer scan
+> rather than assumed:
 
-```
-branch_a_gnn_lstm/train_branch_a.py        # 60 s, trains on zero records
-branch_b_world_model/train_branch_b.py     # 60 s
-deepop_decoder/train_cwa_decoder.py        # 60 s
-deepop_decoder/train_balanced_cwa.py       # 60 s
-branch_a_gnn_lstm/technique_vocab.py       # dead vocabulary
-data_unification/host_attributes.py        # advertises non-existent features
-```
+| File | Importers | Verdict |
+|---|---|---|
+| `branch_a_gnn_lstm/train_branch_a.py` | `control_backend/model_adapter.py:123` (`build_or_load_tgne_ta`) — **live path** | **KEEP** |
+| `branch_b_world_model/train_branch_b.py` | `scripts/retrain_future_models_live.py:21` (`HostRolloutDataset`, `create_rollout_samples`) — the trainer that produced the shipped weights | **KEEP** |
+| `deepop_decoder/train_cwa_decoder.py` | `scripts/retrain_future_models_live.py:27` (`CWASequenceDataset`, `create_cwa_training_samples`) | **KEEP** |
+| `data_unification/host_attributes.py` | `data_unification/tgne_features.py:23` | **KEEP** (still misleading; fix its contents, do not delete) |
+| `deepop_decoder/train_balanced_cwa.py` | none | **DELETED** |
+| `branch_a_gnn_lstm/technique_vocab.py` | none | **DELETED** |
+
+Only two of the six were genuinely orphaned. For the four that stay, the defect was never the file —
+it was the hardcoded `window_size_sec=60.0`, which is now bound to `get_contract().window_seconds` so
+these trainers can reproduce what they claim to produce.
+
+**Lesson worth keeping:** "this code path is dead" does not imply "this file is dead." A module can be
+unreachable as a script and still be a library for something that is very much alive.
 
 `world_model/` is **kept** — it is the only code aimed at the PS benchmark deliverable, and its
 `evaluation/` metrics are salvageable. It must not be cited as runnable until `models/` and `data/`

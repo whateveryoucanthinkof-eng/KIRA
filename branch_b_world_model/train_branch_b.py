@@ -19,6 +19,7 @@ from data_unification.split_manager import ScientificSplitManager
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor, HostWindowSnapshot
 from branch_b_world_model.rollout_encoder_decoder import HostWorldDynamicsTransformer
 from branch_b_world_model.infiltration_head import InfiltrationRiskHead
+from cyberworld_v4.config import get_contract
 
 
 class HostRolloutDataset(Dataset):
@@ -89,7 +90,12 @@ def train_branch_b(
     val_records = sm.get_val_records(max_per_source=200)
 
     tgn = build_or_load_tgne_ta()
-    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=60.0)
+    # Contract-bound. This was hardcoded to 60.0 while the shipped checkpoints
+    # and live inference ran at 2.0s, so this trainer could not reproduce them.
+    # The window now comes from the single source of truth.
+    extractor = HostTrajectoryExtractor(
+        tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds
+    )
     train_trajectories = extractor.extract_trajectories(train_records)
     val_trajectories = extractor.extract_trajectories(val_records)
 

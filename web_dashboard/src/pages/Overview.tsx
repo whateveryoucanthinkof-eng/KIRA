@@ -46,6 +46,16 @@ function fmtTs(ts: string): string {
   } catch { return ts; }
 }
 
+/** True forecast horizon from the backend, in seconds (steps are window_seconds apart). */
+function fmtHorizon(seconds: number, prefix: string = "+"): string {
+  if (!Number.isFinite(seconds)) return "—";
+  if (Math.abs(seconds) < 60) {
+    return `${prefix}${seconds % 1 === 0 ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+  }
+  const m = seconds / 60;
+  return `${prefix}${m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)}m`;
+}
+
 function fmtUptime(s: number): string {
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
@@ -147,6 +157,9 @@ function logLineColor(line: string): string {
 export default function Overview({
   status, telemetry, forecast, prediction, attackEvents, events, topology, logLines,
 }: OverviewProps) {
+  // Hooks must run on every render — keep them above the early return.
+  const [explainExpanded, setExplainExpanded] = useState(true);
+
   if (!status) {
     return (
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--color-text-muted)", fontSize: 13 }}>
@@ -174,8 +187,21 @@ export default function Overview({
   const trafficMin = chartData.length ? Math.max(0, Math.min(...chartData.map(d => d.lower)) - 80) : 0;
   const forecastMin = forecastChartData.length ? Math.max(0, Math.min(...forecastChartData.map(d => d.lower)) - 60) : 0;
 
-  const [explainExpanded, setExplainExpanded] = useState(true);
   const recentLogs = logLines.slice(-8);
+
+  // Real Input x Gradient attributions off the wire (schema.py:ExplainabilityPayload).
+  const explain = prediction?.explainability ?? null;
+  const explainAvailable = Boolean(explain?.available);
+  const topFeatures = explainAvailable ? explain!.top_features : [];
+  const explainGroups = explainAvailable ? explain!.groups : [];
+  const explainMethod = explainAvailable ? explain!.method : null;
+  const topScore = Math.max(
+    topFeatures.reduce((m, f) => Math.max(m, f.score), 0),
+    (prediction?.signals ?? []).reduce((m, s) => Math.max(m, s.weight), 0),
+  );
+
+  // True forecast span: horizon_seconds of the last step (e.g. 16s), not "30m".
+  const forecastSpan = forecast.length ? forecast[forecast.length - 1].horizonSeconds : null;
 
   return (
     <div className="overview-scroll">
@@ -270,7 +296,7 @@ export default function Overview({
             {/* 30-Min Forecast */}
             <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
               <div className="panel-header">
-                <span className="panel-title">30-Min Forecast</span>
+                <span className="panel-title">{forecastSpan != null ? `Forecast — Next ${fmtHorizon(forecastSpan, "")}` : "Forecast"}</span>
                 <span style={{ fontSize: 9, color: "var(--color-text-muted)", flexShrink: 0 }}>horizon</span>
               </div>
               <div style={{ padding: "10px 8px 4px", height: 120 }}>
@@ -295,7 +321,7 @@ export default function Overview({
               <div style={{ borderTop: "1px solid var(--color-border)", padding: "6px 12px 8px" }}>
                 {forecast.slice(0, 4).map((f, i) => (
                   <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0", borderBottom: i < 3 ? "1px solid var(--color-border)" : "none" }}>
-                    <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>+{(i + 1) * 5}m</span>
+                    <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>{fmtHorizon(f.horizonSeconds)}</span>
                     <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)" }}>
                       {f.predicted}<span style={{ color: "var(--color-text-muted)", fontSize: 9 }}> M</span>
                     </span>
@@ -374,7 +400,7 @@ export default function Overview({
               <div className="panel-header">
                 <span className="panel-title">Prediction Summary</span>
                 <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-                  {prediction.horizon}m horizon
+                  {fmtHorizon(prediction.horizon, "")} horizon
                 </span>
               </div>
               <div style={{ padding: 12 }}>
@@ -398,26 +424,59 @@ export default function Overview({
                     {prediction.model}
                   </span>
                 </div>
-                <div className="panel-title" style={{ marginBottom: 8 }}>Contributing Signals</div>
-                {prediction.signals.slice(0, 6).map((sig) => (
+                {/* Attack-stage annotation straight off the wire (PS 26153) */}
+                {(prediction.predicted_stage || prediction.mitre_tactic || prediction.mitre_technique) && (
+                  <div style={{ background: "var(--color-base)", border: "1px solid var(--color-border)", borderRadius: 6, padding: "8px 10px", marginBottom: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 3 }}>
+                      <span style={{ fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--color-text-muted)" }}>
+                        Predicted Attack Stage
+                      </span>
+                      {prediction.technique_confidence != null && (
+                        <span style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", flexShrink: 0 }}>
+                          {(prediction.technique_confidence * 100).toFixed(0)}% conf
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 12, fontWeight: 600, fontFamily: "var(--font-mono)", color: "var(--color-status-amber)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {prediction.predicted_stage || "—"}
+                    </div>
+                    {(prediction.mitre_tactic || prediction.mitre_technique) && (
+                      <div style={{ fontSize: 10, color: "var(--color-text-secondary)", marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <span style={{ color: "var(--color-text-muted)" }}>MITRE </span>
+                        {prediction.mitre_tactic_id ? `${prediction.mitre_tactic_id} · ` : ""}
+                        {prediction.mitre_tactic || "—"}
+                        {prediction.mitre_technique ? ` → ${prediction.mitre_technique}` : ""}
+                      </div>
+                    )}
+                    {prediction.mitre_description && (
+                      <div style={{ fontSize: 9, color: "var(--color-text-muted)", marginTop: 3, lineHeight: 1.45 }}>
+                        {prediction.mitre_description}
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div className="panel-title" style={{ marginBottom: 8 }}>Top Feature Attributions</div>
+                {prediction.signals.length > 0 ? prediction.signals.slice(0, 6).map((sig) => (
                   <div key={sig.name} style={{ marginBottom: 7 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, gap: 6 }}>
-                      <span style={{ fontSize: 10, color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {sig.name}
                       </span>
                       <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", flexShrink: 0 }}>
-                        {(sig.weight * 100).toFixed(0)}%
+                        {(sig.weight * 100).toFixed(1)}%
                       </span>
                     </div>
                     <div style={{ height: 4, background: "var(--color-base)", borderRadius: 2 }}>
                       <div style={{
-                        width: `${sig.weight * 100}%`, height: "100%", borderRadius: 2,
-                        background: sig.direction === "positive" ? "var(--color-status-red)" : sig.direction === "negative" ? "var(--color-status-green)" : "var(--color-text-muted)",
+                        width: `${topScore > 0 ? (sig.weight / topScore) * 100 : 0}%`, height: "100%", borderRadius: 2,
+                        background: sig.direction === "positive" ? "var(--color-status-red)" : sig.direction === "negative" ? "var(--color-status-green)" : "var(--color-status-blue)",
                         transition: "width 0.3s ease",
                       }} />
                     </div>
                   </div>
-                ))}
+                )) : (
+                  <div style={{ fontSize: 10, color: "var(--color-text-muted)" }}>Feature attributions unavailable</div>
+                )}
               </div>
             </div>
           )}
@@ -498,14 +557,14 @@ export default function Overview({
           </div>
         </div>
 
-        {/* ML Explainability — SHAP-style feature impact */}
+        {/* ML Explainability — real Input x Gradient attributions from the model */}
         <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
           <div className="panel-header">
             <span className="panel-title">ML Explainability — Feature Impact</span>
-            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              {prediction && (
-                <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-                  {prediction.model.split(" ").slice(0, 2).join(" ")}
+            <div style={{ display: "flex", gap: 10, alignItems: "center", minWidth: 0 }}>
+              {explainMethod && (
+                <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {explainMethod}
                 </span>
               )}
               <button
@@ -524,30 +583,61 @@ export default function Overview({
           </div>
           {explainExpanded && (
             <div style={{ padding: "10px 14px 12px", flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
-              {prediction ? prediction.signals.map((sig) => {
-                const impact = sig.weight * 100;
-                const isPos = sig.direction === "positive";
-                const isNeg = sig.direction === "negative";
-                const barColor = isPos ? "var(--color-status-red)" : isNeg ? "var(--color-status-green)" : "var(--color-text-muted)";
-                const dirLabel = isPos ? "↑ risk" : isNeg ? "↓ risk" : "neutral";
-                return (
-                  <div key={sig.name} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center" }}>
-                    <div>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, alignItems: "baseline" }}>
-                        <span style={{ fontSize: 10, color: "var(--color-text-secondary)" }}>{sig.name}</span>
-                        <span style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: barColor, marginLeft: 8, flexShrink: 0 }}>{dirLabel}</span>
-                      </div>
-                      <div style={{ height: 5, background: "var(--color-base)", borderRadius: 3, overflow: "hidden" }}>
-                        <div style={{ width: `${impact}%`, height: "100%", borderRadius: 3, background: barColor }} />
-                      </div>
+              {topFeatures.length > 0 ? (
+                <>
+                  {/* Attribution mass per feature group */}
+                  {explainGroups.length > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 2 }}>
+                      {explainGroups.slice(0, 4).map((g) => (
+                        <span key={g.name} style={{
+                          fontSize: 9, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)",
+                          background: "var(--color-base)", border: "1px solid var(--color-border)",
+                          borderRadius: 3, padding: "2px 6px", whiteSpace: "nowrap",
+                        }}>
+                          {g.name} <span style={{ color: "var(--color-text-secondary)" }}>{g.percentage.toFixed(1)}%</span>
+                        </span>
+                      ))}
                     </div>
-                    <span style={{ fontSize: 11, fontWeight: 600, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", minWidth: 32, textAlign: "right" }}>
-                      {impact.toFixed(0)}%
-                    </span>
+                  )}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 190, overflowY: "auto" }}>
+                    {topFeatures.map((f, i) => {
+                      const share = f.score * 100;
+                      const rel = topScore > 0 ? (f.score / topScore) * 100 : 0;
+                      return (
+                        <div key={f.feature} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center" }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, alignItems: "baseline", gap: 8 }}>
+                              <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {f.feature}
+                              </span>
+                              <span style={{ fontSize: 9, letterSpacing: "0.05em", textTransform: "uppercase", color: "var(--color-text-muted)", flexShrink: 0 }}>
+                                {f.group}
+                              </span>
+                            </div>
+                            <div style={{ height: 5, background: "var(--color-base)", borderRadius: 3, overflow: "hidden" }}>
+                              <div style={{
+                                width: `${rel}%`, height: "100%", borderRadius: 3,
+                                background: "var(--color-status-blue)",
+                                opacity: Math.max(0.45, 1 - i * 0.08),
+                                transition: "width 0.3s ease",
+                              }} />
+                            </div>
+                          </div>
+                          <span style={{ fontSize: 11, fontWeight: 600, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", minWidth: 40, textAlign: "right" }}>
+                            {share.toFixed(1)}%
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
-                );
-              }) : (
-                <div style={{ color: "var(--color-text-muted)", fontSize: 12, paddingTop: 8 }}>No prediction data</div>
+                  <div style={{ fontSize: 9, color: "var(--color-text-muted)", marginTop: 2, lineHeight: 1.4 }}>
+                    bar = share of the top driver · % = share of total attribution (unsigned magnitude)
+                  </div>
+                </>
+              ) : (
+                <div style={{ color: "var(--color-text-muted)", fontSize: 12, paddingTop: 8 }}>
+                  {prediction ? "Feature attributions unavailable for this window" : "No prediction data"}
+                </div>
               )}
             </div>
           )}
