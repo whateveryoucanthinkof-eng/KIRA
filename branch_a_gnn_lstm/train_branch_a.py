@@ -158,7 +158,7 @@ def train_branch_a(
     train_trajectories = extractor.extract_trajectories(train_records)
     print(f"Active train hosts tracked: {len(train_trajectories)}")
 
-    train_samples = create_host_sequence_samples(train_trajectories, seq_len=5, min_trajectory_len=1)
+    train_samples = create_host_sequence_samples(train_trajectories, seq_len=get_contract().history_steps, min_trajectory_len=1)
     print(f"Total train sequence samples: {len(train_samples)}")
     if len(train_samples) < 10:
         print("Warning: Few train samples created. Duplicating for robust mini-batch training.")
@@ -169,13 +169,13 @@ def train_branch_a(
     val_trajectories = extractor.extract_trajectories(val_records)
     print(f"Active val hosts tracked: {len(val_trajectories)}")
 
-    val_samples = create_host_sequence_samples(val_trajectories, seq_len=5, min_trajectory_len=1)
+    val_samples = create_host_sequence_samples(val_trajectories, seq_len=get_contract().history_steps, min_trajectory_len=1)
     print(f"Total val sequence samples: {len(val_samples)}")
     if len(val_samples) < 5:
         val_samples = val_samples * 5
 
-    train_set = HostSequenceDataset(train_samples, seq_len=5)
-    val_set = HostSequenceDataset(val_samples, seq_len=5)
+    train_set = HostSequenceDataset(train_samples, seq_len=get_contract().history_steps)
+    val_set = HostSequenceDataset(val_samples, seq_len=get_contract().history_steps)
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
