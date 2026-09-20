@@ -116,3 +116,51 @@ Highest-leverage fixes, in order: wire the real explainability + ATT&CK stage in
 | `0a01138` | Restored `pcap_engine.py`; marked `docs/ARCHITECTURE.md` as the retired V3.1 design |
 
 Everything removed at any point is preserved on `archive/pre-cleanup-2026-09-19` (on both remotes).
+
+---
+
+## v4 build status
+
+`cyberworld_v4/` is the rebuilt scientific core. 118 tests pass; pyflakes clean.
+
+| Built | What it replaces |
+|---|---|
+| `config.py` / `contract.py` | contract scattered across modules; refuses mismatched checkpoints |
+| `identity.py` | raw-IP grouping and `hash()` (salted per process) |
+| `targets.py` | `target_snap = window_slice[-1]` — the nowcast defect |
+| `splits.py` | missing calibration split; row-level splitting |
+| `metrics/` | accuracy as headline; horizon = "lead time" |
+| `conformal.py` | hardcoded ±0.05 called conformal |
+| `models.py` | one "risk" scalar doing four jobs |
+| `benchmark.py` | no baselines, no benchmark table |
+| `manifest.py` | checkpoints with no reproducible origin |
+| `scripts/train_v4.py` | trainers that could not reproduce their own outputs |
+| `data_unification/pcap_adapter.py` | fabricated host IPs; unwired packet features |
+| `POST /api/replay` | no CSV/PCAP demo input |
+
+### Defects found by building it
+
+Each was measured, not inferred:
+
+1. **TGNE embedded on a different graph at train vs serve.** Trainers pass the full window; the live
+   adapter passed only the target's edges. 1.5e-2 per dimension. Neither this audit nor the external
+   review found it — only the parity test did. Now 0.000e+00.
+2. **Prefix sampling makes forecasting vacuous.** `--rows-per-file` is pandas `nrows`; the first 60k
+   rows of a day are 87–100% one label. Measured label churn: **0.0000**, persistence PR-AUC **1.000**
+   at every horizon. The 0.98 "forecast PR-AUC" that produced was nowcasting relabelled.
+3. **Lead time inflated by duplicate timestamps** — `list(times).index(t)` credited an earlier window.
+4. **Benchmark compared two probability scales** — threshold from raw validation scores applied to
+   calibrated test scores, yielding all-positive operating points.
+5. **`MITRE Unknown` on the dashboard** — the rule layer emits labels that are not ATT&CK ids.
+6. **React hook-ordering crash** in `Overview.tsx` — `useState` after an early return.
+
+### The number worth remembering
+
+With the SOC rules on, the console displayed **0.657**. The model output **0.197**. Both are now on the
+wire as `ml_risk` / `rule_risk`, and `CYBERWORLD_DISABLE_RULES=1` gives model-only output.
+
+### Still open
+
+No trained v4 checkpoint that clears the degeneracy guard. The v4 contract invalidates all four v3
+checkpoints by design, and the CSV path may not be able to support a forecasting claim at all — which
+is why `pcap_adapter.py` exists. Packet features are extracted but not yet in a model's input space.
