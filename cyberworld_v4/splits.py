@@ -105,32 +105,78 @@ def chronological_split(
     #
     # Groups are still never split, so the boundary guarantee is unchanged; only
     # where the boundary falls changes.
-    targets = [fractions[0] * total, fractions[1] * total, fractions[2] * total]
-    buckets: Dict[SplitName, List[str]] = {TRAIN: [], VAL: [], CALIB: [], TEST: []}
-    order = [TRAIN, VAL, CALIB, TEST]
-    cur, acc = 0, 0
+    # Two constraints, in priority order:
+    #   1. every split gets at least one group (an empty split is unusable)
+    #   2. sample counts land as close to `fractions` as group boundaries allow
+    #
+    # Constraint 1 comes first because a 0-sample validation split cannot pick a
+    # threshold and a 0-sample test split cannot be scored. When one group holds
+    # most of the data, no sample-balanced split exists at all; that is reported
+    # in `notes` rather than silently producing a lopsided result.
+    n_splits = len(SPLIT_ORDER)
+    if len(ordered) < n_splits:
+        raise ValueError(
+            f"{len(ordered)} groups cannot fill {n_splits} splits; "
+            f"need at least one group per split"
+        )
 
-    for g in ordered:
-        # advance while the current split has met its target AND a later split
-        # still needs groups to remain non-empty
-        while cur < 3 and acc >= targets[cur]:
-            remaining = len(ordered) - sum(len(v) for v in buckets.values())
-            if remaining <= (3 - cur):
-                break  # reserve at least one group for each remaining split
-            cur += 1
-            acc = 0
-        buckets[order[cur]].append(g)
+    # Splits are contiguous in time, so the assignment is three cut points in
+    # the time-ordered group list. Choose them greedily against the cumulative
+    # sample targets, then repair any empty split by moving a boundary.
+    #
+    # Repair is required, not cosmetic: when one host holds most of the samples
+    # the greedy pass puts everything before the first cut and leaves later
+    # splits empty. A 0-sample validation split cannot pick a threshold and a
+    # 0-sample test split cannot be scored.
+    cum_targets = np.cumsum([f * total for f in fractions])[: n_splits - 1]
+
+    cuts: List[int] = []
+    acc = 0.0
+    ti = 0
+    for i, g in enumerate(ordered):
         acc += sizes[g]
+        while ti < len(cum_targets) and acc >= cum_targets[ti]:
+            cuts.append(i + 1)
+            ti += 1
+    while len(cuts) < n_splits - 1:
+        cuts.append(len(ordered))
+
+    # Repair: enforce strictly increasing cuts leaving >=1 group per split.
+    n = len(ordered)
+    for i in range(len(cuts)):
+        lo = i + 1                       # at least one group before this cut
+        hi = n - (len(cuts) - i)         # leave one group for each later split
+        cuts[i] = max(lo, min(cuts[i], hi))
+    for i in range(1, len(cuts)):
+        if cuts[i] <= cuts[i - 1]:
+            cuts[i] = cuts[i - 1] + 1
+
+    bounds = [0] + cuts + [n]
+    buckets: Dict[SplitName, List[str]] = {
+        SPLIT_ORDER[i]: ordered[bounds[i] : bounds[i + 1]] for i in range(n_splits)
+    }
+
+    achieved = {k: sum(sizes[g] for g in v) for k, v in buckets.items()}
+    largest = max(sizes.values()) if sizes else 0
+    dominated = largest > 0.5 * total
 
     assign = SplitAssignment(
         groups=buckets,
         strategy="chronological",
         notes={
             "n_groups": len(ordered),
-            "fractions": list(fractions),
+            "fractions_requested": list(fractions),
+            "fractions_achieved": {k: round(v / total, 4) for k, v in achieved.items()},
+            "samples_per_split": achieved,
             "ordered_by": "first timestamp",
-            "balanced_by": "sample count",
-            "group_sizes": {g: sizes[g] for g in ordered},
+            "balanced_by": "sample count, one group per split guaranteed",
+            "largest_group_share": round(largest / total, 4) if total else 0.0,
+            "dominated_by_one_group": dominated,
+            "warning": (
+                "one group holds >50% of samples; no sample-balanced split exists "
+                "and the achieved fractions will be far from requested"
+                if dominated else None
+            ),
         },
     )
     assign.assert_disjoint()
