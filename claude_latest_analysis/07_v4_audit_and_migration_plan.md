@@ -134,7 +134,35 @@ but live and referenced by `train_branch_a.py:48-50`.
 **D5 — Overlapping windows.** Stride-1 sequences; 35,993 "samples" are not independent. Bootstrap at
 capture/host level.
 
-**D6 — Row-prefix sampling.** `--rows-per-file` takes a prefix, not a sample.
+**D6 — Row-prefix sampling. MEASURED: it makes forecasting vacuous.**
+
+`--rows-per-file` is pandas `nrows` — a prefix, not a sample. The CSVs are time-ordered and attacks
+occur in contiguous blocks, so a prefix is nearly single-label:
+
+| File | first 60k rows |
+|---|---|
+| `fri_16_csv.csv` | **99.8% Impact** |
+| `thu_1_csv.csv` | **100.0% Benign** |
+| `fri_23_csv.csv` | 99.1% Benign |
+| `thu_15_csv.csv` | 87.5% Impact |
+
+Compounded with D1's round-robin fabricated IPs, every synthetic host's trajectory carries one label
+for its entire length. A full v4 training run on 1.38M prefix records measured:
+
+```
+label churn (fraction where A_t+K != A_t) : 0.0000
+persistence forecast PR-AUC by step        : [1.0, 1.0, 1.0, 1.0, 1.0]
+```
+
+**Zero churn means the forecasting task has no content.** `A_{t+K}` is always `A_t`, so a model that
+ignores the future entirely is perfect, and the 0.98 "forecast PR-AUC" that run produced is nowcasting
+under a different name. It would have been reportable as a forecasting result by anyone not checking.
+
+This is why `scripts/train_v4.py` refuses to present such a run as a result: it prints the churn figure
+and a DEGENERATE TASK warning whenever persistence exceeds 0.99.
+
+Fix applied: `--stride` samples every Nth row so the set spans the file's full time range. On
+`fri_16_csv.csv` that moves the majority class from 99.8% to 63.9%.
 
 **D7 — Armed-attack oracle.** `attack_active` reaches risk computation.
 

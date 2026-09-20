@@ -49,20 +49,41 @@ from cyberworld_v4.targets import build_samples, describe_targets
 from cyberworld_v4.baselines import LogisticBaseline, GradientBoostingBaseline, PersistenceBaseline
 
 
-def load_records(cic_dir: Path, ctu_dir: Path, rows: int):
+def load_records(cic_dir: Path, ctu_dir: Path, rows: int, stride: int = 1):
     from data_unification.cic2018_adapter import CIC2018Adapter
     from data_unification.ctu13_adapter import CTU13Adapter
 
-    # The adapters yield generators; materialise before counting.
+    """Load records spanning each file's full time range.
+
+    max_rows in the adapters is a PREFIX (pandas nrows). Measured on this
+    corpus, the first 60k rows of a CIC-2018 day are 87-100% a single label,
+    because the CSVs are ordered in time and attacks occur in contiguous blocks.
+    Training on a prefix therefore yields host trajectories that never change
+    label — label churn 0.0000 — so persistence scores a perfect 1.0 and the
+    forecasting task has no content at all.
+
+    Reading with a stride covers the whole day instead, so trajectories can span
+    benign -> attack transitions, which is the only thing a forecaster can learn.
+    """
     recs = []
+
+    def strided(gen, stride: int, want: int):
+        out = []
+        for i, r in enumerate(gen):
+            if i % stride == 0:
+                out.append(r)
+                if len(out) >= want:
+                    break
+        return out
+
     for f in sorted(glob.glob(str(cic_dir / "*.csv"))):
-        got = list(CIC2018Adapter().parse_file(f, max_rows=rows))
+        got = strided(CIC2018Adapter().parse_file(f, max_rows=rows * stride), stride, rows)
         recs.extend(got)
-        print(f"  {Path(f).name:<24} {len(got):>7} records")
+        print(f"  {Path(f).name:<24} {len(got):>7} records (stride {stride})")
     for f in sorted(glob.glob(str(ctu_dir / "*/*.binetflow"))):
-        got = list(CTU13Adapter().parse_netflow_csv(f, max_rows=rows))
+        got = strided(CTU13Adapter().parse_netflow_csv(f, max_rows=rows * stride), stride, rows)
         recs.extend(got)
-        print(f"  {(Path(f).parent.name + '/' + Path(f).name)[:24]:<24} {len(got):>7} records")
+        print(f"  {(Path(f).parent.name + '/' + Path(f).name)[:24]:<24} {len(got):>7} records (stride {stride})")
     return recs
 
 
@@ -74,6 +95,9 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--stride", type=int, default=20,
+                    help="sample every Nth row so the set spans the file's full "
+                         "time range; a prefix is single-label and gives zero churn")
     ap.add_argument("--allow-cpu", action="store_true",
                     help="permit CPU training (refused by default)")
     ap.add_argument("--output", type=Path, default=REPO / "saved_models/v4/forecaster.pt")
@@ -105,7 +129,7 @@ def main() -> int:
     )
 
     print("Loading records:")
-    records = load_records(args.cic_dir, args.ctu_dir, args.rows_per_file)
+    records = load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, args.stride)
     print(f"  total {len(records)} records\n")
 
     from data_unification.multi_dataset_stream import HostTrajectoryExtractor
