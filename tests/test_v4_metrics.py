@@ -499,17 +499,13 @@ def test_first_valid_alert_sorts_and_handles_empty_input():
     assert lead_time_report([], threshold=0.5)["detection_rate"] == 0.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG in earlywarning.first_valid_alert: it resolves the run start with "
-        "list(times).index(t), which finds the FIRST index holding that timestamp "
-        "value. With a duplicated timestamp it credits an earlier window than the "
-        "one that started the qualifying run, inflating reported lead time — the "
-        "exact overstatement this module exists to prevent."
-    ),
-)
 def test_duplicate_timestamps_must_not_inflate_lead_time():
+    """Regression: first_valid_alert used list(times).index(t) to locate the run
+    start, which returns the FIRST index holding that timestamp. A duplicated
+    timestamp therefore credited an earlier window and inflated lead time — the
+    precise overstatement this module exists to prevent. The run start is now
+    tracked by index.
+    """
     # the run of two over-threshold windows starts at the FIRST t=4.0 entry
     times = np.array([0.0, 2.0, 4.0, 4.0, 6.0])
     scores = np.array([0.1, 0.1, 0.9, 0.9, 0.1])

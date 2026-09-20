@@ -57,12 +57,22 @@ def first_valid_alert(
         if times.size == 0:
             return None
 
+    # Track the run's start POSITION. Resolving it by value with
+    # list(times).index(t) returns the first index holding that timestamp, so a
+    # duplicated timestamp credits an earlier window than the one that actually
+    # began the qualifying run — inflating reported lead time, which is the
+    # precise overstatement this module exists to prevent.
     run = 0
-    for t, s in zip(times, scores):
-        run = run + 1 if s >= threshold else 0
+    run_start = 0
+    for i, sc in enumerate(scores):
+        if sc >= threshold:
+            if run == 0:
+                run_start = i
+            run += 1
+        else:
+            run = 0
         if run >= persistence:
-            # credit the start of the qualifying run, not its end
-            return float(times[list(times).index(t) - (persistence - 1)])
+            return float(times[run_start])
     return None
 
 
