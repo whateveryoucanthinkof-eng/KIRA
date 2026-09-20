@@ -10,6 +10,8 @@ Assessment of this repo against **SIH PS 26153 (NTRO)** — *AI based Network At
 | 04 | [RL at inference + MIRAS](04_rl_at_inference_and_miras.md) | Test-time adaptation, online learning, MIRAS |
 | 05 | [CIC-2018 PCAP completeness](05_cic2018_pcap_completeness.md) | Is the claim "the PCAPs only hold 1–2 hours" true? |
 | 06 | [PCAP corruption scan](06_pcap_corruption_scan.md) | Full census: which files are corrupt and need re-downloading |
+| 07 | [v4 audit and migration plan](07_v4_audit_and_migration_plan.md) | Spec-mandated A–J audit before the v4 rebuild |
+| 08 | [Why the CSV path cannot benchmark](08_why_the_csv_path_cannot_benchmark.md) | Three training runs, three discarded results, and the reason |
 
 ## Corruption scan (report 06) — supersedes report 05's integrity claim
 
@@ -161,8 +163,19 @@ Each was measured, not inferred:
 With the SOC rules on, the console displayed **0.657**. The model output **0.197**. Both are now on the
 wire as `ml_risk` / `rule_risk`, and `CYBERWORLD_DISABLE_RULES=1` gives model-only output.
 
+### Settled: there is no v4 benchmark, and there should not be one yet
+
+Three full training runs on the 4060 produced `PR-AUC 0.9998` and all three were discarded. See
+[report 08](08_why_the_csv_path_cannot_benchmark.md). In short: the test split reached a 0.9997 base
+rate, where **pure random noise scores 0.9999**; label churn was 0.0007, so there was nothing to
+forecast; and the test split held a single host, so no confidence interval existed.
+
+Root cause is the data, not the model: 66,417 nominal hosts yield only 14 with 20 consecutive
+windows, and those 14 are the *fabricated* ones from row-index IP synthesis. The trainer now refuses
+to present such a run as a result.
+
 ### Still open
 
-No trained v4 checkpoint that clears the degeneracy guard. The v4 contract invalidates all four v3
+No trained v4 checkpoint that clears the credibility gate. The v4 contract invalidates all four v3
 checkpoints by design, and the CSV path may not be able to support a forecasting claim at all — which
 is why `pcap_adapter.py` exists. Packet features are extracted but not yet in a model's input space.

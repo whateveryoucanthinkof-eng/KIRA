@@ -74,6 +74,7 @@ class TemperatureScaler:
     def __init__(self) -> None:
         self.temperature: float = 1.0
         self.fitted: bool = False
+        self.at_boundary: bool = False
         self._before: Optional[Dict[str, Any]] = None
         self._after: Optional[Dict[str, Any]] = None
 
@@ -98,6 +99,11 @@ class TemperatureScaler:
             if nll < best_nll:
                 best_nll, best_t = float(nll), float(t)
 
+        # A temperature landing on either end of the grid is not a fit, it is a
+        # boundary hit: the objective wanted to go further and could not. Seen
+        # both ways on real runs — 10.0 with a mismatched calibration split, and
+        # 0.05 with a single-class one.
+        self.at_boundary = bool(best_t <= grid[0] * 1.001 or best_t >= grid[-1] * 0.999)
         self.temperature = best_t
         self.fitted = True
         self._after = calibration_report(y, self._sigmoid(logits / best_t))
@@ -119,6 +125,12 @@ class TemperatureScaler:
         return {
             "temperature": self.temperature,
             "fitted": self.fitted,
+            "at_grid_boundary": self.at_boundary,
+            "boundary_warning": (
+                "temperature hit the search boundary; the calibration split is likely "
+                "single-class or drawn from a different distribution than the model saw"
+                if self.at_boundary else None
+            ),
             "before": self._before,
             "after": self._after,
             "ece_improvement": (

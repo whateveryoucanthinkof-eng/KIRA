@@ -291,9 +291,39 @@ def main() -> int:
         print("     Increase --rows-per-file so trajectories span label transitions.")
     label_churn = float(np.mean(y_fut[:, -1] != y_cur))
     print(f"  label churn over the horizon (fraction where A_t+K != A_t): {label_churn:.4f}")
+    globals()["_label_churn"] = label_churn
     print("=" * 68)
 
+    # --- credibility gate ------------------------------------------------
+    # Every one of these makes the headline numbers unreportable. They are
+    # checked and stated rather than left for a reader to notice.
+    label_churn = globals().get("_label_churn", 0.0)
+    problems = []
+    if min(base["persistence_forecast"]["pr_auc_by_step"]) > 0.99:
+        problems.append("persistence is near-perfect: the label does not change over the horizon")
+    if label_churn < 0.01:
+        problems.append(f"label churn {label_churn:.4f}: almost nothing to forecast")
+    if ci.get("n_groups", 0) < 5:
+        problems.append(f"test split has {ci.get('n_groups')} host group(s): no usable confidence interval")
+    if now.get("extreme_base_rate"):
+        problems.append(f"test base rate {now['positive_rate']:.4f} is extreme: PR-AUC is near 1.0 for any ranking")
+    if scaler.report().get("at_grid_boundary"):
+        problems.append("temperature hit the search boundary: calibration split is unrepresentative")
+    if len(P[VAL]["current"]) < 500:
+        problems.append(f"validation split has {len(P[VAL]['current'])} samples: threshold selection is noise")
+
+    if problems:
+        print()
+        print("=" * 68)
+        print("BENCHMARK NOT CREDIBLE — do not report these numbers")
+        print("=" * 68)
+        for x in problems:
+            print(f"  - {x}")
+        print("=" * 68)
+
     out = {
+        "credible": not problems,
+        "credibility_problems": problems,
         "contract": c.to_dict(), "manifest": manifest.to_dict(),
         "target_balance": bal, "splits": rep,
         "nowcast": now, "nowcast_pr_auc_ci": ci,
