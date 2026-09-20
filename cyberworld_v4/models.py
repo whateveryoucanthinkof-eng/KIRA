@@ -24,7 +24,7 @@ confidence band bolted on afterwards.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn

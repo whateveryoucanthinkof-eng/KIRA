@@ -29,13 +29,55 @@ export interface TelemetryPoint {
   anomalyScore: number;
 }
 
+// ─── Explainability (mirrors control_backend/schema.py) ──────────────────────
+// ExplainabilityGroup / ExplainabilityFeature / ExplainabilityPayload are the
+// exact wire shapes emitted by ModelAdapter._explain() (Input x Gradient).
+
+export interface ExplainabilityGroup {
+  name: string;       // e.g. "TGNE Latent", "Volume", "Connectivity", "Timing"
+  percentage: number; // 0–100, share of total attribution for that group
+}
+
+export interface ExplainabilityFeature {
+  feature: string; // raw feature name, e.g. "byte_rate" or "H_emb_3"
+  score: number;   // 0–1, share of total |input x gradient| attribution
+  group: string;
+}
+
+export interface ExplainabilityPayload {
+  available: boolean;
+  method?: string | null; // e.g. "Input x Gradient Saliency"
+  groups: ExplainabilityGroup[];
+  top_features: ExplainabilityFeature[];
+}
+
 export interface PredictionResult {
   timestamp: string;
   value: number;
   confidence: number;
-  horizon: number; // minutes
+  horizon: number; // seconds — forecast_steps x window_seconds from ModelMetadata
   model: string;
   signals: ContributingSignal[];
+  // Real model attributions, straight off the wire.
+  explainability?: ExplainabilityPayload | null;
+  // PredictionData fields (control_backend/schema.py:PredictionData)
+  risk?: number;
+  max_future_risk?: number;
+  predicted_risk_prior?: number | null;
+  forecast_error?: number | null;
+  hazard_score?: number | null;
+  malicious_confidence?: number | null;
+  precursor_confidence?: number | null;
+  alert?: boolean;
+  alert_level?: string; // NOMINAL | WARNING | ELEVATED | CRITICAL
+  threshold?: number;
+  predicted_stage?: string;
+  mitre_tactic?: string | null;
+  mitre_technique?: string | null;
+  mitre_tactic_id?: string | null;
+  mitre_description?: string | null;
+  stage_probabilities?: Record<string, number> | null;
+  technique_confidence?: number | null;
   stage_provenance?: Record<string, string>;
   branch_a_risk?: number;
   branch_b_risk?: number;
@@ -50,6 +92,10 @@ export interface ContributingSignal {
 
 export interface ForecastPoint {
   timestamp: string;
+  // True horizon of this step, in SECONDS, straight from the backend
+  // (schema.py:ForecastPoint.horizon_seconds). Steps are window_seconds apart.
+  horizonSeconds: number;
+  predictedStage?: string | null;
   predicted: number;
   upperBound: number;
   lowerBound: number;

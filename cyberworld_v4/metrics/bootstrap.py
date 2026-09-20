@@ -13,7 +13,7 @@ the independent unit.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence
 
 import numpy as np
 

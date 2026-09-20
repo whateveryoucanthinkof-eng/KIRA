@@ -86,6 +86,9 @@ class AntigravityModelAdapter:
         self.h_state_history_by_target: Dict[str, List[torch.Tensor]] = {}
         self.feature_history_by_target: Dict[str, List[torch.Tensor]] = {}
         self.alert_threshold = 0.65
+        # Rules on by default so the operator console is unchanged; off for any
+        # scientific run. CYBERWORLD_DISABLE_RULES=1 yields ML-only output.
+        self.rules_enabled = os.environ.get("CYBERWORLD_DISABLE_RULES", "") not in ("1", "true", "True")
         self.window_seconds = LIVE_WINDOW_SIZE_SEC
         self.forecast_steps = DEFAULT_ROLLOUT_HORIZON_LIVE
         self.history_steps = DEFAULT_HISTORY_STEPS
@@ -190,32 +193,51 @@ class AntigravityModelAdapter:
 
         raise RuntimeError(f"TGNE produced no embedding for target host {target_ip}")
 
-    def _explain(self, feature_vector: np.ndarray) -> ExplainabilityPayload:
-        x = (
-            torch.from_numpy(feature_vector.astype(np.float32))
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .to(self.device)
-        )
+    def _explain(self, x_tensor: torch.Tensor) -> ExplainabilityPayload:
+        """Input x Gradient attribution for the prediction actually made.
+
+        Two defects this fixes:
+
+        1. It used to rebuild a [1, 1, 27] tensor from the final feature vector
+           while the scored input was [1, 5, 27]. On a temporal model that
+           explains a single history-less timestep the model never scored -- not
+           an explanation of the prediction.
+
+        2. It called self.branch_a.train() as a cuDNN-RNN-backward workaround,
+           leaving dropout=0.2 active on the LSTM and every head, so the
+           attributions were stochastic and irreproducible run to run.
+           torch.backends.cudnn.flags(enabled=False) achieves the same thing
+           while the module stays in eval().
+
+        Attribution is over the last timestep of the real sequence, with
+        gradients flowing through the full history.
+        """
+        x = x_tensor.detach().clone().to(self.device)
         x.requires_grad_(True)
+
         was_training = self.branch_a.training
-        self.branch_a.train()
+        self.branch_a.eval()
         try:
-            out = self.branch_a(x)
-            risk = out["risk_score"]
-            if risk.ndim > 0:
-                risk = risk.reshape(-1)[0]
-            risk.backward()
+            # RNN backward needs cuDNN disabled in eval; this replaces the
+            # train()-mode workaround without enabling dropout.
+            with torch.backends.cudnn.flags(enabled=False):
+                out = self.branch_a(x)
+                risk = out["risk_score"]
+                if risk.ndim > 0:
+                    risk = risk.reshape(-1)[0]
+                self.branch_a.zero_grad(set_to_none=True)
+                risk.backward()
+
             grads = (
                 x.grad[0, -1, :].detach().cpu().numpy()
                 if x.grad is not None
-                else np.zeros(27, dtype=np.float32)
+                else np.zeros(x.shape[-1], dtype=np.float32)
             )
             inputs = x[0, -1, :].detach().cpu().numpy()
             attributions = np.abs(grads * inputs)
         finally:
-            if not was_training:
-                self.branch_a.eval()
+            if was_training:
+                self.branch_a.train()
 
         total = float(attributions.sum()) + 1e-12
         attributions = attributions / total
@@ -344,13 +366,33 @@ class AntigravityModelAdapter:
             ]
         ext_count = len(ext_flows)
 
+        # --- SOC rule layer, isolated (spec 41) -------------------------------
+        #
+        # This block used to be inline, so the number on the dashboard was
+        # `max(model_output, 0.40) + f(external_flow_count)` during every attack
+        # demo -- a rule, not a prediction, and indistinguishable from one.
+        #
+        # It is retained because hybrid detection is legitimate in production
+        # SOC tooling, but it is now: named, separable, reported alongside the
+        # untouched model output, and switchable off via CYBERWORLD_DISABLE_RULES=1.
+        #
+        # `attack_active` is an operator/harness flag -- it is knowledge of the
+        # answer. Any benchmark path must run with rules disabled (spec 42); the
+        # offline harness in cyberworld_v4/benchmark.py never touches this code.
+        ml_risk = float(raw_risk)
+        ml_technique = obs_technique
+        rule_risk: Optional[float] = None
+        rules_applied = False
+
         if is_mitigated:
             obs_risk = max(0.02, raw_risk * 0.15)
             obs_technique = "Benign"
-        else:
+            rules_applied = True
+        elif self.rules_enabled:
             if ext_count > 0 or attack_active:
                 threat_boost = min(0.65, (max(1, ext_count) / 75.0) * 0.50 + 0.25)
-                obs_risk = min(0.96, max(raw_risk, 0.40) + threat_boost)
+                rule_risk = float(min(0.96, max(raw_risk, 0.40) + threat_boost))
+                obs_risk = rule_risk
                 ports_seen = {getattr(r, "dst_port", 0) for r in ext_flows}
                 if len(ports_seen) >= 5:
                     obs_technique = "PortScan"
@@ -358,8 +400,14 @@ class AntigravityModelAdapter:
                     obs_technique = "WebAttack"
                 else:
                     obs_technique = "Exploit"
+                rules_applied = True
             else:
                 obs_risk = max(0.05, raw_risk * 0.4)
+                rules_applied = True
+        else:
+            # Research mode: the displayed number IS the model output.
+            obs_risk = ml_risk
+            obs_technique = ml_technique
 
         curr_h = torch.from_numpy(h_emb).float().unsqueeze(0).to(self.device)
         h_state_history = self.h_state_history_by_target.setdefault(target_ip, [])
@@ -435,7 +483,7 @@ class AntigravityModelAdapter:
             obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
         )
 
-        explain = self._explain(feature_vector)
+        explain = self._explain(x_tensor)
         inf_ms = (time.perf_counter() - t0) * 1000.0
         now_ts = time.time()
 
@@ -486,6 +534,11 @@ class AntigravityModelAdapter:
             ),
             prediction=PredictionData(
                 risk=round(obs_risk, 4),
+                # Provenance of the number above, so a rule-driven demo cannot
+                # be read as a model result (spec 21, 41).
+                ml_risk=round(ml_risk, 4),
+                rule_risk=(round(rule_risk, 4) if rule_risk is not None else None),
+                rules_applied=rules_applied,
                 max_future_risk=round(max_future, 4),
                 hazard_score=round(max_future, 4),
                 malicious_confidence=round(obs_risk, 4),

@@ -54,7 +54,7 @@ It is **not** an inline firewall/IPS, and it does **not** rely on a hardcoded at
 └─────────────────────────────────────┘
 ```
 
-### Live ML stack (authoritative)
+### Live ML stack (v3 — what the shipped checkpoints implement)
 
 ```text
 SPAN 5-tuple flows
@@ -88,6 +88,34 @@ TGNE-TA (BiTA) → 12-D host latent H
 | Label leakage | Forbidden on live path |
 
 Retired: root `model/` V3.1 72-D PCAP transformer is **not** the live path.
+
+---
+
+## CyberWorld v4
+
+v4 is the in-progress rework of the learned system: future-dated targets instead of nowcasting,
+separate heads with matching loss semantics, a distributional world model, real conformal
+prediction, post-hoc calibration, and mandatory baselines.
+
+**v4 temporal contract** — single source of truth, `cyberworld_v4/config.py`:
+
+| | Value |
+|---|---|
+| Window `Δt` | **2.0 s** |
+| History `L` | **15** steps (30 s) |
+| Forecast `K` | **5** steps (10 s) |
+| Model input | **27-D** (12-D TGNE-TA latent + 15 flow attributes) |
+
+This supersedes the v3 live contract above (`L=5, K=8`) and **invalidates all four shipped
+checkpoints** — v4 requires retraining, and `cyberworld_v4/contract.py` refuses a mismatched
+checkpoint at load. There is no trained v4 checkpoint and no benchmark result yet.
+
+| Where | What |
+|---|---|
+| `cyberworld_v4/` | config, contract, identity, targets, splits, models, conformal, benchmark, manifest, `metrics/`, `baselines/` |
+| `docs/ARCHITECTURE.md` | the 2-page ML architecture document |
+| `docs/CYBER_RANGE.md` | Containerlab range, SPAN tap, capture path |
+| `claude_latest_analysis/` | verified audits; `07_v4_audit_and_migration_plan.md` is the current-state record |
 
 ---
 
@@ -263,7 +291,7 @@ External campaigns are **operator-driven** (ARM EXTERNAL). The UI does not injec
 
 ## Security posture (lab firewall)
 
-Typical Containerlab policy (see `docs/ARCHITECTURE.md` for diagrams):
+Typical Containerlab policy (see `docs/CYBER_RANGE.md` for diagrams):
 
 - Outside range can reach public DMZ services; east-west to Users/Servers is blocked at the edge.
 - Database accepts only the app tier.

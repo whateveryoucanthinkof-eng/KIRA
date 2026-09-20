@@ -19,17 +19,16 @@ Two rules enforced here rather than left to discipline:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 
 from .config import CyberWorldConfig, DEFAULT_CONFIG
-from .metrics.bootstrap import format_ci, group_bootstrap_ci, multi_seed_summary
-from .metrics.calibration import TemperatureScaler, calibration_report
+from .metrics.bootstrap import format_ci, group_bootstrap_ci
+from .metrics.calibration import TemperatureScaler
 from .metrics.detection import detection_metrics
-from .metrics.forecasting import horizon_metrics
 
 
 @dataclass

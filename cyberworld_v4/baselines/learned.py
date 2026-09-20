@@ -9,7 +9,7 @@ neural path consumes.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 

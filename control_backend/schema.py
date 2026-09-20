@@ -79,6 +79,13 @@ class PredictionData(BaseModel):
     technique_confidence: Optional[float] = None
     stage_provenance: Optional[Dict[str, str]] = None
 
+    # Provenance of the displayed risk (spec 21, 41). The SOC layer may blend
+    # model output with deterministic rules, but the three numbers must be
+    # separable or a rule-driven demo can be mistaken for a model result.
+    ml_risk: Optional[float] = None          # model output, untouched
+    rule_risk: Optional[float] = None        # deterministic SOC rules alone
+    rules_applied: Optional[bool] = None     # whether `risk` was rule-adjusted
+
 
 class LatencyData(BaseModel):
     telemetry_ms: float

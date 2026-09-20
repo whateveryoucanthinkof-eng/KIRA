@@ -182,6 +182,9 @@ export default function App() {
           if (data.forecast) {
             const mapped = data.forecast.map((f: any) => ({
               timestamp: new Date(Date.now() + (f.horizon_seconds * 1000)).toISOString(),
+              // Keep the true horizon (seconds) and the per-step stage off the wire.
+              horizonSeconds: Number(f.horizon_seconds) || 0,
+              predictedStage: f.predicted_stage ?? null,
               predicted: f.risk * 100,
               lowerBound: Math.max(0, (f.risk * 100) - ((f.confidence || 0.5) * 20)),
               upperBound: Math.min(100, (f.risk * 100) + ((f.confidence || 0.5) * 20)),
