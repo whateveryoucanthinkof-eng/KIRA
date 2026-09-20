@@ -11,9 +11,10 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -221,6 +222,142 @@ async def get_topology():
     """Live discovery graph from observed SPAN flows (empty until traffic)."""
     evt = topology_service.snapshot()
     return evt.dict() if hasattr(evt, "dict") else evt.model_dump()
+
+
+@app.post("/api/replay")
+async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
+    """Offline analysis of an uploaded capture or flow CSV.
+
+    PS 26153 asks for a demo interface accepting "a PCAP or CSV file", running
+    fully offline. The live path only ever consumed a SPAN feed, so a CSV of
+    flow records — the form both CIC-IDS-2018 and CTU-13 ship in — had no way in
+    at all.
+
+    Runs entirely locally: no network egress, no cloud dependency. The upload is
+    written to a temp file, parsed, scored window by window, and deleted.
+
+    Rules are disabled for this path regardless of the server's setting: an
+    offline analysis is an evaluation, and a heuristic that floors risk at 0.40
+    would make every uploaded file look alarming.
+    """
+    import tempfile
+
+    from control_backend.model_adapter import model_adapter, select_primary_target
+
+    name = (file.filename or "upload").lower()
+    suffix = Path(name).suffix
+    if suffix not in (".pcap", ".pcapng", ".csv", ".binetflow", ""):
+        raise HTTPException(400, f"Unsupported file type '{suffix}'. Expected .pcap, .pcapng or .csv")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty upload")
+
+    tmp = Path(tempfile.mkstemp(suffix=suffix or ".bin")[1])
+    tmp.write_bytes(data)
+
+    prev_rules = getattr(model_adapter, "rules_enabled", False)
+    try:
+        model_adapter.rules_enabled = False
+        model_adapter.reset_history()
+
+        if suffix in (".csv", ".binetflow"):
+            records = _parse_flow_file(tmp, suffix)
+            windows = _group_records_into_windows(records, model_adapter.window_seconds)
+        else:
+            windows = _replay_pcap_windows(tmp, max_windows)
+
+        results = []
+        for widx, flows in enumerate(windows[:max_windows]):
+            if not flows:
+                continue
+            target = select_primary_target(flows)
+            if not target:
+                continue
+            ev = model_adapter.predict_window(target_ip=target, flows=flows, window_id=widx)
+            results.append({
+                "window": widx,
+                "target": target,
+                "risk": ev.prediction.risk,
+                "ml_risk": ev.prediction.ml_risk,
+                "alert": ev.prediction.alert,
+                "stage": ev.prediction.predicted_stage,
+                "mitre_tactic": ev.prediction.mitre_tactic,
+                "mitre_technique": ev.prediction.mitre_technique,
+                "forecast": [
+                    {"horizon_seconds": f.horizon_seconds, "risk": f.risk} for f in ev.forecast
+                ],
+                "top_features": [
+                    {"feature": f.feature, "score": f.score, "group": f.group}
+                    for f in ev.explainability.top_features[:5]
+                ],
+            })
+
+        flagged = [r for r in results if r["alert"]]
+        return {
+            "filename": file.filename,
+            "kind": "csv" if suffix in (".csv", ".binetflow") else "pcap",
+            "windows_analyzed": len(results),
+            "flagged_windows": len(flagged),
+            "rules_disabled": True,
+            "results": results,
+        }
+    finally:
+        model_adapter.rules_enabled = prev_rules
+        tmp.unlink(missing_ok=True)
+
+
+def _parse_flow_file(path: Path, suffix: str):
+    """CSV/binetflow -> UnifiedFlowRecord via the same adapters training uses."""
+    from data_unification.cic2018_adapter import CIC2018Adapter
+    from data_unification.ctu13_adapter import CTU13Adapter
+
+    if suffix == ".binetflow":
+        return list(CTU13Adapter().parse_netflow_csv(str(path), max_rows=100000))
+    return list(CIC2018Adapter().parse_file(str(path), max_rows=100000))
+
+
+def _group_records_into_windows(records, window_seconds: float):
+    """Bucket flow records into fixed windows by end_time."""
+    if not records:
+        return []
+    recs = sorted(records, key=lambda r: r.end_time)
+    t0 = recs[0].end_time
+    buckets: Dict[int, list] = {}
+    for r in recs:
+        buckets.setdefault(int((r.end_time - t0) // window_seconds), []).append(r)
+    return [buckets[k] for k in sorted(buckets)]
+
+
+def _replay_pcap_windows(path: Path, max_windows: int):
+    """Reuse the sensor's own window builder so replay matches live exactly."""
+    import struct
+
+    from telemetry.capture.sniffer import StreamingPacketSniffer
+    from telemetry.state.state_builder import LiveStateBuilder
+    from control_backend.model_adapter import flows_from_span_dicts, model_adapter
+
+    sb = LiveStateBuilder(window_sec=model_adapter.window_seconds)
+    windows, anchored = [], False
+    with open(path, "rb") as f:
+        if len(f.read(24)) < 24:
+            raise HTTPException(400, "Not a valid PCAP file")
+        while len(windows) < max_windows:
+            hdr = f.read(16)
+            if len(hdr) < 16:
+                break
+            sec, usec, incl, _orig = struct.unpack("=IIII", hdr)
+            ts = sec + usec / 1e6
+            if not anchored:
+                sb.seek_to(ts)
+                anchored = True
+            pkt = StreamingPacketSniffer.parse_frame(f.read(incl), ts)
+            if pkt:
+                sb.ingest_packet(pkt)
+            if sb.is_window_ready(current_time=ts):
+                st = sb.close_window(close_ts=ts)
+                windows.append(flows_from_span_dicts(st.get("flows") or []))
+    return windows
 
 
 @app.post("/api/command/{cmd_name}")
