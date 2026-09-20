@@ -98,11 +98,13 @@ Findings marked *verified* in these reports were independently re-checked agains
 
 The modelling core is real — a genuine autoregressive latent world model with K-step rollout, ATT&CK mapping, and working gradient-based attribution. The losses are in the **evidence layer** and the **demo layer**.
 
-Three findings are more dangerous than any missing feature, because a judge can reach them by opening two files:
+Three findings were more dangerous than any missing feature, because a judge could reach them by
+opening two files. **All three are now fixed** — see *v4 build status* below. They are kept here as
+the record of what was found:
 
-1. **The dashboard never reads the model's explainability.** The backend computes real Input×Gradient attributions and puts them on the wire; the frontend renders three hardcoded risk scores relabelled as features, one of them permanently zero. (`web_dashboard/src/api/adapter.ts:243-247`)
-2. **The headline risk number is a hand-written rule.** During any external-flow activity — i.e. every attack demo — displayed risk is `max(model_output, 0.40) + f(flow_count)`. (`control_backend/model_adapter.py:350-362`)
-3. **No F1, precision, recall or FPR exists anywhere.** The only numeric artefact is a single-epoch TGNE curve with `val_accuracy=0.0` and inductive AUC *below chance*. (`results/training_metrics.csv`)
+1. ~~**The dashboard never reads the model's explainability.**~~ **FIXED.** The backend computes real Input×Gradient attributions and puts them on the wire; the frontend renders three hardcoded risk scores relabelled as features, one of them permanently zero. (`web_dashboard/src/api/adapter.ts:243-247`)
+2. ~~**The headline risk number is a hand-written rule.**~~ **FIXED** — separated into `ml_risk` / `rule_risk`, switchable off. During any external-flow activity — i.e. every attack demo — displayed risk is `max(model_output, 0.40) + f(flow_count)`. (`control_backend/model_adapter.py:350-362`)
+3. ~~**No F1, precision, recall or FPR exists anywhere.**~~ **HARNESS BUILT** (`cyberworld_v4/benchmark.py`); no trustworthy numbers yet, because the data pipeline currently yields a degenerate forecasting task. The only numeric artefact is a single-epoch TGNE curve with `val_accuracy=0.0` and inductive AUC *below chance*. (`results/training_metrics.csv`)
 
 Highest-leverage fixes, in order: wire the real explainability + ATT&CK stage into the UI (~0.5 d), delete the heuristic override (~1 h), produce the logistic-regression benchmark on the held-out split (~1 d). Those three are roughly two days and move four requirements.
 
