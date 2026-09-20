@@ -371,12 +371,28 @@ class AntigravityModelAdapter:
                 if record.end_time >= window_start or record.start_time >= window_start
             ]
 
+        # Host-scoped flows are correct for the temporal ATTRIBUTES: those are
+        # per-host aggregates (this host's byte counts, peers, ports).
         temp_attrs = self.extractor.compute_host_temporal_attributes(
             host_ip=target_ip,
             window_records=host_flows,
             window_duration=self.window_seconds,
         )
-        h_emb = self._build_embedding(target_ip, host_flows)
+
+        # ...but NOT for the TGNE embedding. TGNE is a graph encoder: it
+        # aggregates over a host's neighbourhood, so the graph it is given
+        # changes the embedding it returns. The offline trainers call
+        # extract_trajectories() on the FULL window, while this path used to
+        # pass only host_flows — a strictly smaller subgraph. Measured on a
+        # replayed window with 16 flows of which 2 touched the target, the two
+        # embeddings differed by 1.5e-2 per dimension, and the gap widens with
+        # cross-host traffic. That is a train/serve mismatch: the model was
+        # fitted on full-graph embeddings and served subgraph ones.
+        #
+        # The full window is passed here so live matches training. Verified by
+        # scripts/verify_offline_live_parity.py.
+        window_flows = flows if flows else host_flows
+        h_emb = self._build_embedding(target_ip, window_flows)
         
         import model_contract
         model_contract.assert_shape(h_emb, (model_contract.TGNE_LATENT_DIM,), "TGNE Embedding")

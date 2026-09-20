@@ -154,6 +154,33 @@ leak. The prompting audit was right to decline this accusation.
 | E5 | TGNE pretrained on Warden bipartite | live shared IP namespace | retrain on production schema |
 | E6 | Risk target = severity lookup | displayed risk = heuristic | both replaced |
 
+**E7 — TGNE embedded on a different graph at train vs serve time. FOUND LATE, FIXED.**
+
+Neither this audit nor the review that prompted it caught this; it surfaced only when the spec-43
+parity check was actually built and run.
+
+TGNE is a *graph* encoder — it aggregates over a host's neighbourhood, so the graph handed to it
+determines the embedding. The two paths handed it different graphs:
+
+| | Graph passed |
+|---|---|
+| Offline trainers | `extract_trajectories(all_records)` — the full window |
+| Live adapter | `_build_embedding(target, host_flows)` — only edges touching the target |
+
+Measured on a replayed window holding 16 flows of which 2 touched the target host, the two embeddings
+differed by **1.5e-2 per dimension**, and the gap grows with cross-host traffic. The model was fitted on
+full-graph embeddings and served subgraph ones.
+
+Fixed: the live path now passes the full window to the encoder while the temporal *attributes* stay
+host-scoped, which is correct since those are per-host aggregates. `scripts/verify_offline_live_parity.py`
+now reports **0.000e+00** deviation.
+
+The lesson is the spec's own: parity between offline and live has to be *asserted by a test*, not
+inferred from the fact that both call the same class. Both paths did call the same extractor — they just
+fed it different data.
+
+---
+
 E2 is the subtle one: Branch B is trained with its own deltas damped toward zero, then validated against
 a **persistence** baseline — biased toward the baseline it is measured against.
 
