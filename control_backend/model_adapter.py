@@ -158,6 +158,7 @@ class AntigravityModelAdapter:
         self.branch_a.load_state_dict(ckpt["model_state_dict"])
         self.branch_a.eval()
         self._adopt_contract(ckpt, "branch_a")
+        self._warn_if_not_credible(ckpt, "branch_a")
 
         self.wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64).to(self.device)
         self.risk_head = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(self.device)
@@ -230,6 +231,29 @@ class AntigravityModelAdapter:
                 logger.error("SERVING STALE CHECKPOINTS ANYWAY. %s", msg)
             else:
                 raise RuntimeError(msg)
+
+    def _warn_if_not_credible(self, ckpt: Dict[str, Any], name: str) -> None:
+        """Surface a checkpoint that its own training run flagged as unsound.
+
+        The credibility gate measures whether a result can mean anything at
+        all -- label churn, base rate, host-group count, and whether the model
+        even beats a persistence baseline. A checkpoint that failed it can
+        still be loaded (an operator may want it for a demo), but serving one
+        silently is how a meaningless number becomes a reported result.
+        """
+        cred = ckpt.get("credibility") or {}
+        if not cred.get("checked"):
+            logger.warning(
+                "%s checkpoint carries no credibility verdict; its metrics are "
+                "unvalidated", name)
+            return
+        if not cred.get("credible", True):
+            logger.error(
+                "%s checkpoint was marked NOT CREDIBLE by its own training run: "
+                "%s. Its predictions are being served, but its metrics must not "
+                "be reported as results.",
+                name, "; ".join(cred.get("problems", [])) or "unspecified",
+            )
 
     def _adopt_contract(self, ckpt: Dict[str, Any], name: str) -> None:
         """Take the temporal contract from the checkpoint being loaded.

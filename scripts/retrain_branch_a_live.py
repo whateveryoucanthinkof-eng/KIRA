@@ -334,14 +334,37 @@ def main():
                              batch_size=args.batch_size, shuffle=False)
     test_metrics = _evaluate(model, test_loader, device)
     print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): {test_metrics}", flush=True)
+    # The credibility verdict travels WITH the checkpoint.
+    #
+    # It used to be computed, printed to stdout, and thrown away. The
+    # checkpoint kept `test_metrics` but nothing recording that those numbers
+    # might be meaningless, so a non-credible model could be loaded and served
+    # with no trace -- and its metrics quoted as results. That is the same
+    # "looks fine, means nothing" failure mode as a collapsed head scoring
+    # 0.83 CatAcc, or a class with seven training samples.
+    credibility = {"checked": False}
     try:
         from credibility_check import evaluate_samples as _es, gate as _g, report as _r
         _ts = _es(train_samples, test_samples)
-        _r(_ts, _g(_ts, model_accuracy=test_metrics.get("tech_accuracy")))
+        _problems = _g(_ts, model_accuracy=test_metrics.get("tech_accuracy"))
+        _r(_ts, _problems)
+        credibility = {
+            "checked": True,
+            "credible": not _problems,
+            "problems": list(_problems),
+            "stats": {k: (float(v) if isinstance(v, (int, float)) else str(v))
+                      for k, v in _ts.items()},
+        }
     except Exception as _e:
+        credibility = {"checked": False, "error": str(_e)}
         print(f"test credibility check skipped: {_e}", flush=True)
+
     ckpt["test_metrics"] = test_metrics
+    ckpt["credibility"] = credibility
     torch.save(ckpt, args.output)
+    if credibility.get("checked") and not credibility.get("credible"):
+        print("WARNING: checkpoint saved but marked NOT CREDIBLE -- "
+              "its metrics must not be reported as results.", flush=True)
 
     print(f"saved={args.output} best_metrics={best_metrics} test_metrics={test_metrics}")
 
