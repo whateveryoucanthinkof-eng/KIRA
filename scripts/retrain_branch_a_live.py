@@ -83,6 +83,45 @@ def _make_samples(records, extractor, seq_len: int):
     )
 
 
+def _selection_score(metrics, mode):
+    """Higher is better. Which epoch's weights we keep.
+
+    ## Why the default is not validation loss
+
+    The objective is Kendall & Gal homoscedastic uncertainty weighting:
+
+        L = sum_i [ exp(-s_i) * L_i + s_i ]
+
+    where every `s_i` is a **learned parameter that moves during training**.
+    Two epochs therefore do not report the same quantity: the loss is computed
+    under a different weighting each time, and the bare `+ s_i` terms add a
+    drifting constant. The 2026-09-21 checkpoint ended with
+    s_risk = -3.0090 and s_tech = -3.0243 against an initialisation of 0, so
+    that constant drifted from 0 to -7.04 over the run. A large part of the
+    apparent fall in validation loss was the offset moving, not the model
+    improving -- and picking the single lowest reading then selected epoch 6
+    (0.6601, about half the median of the other epochs), which scored worst on
+    the held-out test.
+
+    A selection metric has to mean the same thing at every epoch. Macro F1 and
+    risk MAE do; the weighted loss does not.
+
+    - ``composite`` (default): ``0.5 * macro_f1 + 0.5 * (1 - min(risk_mae, 1))``
+      -- balances the two heads that carry the task, both bounded in [0, 1] and
+      both independent of the loss weighting.
+    - ``macro_f1``: technique head only.
+    - ``val_loss``: the previous behaviour, kept so a run can be reproduced.
+      Negated here because this function is maximised.
+    """
+    if mode == "val_loss":
+        return -float(metrics["loss"])
+    if mode == "macro_f1":
+        return float(metrics.get("tech_macro_f1", 0.0))
+    f1 = float(metrics.get("tech_macro_f1", 0.0))
+    mae = min(float(metrics.get("risk_mae", 1.0)), 1.0)
+    return 0.5 * f1 + 0.5 * (1.0 - mae)
+
+
 def _flag_outlier_selection(history, best):
     """Warn when the winning epoch's val loss is far off the run's own trend.
 
@@ -196,6 +235,10 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
     n_risk = 0
     correct_tech_t = torch.zeros((), device=device, dtype=torch.long)
 
+    task_sums = {k: torch.zeros((), device=device, dtype=torch.float64)
+                 for k in ("loss_risk", "loss_tech", "loss_grad",
+                           "weight_risk", "weight_tech", "weight_grad")}
+
     C = int(num_techniques) if num_techniques else len(TECHNIQUE_VOCAB)
     # confusion[t * C + p] -- flat so one bincount per batch suffices
     confusion = torch.zeros(C * C, device=device, dtype=torch.long)
@@ -212,8 +255,17 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
                 "gradation": batch["gradation"].to(device, non_blocking=non_blocking),
             }
             predictions = model(x)
-            loss, _ = model.compute_loss(predictions, targets)
+            loss, parts = model.compute_loss(predictions, targets)
             loss_sum += loss.detach().double().sum()
+            # Per-task losses and their learned weights. Without these the
+            # total is uninterpretable: the 2026-09-21 run reported a
+            # validation loss of 0.66 against a test loss of 26.36 with no way
+            # to see that two of the three weights had saturated at exp(3)=20
+            # and were multiplying everything.
+            for _k, _acc in task_sums.items():
+                _v = parts.get(_k)
+                if _v is not None:
+                    _acc += _v.double().reshape(())
             nb += 1
             err = (predictions["risk_score"] - targets["risk"]).abs()
             abs_err_sum += err.double().sum()
@@ -260,10 +312,12 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
         for c in range(C) if support[c] > 0 or predicted[c] > 0
     }
 
+    out_tasks = {k: (float((v / nb).item()) if nb else 0.0) for k, v in task_sums.items()}
     return {
         "loss": float((loss_sum / nb).item()) if nb else 0.0,
         "risk_mae": float((abs_err_sum / n_risk).item()) if n_risk else 0.0,
         "tech_accuracy": accuracy,
+        **out_tasks,
         # -- the metrics that can tell a working head from a collapsed one --
         "tech_macro_f1": macro_f1,
         "tech_majority_baseline": baseline,
@@ -286,6 +340,16 @@ def main():
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--select-on", choices=("composite", "macro_f1", "val_loss"),
+                        default="composite",
+                        help="Which validation metric picks the kept checkpoint. "
+                             "Default 'composite' = 0.5*macro_f1 + 0.5*(1-risk_mae). "
+                             "'val_loss' was the previous default but is not "
+                             "comparable across epochs: the uncertainty-weighted "
+                             "loss contains learned log-variance terms that drift "
+                             "(0 -> -7.04 over the 2026-09-21 run), so part of its "
+                             "fall is the weighting moving rather than the model "
+                             "improving.")
     parser.add_argument("--eval-only", type=str, default=None,
                         metavar="CKPT",
                         help="Score an existing checkpoint and exit; no "
@@ -477,7 +541,7 @@ def main():
         num_gradations=4,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    best_loss = float("inf")
+    best_loss = float("-inf")       # _selection_score is maximised
     _history: List[Dict[str, float]] = []
     best_metrics: Dict[str, float] = {}
 
@@ -552,6 +616,10 @@ def main():
             loss, _ = model.compute_loss(predictions, targets)
             loss.backward()
             optimizer.step()
+            # Keep the log-variances in range in the saved weights too: a step
+            # can leave one epsilon outside the bound, and that is the value a
+            # checkpoint written this epoch would record.
+            model.uncertainty_loss.project_()
             _loss_sum += loss.detach().double().sum()
             _nb += 1
             if args.log_every and _nb % args.log_every == 0:
@@ -574,6 +642,11 @@ def main():
             f"tech_macro_f1={metrics['tech_macro_f1']:.3f} "
             f"lift={metrics['tech_lift_over_baseline']:+.3f} "
             f"classes_pred={metrics['tech_classes_predicted']}/{metrics['tech_classes_present']} "
+            f"sel[{args.select_on}]={_selection_score(metrics, args.select_on):.4f} "
+            f"| task_loss risk={metrics['loss_risk']:.4f} tech={metrics['loss_tech']:.4f} "
+            f"grad={metrics['loss_grad']:.4f} "
+            f"| weight risk={metrics['weight_risk']:.2f} tech={metrics['weight_tech']:.2f} "
+            f"grad={metrics['weight_grad']:.2f} "
             f"wall={metrics['epoch_seconds'] / 60:.1f}m"
         )
         _warn_if_head_collapsed(metrics, f"epoch {epoch}")
@@ -581,8 +654,11 @@ def main():
         # are written, so without this the other epochs are unrecoverable and
         # a selection decision cannot be revisited without a full retrain.
         _history.append({k: v for k, v in metrics.items() if k != "tech_per_class"})
-        if metrics["loss"] < best_loss:
-            best_loss = metrics["loss"]
+        _score = _selection_score(metrics, args.select_on)
+        metrics["selection_score"] = _score
+        metrics["selection_metric"] = args.select_on
+        if _score > best_loss:
+            best_loss = _score
             best_metrics = metrics
             args.output.parent.mkdir(parents=True, exist_ok=True)
             torch.save(

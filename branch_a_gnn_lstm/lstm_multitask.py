@@ -73,6 +73,24 @@ class MultiTaskUncertaintyLoss(nn.Module):
         self.log_var_tech = nn.Parameter(torch.zeros(1))
         self.log_var_grad = nn.Parameter(torch.zeros(1))
 
+    @torch.no_grad()
+    def project_(self):
+        """Clamp the log-variance parameters back into range, in place.
+
+        `forward` calls this before using them, so the values the loss sees are
+        always bounded. It is also public because an optimiser step can leave a
+        parameter epsilon outside the bound until the next forward, and a
+        checkpoint saved in that window records the out-of-range value -- which
+        is exactly how the 2026-09-21 checkpoint came to hold -3.0090 and
+        -3.0243. A training loop that calls this after `optimizer.step()` saves
+        clean values.
+        """
+        if not self.clamp:
+            return
+        self.log_var_risk.clamp_(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
+        self.log_var_tech.clamp_(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
+        self.log_var_grad.clamp_(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
+
     def forward(
         self,
         risk_loss: torch.Tensor,
@@ -97,11 +115,24 @@ class MultiTaskUncertaintyLoss(nn.Module):
         # That matters here specifically: risk_score is derived from is_attack
         # (benign exactly 0.0, attack >= 0.20), so it is the EASIEST task and
         # the least informative -- exactly the one that would run away.
-        lv_risk, lv_tech, lv_grad = self.log_var_risk, self.log_var_tech, self.log_var_grad
+        # Project the PARAMETERS back into range, rather than clamping a copy.
+        #
+        # `x.clamp(lo, hi)` passes no gradient where x is outside [lo, hi]. The
+        # 2026-09-21 checkpoint shows what that costs: log_var_risk settled at
+        # -3.0090 and log_var_tech at -3.0243, both just past the lower bound,
+        # where their gradient is identically zero -- so they were frozen for
+        # the rest of training and could never come back even if the balance
+        # they imply stopped being right. Two of the three task weights had
+        # quietly become constants.
+        #
+        # Clamping the parameter in place keeps the value bounded AND the
+        # gradient live at the boundary (clamp's gradient is inclusive of the
+        # endpoints), which is ordinary projected gradient descent. The
+        # effective weighting is unchanged; the difference is that a parameter
+        # pinned at the bound can still move back off it.
         if self.clamp:
-            lv_risk = lv_risk.clamp(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
-            lv_tech = lv_tech.clamp(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
-            lv_grad = lv_grad.clamp(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
+            self.project_()
+        lv_risk, lv_tech, lv_grad = self.log_var_risk, self.log_var_tech, self.log_var_grad
 
         prec_risk = torch.exp(-lv_risk)
         prec_tech = torch.exp(-lv_tech)
@@ -113,14 +144,24 @@ class MultiTaskUncertaintyLoss(nn.Module):
             prec_grad * grad_loss + lv_grad
         )
 
+        # Detached 0-dim tensors, not floats.
+        #
+        # These seven `.item()` calls each forced a host-device sync, on every
+        # batch of the training loop -- ~1.1M syncs per epoch at 161,439
+        # batches. Nothing consumed the dict (the one caller that binds it,
+        # train_branch_a.py:306, never reads it), so the whole cost bought
+        # nothing, and it cancelled out the loop-level sync removed earlier.
+        #
+        # 0-dim tensors format and float() exactly like scalars, so a caller
+        # that wants numbers pays for them only when it asks.
         metrics = {
-            "loss_total": total_loss.item(),
-            "loss_risk": risk_loss.item(),
-            "loss_tech": tech_loss.item(),
-            "loss_grad": grad_loss.item(),
-            "weight_risk": prec_risk.item(),
-            "weight_tech": prec_tech.item(),
-            "weight_grad": prec_grad.item(),
+            "loss_total": total_loss.detach(),
+            "loss_risk": risk_loss.detach(),
+            "loss_tech": tech_loss.detach(),
+            "loss_grad": grad_loss.detach(),
+            "weight_risk": prec_risk.detach(),
+            "weight_tech": prec_tech.detach(),
+            "weight_grad": prec_grad.detach(),
         }
         return total_loss, metrics
 
@@ -237,7 +278,7 @@ class MultiTaskLSTM(nn.Module):
         grad_loss = F.cross_entropy(predictions["gradation_logits"], batch["gradation"])
 
         total_loss, metrics = self.uncertainty_loss(risk_loss, tech_loss, grad_loss)
-        metrics["temperature"] = float(temp.item())
+        metrics["temperature"] = temp.detach()      # see MultiTaskUncertaintyLoss
         return total_loss, metrics
 
     def predict_calibrated_risk(
