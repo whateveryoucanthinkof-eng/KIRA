@@ -28,6 +28,7 @@ from control_backend.schema import (
     PredictionEvent,
     FocusEdge,
 )
+from data_unification.host_attributes import HOST_ATTRIBUTES
 from data_unification.unified_schema import UnifiedFlowRecord, CoarseCategory
 from data_unification.temporal_config import (
     LIVE_WINDOW_SIZE_SEC,
@@ -68,8 +69,16 @@ RULE_TECHNIQUE_TO_ATTCK = {
     "Exploit": "T1190",      # Exploit Public-Facing Application
 }
 
-FEATURE_GROUP_MAP = {
-    **{f"H_emb_{i}": "TGNE Latent" for i in range(12)},
+# Dashboard grouping for each feature, keyed off the CANONICAL names.
+#
+# This was a third hand-written copy of the attribute list, and two of its
+# keys did not exist: "avg_flow_duration" (canonical: avg_duration) and
+# "active_conn_density" (canonical: peer_density). Those two lookups silently
+# missed, so two of the fifteen attributes showed no group in the UI.
+#
+# Keyed off HOST_ATTRIBUTES and asserted complete below, so a rename in one
+# place can no longer leave a dangling key here.
+_ATTR_GROUPS = {
     "flow_count": "Connectivity",
     "fwd_bytes": "Volume",
     "bwd_bytes": "Volume",
@@ -79,12 +88,25 @@ FEATURE_GROUP_MAP = {
     "total_packets": "Volume",
     "unique_peers": "Connectivity",
     "unique_dst_ports": "Connectivity",
-    "tcp_ratio": "Connectivity",
-    "udp_ratio": "Connectivity",
-    "avg_flow_duration": "Timing",
-    "byte_rate": "Volume",
-    "packet_rate": "Volume",
-    "active_conn_density": "Connectivity",
+    "tcp_ratio": "Protocol",
+    "udp_ratio": "Protocol",
+    "avg_duration": "Timing",
+    "byte_rate": "Rate",
+    "packet_rate": "Rate",
+    "peer_density": "Connectivity",
+}
+
+_missing = [n for n in HOST_ATTRIBUTES if n not in _ATTR_GROUPS]
+_extra = [n for n in _ATTR_GROUPS if n not in HOST_ATTRIBUTES]
+if _missing or _extra:
+    raise RuntimeError(
+        f"FEATURE_GROUP_MAP is out of sync with host_attributes.HOST_ATTRIBUTES: "
+        f"missing={_missing} unknown={_extra}"
+    )
+
+FEATURE_GROUP_MAP = {
+    **{f"H_emb_{i}": "TGNE Latent" for i in range(12)},
+    **_ATTR_GROUPS,
 }
 
 class AntigravityModelAdapter:

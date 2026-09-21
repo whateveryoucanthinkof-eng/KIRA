@@ -153,3 +153,78 @@ def test_peer_is_resolved_from_whichever_side_is_not_the_host():
     )
     got = _attrs([inbound])[HOST_ATTRIBUTE_INDEX["unique_peers"]]
     assert got == pytest.approx(min(1.0, np.log1p(1) / 5.0), rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Nobody may keep a second copy of these names
+# ---------------------------------------------------------------------------
+
+def test_explainability_names_derive_from_the_single_source():
+    """`explainability/unified_explanation.py` kept its own hardcoded copy and
+    had already drifted: index 14 was "active_conn_density" when the value is
+    unique_peers / flow_count -- peer fan-out, not a connection count.
+
+    These strings sit next to attribution scores an operator reads, so a wrong
+    one is a confidently-stated wrong explanation.
+    """
+    from explainability.unified_explanation import FEATURE_NAMES
+    assert len(FEATURE_NAMES) == 27, "12 embedding dims + 15 attributes"
+    assert FEATURE_NAMES[12:] == list(HOST_ATTRIBUTES), (
+        "explainability has drifted from host_attributes again"
+    )
+    assert FEATURE_NAMES[:12] == [f"H_emb_{i}" for i in range(12)]
+
+
+def test_no_module_hardcodes_a_rival_attribute_list():
+    """Catch a future copy-paste before it drifts.
+
+    Three separate copies of this list existed and two had already drifted:
+    explainability said "active_conn_density"; model_adapter used both
+    "active_conn_density" and "avg_flow_duration" as dict KEYS, names that do
+    not exist, so those lookups silently missed.
+
+    Uses ast so only real string literals count -- comments and docstrings
+    legitimately name the old values when explaining what went wrong.
+    """
+    import ast
+    import pathlib
+
+    banned = {"active_conn_density", "avg_flow_duration", "tcp_flags_syn",
+              "bytes_in_rate", "conn_duration_avg"}
+    offenders = []
+    for path in pathlib.Path(".").rglob("*.py"):
+        if set(path.parts) & {".git", "tests", "cyberworld_v4", "node_modules"}:
+            continue
+        try:
+            tree = ast.parse(path.read_text())
+        except Exception:
+            continue
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                d = ast.get_docstring(node, clean=False)
+                if d:
+                    docstrings.add(d)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and node.value in banned and node.value not in docstrings):
+                offenders.append(f"{path}:{node.lineno}:{node.value}")
+    assert not offenders, (
+        "stale host-attribute names used as real values; import "
+        "HOST_ATTRIBUTES instead of copying: " + ", ".join(offenders)
+    )
+
+
+def test_the_dashboard_group_map_covers_every_attribute():
+    """model_adapter's FEATURE_GROUP_MAP had two keys that do not exist, so
+    two of the fifteen attributes showed no group in the UI."""
+    src = open("control_backend/model_adapter.py").read()
+    ns = {}
+    exec(compile(src.split("class AntigravityModelAdapter")[0], "ma", "exec"), ns)
+    group_map = ns["FEATURE_GROUP_MAP"]
+    for name in HOST_ATTRIBUTES:
+        assert name in group_map, f"{name} has no dashboard group"
+    dangling = [k for k in group_map
+                if not k.startswith("H_emb_") and k not in HOST_ATTRIBUTES]
+    assert not dangling, f"group map keys that are not real attributes: {dangling}"

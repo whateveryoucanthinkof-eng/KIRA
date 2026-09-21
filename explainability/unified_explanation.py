@@ -21,15 +21,25 @@ from correlation.trajectory_assembler import HostAttackTrajectory
 from correlation.campaign_merge import AttackCampaign
 
 
-FEATURE_NAMES = [
-    # TGNE-TA latent dims (0..11)
-    "H_emb_0", "H_emb_1", "H_emb_2", "H_emb_3", "H_emb_4", "H_emb_5",
-    "H_emb_6", "H_emb_7", "H_emb_8", "H_emb_9", "H_emb_10", "H_emb_11",
-    # 15 Temporal Attributes (12..26)
-    "flow_count", "fwd_bytes", "bwd_bytes", "total_bytes", "fwd_packets", "bwd_packets",
-    "total_packets", "unique_peers", "unique_dst_ports", "tcp_ratio", "udp_ratio",
-    "avg_flow_duration", "byte_rate", "packet_rate", "active_conn_density",
-]
+# Feature names for the 27-D Branch A input, DERIVED -- never duplicated.
+#
+# This module used to keep its own hardcoded copy of the 15 host attribute
+# names, and it had already drifted from the computation: index 14 was called
+# "active_conn_density" when the value is unique_peers / flow_count, i.e. peer
+# fan-out, not a connection count. A duplicated name list is the same defect
+# that made host_attributes.py wrong in all fifteen entries -- names and the
+# code that computes them must have exactly one source.
+#
+# These strings are what an operator reads next to an attribution score, so a
+# wrong one is a confidently-stated wrong explanation.
+from data_unification.host_attributes import HOST_ATTRIBUTES
+
+TGNE_LATENT_NAMES = [f"H_emb_{i}" for i in range(12)]
+FEATURE_NAMES = TGNE_LATENT_NAMES + list(HOST_ATTRIBUTES)
+
+assert len(FEATURE_NAMES) == 27, (
+    f"Branch A input is 27-D (12 embedding + 15 attributes); got {len(FEATURE_NAMES)}"
+)
 
 
 @dataclass
