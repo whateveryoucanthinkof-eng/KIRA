@@ -495,13 +495,65 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     if randomize_features:
         node_features = np.random.rand(node_features.shape[0], node_features.shape[1]).astype(np.float32)
 
-    val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
-
     sources = graph_df.u.values
     destinations = graph_df.i.values
     edge_idxs = graph_df.idx.values
     labels = graph_df.label.values
     timestamps = graph_df.ts.values
+
+    # -------------------------------------------------------------- the split
+    #
+    # The temporal cut is taken PER CORPUS, not over the concatenated timeline.
+    #
+    # The three corpora occupy disjoint absolute time ranges -- CTU-13 is 2011,
+    # CIC-2017 is July 2017, CIC-2018 is Feb/Mar 2018. A global
+    # `np.quantile(graph_df.ts, [0.70, 0.85])` over records sorted by absolute
+    # time therefore does not split time at all: it splits by CORPUS. The model
+    # trained on 2011 Czech university botnet traffic and was validated and
+    # tested on 2018 AWS enterprise traffic.
+    #
+    # That single fact explained three symptoms at once:
+    #   * the focal-loss alpha came back {Benign: .239, C2: 1.761, Impact: 1.0,
+    #     InitialAccess: 1.0, Recon: 1.0} -- weights of exactly 1.0 are what
+    #     inverse_frequency_alpha leaves for classes with ZERO training
+    #     samples, i.e. 3 of 5 categories never appeared in training, because
+    #     CTU-13's label vocabulary is only Benign and C2;
+    #   * inductive val AUC sat at chance (0.5043) -- val hosts were 172.31.x
+    #     and 192.168.10.x while training hosts were CTU-13's 147.32.x, an
+    #     entirely disjoint host population;
+    #   * val CatAcc was frozen to four decimals across epochs.
+    #
+    # Splitting within each corpus gives every corpus a 70/15/15 of its own
+    # timeline, so all five categories and all host populations are represented
+    # on both sides, and "past predicts future" is what is actually being
+    # measured.
+    if "source" in graph_df.columns:
+        src_tag = graph_df.source.values
+        val_mask_t = np.zeros(len(timestamps), dtype=bool)
+        test_mask_t = np.zeros(len(timestamps), dtype=bool)
+        for tag in np.unique(src_tag):
+            sel = src_tag == tag
+            v_t, te_t = np.quantile(timestamps[sel], [0.70, 0.85])
+            val_mask_t |= sel & (timestamps > v_t) & (timestamps <= te_t)
+            test_mask_t |= sel & (timestamps > te_t)
+            logging.info(
+                "  corpus %s: %d edges, val cut %.0f, test cut %.0f",
+                tag, int(sel.sum()), v_t, te_t,
+            )
+        train_mask_t = ~(val_mask_t | test_mask_t)
+        # val_time is still needed below to pick the inductive node pool; use
+        # the earliest per-corpus validation boundary so "held-out node" keeps
+        # meaning "appears only after its own corpus's cut".
+        val_time = float(min(np.quantile(timestamps[src_tag == t], 0.70)
+                             for t in np.unique(src_tag)))
+        test_time = float(min(np.quantile(timestamps[src_tag == t], 0.85)
+                              for t in np.unique(src_tag)))
+    else:
+        # Single-corpus data (the Warden loader) -- a global cut is correct.
+        val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
+        train_mask_t = timestamps <= val_time
+        val_mask_t = (timestamps > val_time) & (timestamps <= test_time)
+        test_mask_t = timestamps > test_time
 
     full_data = Data(sources, destinations, timestamps, edge_idxs, labels)
 
@@ -509,7 +561,8 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     node_set = set(sources) | set(destinations)
     n_total_unique_nodes = len(node_set)
 
-    test_node_set = set(sources[timestamps > val_time]).union(set(destinations[timestamps > val_time]))
+    _held_out = val_mask_t | test_mask_t
+    test_node_set = set(sources[_held_out]).union(set(destinations[_held_out]))
     requested_new_nodes = max(1, int(0.1 * n_total_unique_nodes))
     requested_new_nodes = min(requested_new_nodes, len(test_node_set))
     new_test_node_set = set(
@@ -520,14 +573,14 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
     observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
 
-    train_mask = np.logical_and(timestamps <= val_time, observed_edges_mask)
+    train_mask = np.logical_and(train_mask_t, observed_edges_mask)
     train_data = Data(sources[train_mask], destinations[train_mask], timestamps[train_mask], edge_idxs[train_mask], labels[train_mask])
 
     train_node_set = set(train_data.sources).union(train_data.destinations)
     new_node_set = node_set - train_node_set
 
-    val_mask = np.logical_and(timestamps <= test_time, timestamps > val_time)
-    test_mask = timestamps > test_time
+    val_mask = val_mask_t
+    test_mask = test_mask_t
 
     if different_new_nodes:
         n_new_nodes = len(new_test_node_set) // 2
