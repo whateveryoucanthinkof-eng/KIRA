@@ -20,6 +20,7 @@ exist as Python objects.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -242,6 +243,23 @@ class TrajectoryStoreBuilder:
             feats = (np.memmap(self._spill_path, dtype=np.float32, mode="r",
                                shape=(self._n, FEAT_DIM))
                      if self._n else np.zeros((0, FEAT_DIM), dtype=np.float32))
+            # Unlink the backing file NOW, while the mapping holds it open.
+            #
+            # On POSIX the inode survives until every reference is dropped, so
+            # the memmap above stays fully valid, and the space is reclaimed
+            # automatically when the mapping is released -- including on a
+            # crash or a kill, which no explicit cleanup path can promise.
+            #
+            # Nothing deleted these before. At full density each of Branch A,
+            # Branch B and DeepOP writes a multi-GB block, and this disk is
+            # already 90% full; a handful of runs would have filled it. A
+            # 216 MB orphan from an earlier run is what exposed it.
+            try:
+                os.unlink(self._spill_path)
+            except OSError as exc:
+                logging.getLogger(__name__).warning(
+                    "could not unlink spill file %s: %s (it will need manual "
+                    "cleanup)", self._spill_path, exc)
         else:
             feats = self._block[: self._n]
 
