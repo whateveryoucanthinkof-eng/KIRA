@@ -44,6 +44,30 @@ EPOCH_RE = re.compile(r"Epoch (\d+) \[.*?Inductive Val AUC: ([\d.]+), AP: ([\d.]
 PERCLASS_RE = re.compile(r"per-class val acc: \{([^}]*)\}")
 
 
+def smooth(values, window: int):
+    """Centred moving average, clipped at the ends. INFORMATIONAL ONLY.
+
+    An earlier version of this script SELECTED on the smoothed score. That was
+    wrong: smoothing identifies a good REGION of training, but we deploy one
+    specific checkpoint, and that checkpoint's quality is its own raw score,
+    not its neighbours' average. It picked epoch 2 (raw 0.9286) over epoch 6
+    (raw 0.9357) -- a demonstrably worse checkpoint.
+
+    The real concern it was reaching for is the winner's curse: with C2
+    inductive recall at std 0.119 across epochs, the maximum is partly luck
+    and will regress. The honest remedy is to report which epochs are
+    statistically tied, not to deliberately choose a lower-scoring one.
+    """
+    if window <= 1:
+        return list(values)
+    out = []
+    half = window // 2
+    for i in range(len(values)):
+        lo, hi = max(0, i - half), min(len(values), i + half + 1)
+        out.append(sum(values[lo:hi]) / (hi - lo))
+    return out
+
+
 def score_log(log_text: str):
     """[(epoch:int, inductive_ap, macro_recall, selection)] in epoch order."""
     epochs = EPOCH_RE.findall(log_text)
@@ -64,6 +88,12 @@ def main() -> int:
     p.add_argument("log", type=Path)
     p.add_argument("--prefix", default="bita_bigru_transformer-unified_final")
     p.add_argument("--checkpoint-dir", type=Path, default=Path("saved_checkpoints"))
+    p.add_argument("--smooth", type=int, default=3,
+                   help="Window for the informational smoothed column. Selection "
+                        "always uses the raw score; see smooth().")
+    p.add_argument("--tie-tolerance", type=float, default=0.01,
+                   help="Epochs within this of the best are reported as tied, "
+                        "because minority-class recall is noisy (C2 std 0.119).")
     p.add_argument("--copy", type=Path, default=None,
                    help="Copy the winning checkpoint here (e.g. saved_models/...pth)")
     a = p.parse_args()
@@ -73,11 +103,19 @@ def main() -> int:
         print(f"no completed epochs found in {a.log}")
         return 1
 
-    print(f"{'epoch':>5}  {'ind_AP':>7}  {'macro':>7}  {'selection':>9}")
-    for ep, ap, macro, sel in rows:
-        print(f"{ep:>5}  {ap:>7.4f}  {macro:>7.4f}  {sel:>9.4f}")
+    sm = smooth([r[3] for r in rows], a.smooth)
+    print(f"{'epoch':>5}  {'ind_AP':>7}  {'macro':>7}  {'selection':>9}  {'smoothed':>9}")
+    for (ep, ap, macro, sel), sv in zip(rows, sm):
+        print(f"{ep:>5}  {ap:>7.4f}  {macro:>7.4f}  {sel:>9.4f}  {sv:>9.4f}")
 
+    # Select on the RAW score -- that is the deployed checkpoint's own quality.
     best = max(rows, key=lambda r: r[3])
+    tied = [r[0] for r in rows if r[3] >= best[3] - a.tie_tolerance and r[0] != best[0]]
+    if tied:
+        print(f"\nStatistically tied within {a.tie_tolerance}: epochs "
+              f"{', '.join(str(t) for t in tied)}. Minority-class recall is noisy "
+              f"(C2 inductive std 0.119 across epochs), so the winner is partly "
+              f"luck and any of these is a defensible choice.")
     ckpt = a.checkpoint_dir / f"{a.prefix}-{best[0]}.pth"
     print(f"\nbest epoch: {best[0]}  (selection {best[3]:.4f}, "
           f"inductive AP {best[1]:.4f}, macro recall {best[2]:.4f})")

@@ -79,3 +79,39 @@ def test_partial_epoch_without_per_class_is_skipped():
     partial = REAL_LOG + "\nEpoch 06 [700s] Loss: 0.14 | Val AUC: 0.999, AP: 0.999, CatAcc: 0.9, MRR: 0.9 | Inductive Val AUC: 0.99, AP: 0.99, CatAcc: 0.9\n"
     rows = score_log(partial)
     assert [r[0] for r in rows] == [0, 1, 2, 3, 4, 5], "an epoch with no per-class line must not score"
+
+
+# ---------------------------------------------------------------------------
+# Selection must use the RAW score, not a smoothed one
+# ---------------------------------------------------------------------------
+
+def test_smoothing_is_informational_not_the_selector():
+    """An earlier version selected on the smoothed score and picked epoch 2
+    (raw 0.9286) over epoch 6 (raw 0.9357) -- a demonstrably worse checkpoint.
+
+    Smoothing identifies a good REGION of training, but we deploy one specific
+    checkpoint and its quality is its own raw score, not its neighbours'
+    average.
+    """
+    src = open("scripts/select_best_encoder.py").read()
+    assert "best = max(rows, key=lambda r: r[3])" in src, "must select on the raw score"
+    assert "INFORMATIONAL ONLY" in src
+
+
+def test_it_reports_the_tie_set():
+    """The winner's curse is real -- C2 inductive std is 0.119 -- so the honest
+    remedy is to name the epochs that are statistically tied, not to pick a
+    lower-scoring one."""
+    src = open("scripts/select_best_encoder.py").read()
+    assert "tie_tolerance" in src
+    assert "partly luck" in src
+
+
+def test_smooth_handles_edges_and_trivial_windows():
+    from scripts.select_best_encoder import smooth
+    v = [1.0, 2.0, 3.0, 4.0]
+    assert smooth(v, 1) == v
+    out = smooth(v, 3)
+    assert len(out) == len(v)
+    assert out[0] == pytest.approx(1.5)      # clipped at the start
+    assert out[-1] == pytest.approx(3.5)     # clipped at the end
