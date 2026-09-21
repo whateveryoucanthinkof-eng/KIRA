@@ -87,18 +87,25 @@ def eval_edge_prediction_with_categories(
     auc_score = roc_auc_score(all_labels, all_scores)
     avg_precision = average_precision_score(all_labels, all_scores)
 
-    # Hits@K
-    hits_at_k = lambda k: np.mean([
-        y_true[i] in np.argsort(-y_scores[i])[:k] for i in range(len(y_true))
-    ])
-    hits_at_1 = hits_at_k(1)
-    hits_at_3 = hits_at_k(3)
-    hits_at_5 = hits_at_k(5)
+    # Hits@K and MRR, vectorised.
+    #
+    # These were Python loops over every evaluation sample, each doing its own
+    # argsort and an O(C) membership scan. At a million interactions that is the
+    # dominant cost of an epoch. The rank of the true class is just one plus the
+    # number of classes scoring strictly higher, which needs no sort at all.
+    #
+    # Tie handling: ranks are optimistic (a tie with the true class does not
+    # push it down). The previous argsort-based version broke ties by class
+    # index. Exact ties between float softmax outputs are vanishingly rare, and
+    # test_eval_metrics_vectorisation.py pins the two against each other.
+    row = np.arange(len(y_true))
+    true_class_score = y_scores[row, y_true]
+    correct_ranks = 1 + (y_scores > true_class_score[:, None]).sum(axis=1)
 
-    # MRR
-    ranks = np.argsort(-y_scores, axis=1)
-    correct_ranks = np.array([np.where(ranks[i] == y_true[i])[0][0] + 1 for i in range(len(y_true))])
-    mrr = np.mean(1 / correct_ranks)
+    hits_at_1 = float(np.mean(correct_ranks <= 1))
+    hits_at_3 = float(np.mean(correct_ranks <= 3))
+    hits_at_5 = float(np.mean(correct_ranks <= 5))
+    mrr = float(np.mean(1.0 / correct_ranks))
 
     # Overall classification metrics
     acc = accuracy_score(y_true, y_pred)
@@ -163,12 +170,22 @@ def eval_edge_prediction_with_categories(
         except:
             auc_by_class[c] = float('nan')
 
-        ranks_c = np.argsort(-y_score_class)
+        # Per-class MRR, vectorised.
+        #
+        # This was the single worst hot spot in the file: `np.where(ranks_c ==
+        # idx)[0][0]` is a full O(N) scan of the ranking, run once per positive
+        # sample, inside a loop over classes -- O(N x P x C) overall, which on a
+        # million-row evaluation set stalls an epoch for many minutes.
+        #
+        # `np.where(ranks_c == idx)[0][0]` is just the position of sample `idx`
+        # in the ordering, i.e. the inverse permutation of the argsort. Building
+        # that inverse once costs O(N log N) and gives bit-identical results.
         true_indices = np.where(y_true_bin == 1)[0]
         if len(true_indices) > 0:
-            mrr_c = np.mean([
-                1 / (np.where(ranks_c == idx)[0][0] + 1) for idx in true_indices
-            ])
+            order = np.argsort(-y_score_class)
+            position = np.empty(len(order), dtype=np.int64)
+            position[order] = np.arange(len(order))
+            mrr_c = float(np.mean(1.0 / (position[true_indices] + 1)))
         else:
             mrr_c = 0.0
         mrr_by_class[c] = mrr_c
