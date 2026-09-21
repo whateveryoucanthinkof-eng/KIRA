@@ -25,6 +25,7 @@ from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.cic2018_adapter import CIC2018Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
+from data_unification.split_policy import partition_paths
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
@@ -137,17 +138,28 @@ def main():
     if len(all_files) < 4:
         raise RuntimeError(f"Expected supplied SIH/CTU files, found {len(all_files)}")
 
-    # Three-way, file-disjoint. Previously train/val only, which meant the
-    # reported number came from the same split used to pick the checkpoint --
-    # a selection estimate, not a generalisation estimate. Test is scored once,
-    # after the model is frozen, and never influences training.
-    n = len(all_files)
-    n_train = max(1, int(n * 0.7))
-    n_val = max(1, int(n * 0.15))
-    train_files = all_files[:n_train]
-    val_files = all_files[n_train:n_train + n_val]
-    test_files = all_files[n_train + n_val:] or all_files[-1:]
-    print(f"split: {len(train_files)} train / {len(val_files)} val / {len(test_files)} test files", flush=True)
+    # Three-way, capture-disjoint, and READ FROM THE FROZEN LOCK.
+    #
+    # This used to slice a *sorted* file list 70/15/15, so "train" meant
+    # "alphabetically first" and the assignment shifted whenever a file was
+    # added or renamed -- results were not comparable across retrains, which is
+    # the entire reason data_unification/splits.lock.json exists. The lock had
+    # zero consumers; now it has this one.
+    #
+    # Test is scored once, after the model is frozen, and never influences
+    # training.
+    partition = partition_paths(all_files)
+    train_files, val_files, test_files = (
+        partition["train"], partition["val"], partition["test"],
+    )
+    for _name, _files in (("train", train_files), ("val", val_files), ("test", test_files)):
+        if not _files:
+            raise RuntimeError(
+                f"frozen split '{_name}' matched no files under {args.cic_dir} / "
+                f"{args.ctu_dir}. Refusing to train on a split that does not exist."
+            )
+    print(f"frozen split: {len(train_files)} train / {len(val_files)} val / "
+          f"{len(test_files)} test captures", flush=True)
     import time
     tgn = build_or_load_tgne_ta()
     # Contract-bound (v4). Previously 2.0s / seq_len=5 hardcoded, which matched

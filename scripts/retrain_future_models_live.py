@@ -25,6 +25,26 @@ from data_unification.cic2018_adapter import CIC2018Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.pcap_bridge import iter_day_records
+from data_unification.split_policy import partition_paths, split_of
+
+
+def _pcap_day_split(day_dir) -> str:
+    """Frozen split of one PCAP capture day, from splits.lock.json.
+
+    Day directory names are the lock's PCAP2018 capture keys verbatim, including
+    the two that are misspelled in the corpus itself (fri_23_pacap,
+    thu_15_pacap). A day the lock does not name is an error rather than a guess:
+    silently defaulting it to train is how an evaluation day leaks.
+    """
+    from pathlib import Path as _P
+    name = _P(day_dir).name
+    try:
+        return split_of("PCAP2018", name)
+    except KeyError:
+        raise KeyError(
+            f"PCAP day {name!r} is not in the frozen split. Add it via "
+            f"scripts/freeze_splits.py rather than assigning it on the fly."
+        )
 from deepop_decoder.forecast_decoder import DeepOPForecastDecoder
 from deepop_decoder.joint_vocab import get_joint_vocab
 from deepop_decoder.train_cwa_decoder import CWASequenceDataset, create_cwa_training_samples
@@ -48,16 +68,22 @@ def load_records(cic_dir, ctu_dir, rows_per_file, stride=1):
     cic = CIC2018Adapter()
     ctu = CTU13Adapter()
     files = sorted(cic_dir.glob("*.csv")) + sorted(ctu_dir.glob("*/*.binetflow"))
-    split = max(1, int(len(files) * 0.8))
-    for path in files[:split]:
-        gen = cic.parse_file(str(path), max_rows=rows_per_file * stride) if path.suffix == ".csv" else ctu.parse_netflow_csv(str(path), max_rows=rows_per_file * stride)
-        records.extend(_strided(gen, stride, rows_per_file))
-    train_files = records
-    records = []
-    for path in files[split:]:
-        gen = cic.parse_file(str(path), max_rows=rows_per_file * stride) if path.suffix == ".csv" else ctu.parse_netflow_csv(str(path), max_rows=rows_per_file * stride)
-        records.extend(_strided(gen, stride, rows_per_file))
-    return train_files, records
+    # The frozen lock decides this, not an 80/20 slice of a sorted list. The
+    # previous version put whichever captures sorted last into validation, so
+    # the assignment moved whenever a file was added -- and it disagreed with
+    # splits.lock.json, which every other stage is now bound to.
+    part = partition_paths(files)
+
+    def _read(paths):
+        out = []
+        for path in paths:
+            gen = (cic.parse_file(str(path), max_rows=rows_per_file * stride)
+                   if path.suffix == ".csv"
+                   else ctu.parse_netflow_csv(str(path), max_rows=rows_per_file * stride))
+            out.extend(_strided(gen, stride, rows_per_file))
+        return out
+
+    return _read(part["train"]), _read(part["val"])
 
 
 def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_day=None, max_packets_per_host=20000, window_stride=1):
@@ -76,8 +102,9 @@ def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_
     day_re = re.compile(r"^(?P<day>.+)_pa?cap$")
     day_dirs = sorted((p, day_re.match(p.name)) for p in Path(pcap_root).iterdir() if p.is_dir())
     day_dirs = sorted((p, m.group("day")) for p, m in day_dirs if m)
-    split = max(1, int(len(day_dirs) * 0.8))
-    train_days, val_days = day_dirs[:split], day_dirs[split:]
+    # Frozen per-day assignment, not an 80/20 slice (see splits.lock.json).
+    train_days = [d for d in day_dirs if _pcap_day_split(d) == "train"]
+    val_days = [d for d in day_dirs if _pcap_day_split(d) == "val"]
 
     def _load(days):
         records = []
@@ -132,10 +159,10 @@ def iter_pcap_day_records(pcap_root, csv_label_dir, window_seconds, max_windows_
     day_re = re.compile(r"^(?P<day>.+)_pa?cap$")
     day_dirs = sorted((p, day_re.match(p.name)) for p in Path(pcap_root).iterdir() if p.is_dir())
     day_dirs = sorted((p, m.group("day")) for p, m in day_dirs if m)
-    split_at = max(1, int(len(day_dirs) * 0.8))
+    # Frozen per-day assignment; see splits.lock.json / _pcap_day_split.
 
     for i, (day_dir, day) in enumerate(day_dirs):
-        split = "train" if i < split_at else "val"
+        split = _pcap_day_split(day_dir)
         csv_path = Path(csv_label_dir) / f"{day}_csv.csv"
         if not csv_path.exists():
             prefix = day.rsplit("_", 1)[0]
@@ -250,9 +277,14 @@ def _pcap_trajectories_per_day(args, extractor):
     import gc, time
     from data_unification.trajectory_store import TrajectoryStoreBuilder
     spill = str(args.spill_dir) if args.spill_dir else None
-    builders = {"train": TrajectoryStoreBuilder(spill_dir=spill),
-                "val": TrajectoryStoreBuilder(spill_dir=spill)}
-    wbase = {"train": 0, "val": 0}
+    # All three splits get a store. The frozen lock assigns thu_1_pcap to test,
+    # and without a store for it the day would either crash on a missing key or
+    # -- worse, if defaulted -- be folded into training. It is extracted and
+    # kept separate so a held-out PCAP evaluation is possible, and it is never
+    # returned to the trainers.
+    builders = {k: TrajectoryStoreBuilder(spill_dir=spill)
+                for k in ("train", "val", "test")}
+    wbase = {"train": 0, "val": 0, "test": 0}
     for split, day, recs in iter_pcap_day_records(
             args.pcap_root, args.cic2018_csv_dir, get_contract().window_seconds,
             args.pcap_max_windows_per_day, window_stride=args.pcap_window_stride):
@@ -269,7 +301,7 @@ def _pcap_trajectories_per_day(args, extractor):
         st = b.finalize()
         print(f"{k}: {st.n_snapshots} snapshots over {len(st)} hosts | {st.memory_report()}", flush=True)
         out[k] = st
-    return out["train"], out["val"]
+    return out
 
 
 def main():
@@ -295,7 +327,12 @@ def main():
     if args.pcap_root:
         if not args.cic2018_csv_dir:
             parser.error("--pcap-root requires --cic2018-csv-dir (PCAP packets carry no label of their own)")
-        train_traj, val_traj = _pcap_trajectories_per_day(args, extractor)
+        _stores = _pcap_trajectories_per_day(args, extractor)
+        train_traj, val_traj = _stores["train"], _stores["val"]
+        # _stores["test"] is the frozen held-out capture day. It is deliberately
+        # not handed to the trainers; score it once, after the model is frozen.
+        print(f"held-out test store: {_stores['test'].n_snapshots} snapshots "
+              f"(not used for training or model selection)", flush=True)
     else:
         if not (args.cic_dir and args.ctu_dir):
             parser.error("either --pcap-root/--cic2018-csv-dir or --cic-dir/--ctu-dir is required")
