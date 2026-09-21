@@ -91,3 +91,52 @@ def test_shuffling_is_on_by_default_and_can_be_disabled():
     src = open("bita/train.py").read()
     assert "'--shuffle_batches', action='store_true', default=True" in src
     assert "'--no_shuffle_batches'" in src
+
+
+# ---------------------------------------------------------------------------
+# Shuffling must not break causality
+# ---------------------------------------------------------------------------
+
+def test_shuffled_batches_still_only_see_the_past():
+    """The correctness question behind the fix.
+
+    A forecaster that peeks at the future is worthless, so shuffling is only
+    acceptable if every sampled neighbour still predates the edge being
+    scored. It does, because `find_before` cuts on each edge's OWN timestamp
+    rather than on position in the batch -- but that is worth proving, not
+    assuming.
+    """
+    from bita.utils.utils import get_neighbor_finder
+
+    class _D:
+        def __init__(s, a, b, c, d):
+            s.sources, s.destinations, s.edge_idxs, s.timestamps = a, b, c, d
+
+    rng = np.random.default_rng(0)
+    n, nodes = 20000, 500
+    d = _D(rng.integers(1, nodes, n), rng.integers(1, nodes, n),
+           np.arange(1, n + 1), np.sort(rng.random(n) * 1e6))
+    nf = get_neighbor_finder(d, uniform=False, max_node_idx=nodes)
+
+    # Query in a SHUFFLED order, exactly as the trainer now does.
+    perm = rng.permutation(n)[:2000]
+    src = d.sources[perm]
+    ts = d.timestamps[perm]
+    nbr, eidx, etimes = nf.get_temporal_neighbor(src, ts, 10)
+
+    for row in range(len(perm)):
+        real = etimes[row][etimes[row] > 0]
+        if len(real):
+            assert real.max() < ts[row], (
+                f"row {row} sampled a neighbour at t={real.max()} for a query "
+                f"at t={ts[row]} -- the model can see the future"
+            )
+
+
+def test_permutation_covers_every_sample_exactly_once():
+    """A shuffle that drops or duplicates samples would silently change the
+    effective dataset size."""
+    n = 10_000
+    perm = np.random.default_rng(3).permutation(n)
+    assert len(perm) == n
+    assert sorted(perm.tolist()) == list(range(n))
