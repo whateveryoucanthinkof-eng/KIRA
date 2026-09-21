@@ -1086,6 +1086,7 @@ def train(args):
         val_mrr = val_results[2]
         val_cat_acc = val_results[4]
         val_cat_loss = val_results[5]
+        val_f1_macro = val_results[8]
 
         if args.use_memory:
             val_memory_backup = tgn.memory.backup_memory()
@@ -1138,10 +1139,34 @@ def train(args):
         # Checkpoint current epoch
         torch.save(tgn.state_dict(), checkpoint_path_fn(epoch))
 
+        # Model selection metric.
+        #
+        # This used val_ap alone -- link prediction on seen hosts. That task
+        # converges in ONE epoch on this corpus and then saturates:
+        #
+        #     val_ap        0.9971 -> 0.9968 -> 0.9968
+        #     inductive AP  0.9926 -> 0.9921 -> 0.9918
+        #
+        # while the classification head was still improving materially
+        # (C2 inductive recall 0.325 -> 0.319 -> 0.517). Selecting on the
+        # saturated metric restores epoch 0 and throws the improving one away.
+        #
+        # The encoder is judged on two things that both matter downstream:
+        # embedding quality on UNSEEN hosts (inductive AP -- deployment meets
+        # new hosts constantly, and the transductive figure has no
+        # discriminative power left at 0.9968), and balanced classification
+        # (macro F1, not aggregate accuracy, because Benign is ~90% of val and
+        # dominates any unweighted average).
+        _sel = 0.5 * float(nn_val_ap) + 0.5 * float(val_f1_macro)
+        logging.info(
+            "           selection=%.4f  (inductive AP %.4f, val macro-F1 %.4f)",
+            _sel, nn_val_ap, val_f1_macro,
+        )
+
         # Check early stopping
-        if early_stopper.early_stop_check(val_ap):
+        if early_stopper.early_stop_check(_sel):
             logging.info(f"Early stopping triggered! No improvement over {early_stopper.max_round} epochs.")
-            logging.info(f"Best model was at Epoch {early_stopper.best_epoch} with Val AP: {early_stopper.last_best:.4f}")
+            logging.info(f"Best model was at Epoch {early_stopper.best_epoch} with selection score: {early_stopper.last_best:.4f}")
             best_checkpoint = checkpoint_path_fn(early_stopper.best_epoch)
             tgn.load_state_dict(torch.load(best_checkpoint, map_location=device))
             break
