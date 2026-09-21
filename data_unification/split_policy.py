@@ -137,3 +137,47 @@ def partition_paths(paths) -> Dict[str, List]:
             f"via scripts/freeze_splits.py rather than assigning them on the fly."
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# The two splits, and which one is frozen
+# ---------------------------------------------------------------------------
+#
+# There are two, they are easy to confuse, and only one of them is this file's
+# lock:
+#
+# 1. THE FROZEN CAPTURE SPLIT -- splits.lock.json, above.
+#    Which whole captures are train / val / test for the PIPELINE.
+#    CIC-2018 8/1/1, CIC-2017 6/1/1, CTU-13 9/2/2, PCAP 8/1/1.
+#    Frozen 2026-09-21T04:55:11Z. **Never changes.** Changing it invalidates
+#    comparability with every number previously reported.
+#
+# 2. THE ENCODER'S INTERNAL SUB-SPLIT -- bita/train.py::split_data.
+#    TGNE trains only on the 23 captures that (1) assigns to train, and needs
+#    its own train/val/test inside them for early stopping and for inductive
+#    (unseen-host) evaluation. It cannot reach the captures (1) holds out --
+#    they are never loaded, which `--train_splits train` enforces and the
+#    load log states ("N captures read, 8 held out from the encoder").
+#
+# Policy (2) is now FIXED as well, after three iterations that each starved a
+# class in a different way:
+#
+#   global time quantile  -> split by CORPUS (disjoint years), 3 of 5 classes
+#                            absent from training
+#   per-corpus quantile   -> Recon 7 samples: CIC-2017's cut fell at 13:13 and
+#                            all PortScan runs 13:00-15:59
+#   per-capture quantile  -> Recon 0 samples: its single carrier host
+#                            (172.16.0.1) was held out by the inductive draw
+#
+# SETTLED POLICY: cut each CAPTURE at its own 70/85 time quantiles, then
+# guarantee no class is deleted by the inductive node draw. Rationale: it is
+# the finest grain that still preserves causality (train precedes val precedes
+# test within every capture) while letting every attack class appear on all
+# three sides. Do not change it again without a measured reason recorded here.
+
+ENCODER_SUBSPLIT_POLICY = {
+    "granularity": "capture",
+    "quantiles": (0.70, 0.85),
+    "guard": "no class may be emptied from train by the inductive node draw",
+    "settled": "2026-09-21",
+}
