@@ -307,3 +307,24 @@ Two things worth recording:
 
 ### 16:49 — Restarted (v3). `logs/tgne_final.out`
 Previous logs archived: `tgne_final_PRE_CATWEIGHT.out`, `..._PRE_SHUFFLE.out`.
+
+### 17:00 — Branch A would not have fitted at full density. Fixed.
+Measured the snapshot volume before launching the retrain rather than
+discovering it mid-run:
+
+- snapshot ratios: **1.99 per record** (CIC-2018), **0.72** (CTU-13)
+- Branch A's 32.7M training records → **~42M snapshots**
+- `create_host_sequence_samples` materialises a `[15, 27]` float32 array per
+  sample = **2,053 bytes each** → **80.3 GiB**
+
+On a 22 GiB machine that is a hard blocker, and thinning is not an option.
+
+**Fix:** `LazyHostSequenceDataset` keeps two int32 columns (~8 B/sample,
+**336 MB** at 42M) and gathers each window from the memmapped feature block in
+`__getitem__` — which is what DataLoader workers are for. Semantics identical;
+7 tests, the main one asserting every sample matches the eager path field for
+field. Credibility gate switched to `evaluate_store`, which already existed
+for this purpose.
+
+Branch A also needs `--spill-dir` at full density (store is ~6.3 GB on disk,
+~1 GB resident).
