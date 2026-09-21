@@ -311,25 +311,96 @@ def load_and_preprocess_unified_dataset(
             logging.warning("%s is not in the frozen split -- skipped", path)
             return False
 
-    records = []
+    # ---------------------------------------------------------------- columnar
+    #
+    # Records are consumed as they stream and never accumulated.
+    #
+    # The previous version built a Python list of every record just to turn it
+    # into fixed-width numeric columns. At ~8M records that list alone is
+    # ~2.4 GB, and it coexisted with the sort, four more list comprehensions
+    # and the edge-feature pass -- peak reached 14.3 GiB and the job was
+    # OOM-killed by its own cgroup. Nothing in the output needs the objects:
+    # every column here is a scalar derived from one record.
+    #
+    # Columns grow by doubling, which keeps peak at 2x the live size during a
+    # resize rather than holding a second full structure.
+    _probe = extract_canonical_edge_features(
+        fwd_bytes=0, bwd_bytes=0, fwd_packets=0, bwd_packets=0, duration_sec=0.0,
+        byte_rate=0.0, packet_rate=0.0, protocol=6, dst_port=0,
+    )
+    edge_dim = len(_probe)
+
+    class _Growable:
+        """Append-only numpy column that doubles in place."""
+
+        __slots__ = ("buf", "n")
+
+        def __init__(self, dtype, width=None, cap=1 << 20):
+            shape = (cap,) if width is None else (cap, width)
+            self.buf = np.empty(shape, dtype=dtype)
+            self.n = 0
+
+        def append(self, v):
+            if self.n == len(self.buf):
+                bigger = np.empty((len(self.buf) * 2,) + self.buf.shape[1:], self.buf.dtype)
+                bigger[: self.n] = self.buf[: self.n]
+                self.buf = bigger
+            self.buf[self.n] = v
+            self.n += 1
+
+        def done(self):
+            return self.buf[: self.n]
+
+    col_u = _Growable(np.int64)
+    col_i = _Growable(np.int64)
+    col_ts = _Growable(np.float64)
+    col_lbl = _Growable(np.int32)
+    col_edge = _Growable(np.float32, width=edge_dim)
+
+    ip_to_id: dict = {}
+    cat_to_id: dict = {}
+
+    def _consume(stream):
+        for r in stream:
+            su = ip_to_id.get(r.src_ip)
+            if su is None:
+                su = ip_to_id[r.src_ip] = len(ip_to_id) + 1   # 1-based; 0 is padding
+            di = ip_to_id.get(r.dst_ip)
+            if di is None:
+                di = ip_to_id[r.dst_ip] = len(ip_to_id) + 1
+            ci = cat_to_id.get(r.coarse_category)
+            if ci is None:
+                ci = cat_to_id[r.coarse_category] = len(cat_to_id)
+            col_u.append(su)
+            col_i.append(di)
+            col_ts.append(r.start_time)
+            col_lbl.append(ci)
+            col_edge.append(extract_canonical_edge_features(
+                fwd_bytes=r.fwd_bytes, bwd_bytes=r.bwd_bytes,
+                fwd_packets=r.fwd_packets, bwd_packets=r.bwd_packets,
+                duration_sec=r.duration, byte_rate=r.byte_rate,
+                packet_rate=r.packet_rate, protocol=r.protocol,
+                dst_port=r.dst_port,
+            ))
+
     skipped = []
     n_read = 0
     if cic2017_dir:
         for f in sorted(glob.glob(os.path.join(cic2017_dir, "*.csv"))):
             if not _in_split(f):
                 skipped.append(os.path.basename(f)); continue
-            records.extend(_take(CIC2017Adapter().parse_file(f, max_rows=None))); n_read += 1
+            _consume(_take(CIC2017Adapter().parse_file(f, max_rows=None))); n_read += 1
     if cic2018_dir:
         for f in sorted(glob.glob(os.path.join(cic2018_dir, "*.csv"))):
             if not _in_split(f):
                 skipped.append(os.path.basename(f)); continue
-            records.extend(_take(CIC2018Adapter().parse_file(f, max_rows=None))); n_read += 1
+            _consume(_take(CIC2018Adapter().parse_file(f, max_rows=None))); n_read += 1
     if ctu13_dir:
         ctu_adapter = CTU13Adapter()
         for f in sorted(glob.glob(os.path.join(ctu13_dir, "*", "*.binetflow"))):
             if not _in_split(f):
                 skipped.append(os.path.basename(f)); continue
-            records.extend(_take(ctu_adapter.parse_netflow_csv(f, max_rows=None))); n_read += 1
+            _consume(_take(ctu_adapter.parse_netflow_csv(f, max_rows=None))); n_read += 1
 
     logging.info(
         "Frozen split %s: %d capture(s) read, %d held out from the encoder%s",
@@ -339,62 +410,42 @@ def load_and_preprocess_unified_dataset(
         (": " + ", ".join(skipped)) if skipped else "",
     )
 
-    if not records:
+    n = col_ts.n
+    if n == 0:
         raise FileNotFoundError(
             f"No records loaded (cic2017_dir={cic2017_dir}, cic2018_dir={cic2018_dir}, ctu13_dir={ctu13_dir})"
         )
 
-    records.sort(key=lambda r: r.start_time)
-    logging.info(f"Loaded {len(records)} unified flow records from CIC-2017/CIC-2018/CTU-13")
+    # Chronological order, by permuting the columns rather than sorting objects.
+    order = np.argsort(col_ts.done(), kind="stable")
+    u_list = col_u.done()[order]
+    i_list = col_i.done()[order]
+    ts_list = col_ts.done()[order]
+    label_list = col_lbl.done()[order]
 
-    # Shared node namespace, 1-based (0 reserved for padding).
-    ip_to_id = {}
-    for r in records:
-        if r.src_ip not in ip_to_id:
-            ip_to_id[r.src_ip] = len(ip_to_id) + 1
-        if r.dst_ip not in ip_to_id:
-            ip_to_id[r.dst_ip] = len(ip_to_id) + 1
+    # Row 0 stays zero: it is the padding edge, which is why no vstack is needed.
+    edge_features = np.zeros((n + 1, edge_dim), dtype=np.float32)
+    edge_features[1:] = col_edge.done()[order]
+    del col_u, col_i, col_ts, col_lbl, col_edge, order
 
-    u_list = np.array([ip_to_id[r.src_ip] for r in records], dtype=np.int64)
-    i_list = np.array([ip_to_id[r.dst_ip] for r in records], dtype=np.int64)
-    ts_list = np.array([r.start_time for r in records], dtype=np.float64)
-    idx_list = np.arange(1, len(records) + 1)
+    idx_list = np.arange(1, n + 1)
 
-    label_encoder = LabelEncoder()
-    label_list = label_encoder.fit_transform([r.coarse_category for r in records])
-    category_mapping = {index: label for index, label in enumerate(label_encoder.classes_)}
-    logging.info(f"Detected coarse categories: {category_mapping}")
+    # Category ids must match LabelEncoder's semantics -- ALPHABETICAL order,
+    # not first-seen. cat_to_id above is assigned in encounter order for speed,
+    # so remap it here. Getting this wrong would silently renumber the classes
+    # relative to every previous run and to the focal-loss alpha vector, which
+    # is indexed by class id.
+    ordered = sorted(cat_to_id)
+    remap = np.empty(len(ordered), dtype=np.int32)
+    for name, encounter_id in cat_to_id.items():
+        remap[encounter_id] = ordered.index(name)
+    label_list = remap[label_list]
+    category_mapping = {i: name for i, name in enumerate(ordered)}
+    logging.info("Loaded %d unified flow records from CIC-2017/CIC-2018/CTU-13", n)
+    logging.info("Detected coarse categories: %s", category_mapping)
 
-    graph_df = pd.DataFrame({'u': u_list, 'i': i_list, 'ts': ts_list, 'label': label_list, 'idx': idx_list})
-
-    # Edge features are written straight into one preallocated array.
-    #
-    # This used to build a Python list of N separate 12-element arrays, np.stack
-    # it, then np.vstack a padding row on top -- three full copies of the
-    # feature block alive at once plus ~150 B of numpy object overhead per row.
-    # At ~10M records that is several GB of peak on a 22 GiB machine, and peak
-    # is what decides whether the job survives.
-    #
-    # Row 0 is the padding edge and stays zero, which is why the destination
-    # offset is i + 1 and no vstack is needed.
-    _probe = extract_canonical_edge_features(
-        fwd_bytes=0, bwd_bytes=0, fwd_packets=0, bwd_packets=0, duration_sec=0.0,
-        byte_rate=0.0, packet_rate=0.0, protocol=6, dst_port=0,
-    )
-    edge_dim = len(_probe)
-    edge_features = np.zeros((len(records) + 1, edge_dim), dtype=np.float32)
-    for i, r in enumerate(records):
-        edge_features[i + 1] = extract_canonical_edge_features(
-            fwd_bytes=r.fwd_bytes,
-            bwd_bytes=r.bwd_bytes,
-            fwd_packets=r.fwd_packets,
-            bwd_packets=r.bwd_packets,
-            duration_sec=r.duration,
-            byte_rate=r.byte_rate,
-            packet_rate=r.packet_rate,
-            protocol=r.protocol,
-            dst_port=r.dst_port,
-        )
+    graph_df = pd.DataFrame({'u': u_list, 'i': i_list, 'ts': ts_list,
+                             'label': label_list, 'idx': idx_list})
 
     # Node features were np.zeros(...). Every one of them. In TGN a node's
     # embedding is a function of its memory, its node features and its

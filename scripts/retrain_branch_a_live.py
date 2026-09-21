@@ -172,6 +172,8 @@ def main():
     # at once costs an extra ~2.8 GB at full density for no reason: the val
     # records are not needed until the train split has already been reduced to
     # samples.
+    record_counts: Dict[str, int] = {}
+
     def _samples_per_file(files, label):
         """Load -> extract -> free, one capture file at a time.
 
@@ -204,6 +206,12 @@ def main():
         store = shared.finalize()
         print(f"{label}: {total_recs} records -> {store.n_snapshots} snapshots "
               f"over {len(store)} hosts | {store.memory_report()}", flush=True)
+        # The record count is returned, not just printed: the run summary below
+        # used to reference `train_records`/`val_records`, which the
+        # load -> extract -> free refactor had already deleted. Every
+        # non-credible run therefore died with NameError instead of reporting
+        # the credibility verdict it had just computed.
+        record_counts[label] = total_recs
         return create_host_sequence_samples(store, seq_len=_c.history_steps, min_trajectory_len=1)
 
     import gc
@@ -252,7 +260,8 @@ def main():
     best_metrics: Dict[str, float] = {}
 
     print(
-        f"train_records={len(train_records)} val_records={len(val_records)} "
+        f"train_records={record_counts.get('train', 0)} "
+        f"val_records={record_counts.get('val', 0)} "
         f"train_samples={len(train_samples)} val_samples={len(val_samples)} device={device}"
     )
     for epoch in range(1, args.epochs + 1):
