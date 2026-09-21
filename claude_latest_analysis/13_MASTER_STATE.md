@@ -137,6 +137,9 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 | 25 | PCAP test day would `KeyError` or be folded into train | `retrain_future_models_live.py` | Lock assigns `thu_1_pcap` to test; only train/val stores existed |
 | 26 | **String interning never fired for IPs** | `data_unification/unified_schema.py` | Guard was `type(x) is str`; adapters emit `numpy.str_`. 479 -> 300 B/record |
 | 27 | Edge features copied three times at peak | `bita/train.py` | list of N small arrays -> np.stack -> np.vstack |
+| 28 | **TGNE trained on the held-out captures** | `bita/train.py` | Its category head uses labels; val/test captures leaked into the encoder, invisible to any branch-level check |
+| 29 | Loader held ~8M record objects -> OOM-killed at 14.3 GiB | `bita/train.py` | Now streams into growable numpy columns; nothing in the output needs the objects |
+| 30 | `NameError: train_records` on every non-credible run | `scripts/retrain_branch_a_live.py:255` | The credibility verdict was replaced by a traceback |
 
 ### Still open
 
@@ -202,21 +205,32 @@ each script invents its own split and the lock is documentation, not enforcement
 
 ## 8. Current training run
 
-Launched 2026-09-21 11:02, unit `tgne-retrain`, log `logs/tgne_fixed_retrain.out`.
+Unit `tgne-retrain`, log `logs/tgne_fixed_retrain.out`.
 
 ```
---stride 4  (no --rows_per_file cap)  --n_epoch 30 --patience 5 --gpu 0
---data_name unified_clockfixed
+--stride 4 --train_splits train --n_epoch 30 --patience 5 --gpu 0
+--data_name unified_v4
 ```
 
-This is the first run with the repaired clock, in-ingestion striding and the
-fast evaluation. `--stride 4` over the full corpus (~39M records) keeps ~9.7M
-spanning every capture uniformly — strictly better than the previous run's 8.5M
-chronological-prefix records, and bounded to roughly 5-6 GiB.
+First run with the clock repair, IP node features, working interning, the
+columnar loader, the frozen train-only split and the fast evaluation.
 
-The previous run's log is archived at `logs/tgne_retrain_PRE_CLOCKFIX.out`. It
-is not a valid baseline (leaking temporal split, see §4), but its collapse
-signature is the diagnostic record for open items A and B:
+**Launch discipline learned the hard way:** run nothing else heavy while this
+is loading. A concurrent smoke test drove system-available to 0.4 GiB and the
+unit was OOM-killed at 14.3 GiB. The cgroup cap contained it -- the desktop did
+not freeze -- which is exactly what the cap is for.
+
+Archived logs, in order, none of them valid baselines:
+
+| log | why it is not a baseline |
+|---|---|
+| `tgne_retrain_PRE_CLOCKFIX.out` | 12-hour clock unrepaired -> leaking temporal split |
+| `tgne_retrain_PRE_NODEFEAT.out` | node features all zero |
+| `tgne_retrain_PRE_LEAKFIX.out` | trained on val/test captures |
+| `tgne_retrain_OOM_ATTEMPT.out`, `tgne_retrain_OOM2.out` | OOM-killed during load |
+
+The collapse signature from the pre-clockfix run is the diagnostic record for
+open items A and B:
 
 | | Epoch 00 | Epoch 01 |
 |---|---|---|
@@ -224,6 +238,9 @@ signature is the diagnostic record for open items A and B:
 | Val CatAcc | 0.3327 | 0.3326 |
 | Inductive Val AUC | 0.5043 | 0.5026 |
 | Inductive CatAcc | 0.4342 | 0.4340 |
+
+CatAcc stable to four decimals across two epochs is a constant prediction, not
+learning.
 
 ---
 
