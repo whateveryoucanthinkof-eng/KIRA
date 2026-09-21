@@ -131,3 +131,20 @@ The full progression of this one class, each stage a different bug:
 (172.16.0.1). The class is now *trainable* but not *generalisable* — a good
 Recon score means the model recognises that host. Do not report Recon as
 detection performance.
+
+### 16:10 — Cumulative horizon risk was taking the peak, not accumulating
+`InfiltrationRiskHead` returned `max(step_risks)` as `cumulative_risk`,
+contradicting its own docstring and the v4 metrics module (which has a test
+arguing peak is wrong). The worked example:
+
+| step risks | peak | cumulative |
+|---|---|---|
+| `[0.50, 0, 0, 0, 0]` | 0.50 | 0.500 |
+| `[0.30, 0.30, 0.30, 0, 0]` | 0.30 | **0.657** |
+
+Peak ranks the single spike above the sustained threat. This value feeds
+`HostAttackTrajectory.cumulative_forecast_risk` — **how hosts get ordered for
+an analyst** — so a host under persistent pressure was being ranked below one
+with a noisy spike. Now `1 - prod(1-r)` in log space; `peak_risk()` kept
+separately since it answers a different question.
+Training unaffected (every trainer discarded this value). *7 tests.*
