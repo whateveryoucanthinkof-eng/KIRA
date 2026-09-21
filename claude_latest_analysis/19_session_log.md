@@ -366,3 +366,25 @@ transferable structure.
 
 Weakest classes: InitialAccess 0.505 and C2 0.677/0.325. Worth watching
 across epochs.
+
+### 17:30 — Epoch 1. Learning, and C2 exposes a second data limitation.
+
+| class | ep 0 | ep 1 |
+|---|---|---|
+| InitialAccess | 0.505 | **0.714** |
+| C2 | 0.677 | 0.674 |
+| C2 inductive | 0.325 | 0.319 |
+| Benign / Impact / Recon | 0.994 / 1.0 / 0.995 | 0.993 / 1.0 / 0.994 |
+
+CatAcc 0.9758 → 0.9803, inductive AUC steady at 0.9918.
+
+**C2's val-vs-inductive gap (0.67 vs 0.32) is the tell.** C2 is botnet C&C and
+comes almost entirely from CTU-13, where I measured **1–2 bot source hosts per
+scenario** (only scenario 9 has 10). So the model can recognise C2 on hosts it
+has seen and cannot transfer to new ones — the same structural limitation as
+Recon, less extreme.
+
+**Two of five classes are therefore host-diversity-limited, not model-limited:**
+Recon (1 host) and C2 (10 hosts across all of CTU-13). No amount of training
+fixes that; it needs a corpus with more distinct attackers (CIDDS-001 was the
+candidate identified earlier).
