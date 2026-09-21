@@ -414,10 +414,18 @@ def load_and_preprocess_unified_dataset(
     # time ranges (CTU-13 2011, CIC-2017 2017, CIC-2018 2018), so a global
     # temporal split silently becomes a split BY CORPUS. See split_data().
     col_src = _Growable(np.int8)
+    # Capture id. The temporal cut is taken per CAPTURE, not per corpus:
+    # CIC-2017 and CIC-2018 organise attack types BY DAY, so a per-corpus
+    # cut segregates whole attack classes into the future half. Measured:
+    # Recon had 7 training samples out of 11.8M because CIC-2017's 70%
+    # cut fell at 13:13 and all 158,930 PortScan rows run 13:00-15:59.
+    col_cap = _Growable(np.int16)
 
     ip_to_id: dict = {}
     cat_to_id: dict = {}
     src_to_id: dict = {}
+    cap_to_id: dict = {}
+    _cur_cap = [0]
 
     def _consume(stream):
         for r in stream:
@@ -434,6 +442,7 @@ def load_and_preprocess_unified_dataset(
             if si is None:
                 si = src_to_id[r.raw_label_source] = len(src_to_id)
             col_src.append(si)
+            col_cap.append(_cur_cap[0])
             col_u.append(su)
             col_i.append(di)
             col_ts.append(r.start_time)
@@ -495,10 +504,13 @@ def load_and_preprocess_unified_dataset(
             col_lbl.extend(cat_map[res["lbl"]])
             col_edge.extend(res["edge"])
             col_src.extend(np.full(res["n"], si, dtype=np.int8))
+            _cid = cap_to_id.setdefault(res["path"], len(cap_to_id))
+            col_cap.extend(np.full(res["n"], _cid, dtype=np.int16))
             logging.info("  %s: %d records", os.path.basename(res["path"]), res["n"])
         logging.info("Parallel ingest finished in %.1fs", _t.time() - _t0)
     else:
         for kind, f in captures:
+            _cur_cap[0] = cap_to_id.setdefault(f, len(cap_to_id))
             if kind == "CIC2017":
                 _consume(_take(CIC2017Adapter().parse_file(f, max_rows=None)))
             elif kind == "CIC2018":
@@ -527,11 +539,12 @@ def load_and_preprocess_unified_dataset(
     ts_list = col_ts.done()[order]
     label_list = col_lbl.done()[order]
     source_list = col_src.done()[order]
+    capture_list = col_cap.done()[order]
 
     # Row 0 stays zero: it is the padding edge, which is why no vstack is needed.
     edge_features = np.zeros((n + 1, edge_dim), dtype=np.float32)
     edge_features[1:] = col_edge.done()[order]
-    del col_u, col_i, col_ts, col_lbl, col_edge, col_src, order
+    del col_u, col_i, col_ts, col_lbl, col_edge, col_src, col_cap, order
 
     idx_list = np.arange(1, n + 1)
 
@@ -551,7 +564,7 @@ def load_and_preprocess_unified_dataset(
 
     graph_df = pd.DataFrame({'u': u_list, 'i': i_list, 'ts': ts_list,
                              'label': label_list, 'idx': idx_list,
-                             'source': source_list})
+                             'source': source_list, 'capture': capture_list})
     _src_names = {v: k for k, v in src_to_id.items()}
     logging.info(
         "Edges per corpus: %s",
@@ -621,8 +634,22 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     # timeline, so all five categories and all host populations are represented
     # on both sides, and "past predicts future" is what is actually being
     # measured.
-    if "source" in graph_df.columns:
-        src_tag = graph_df.source.values
+    # Prefer the CAPTURE tag over the corpus tag. CIC-2017 and CIC-2018
+    # organise attack types BY DAY, so cutting a whole corpus at one quantile
+    # segregates entire attack classes into the future half. Measured: Recon
+    # ended up with SEVEN training samples out of 11.8M, because CIC-2017's
+    # 70% cut landed at 13:13 and all 158,930 PortScan rows run 13:00-15:59
+    # on the Friday afternoon capture. A class with 7 samples cannot be
+    # learned, and Recon is the earliest attack stage -- the one a forecaster
+    # most needs.
+    #
+    # Cutting inside each capture keeps the causal property that matters
+    # (train precedes val precedes test within every capture) while letting
+    # every attack type appear on all three sides.
+    _tag_col = "capture" if "capture" in graph_df.columns else (
+        "source" if "source" in graph_df.columns else None)
+    if _tag_col is not None:
+        src_tag = graph_df[_tag_col].values
         val_mask_t = np.zeros(len(timestamps), dtype=bool)
         test_mask_t = np.zeros(len(timestamps), dtype=bool)
         for tag in np.unique(src_tag):
@@ -630,11 +657,16 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
             v_t, te_t = np.quantile(timestamps[sel], [0.70, 0.85])
             val_mask_t |= sel & (timestamps > v_t) & (timestamps <= te_t)
             test_mask_t |= sel & (timestamps > te_t)
-            logging.info(
-                "  corpus %s: %d edges, val cut %.0f, test cut %.0f",
-                tag, int(sel.sum()), v_t, te_t,
+            logging.debug(
+                "  %s %s: %d edges, val cut %.0f, test cut %.0f",
+                _tag_col, tag, int(sel.sum()), v_t, te_t,
             )
         train_mask_t = ~(val_mask_t | test_mask_t)
+        logging.info(
+            "Temporal split taken per %s across %d unit(s): train=%d val=%d test=%d",
+            _tag_col, len(np.unique(src_tag)),
+            int(train_mask_t.sum()), int(val_mask_t.sum()), int(test_mask_t.sum()),
+        )
         # val_time is still needed below to pick the inductive node pool; use
         # the earliest per-corpus validation boundary so "held-out node" keeps
         # meaning "appears only after its own corpus's cut".
@@ -643,7 +675,7 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
         test_time = float(min(np.quantile(timestamps[src_tag == t], 0.85)
                               for t in np.unique(src_tag)))
     else:
-        # Single-corpus data (the Warden loader) -- a global cut is correct.
+        # Untagged data (the Warden loader) -- a global cut is correct.
         val_time, test_time = list(np.quantile(graph_df.ts, [0.70, 0.85]))
         train_mask_t = timestamps <= val_time
         val_mask_t = (timestamps > val_time) & (timestamps <= test_time)
