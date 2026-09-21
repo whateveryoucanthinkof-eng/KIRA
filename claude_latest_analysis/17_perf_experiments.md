@@ -88,10 +88,67 @@ guess.
 
 ## Results
 
-| run | load | epoch 0 | Val AUC | Val CatAcc | Ind. AUC | Ind. CatAcc |
-|---|---|---|---|---|---|---|
-| A (baseline) | *pending* | | | | | |
-| B (perf) | | | | | | |
+### Experiment A (baseline) — completed, then superseded
+
+| | |
+|---|---|
+| serial ingest | **12.5 min** (34,152,542 records) |
+| epoch 0 | **1022.7 s** (115,693 batches, ~113 batch/s) |
+| Val AUC / AP | 0.8168 / 0.8100 |
+| Val CatAcc | **0.2115** |
+| Inductive Val AUC / AP | **0.7961** / 0.7880 |
+| Inductive CatAcc | 0.3557 |
+| per-class val acc | `{Benign 0.2, C2 0.0, Impact 0.0, InitialAccess 1.0, Recon 0.0}` |
+
+**A's real contribution was not a timing baseline.** Its per-class line
+exposed a collapsed category head: it predicts InitialAccess for everything.
+
+That reframes the earlier "good" result too. The run before it scored
+aggregate CatAcc **0.8351** by predicting **Benign** for everything — Benign
+is ~80% of the data. Both runs were collapsed. Only *which* class changed,
+and it changed when the focal weights changed: the signature of a head with
+no discriminative signal, following whichever class the loss favours.
+
+Root cause was architectural, not a matter of loss tuning:
+
+```python
+combined = source_node_embedding + destination_node_embedding   # 12-D
+logits   = nn.Linear(12, n_classes)(combined)
+```
+
+The head **never saw the edge**. The label is a property of the FLOW — ports,
+byte volumes, duration, protocol — so a benign flow and an attack flow between
+the same host pair were *identical inputs*. Unseparable in principle. And
+addition is symmetric, so A→B and B→A were identical as well.
+
+Fixed to `[src_emb ; dst_emb ; edge_features] → Linear → ReLU → Dropout →
+Linear`. Smoke-tested: logits now change when only the edge changes.
+
+Because this changes the architecture, A is no longer a valid baseline for
+anything, and the strict A/B perf comparison was dropped in favour of the more
+valuable question — does the head fix work.
+
+### Perf changes: equivalence established at unit level
+
+The A/B run was superseded, but both changes are proven lossless where it
+counts:
+
+| change | evidence |
+|---|---|
+| vectorised sampler | 25 tests against the original loop kept verbatim as oracle; exact equality incl. dtypes, empty history, right-alignment, strict cut-time |
+| parallel ingest | 6 tests; **bit-identical** `graph_df`, `edge_features`, `node_features`, category map. Measured 3.14x (42.5s → 13.5s) |
+
+Wall-clock effect is read off the final run's ingest and epoch timings instead
+of a dedicated A/B.
+
+### Final run — in progress
+
+Launched 15:52 with the edge-aware head, per-capture split, full density,
+parallel ingest and the vectorised sampler. `logs/tgne_final.out`.
+
+**What to check at epoch 0:** per-class accuracy must show more than one class
+above zero. Aggregate CatAcc is not evidence either way — 0.8351 and 0.2115
+were both collapses.
 
 ---
 
