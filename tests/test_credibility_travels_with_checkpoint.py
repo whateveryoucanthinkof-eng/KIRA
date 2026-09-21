@@ -63,3 +63,30 @@ def test_verdict_shape_is_serialisable():
                "problems": ["label churn 0.0000: nothing to forecast"],
                "stats": {"val_label_churn": 0.0, "val_n": 147.0}}
     json.dumps(verdict)   # raises if not plain types
+
+
+# ---------------------------------------------------------------------------
+# Label-mapping coverage must be reported, not just tracked
+# ---------------------------------------------------------------------------
+
+def test_label_coverage_is_reported_by_the_trainer():
+    """LabelResolver tracks unresolved labels and had ZERO callers -- the
+    number was computed and discarded, like the credibility verdict and the
+    two loss terms before it.
+
+    Unmapped labels become UNKNOWN with is_attack=False. That is the right
+    default (it asserts nothing) but it is silent label noise if the rate is
+    material, and it will matter when new data arrives with label strings the
+    maps have not seen.
+    """
+    src = pathlib.Path("bita/train.py").read_text()
+    assert "unresolved_report()" in src, "label coverage is never reported"
+    assert "UNRESOLVED" in src, "a nonzero unresolved rate must warn"
+
+
+def test_the_resolver_still_reports_a_usable_shape():
+    from data_unification.label_resolver import LabelResolver
+    rep = LabelResolver().unresolved_report()
+    for k in ("resolve_calls", "unresolved_calls", "unresolved_rate",
+              "mapped_rate", "distinct_unresolved_labels"):
+        assert k in rep

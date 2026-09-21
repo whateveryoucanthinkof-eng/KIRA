@@ -518,6 +518,33 @@ def load_and_preprocess_unified_dataset(
             else:
                 _consume(_take(CTU13Adapter().parse_netflow_csv(f, max_rows=None)))
 
+    # Label-mapping coverage, reported beside the data it describes.
+    #
+    # LabelResolver tracks how many label strings it could not map -- those
+    # become UNKNOWN with is_attack=False, which is the right call (it asserts
+    # nothing) but is silent label noise if the rate is material. The tracker
+    # existed and had ZERO callers, so the number was computed and discarded,
+    # the same pattern as the credibility verdict and the two loss terms.
+    #
+    # Measured 0.0% across 450k records from all three corpora today, so this
+    # is a safeguard rather than a fix -- it matters when new data arrives with
+    # label strings the maps have not seen.
+    try:
+        from data_unification.label_resolver import get_default_resolver
+        _cov = get_default_resolver().unresolved_report()
+        if _cov["unresolved_calls"]:
+            logging.warning(
+                "Label coverage: %.4f%% UNRESOLVED (%d of %d). Unmapped labels "
+                "become UNKNOWN/is_attack=False -- silent label noise. First few: %s",
+                100.0 * _cov["unresolved_rate"], _cov["unresolved_calls"],
+                _cov["resolve_calls"], _cov["distinct_unresolved_labels"][:10],
+            )
+        else:
+            logging.info("Label coverage: 100%% of %d labels mapped",
+                         _cov["resolve_calls"])
+    except Exception as _e:
+        logging.warning("label coverage unavailable: %s", _e)
+
     logging.info(
         "Frozen split %s: %d capture(s) read, %d held out from the encoder%s",
         ",".join(sorted(wanted)) if wanted else "ALL",
