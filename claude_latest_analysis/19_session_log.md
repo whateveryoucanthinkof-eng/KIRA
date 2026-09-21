@@ -163,3 +163,21 @@ sampling loop was costing more than the microbenchmark suggested.
 
 Combined with parallel ingest (12.5 min -> 3.9 min), a full 30-epoch run goes
 from roughly 8.7 h to **6.3 h**.
+
+### 16:15 — Found two more copies of the attribute-name list; both had drifted
+Same defect as this morning's `host_attributes.py`, in two more places:
+
+- **`explainability/unified_explanation.py`** said `active_conn_density` for
+  a value that is `unique_peers / flow_count` (peer fan-out). These strings
+  sit next to attribution scores an operator reads.
+- **`control_backend/model_adapter.py`** used `avg_flow_duration` and
+  `active_conn_density` as dict **keys** in `FEATURE_GROUP_MAP`. Neither name
+  exists, so both lookups silently missed and two of fifteen attributes had
+  no group in the dashboard UI.
+
+Both now derive from `HOST_ATTRIBUTES`; model_adapter raises at import if the
+two ever disagree. An ast-based test now fails if any module uses a stale name
+as a real string literal (docstrings excluded — they legitimately quote the
+old names when explaining the bug).
+
+*A duplicated name list drifts. The fix is to not have one.* *2 tests.*
