@@ -51,3 +51,8 @@ instead. Recorded the reasoning in `17_perf_experiments.md`.
 ### What to check at epoch 0
 **Per-class accuracy with more than one class above zero.** Aggregate CatAcc
 proves nothing — 0.8351 and 0.2115 were both collapses.
+
+### 15:56 — Parallel ingest confirmed on the real corpus
+**231.9 s** vs **12.5 min** serial for the same 34,152,542 records → **3.23x**,
+matching the 3.14x measured in isolation. ~8.6 min saved per run, and it
+applies to every downstream retrain too. Output is bit-identical (6 tests).
