@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
 from branch_a_gnn_lstm.sequence_dataset import (
     TECHNIQUE_VOCAB,
+    TECH_TO_IDX,
     HostSequenceDataset,
     create_host_sequence_samples,
     LazyHostSequenceDataset,
@@ -82,14 +83,73 @@ def _make_samples(records, extractor, seq_len: int):
     )
 
 
-def _evaluate(model, loader, device):
+def _print_per_class(per_class, where):
+    """Per-class precision/recall/f1/support, largest class first."""
+    if not per_class:
+        return
+    inv = {v: k for k, v in TECH_TO_IDX.items()}
+    print(f"  per-class ({where}):", flush=True)
+    print(f"    {'technique':<28} {'prec':>6} {'recall':>7} {'f1':>6} "
+          f"{'support':>9} {'predicted':>10}", flush=True)
+    for c, m in sorted(per_class.items(), key=lambda kv: -kv[1]["support"]):
+        print(f"    {inv.get(c, f'class_{c}'):<28} {m['precision']:>6.3f} "
+              f"{m['recall']:>7.3f} {m['f1']:>6.3f} {m['support']:>9,} "
+              f"{m['predicted']:>10,}", flush=True)
+
+
+def _warn_if_head_collapsed(metrics, where):
+    """Say plainly when accuracy is coming from the class prior, not the model.
+
+    On this corpus 82.5% of validation samples are Benign, so a constant
+    predictor scores ~0.825. Accuracy alone therefore cannot fail visibly. The
+    TGNE category head scored 0.83 while emitting one class for every input and
+    went unnoticed until macro F1 was computed -- these checks exist so that
+    cannot happen quietly a second time.
+    """
+    pred = metrics.get("tech_classes_predicted", 0)
+    present = metrics.get("tech_classes_present", 0)
+    lift = metrics.get("tech_lift_over_baseline", 0.0)
+    f1 = metrics.get("tech_macro_f1", 0.0)
+
+    if pred <= 1 and present > 1:
+        print(f"  WARNING [{where}]: technique head predicts a SINGLE class for "
+              f"every input ({present} classes present in the data). Its "
+              f"accuracy {metrics.get('tech_accuracy', 0):.3f} is the class "
+              f"prior, not a result.", flush=True)
+    elif lift < 0.01 and present > 1:
+        print(f"  WARNING [{where}]: technique accuracy "
+              f"{metrics.get('tech_accuracy', 0):.3f} is within 1 point of the "
+              f"majority-class baseline "
+              f"{metrics.get('tech_majority_baseline', 0):.3f} -- the head is "
+              f"adding almost nothing.", flush=True)
+    elif f1 < 0.2 and present > 2:
+        print(f"  WARNING [{where}]: macro F1 {f1:.3f} over {present} classes -- "
+              f"accuracy {metrics.get('tech_accuracy', 0):.3f} is carried by the "
+              f"majority class while minority classes are largely missed.",
+              flush=True)
+
+
+def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
     """Validation pass.
 
-    Accumulators live on the device and are read once at the end. The previous
+    Accumulators live on the device and are read once at the end. An earlier
     version called `.item()` for the loss, `.cpu().numpy()` for the risk errors
     and `.item()` for the technique hits -- three host-device syncs per batch --
     and grew a Python list to one float per validation sample (1.02M of them).
-    The reported metrics are unchanged.
+
+    ## Why this reports more than accuracy
+
+    82.5% of validation samples are Benign (val_positive_rate 0.1752). A model
+    that predicts Benign for everything scores ~0.825 aggregate accuracy, so
+    `tech_accuracy=0.880` is only 5.5 points above a constant classifier and
+    cannot, by itself, distinguish a working head from a collapsed one. That is
+    not hypothetical: the TGNE category head scored 0.83 while predicting a
+    single class, and was only caught when macro F1 was computed.
+
+    So this also returns macro F1, the majority-class baseline, the lift over
+    it, how many distinct classes the model actually predicts, and per-class
+    precision/recall/support. A confusion matrix is accumulated on-device with
+    a single bincount per batch, which adds no host-device sync.
     """
     model.eval()
     nb = 0
@@ -99,6 +159,14 @@ def _evaluate(model, loader, device):
     abs_err_sum = torch.zeros((), device=device, dtype=torch.float64)
     n_risk = 0
     correct_tech_t = torch.zeros((), device=device, dtype=torch.long)
+
+    C = int(num_techniques) if num_techniques else len(TECHNIQUE_VOCAB)
+    # confusion[t * C + p] -- flat so one bincount per batch suffices
+    confusion = torch.zeros(C * C, device=device, dtype=torch.long)
+
+    grad_correct = torch.zeros((), device=device, dtype=torch.long)
+    grad_total = 0
+
     with torch.no_grad():
         for batch in loader:
             x = batch["features"].to(device, non_blocking=non_blocking)
@@ -114,15 +182,60 @@ def _evaluate(model, loader, device):
             err = (predictions["risk_score"] - targets["risk"]).abs()
             abs_err_sum += err.double().sum()
             n_risk += int(err.numel())
-            correct_tech_t += (
-                predictions["technique_logits"].argmax(dim=-1) == targets["technique"]
-            ).sum()
-            total += int(targets["technique"].numel())
+
+            pred_t = predictions["technique_logits"].argmax(dim=-1)
+            true_t = targets["technique"]
+            correct_tech_t += (pred_t == true_t).sum()
+            total += int(true_t.numel())
+            confusion += torch.bincount(true_t * C + pred_t, minlength=C * C)
+
+            if "gradation_logits" in predictions:
+                pred_g = predictions["gradation_logits"].argmax(dim=-1)
+                grad_correct += (pred_g == targets["gradation"]).sum()
+                grad_total += int(targets["gradation"].numel())
+
     correct_tech = int(correct_tech_t.item())
+    cm = confusion.reshape(C, C).cpu().numpy()
+
+    support = cm.sum(axis=1)             # true count per class
+    predicted = cm.sum(axis=0)           # predicted count per class
+    tp = np.diag(cm)
+
+    present = support > 0                # classes that actually occur
+    with np.errstate(divide="ignore", invalid="ignore"):
+        precision = np.where(predicted > 0, tp / np.maximum(predicted, 1), 0.0)
+        recall = np.where(support > 0, tp / np.maximum(support, 1), 0.0)
+        denom = precision + recall
+        f1 = np.where(denom > 0, 2 * precision * recall / np.maximum(denom, 1e-12), 0.0)
+
+    macro_f1 = float(f1[present].mean()) if present.any() else 0.0
+    # What "always predict the most common class" would score.
+    baseline = float(support.max() / max(support.sum(), 1)) if support.sum() else 0.0
+    accuracy = correct_tech / max(1, total)
+
+    per_class = {
+        int(c): {
+            "precision": float(precision[c]),
+            "recall": float(recall[c]),
+            "f1": float(f1[c]),
+            "support": int(support[c]),
+            "predicted": int(predicted[c]),
+        }
+        for c in range(C) if support[c] > 0 or predicted[c] > 0
+    }
+
     return {
         "loss": float((loss_sum / nb).item()) if nb else 0.0,
         "risk_mae": float((abs_err_sum / n_risk).item()) if n_risk else 0.0,
-        "tech_accuracy": correct_tech / max(1, total),
+        "tech_accuracy": accuracy,
+        # -- the metrics that can tell a working head from a collapsed one --
+        "tech_macro_f1": macro_f1,
+        "tech_majority_baseline": baseline,
+        "tech_lift_over_baseline": accuracy - baseline,
+        "tech_classes_present": int(present.sum()),
+        "tech_classes_predicted": int((predicted > 0).sum()),
+        "tech_per_class": per_class,
+        "gradation_accuracy": (float(grad_correct.item()) / grad_total) if grad_total else None,
     }
 
 
@@ -137,6 +250,11 @@ def main():
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--eval-only", type=str, default=None,
+                        metavar="CKPT",
+                        help="Score an existing checkpoint and exit; no "
+                             "training, no checkpoint is written. '-' means "
+                             "the path given by --output.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader worker processes. 0 loads in the main "
                              "process, which serialises data loading with GPU "
@@ -332,6 +450,27 @@ def main():
         f"train_samples={len(train_ds)} val_samples={len(val_ds)} device={device}"
     )
     _n_train_batches = len(train_loader)
+    if args.eval_only:
+        # Re-score an existing checkpoint without retraining.
+        #
+        # The full-density Branch A run of 2026-09-21 completed before
+        # _evaluate reported macro F1, the majority-class baseline or a
+        # per-class breakdown, so its checkpoint carries only aggregate
+        # accuracy -- which on an 82.5%-Benign corpus cannot distinguish a
+        # working technique head from a collapsed one. Extraction is the
+        # expensive part (~37 min) and is identical either way, so re-scoring
+        # costs a fraction of a retrain.
+        _src = args.eval_only if str(args.eval_only) != "-" else args.output
+        print(f"EVAL-ONLY: scoring {_src} (no training)", flush=True)
+        _ck = torch.load(_src, map_location=device, weights_only=False)
+        model.load_state_dict(_ck["model_state_dict"])
+        _vm = _evaluate(model, val_loader, device, num_techniques=len(TECHNIQUE_VOCAB))
+        _vpc = _vm.pop("tech_per_class", {})
+        print(f"VALIDATION (checkpoint epoch {_ck.get('epoch')}): {_vm}", flush=True)
+        _warn_if_head_collapsed(_vm, "validation")
+        _print_per_class(_vpc, "validation")
+        return
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         # Loss is accumulated as a GPU tensor and read once at the end of the
@@ -375,8 +514,12 @@ def main():
             f"epoch={epoch} train_loss={metrics['train_loss']:.4f} "
             f"val_loss={metrics['loss']:.4f} risk_mae={metrics['risk_mae']:.4f} "
             f"tech_accuracy={metrics['tech_accuracy']:.3f} "
+            f"tech_macro_f1={metrics['tech_macro_f1']:.3f} "
+            f"lift={metrics['tech_lift_over_baseline']:+.3f} "
+            f"classes_pred={metrics['tech_classes_predicted']}/{metrics['tech_classes_present']} "
             f"wall={metrics['epoch_seconds'] / 60:.1f}m"
         )
+        _warn_if_head_collapsed(metrics, f"epoch {epoch}")
         if metrics["loss"] < best_loss:
             best_loss = metrics["loss"]
             best_metrics = metrics
@@ -413,7 +556,11 @@ def main():
     test_loader = DataLoader(test_ds,
                              batch_size=args.batch_size, shuffle=False, **_loader_kw)
     test_metrics = _evaluate(model, test_loader, device)
+    _per_class = test_metrics.pop("tech_per_class", {})
     print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): {test_metrics}", flush=True)
+    _warn_if_head_collapsed(test_metrics, "held-out test")
+    _print_per_class(_per_class, "held-out test")
+    test_metrics["tech_per_class"] = _per_class
     # The credibility verdict travels WITH the checkpoint.
     #
     # It used to be computed, printed to stdout, and thrown away. The
