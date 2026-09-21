@@ -39,13 +39,26 @@ class CWASequenceDataset(Dataset):
         s = self.samples[idx]
         return {
             "h_future": torch.from_numpy(s["h_future"]).float(),
+            **({"h_history": torch.from_numpy(s["h_history"]).float()} if "h_history" in s else {}),
             "input_tokens": torch.from_numpy(s["input_tokens"]).long(),
             "target_tokens": torch.from_numpy(s["target_tokens"]).long(),
             "obs_token": torch.tensor(s["obs_token"], dtype=torch.long),
         }
 
 
-def create_cwa_training_samples(trajectories, vocab, K: int = 4):
+def create_cwa_training_samples(trajectories, vocab, K: int = None, T: int = None):
+    """Build DeepOP samples.
+
+    When T > 0 each sample also carries `h_history`, the T observed states
+    preceding the horizon. That is what lets the trainer condition DeepOP on
+    Branch B's *predicted* future states rather than the oracle ones stored in
+    `h_future` -- audit finding E1: the shipped decoder was trained on ground
+    truth it will never see at serve time, where its input is a WDT rollout.
+    """
+    # K/T were literal 4/0, contradicting the v4 contract (history 15, forecast 5).
+    _c = get_contract()
+    K = _c.forecast_steps if K is None else K
+    T = _c.history_steps if T is None else T
     samples = []
     for host_ip, snaps in trajectories.items():
         if len(snaps) < K:
@@ -56,6 +69,15 @@ def create_cwa_training_samples(trajectories, vocab, K: int = 4):
         for i in range(0, n - K + 1):
             future_snaps = snaps[i : i + K]
             h_fut = np.array([s.embedding for s in future_snaps], dtype=np.float32)
+            h_hist = None
+            if T > 0:
+                lo = max(0, i - T)
+                hist = [s.embedding for s in snaps[lo:i]]
+                if len(hist) < T and hist:
+                    hist = [hist[0]] * (T - len(hist)) + hist
+                elif not hist:
+                    hist = [future_snaps[0].embedding] * T
+                h_hist = np.array(hist, dtype=np.float32)
 
             token_ids = []
             for s in future_snaps:
@@ -79,6 +101,8 @@ def create_cwa_training_samples(trajectories, vocab, K: int = 4):
                 "target_tokens": np.array(target_seq, dtype=int),
                 "obs_token": int(obs_tok),
             }
+            if h_hist is not None:
+                sample_item["h_history"] = h_hist
             samples.append(sample_item)
 
             # Duplicate active attack sequences (2x) to prevent quiescent mode collapse
@@ -91,12 +115,13 @@ def create_cwa_training_samples(trajectories, vocab, K: int = 4):
 
 def train_cwa_decoder(
     epochs: int = 6,
-    K: int = 4,
+    K: int = None,
     batch_size: int = 32,
     lr: float = 5e-4,
     save_path: str = "saved_models/deepop/cwa_forecast_decoder.pt",
     max_per_source: int = 1000,
 ):
+    K = get_contract().forecast_steps if K is None else K
     from data_unification.split_manager import get_split_manager
     print("Loading multi-dataset records for DeepOP CWA Decoder from ScientificSplitManager...")
     sm = get_split_manager()
@@ -309,7 +334,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train DeepOP CWA Decoder")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--K", type=int, default=4, help="Forecast horizon steps")
+    parser.add_argument("--K", type=int, default=get_contract().forecast_steps,
+                        help="Forecast horizon steps (default: the v4 contract)")
     parser.add_argument("--smoke_test", action="store_true", help="Run 1-epoch smoke test with small sample count")
     args = parser.parse_args()
 

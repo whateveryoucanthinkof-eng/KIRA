@@ -12,7 +12,12 @@ from enum import Enum
 import numpy as np
 import torch
 import torch.nn.functional as F
-from data_unification.temporal_config import MACRO_WINDOW_SIZE_SEC, DEFAULT_ROLLOUT_HORIZON_MACRO
+# The assembler feeds the real Branch A / Branch B / DeepOP checkpoints, so its
+# defaults must be the contract's, not the unsupported 60s MACRO granularity it
+# used to default to (K=4, 60s windows, 10/5 history -- all four wrong).
+from cyberworld_v4.config import get_contract
+
+_CONTRACT = get_contract()
 
 
 class Provenance(str, Enum):
@@ -87,10 +92,10 @@ class AttackTrajectoryAssembler:
         self,
         host_trajectories: Dict[str, list],
         batch_size: int = 128,
-        K: int = DEFAULT_ROLLOUT_HORIZON_MACRO,
-        window_size_sec: float = MACRO_WINDOW_SIZE_SEC,
-        max_seq_len_a: int = 10,
-        max_seq_len_wdt: int = 5,
+        K: int = None,
+        window_size_sec: float = None,
+        max_seq_len_a: int = None,
+        max_seq_len_wdt: int = None,
         lateral_pairs: Optional[List[Tuple[str, str]]] = None,
     ) -> Dict[str, HostAttackTrajectory]:
         """
@@ -99,6 +104,14 @@ class AttackTrajectoryAssembler:
         achieving up to ~89x throughput acceleration.
         """
         from branch_a_gnn_lstm.sequence_dataset import TECHNIQUE_VOCAB
+
+        # Resolve against the contract. Branch A is trained with
+        # seq_len=history_steps (15) and Branch B with the same history, so the
+        # previous literals silently truncated both at serving time.
+        K = _CONTRACT.forecast_steps if K is None else K
+        window_size_sec = _CONTRACT.window_seconds if window_size_sec is None else window_size_sec
+        max_seq_len_a = _CONTRACT.history_steps if max_seq_len_a is None else max_seq_len_a
+        max_seq_len_wdt = _CONTRACT.history_steps if max_seq_len_wdt is None else max_seq_len_wdt
 
         results: Dict[str, HostAttackTrajectory] = {}
         items = list(host_trajectories.items())

@@ -45,7 +45,12 @@ class HostRolloutDataset(Dataset):
         }
 
 
-def create_rollout_samples(trajectories, T: int = 4, K: int = 4):
+def create_rollout_samples(trajectories, T: int = None, K: int = None):
+    # T/K were literal 4s, contradicting the v4 contract (history 15, forecast 5)
+    # that every other stage and every checkpoint validator uses.
+    _c = get_contract()
+    T = _c.history_steps if T is None else T
+    K = _c.forecast_steps if K is None else K
     samples = []
     for host_ip, snaps in trajectories.items():
         if len(snaps) < T + 1:
@@ -78,12 +83,15 @@ def create_rollout_samples(trajectories, T: int = 4, K: int = 4):
 
 def train_branch_b(
     epochs: int = 4,
-    T: int = 4,
-    K: int = 4,
+    T: int = None,
+    K: int = None,
     batch_size: int = 32,
     lr: float = 1e-3,
     save_path: str = "saved_models/branch_b/host_wdt.pt",
 ):
+    _c = get_contract()
+    T = _c.history_steps if T is None else T
+    K = _c.forecast_steps if K is None else K
     print("Loading disjoint train/val multi-dataset partitions via ScientificSplitManager for Branch B...")
     sm = ScientificSplitManager()
     train_records = sm.get_train_records(max_per_source=600)
@@ -161,7 +169,7 @@ def train_branch_b(
         wdt.eval()
         risk_head.eval()
         val_losses = []
-        k1_mses, k4_mses, persist_mses = [], [], []
+        k1_mses, k_last_mses, persist_mses = [], [], []
 
         with torch.no_grad():
             for batch in val_loader:
@@ -178,22 +186,22 @@ def train_branch_b(
                 # Compare Horizon 1 MSE vs Persistence Baseline
                 k1_mse = F.mse_loss(h_pred[:, 0, :], h_fut[:, 0, :]).item()
                 persist_mse = F.mse_loss(h_hist[:, -1, :], h_fut[:, 0, :]).item()
-                k4_mse = F.mse_loss(h_pred[:, -1, :], h_fut[:, -1, :]).item()
+                k_last_mse = F.mse_loss(h_pred[:, -1, :], h_fut[:, -1, :]).item()
 
                 k1_mses.append(k1_mse)
                 persist_mses.append(persist_mse)
-                k4_mses.append(k4_mse)
+                k_last_mses.append(k_last_mse)
 
         mean_val = float(np.mean(val_losses))
         mean_k1 = float(np.mean(k1_mses))
         mean_persist = float(np.mean(persist_mses))
-        mean_k4 = float(np.mean(k4_mses))
+        mean_k_last = float(np.mean(k_last_mses))
         improvement = ((mean_persist - mean_k1) / max(1e-6, mean_persist)) * 100.0
 
         print(
             f"Epoch {epoch:02d} | Val Loss: {mean_val:.4f} | "
             f"1-Step MSE: {mean_k1:.4f} vs Persist: {mean_persist:.4f} (+{improvement:.1f}%) | "
-            f"K=4 MSE: {mean_k4:.4f}"
+            f"K={K} MSE: {mean_k_last:.4f}"
         )
 
         if mean_val < best_val_loss:
@@ -204,7 +212,13 @@ def train_branch_b(
                     "risk_head_state_dict": risk_head.state_dict(),
                     "epoch": epoch,
                     "k1_mse": mean_k1,
-                    "k4_mse": mean_k4,
+                    "k_last_mse": mean_k_last,
+                    # Without these, validate_checkpoint() can never accept the
+                    # file -- it has nothing to compare the contract against.
+                    "window_seconds": _c.window_seconds,
+                    "window_size_sec": _c.window_seconds,  # v3 key, kept readable
+                    "history_steps": T,
+                    "forecast_steps": K,
                 },
                 save_path,
             )
@@ -213,7 +227,7 @@ def train_branch_b(
     return {
         "best_val_loss": best_val_loss,
         "k1_mse": mean_k1,
-        "k4_mse": mean_k4,
+        "k_last_mse": mean_k_last,
         "save_path": save_path,
     }
 
