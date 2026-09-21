@@ -166,6 +166,7 @@ class NeighborFinder:
     built directly in branch_a_gnn_lstm and multi_dataset_stream. Large graphs
     come in through get_neighbor_finder(), which passes `_csr` instead and
     never materialises a Python object per edge."""
+    self._csr = _csr
     if _csr is not None:
       flat_nbr, flat_eidx, flat_ts, offsets = _csr
       self.node_to_neighbors = _CSRRows(flat_nbr, offsets)
@@ -201,7 +202,96 @@ class NeighborFinder:
 
     return self.node_to_neighbors[src_idx][:i], self.node_to_edge_idxs[src_idx][:i], self.node_to_edge_timestamps[src_idx][:i]
 
+  def _segment_searchsorted(self, starts, ends, cut_times):
+    """Vectorised `np.searchsorted` inside each node's CSR slice.
+
+    numpy has no segmented searchsorted, and the flat timestamp array is only
+    sorted WITHIN a segment, never globally -- so one global searchsorted is
+    wrong. This runs a branchless binary search over all rows at once:
+    O(log max_degree) vectorised passes instead of one Python-level
+    searchsorted per node.
+    """
+    lo = starts.astype(np.int64, copy=True)
+    hi = ends.astype(np.int64, copy=True)
+    flat_ts = self._csr[2]
+    # ceil(log2) of the widest segment bounds the iteration count.
+    span = int(max(1, (ends - starts).max()))
+    for _ in range(int(np.ceil(np.log2(span + 1))) + 1):
+      active = lo < hi
+      if not active.any():
+        break
+      mid = (lo + hi) >> 1
+      # `mid` is within [starts, ends) for active rows. Inactive rows must
+      # still gather *something*, and `starts` is not safe for them: a node
+      # with no edges after the last owner has starts == len(flat_ts), which
+      # is out of bounds. Clamp into the array.
+      safe_mid = np.where(active, mid, 0)
+      np.clip(safe_mid, 0, max(0, len(flat_ts) - 1), out=safe_mid)
+      go_right = active & (flat_ts[safe_mid] < cut_times)
+      lo = np.where(go_right, mid + 1, lo)
+      hi = np.where(active & ~go_right, mid, hi)
+    return lo
+
   def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=20):
+    """Vectorised over the batch when CSR storage is available.
+
+    The reference implementation loops over every node in the batch, doing its
+    own searchsorted and slicing. At batch 128 that is 384 Python iterations
+    per batch (source, destination, negative) and ~35M per epoch, all
+    GIL-bound on one core -- which is why 15 of 16 cores and ~95% of the GPU
+    sat idle while an epoch took 13.5 minutes.
+
+    `_get_temporal_neighbor_reference` below is the original, kept verbatim as
+    the oracle that tests/test_temporal_neighbor_vectorised.py checks against.
+    """
+    if self._csr is None or n_neighbors <= 0:
+      return self._get_temporal_neighbor_reference(source_nodes, timestamps, n_neighbors)
+
+    flat_nbr, flat_eidx, flat_ts, offsets = self._csr
+    nodes = np.asarray(source_nodes, dtype=np.int64)
+    cut = np.asarray(timestamps, dtype=np.float64)
+    assert len(nodes) == len(cut)
+
+    starts = offsets[nodes]
+    ends = offsets[nodes + 1]
+    # Index one past the last interaction strictly before cut_time.
+    stop = self._segment_searchsorted(starts, ends, cut)
+    avail = stop - starts
+
+    B = len(nodes)
+    col = np.arange(n_neighbors, dtype=np.int64)
+
+    if self.uniform:
+      # Match the reference exactly: it draws n_neighbors indices WITH
+      # replacement from [0, len(source_neighbors)), then re-sorts by time.
+      # Rows with no history stay all-zero.
+      has = avail > 0
+      draw = np.zeros((B, n_neighbors), dtype=np.int64)
+      if has.any():
+        r = np.random.randint(0, np.maximum(avail, 1)[:, None], size=(B, n_neighbors))
+        draw = starts[:, None] + r
+      pick = np.where(has[:, None], draw, 0)
+      nb = np.where(has[:, None], flat_nbr[pick], 0)
+      ei = np.where(has[:, None], flat_eidx[pick], 0)
+      et = np.where(has[:, None], flat_ts[pick], 0.0)
+      order = np.argsort(et, axis=1, kind="stable")
+      rows = np.arange(B)[:, None]
+      return (nb[rows, order].astype(np.int32),
+              ei[rows, order].astype(np.int32),
+              et[rows, order].astype(np.float32))
+
+    # Most-recent-n: take positions [stop - k, stop), right-aligned in the
+    # output, which is what the reference's negative slicing produces.
+    src_idx = stop[:, None] - n_neighbors + col[None, :]
+    valid = (src_idx >= starts[:, None]) & (src_idx < stop[:, None])
+    safe = np.where(valid, src_idx, 0)
+    zero_i = np.zeros((), dtype=np.int32)
+    neighbors = np.where(valid, flat_nbr[safe], zero_i).astype(np.int32)
+    edge_idxs = np.where(valid, flat_eidx[safe], zero_i).astype(np.int32)
+    edge_times = np.where(valid, flat_ts[safe], 0.0).astype(np.float32)
+    return neighbors, edge_idxs, edge_times
+
+  def _get_temporal_neighbor_reference(self, source_nodes, timestamps, n_neighbors=20):
     """
     Given a list of users ids and relative cut times, extracts a sampled temporal neighborhood of each user in the list.
 
