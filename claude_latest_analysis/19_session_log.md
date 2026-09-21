@@ -640,3 +640,43 @@ different path serves them or the feature is inert.
 
 Not touching it: deleting or wiring up UI behaviour is a product decision,
 not a bug fix, and I would be guessing at the intent.
+
+### 20:25 — ENCODER DONE. Held-out test results (scored once).
+
+Early stopping fired after 12 epochs; best = **epoch 6**. `val_ap` and the
+combined criterion agreed, so the auto-saved checkpoint is the right one.
+
+**Transductive (hosts seen in training):**
+
+| | |
+|---|---|
+| Link Prediction AUC / AP | **0.9972 / 0.9973** |
+| MRR | 0.9870 |
+| Category Accuracy | 0.9740 |
+| **Category Macro F1** | **0.8405** |
+
+per-class accuracy: Benign 0.984 · C2 0.816 · Impact 1.000 ·
+**InitialAccess 0.514** · Recon 0.897
+per-class precision: Benign 0.989 · C2 0.874 · Impact 0.980 ·
+**InitialAccess 0.379** · Recon 0.999
+
+**Inductive (unseen hosts):** AUC **0.9626**, AP 0.9617, Macro F1 **0.9551**
+
+### Three caveats these numbers need
+
+1. **Recon 0.897 is host memorisation, not detection.** Its single carrier
+   host (172.16.0.1) is in both train and test, so the transductive score is
+   recognising that host. Precision 0.9995 off one source is the signature.
+   Do not report it as reconnaissance-detection capability.
+2. **Quote macro F1 (0.8405), not accuracy (0.9740).** The latter is ~90%
+   Benign. InitialAccess drags macro down: 0.514 accuracy, **0.379
+   precision** — consistent with it being ~half Infiltration, which a tree
+   also cannot detect (0.278 recall).
+3. **Inductive AUC fell 0.9946 (val) → 0.9626 (test).** A 0.032 drop. Still
+   strong, but the validation figure was optimistic; the inductive test set is
+   129k interactions from different captures.
+
+Worth noting inductive macro F1 (0.9551) *exceeds* transductive (0.8405) —
+almost certainly a class-mix difference in the small inductive test set, not
+better generalisation. Another reason to read macro F1 alongside the
+composition, not alone.
