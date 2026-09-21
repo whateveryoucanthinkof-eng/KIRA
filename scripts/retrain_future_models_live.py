@@ -1,6 +1,7 @@
 """Retrain Branch B and DeepOP on the canonical live TGNE latent space."""
 
 import argparse
+import shutil
 import time
 import os
 import random
@@ -447,9 +448,37 @@ def main():
         print(f"credibility check skipped: {_e}", flush=True)
 
     device="cuda" if torch.cuda.is_available() else "cpu"
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    wdt = train_branch_b_live(train_traj,val_traj,args.out_dir/"host_wdt.canonical-tgne.pt",args.epochs,device,num_workers=args.num_workers)
-    train_deepop_live(train_traj,val_traj,args.out_dir/"cwa_forecast_decoder.canonical-tgne.pt",args.epochs,device,wdt=wdt,num_workers=args.num_workers)
+
+    # Write where the adapter actually loads from.
+    #
+    # These used to be written as "<out_dir>/host_wdt.canonical-tgne.pt" and
+    # "<out_dir>/cwa_forecast_decoder.canonical-tgne.pt". Nothing reads either
+    # name -- control_backend/model_adapter.py loads
+    # saved_models/branch_b/host_wdt.pt and
+    # saved_models/deepop/cwa_forecast_decoder.pt. So a full downstream retrain
+    # could succeed and leave the served models untouched: the v3 checkpoints
+    # would stay in place, the adapter would keep refusing to compose them with
+    # a v4 Branch A, and the parity check would stay blocked -- with nothing
+    # anywhere reporting a failure. Branch A's live script already writes
+    # straight to its served path; these now match it.
+    #
+    # The existing checkpoint is copied aside first, once, before training
+    # starts. Both trainers save on every improving epoch, so a backup taken
+    # any later would capture a partly-retrained model rather than the model
+    # being replaced.
+    bb_out = args.out_dir / "branch_b" / "host_wdt.pt"
+    dp_out = args.out_dir / "deepop" / "cwa_forecast_decoder.pt"
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    for _p in (bb_out, dp_out):
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        if _p.exists():
+            _bak = _p.with_name(f"{_p.stem}.superseded-{stamp}{_p.suffix}")
+            shutil.copy2(_p, _bak)
+            print(f"backed up {_p} -> {_bak}", flush=True)
+
+    wdt = train_branch_b_live(train_traj,val_traj,bb_out,args.epochs,device,num_workers=args.num_workers)
+    train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,num_workers=args.num_workers)
+    print(f"served checkpoints updated: {bb_out}, {dp_out}", flush=True)
 
 
 if __name__ == "__main__":

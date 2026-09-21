@@ -1,7 +1,7 @@
 # Downstream retrain runbook — run this the moment TGNE finishes
 
 **Prerequisite:** `tgne-retrain` completes and writes
-`saved_models/bita_bigru_transformer-unified_v5.pth`.
+`saved_models/bita_bigru_transformer-unified_final.pth`.
 
 Everything below assumes the fixes committed on 2026-09-21 are in place: the
 12-hour clock repair, IP node features, the frozen split wired into every
@@ -84,7 +84,7 @@ and make sure a matching `<checkpoint>_config.json` sits beside it --
 ## 2. Branch A
 
 ```bash
-TGNE_CHECKPOINT_PATH=saved_models/bita_bigru_transformer-unified_v5.pth \
+TGNE_CHECKPOINT_PATH=saved_models/bita_bigru_transformer-unified_final.pth \
 python scripts/retrain_branch_a_live.py \
   --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
   --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
@@ -112,11 +112,24 @@ python scripts/retrain_branch_a_live.py \
 python scripts/retrain_future_models_live.py \
   --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
   --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
-  --tgne saved_models/bita_bigru_transformer-unified_v5.pth \
+  --tgne saved_models/bita_bigru_transformer-unified_final.pth \
   --out-dir saved_models \
-  --epochs 6 --spill-dir .spill \
-  --spill-dir .spill
+  --epochs 6 --spill-dir .spill --num-workers 4
 ```
+
+`--out-dir saved_models` puts the two checkpoints exactly where
+`control_backend/model_adapter.py` loads them:
+`saved_models/branch_b/host_wdt.pt` and
+`saved_models/deepop/cwa_forecast_decoder.pt`. Any existing file is copied to
+`<stem>.superseded-<UTC>.pt` before training starts. (They previously went to
+`host_wdt.canonical-tgne.pt`, which nothing ever read -- see report 23.)
+
+Until both finish, the adapter refuses to load at all --
+`Checkpoint contract conflict on history_steps: branch_b says 5, an earlier
+checkpoint said 15` -- because Branch A is already v4. That is expected. It is
+also what keeps the three adapter test modules skipped and
+`scripts/verify_offline_live_parity.py` blocked; all three clear themselves
+when this run completes.
 
 This one **does** take `--tgne`. To use real per-host PCAP trajectories instead
 of the CSV path (which fabricates host identity on 9 of 10 CIC-2018 days):
