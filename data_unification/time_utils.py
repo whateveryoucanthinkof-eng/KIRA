@@ -14,6 +14,8 @@ One helper, used by all adapters, so the assumption lives in a single place.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
@@ -139,19 +141,53 @@ def hours_present_in_file(
     utc: bool = False,
 ):
     """(set_of_hours, n_valid_rows) from one cheap single-column read."""
+    # Read in CHUNKS. `low_memory=False` was catastrophic here: it forces pandas
+    # to parse the whole file as one block, and the C tokenizer buffers every
+    # column before `usecols` is applied. On tue_20 (7.9M rows x 84 columns)
+    # this single call peaked at 13.91 GiB -- it was the entire reason the TGNE
+    # loader was being OOM-killed, not the records it was accumulating.
+    #
+    # Only the SET of hours and a valid-row count are needed, and both compose
+    # across chunks, so peak is now one chunk.
+    hours: set = set()
+    n_valid = 0
     try:
-        col = pd.read_csv(filepath, usecols=[ts_col], encoding=encoding, low_memory=False)
-    except Exception:
+        # dtype=str is required, not cosmetic. Without it pandas infers dtypes
+        # per chunk, and a column with mixed types -- which the 288,602 blank
+        # padding rows in CIC-2017 Thursday-Morning-WebAttacks guarantee --
+        # sends it down the DtypeWarning path, where `usecols` + `chunksize`
+        # together hit a pandas bug: _concatenate_chunks indexes column_names
+        # by the ORIGINAL column position while that list holds only the
+        # selected column, raising IndexError. Reading the column as text
+        # skips inference entirely, and we parse it as a date ourselves anyway.
+        reader = pd.read_csv(
+            filepath, usecols=[ts_col], encoding=encoding,
+            dtype={ts_col: str}, chunksize=500_000,
+        )
+        for chunk in reader:
+            parsed = pd.to_datetime(chunk[ts_col], dayfirst=dayfirst, utc=utc,
+                                    errors="coerce")
+            e = to_epoch_seconds(parsed)
+            valid = e > 0
+            k = int(valid.sum())
+            if k:
+                n_valid += k
+                hours |= set(np.unique(hour_of_day(e[valid])).tolist())
+            # Once a 24-hour clock is proven there is nothing left to learn.
+            if hours & _IMPOSSIBLE_ON_12H_DIAL:
+                break
+    except Exception as exc:
+        # NEVER fail silently here. A swallowed error returns "no hours", which
+        # reads as "not a 12-hour clock", which leaves a genuinely broken file
+        # unrepaired -- the exact silent-failure shape of the original bug this
+        # module exists to fix (a bare `except` that zeroed every timestamp).
+        logging.getLogger(__name__).error(
+            "clock detection failed on %s (%s: %s); the file will NOT be "
+            "repaired -- investigate rather than ignoring this",
+            filepath, type(exc).__name__, exc,
+        )
         return set(), 0
-    if col.empty:
-        return set(), 0
-    parsed = pd.to_datetime(col[ts_col], dayfirst=dayfirst, utc=utc, errors="coerce")
-    e = to_epoch_seconds(parsed)
-    valid = e > 0
-    n = int(valid.sum())
-    if n == 0:
-        return set(), 0
-    return set(np.unique(hour_of_day(e[valid])).tolist()), n
+    return hours, n_valid
 
 
 def detect_12h_clock_in_file(
