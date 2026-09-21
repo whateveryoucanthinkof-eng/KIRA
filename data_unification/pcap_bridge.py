@@ -79,7 +79,7 @@ def _host_window_stream(
                 yield (
                     cur_bucket,
                     host,
-                    table.snapshot_flows(max_flows=256),
+                    table.snapshot_flows(max_flows=None),
                     engine.extract_features(buf, window_seconds),
                 )
             table, engine, buf = LiveFlowTable(), LivePCAPEngine(), []
@@ -93,7 +93,7 @@ def _host_window_stream(
         yield (
             cur_bucket,
             host,
-            table.snapshot_flows(max_flows=256),
+            table.snapshot_flows(max_flows=None),
             engine.extract_features(buf, window_seconds),
         )
 

@@ -7,7 +7,7 @@ flow telemetry features per 2.0-second time window.
 Zero CSV or disk roundtrips.
 """
 
-from typing import Dict, List, Set, Tuple, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 FLOW_COLUMNS = [
@@ -96,10 +96,18 @@ class FlowRecord:
             if flags.get("URG"): self.urg_count += 1
 
 class LiveFlowTable:
-    def snapshot_flows(self, max_flows: int = 256) -> List[Dict[str, Any]]:
-        """Export active 5-tuple flows for downstream UnifiedFlowRecord ingestion."""
+    def snapshot_flows(self, max_flows: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Export active 5-tuple flows for downstream UnifiedFlowRecord ingestion.
+
+        max_flows=None means EVERY active flow. The default used to be 256,
+        which silently discarded every flow past the 256th for a host in a
+        window -- invisible data loss on the PCAP training path. The live
+        serving path (telemetry/state/state_builder.py) still passes an
+        explicit bound, because there it is a latency guard, not a sample.
+        """
         out: List[Dict[str, Any]] = []
-        for key, f in list(self.active_flows.items())[:max_flows]:
+        items = list(self.active_flows.items())
+        for key, f in (items if max_flows is None else items[:max_flows]):
             src, dst, sport, dport, proto = key
             out.append({
                 "src_ip": str(src),

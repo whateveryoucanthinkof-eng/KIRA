@@ -160,7 +160,7 @@ class PcapFlowExtractor:
                     "window_start": w_start,
                     "window_end": ts,
                     "packet_count": len(buf),
-                    "flows": table.snapshot_flows(max_flows=256),
+                    "flows": table.snapshot_flows(max_flows=None),
                     # The 30 PS-named packet features, finally reaching a caller.
                     "packet_features": engine.extract_features(buf, self.window_seconds),
                 }
@@ -181,7 +181,7 @@ class PcapFlowExtractor:
                 "window_start": w_start,
                 "window_end": w_start + self.window_seconds,
                 "packet_count": len(buf),
-                "flows": table.snapshot_flows(max_flows=256),
+                "flows": table.snapshot_flows(max_flows=None),
                 "packet_features": engine.extract_features(buf, self.window_seconds),
             }
 

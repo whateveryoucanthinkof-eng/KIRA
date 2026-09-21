@@ -184,13 +184,13 @@ class ScientificSplitManager:
 
     # -------------------------------------------------------------- legacy API
 
-    def get_train_records(self, max_per_source: int = 1500, stride: int = 20) -> List[UnifiedFlowRecord]:
+    def get_train_records(self, max_per_source: Optional[int] = None, stride: int = 1) -> List[UnifiedFlowRecord]:
         return self.records_for("train", max_per_source, stride)
 
-    def get_val_records(self, max_per_source: int = 500, stride: int = 20) -> List[UnifiedFlowRecord]:
+    def get_val_records(self, max_per_source: Optional[int] = None, stride: int = 1) -> List[UnifiedFlowRecord]:
         return self.records_for("val", max_per_source, stride)
 
-    def get_heldout_test_records(self, max_per_source: int = 1500, stride: int = 20) -> List[UnifiedFlowRecord]:
+    def get_heldout_test_records(self, max_per_source: Optional[int] = None, stride: int = 1) -> List[UnifiedFlowRecord]:
         """The held-out test split. Score it ONCE, at the end, on the restored
         best checkpoint -- never for model selection."""
         return self.records_for("test", max_per_source)

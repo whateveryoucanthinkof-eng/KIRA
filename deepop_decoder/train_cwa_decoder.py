@@ -7,6 +7,7 @@ import os
 import sys
 import numpy as np
 import torch
+from typing import Optional
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -119,14 +120,15 @@ def train_cwa_decoder(
     batch_size: int = 32,
     lr: float = 5e-4,
     save_path: str = "saved_models/deepop/cwa_forecast_decoder.pt",
-    max_per_source: int = 1000,
+    max_per_source: Optional[int] = None,
 ):
     K = get_contract().forecast_steps if K is None else K
     from data_unification.split_manager import get_split_manager
     print("Loading multi-dataset records for DeepOP CWA Decoder from ScientificSplitManager...")
     sm = get_split_manager()
     train_records = sm.get_train_records(max_per_source=max_per_source)
-    val_records = sm.get_val_records(max_per_source=max(50, max_per_source // 2))
+    val_records = sm.get_val_records(
+        max_per_source=None if max_per_source is None else max(50, max_per_source // 2))
 
     tgn = build_or_load_tgne_ta()
     # Contract-bound. This was hardcoded to 60.0 while the shipped checkpoints

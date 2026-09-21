@@ -26,6 +26,7 @@ from data_unification.cic2018_adapter import CIC2018Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.split_policy import partition_paths
+from data_unification.density import require_full_density
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
@@ -110,7 +111,8 @@ def main():
     parser.add_argument("--cic-dir", type=Path, required=True)
     parser.add_argument("--ctu-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--rows-per-file", type=int, default=1000)
+    parser.add_argument("--rows-per-file", type=int, default=None,
+                        help="Cap records kept per capture. Default None = FULL DENSITY.")
     parser.add_argument("--spill-dir", type=Path, default=None, help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
     parser.add_argument("--epochs", type=int, default=5)
@@ -131,6 +133,12 @@ def main():
         dataset_sources=[str(args.cic_dir), str(args.ctu_dir)],
     )
     set_all_seeds(args.seed)
+
+    require_full_density(
+        'Branch A retrain',
+        stride=args.stride,
+        rows_per_file=args.rows_per_file,
+    )
 
     cic_files = sorted(args.cic_dir.glob("*.csv"))
     ctu_files = sorted(args.ctu_dir.glob("*/*.binetflow"))

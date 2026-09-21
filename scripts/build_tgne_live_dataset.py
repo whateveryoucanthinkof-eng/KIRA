@@ -20,7 +20,8 @@ def main():
     parser.add_argument("--cic-dir", type=Path, required=True)
     parser.add_argument("--ctu-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--rows-per-file", type=int, default=1000)
+    parser.add_argument("--rows-per-file", type=int, default=None,
+                        help="Default None = FULL DENSITY.")
     args = parser.parse_args()
 
     records = []

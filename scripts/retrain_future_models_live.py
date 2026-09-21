@@ -25,6 +25,7 @@ from data_unification.cic2018_adapter import CIC2018Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.pcap_bridge import iter_day_records
+from data_unification.density import require_full_density
 from data_unification.split_policy import partition_paths, split_of
 
 
@@ -86,7 +87,7 @@ def load_records(cic_dir, ctu_dir, rows_per_file, stride=1):
     return _read(part["train"]), _read(part["val"])
 
 
-def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_day=None, max_packets_per_host=20000, window_stride=1):
+def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_day=None, max_packets_per_host=None, window_stride=1):
     """Real per-host host-trajectory data (fixes D1: CIC-2018 CSV fabricates host IPs by row-index
     for 9/10 days -- see claude_latest_analysis/08_why_the_csv_path_cannot_benchmark.md).
 
@@ -148,7 +149,7 @@ def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_
 
 
 def iter_pcap_day_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_day=None,
-                          max_packets_per_host=20000, window_stride=1):
+                          max_packets_per_host=None, window_stride=1):
     """Yields (split, day_name, records) one capture day at a time.
 
     load_pcap_records() accumulates every day's records before returning, which
@@ -312,7 +313,9 @@ def main():
     parser.add_argument("--pcap-max-windows-per-day",type=int,default=None)
     parser.add_argument("--pcap-window-stride",type=int,default=1,help="Keep every Nth window across the full day")
     parser.add_argument("--tgne",type=Path,required=True); parser.add_argument("--out-dir",type=Path,required=True)
-    parser.add_argument("--rows-per-file",type=int,default=1000); parser.add_argument("--stride",type=int,default=1)
+    parser.add_argument("--rows-per-file",type=int,default=None,
+                        help="Cap records kept per capture. Default None = FULL DENSITY.")
+    parser.add_argument("--stride",type=int,default=1)
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=3)
     args=parser.parse_args(); random.seed(42); np.random.seed(42); torch.manual_seed(42)
@@ -323,6 +326,14 @@ def main():
     extractor=HostTrajectoryExtractor(
         tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds,
         spill_dir=str(args.spill_dir) if args.spill_dir else None)
+
+    require_full_density(
+        'Branch B + DeepOP retrain',
+        stride=args.stride,
+        rows_per_file=args.rows_per_file,
+        pcap_window_stride=args.pcap_window_stride,
+        pcap_max_windows_per_day=args.pcap_max_windows_per_day,
+    )
 
     if args.pcap_root:
         if not args.cic2018_csv_dir:

@@ -28,6 +28,7 @@ from data_unification.tgne_features import (
     SCHEMA_VERSION,
     extract_canonical_edge_features,
 )
+from data_unification.density import require_full_density
 
 
 class FocalLoss(nn.Module):
@@ -356,9 +357,14 @@ def load_and_preprocess_unified_dataset(
     col_ts = _Growable(np.float64)
     col_lbl = _Growable(np.int32)
     col_edge = _Growable(np.float32, width=edge_dim)
+    # Which corpus each edge came from. The three occupy DISJOINT absolute
+    # time ranges (CTU-13 2011, CIC-2017 2017, CIC-2018 2018), so a global
+    # temporal split silently becomes a split BY CORPUS. See split_data().
+    col_src = _Growable(np.int8)
 
     ip_to_id: dict = {}
     cat_to_id: dict = {}
+    src_to_id: dict = {}
 
     def _consume(stream):
         for r in stream:
@@ -371,6 +377,10 @@ def load_and_preprocess_unified_dataset(
             ci = cat_to_id.get(r.coarse_category)
             if ci is None:
                 ci = cat_to_id[r.coarse_category] = len(cat_to_id)
+            si = src_to_id.get(r.raw_label_source)
+            if si is None:
+                si = src_to_id[r.raw_label_source] = len(src_to_id)
+            col_src.append(si)
             col_u.append(su)
             col_i.append(di)
             col_ts.append(r.start_time)
@@ -422,11 +432,12 @@ def load_and_preprocess_unified_dataset(
     i_list = col_i.done()[order]
     ts_list = col_ts.done()[order]
     label_list = col_lbl.done()[order]
+    source_list = col_src.done()[order]
 
     # Row 0 stays zero: it is the padding edge, which is why no vstack is needed.
     edge_features = np.zeros((n + 1, edge_dim), dtype=np.float32)
     edge_features[1:] = col_edge.done()[order]
-    del col_u, col_i, col_ts, col_lbl, col_edge, order
+    del col_u, col_i, col_ts, col_lbl, col_edge, col_src, order
 
     idx_list = np.arange(1, n + 1)
 
@@ -445,7 +456,13 @@ def load_and_preprocess_unified_dataset(
     logging.info("Detected coarse categories: %s", category_mapping)
 
     graph_df = pd.DataFrame({'u': u_list, 'i': i_list, 'ts': ts_list,
-                             'label': label_list, 'idx': idx_list})
+                             'label': label_list, 'idx': idx_list,
+                             'source': source_list})
+    _src_names = {v: k for k, v in src_to_id.items()}
+    logging.info(
+        "Edges per corpus: %s",
+        {_src_names[v]: int((source_list == v).sum()) for v in sorted(_src_names)},
+    )
 
     # Node features were np.zeros(...). Every one of them. In TGN a node's
     # embedding is a function of its memory, its node features and its
@@ -573,6 +590,11 @@ def train(args):
     if args.cic2017_dir or args.cic2018_dir or args.ctu13_dir:
         if args.data_name == 'warden_alerts':  # still the default; unified run wasn't given its own name
             args.data_name = 'unified_cic_ctu13'
+        require_full_density(
+            'TGNE encoder training',
+            stride=args.stride,
+            rows_per_file=args.rows_per_file,
+        )
         graph_df, edge_features, node_features, category_mapping = load_and_preprocess_unified_dataset(
             cic2017_dir=args.cic2017_dir,
             cic2018_dir=args.cic2018_dir,

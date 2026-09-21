@@ -63,7 +63,7 @@ python scripts/retrain_branch_a_live.py \
   --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
   --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
   --output saved_models/branch_a/branch_a_lstm.pt \
-  --stride 20 --rows-per-file 40000 --epochs 8 --batch-size 128 \
+  --epochs 8 --batch-size 128 \
   --spill-dir .spill
 ```
 
@@ -71,8 +71,10 @@ python scripts/retrain_branch_a_live.py \
   this script has no such flag.
 - The split is read from `splits.lock.json` (17 train / 3 val / 3 test
   captures). It is no longer a sorted 70/15/15 slice.
-- `--stride` samples across whole captures; a bare `--rows-per-file` would take
-  a chronological prefix, and these captures are benign in the morning.
+- **No `--stride`, no `--rows-per-file`.** Full density is the default and
+  `require_full_density()` refuses to start otherwise. If you genuinely need a
+  smoke run, set `CYBERWORLD_ALLOW_SUBSAMPLING=1` — and the numbers from it are
+  not a result.
 - Expect the **credibility gate** to print a verdict. It is advisory, not
   fatal. Treat "model accuracy does not beat persistence" as a real failure —
   a smoke run already produced 0.7221 against a 0.9666 persistence baseline.
@@ -86,7 +88,7 @@ python scripts/retrain_future_models_live.py \
   --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
   --tgne saved_models/bita_bigru_transformer-unified_v5.pth \
   --out-dir saved_models \
-  --stride 20 --rows-per-file 40000 --epochs 6 \
+  --epochs 6 \
   --spill-dir .spill
 ```
 
@@ -96,7 +98,6 @@ of the CSV path (which fabricates host identity on 9 of 10 CIC-2018 days):
 ```bash
   --pcap-root /var/home/samito/Documents/SIH/DATA/pcap \
   --cic2018-csv-dir /var/home/samito/Documents/SIH/DATA/CSV \
-  --pcap-window-stride 4
 ```
 
 `--pcap-root` requires `--cic2018-csv-dir`: PCAP packets carry no label of

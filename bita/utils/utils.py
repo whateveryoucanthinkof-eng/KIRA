@@ -88,31 +88,101 @@ class RandEdgeSampler(object):
     self.random_state = np.random.RandomState(self.seed)
 
 
-def get_neighbor_finder(data, uniform, max_node_idx=None):
-  max_node_idx = max(data.sources.max(), data.destinations.max()) if max_node_idx is None else max_node_idx
-  adj_list = [[] for _ in range(max_node_idx + 1)]
-  for source, destination, edge_idx, timestamp in zip(data.sources, data.destinations,
-                                                      data.edge_idxs,
-                                                      data.timestamps):
-    adj_list[source].append((destination, edge_idx, timestamp))
-    adj_list[destination].append((source, edge_idx, timestamp))
+class _CSRRows:
+  """Per-node view into one flat array, indexed by node id.
 
-  return NeighborFinder(adj_list, uniform=uniform)
+  `finder.node_to_neighbors[node]` returns a zero-copy numpy VIEW of that
+  node's slice, so slicing (`[:i]`, `[-n:]`) and fancy indexing behave exactly
+  as they did when each node owned its own small array.
+  """
+
+  __slots__ = ("flat", "offsets")
+
+  def __init__(self, flat, offsets):
+    self.flat = flat
+    self.offsets = offsets
+
+  def __getitem__(self, node):
+    return self.flat[self.offsets[node]:self.offsets[node + 1]]
+
+  def __len__(self):
+    return len(self.offsets) - 1
+
+
+def get_neighbor_finder(data, uniform, max_node_idx=None):
+  """Build a NeighborFinder without materialising a Python object per edge.
+
+  The previous implementation built `adj_list = [[] for _ in range(n_nodes)]`
+  and appended a Python tuple `(destination, edge_idx, timestamp)` for every
+  edge in BOTH directions. Measured cost: **293 bytes per edge** -- at full
+  corpus density (~34M edges) that is **9.3 GiB** for the intermediate alone,
+  and NeighborFinder then built numpy arrays from it while the list was still
+  alive, so the true peak was ~11 GiB on top of the loader. That, not the data
+  volume, is what made full-density training look impossible and forced a
+  stride.
+
+  This builds the same structure in CSR form with one vectorised lexsort: no
+  Python tuples, no per-node lists, ~24 bytes per directed edge.
+
+  The lexsort key order is (timestamp, node), so within each node's slice the
+  entries come out sorted by timestamp -- the invariant `find_before`'s
+  `np.searchsorted` depends on. A stable sort on node alone would NOT do: the
+  two directions are concatenated, so their timestamps interleave.
+  """
+  src = np.asarray(data.sources)
+  dst = np.asarray(data.destinations)
+  eidx = np.asarray(data.edge_idxs)
+  ts = np.asarray(data.timestamps, dtype=np.float64)
+
+  max_node_idx = int(max(src.max(), dst.max())) if max_node_idx is None else int(max_node_idx)
+  n_nodes = max_node_idx + 1
+
+  # Each undirected edge appears once per endpoint.
+  owner = np.concatenate([src, dst]).astype(np.int64, copy=False)
+  peer = np.concatenate([dst, src]).astype(np.int32, copy=False)
+  eidx2 = np.concatenate([eidx, eidx]).astype(np.int32, copy=False)
+  ts2 = np.concatenate([ts, ts])
+
+  order = np.lexsort((ts2, owner))          # primary: owner, secondary: time
+  owner_sorted = owner[order]
+  flat_nbr = peer[order]
+  flat_eidx = eidx2[order]
+  flat_ts = ts2[order]
+  del peer, eidx2, ts2, order, owner
+
+  # offsets[k] = first position belonging to node k
+  offsets = np.searchsorted(owner_sorted, np.arange(n_nodes + 1), side="left")
+  del owner_sorted
+
+  return NeighborFinder(
+    None, uniform=uniform,
+    _csr=(flat_nbr, flat_eidx, flat_ts, offsets),
+  )
 
 
 class NeighborFinder:
-  def __init__(self, adj_list, uniform=False, seed=None):
-    self.node_to_neighbors = []
-    self.node_to_edge_idxs = []
-    self.node_to_edge_timestamps = []
+  def __init__(self, adj_list, uniform=False, seed=None, _csr=None):
+    """`adj_list` is the original list-of-lists form, kept for the small graphs
+    built directly in branch_a_gnn_lstm and multi_dataset_stream. Large graphs
+    come in through get_neighbor_finder(), which passes `_csr` instead and
+    never materialises a Python object per edge."""
+    if _csr is not None:
+      flat_nbr, flat_eidx, flat_ts, offsets = _csr
+      self.node_to_neighbors = _CSRRows(flat_nbr, offsets)
+      self.node_to_edge_idxs = _CSRRows(flat_eidx, offsets)
+      self.node_to_edge_timestamps = _CSRRows(flat_ts, offsets)
+    else:
+      self.node_to_neighbors = []
+      self.node_to_edge_idxs = []
+      self.node_to_edge_timestamps = []
 
-    for neighbors in adj_list:
-      # Neighbors is a list of tuples (neighbor, edge_idx, timestamp)
-      # We sort the list based on timestamp
-      sorted_neighhbors = sorted(neighbors, key=lambda x: x[2])
-      self.node_to_neighbors.append(np.array([x[0] for x in sorted_neighhbors]))
-      self.node_to_edge_idxs.append(np.array([x[1] for x in sorted_neighhbors]))
-      self.node_to_edge_timestamps.append(np.array([x[2] for x in sorted_neighhbors]))
+      for neighbors in adj_list:
+        # Neighbors is a list of tuples (neighbor, edge_idx, timestamp)
+        # We sort the list based on timestamp
+        sorted_neighhbors = sorted(neighbors, key=lambda x: x[2])
+        self.node_to_neighbors.append(np.array([x[0] for x in sorted_neighhbors]))
+        self.node_to_edge_idxs.append(np.array([x[1] for x in sorted_neighhbors]))
+        self.node_to_edge_timestamps.append(np.array([x[2] for x in sorted_neighhbors]))
 
     self.uniform = uniform
 

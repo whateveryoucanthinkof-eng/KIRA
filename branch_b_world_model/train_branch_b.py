@@ -94,8 +94,9 @@ def train_branch_b(
     K = _c.forecast_steps if K is None else K
     print("Loading disjoint train/val multi-dataset partitions via ScientificSplitManager for Branch B...")
     sm = ScientificSplitManager()
-    train_records = sm.get_train_records(max_per_source=600)
-    val_records = sm.get_val_records(max_per_source=200)
+    # Full density. These were 600/200 records per capture.
+    train_records = sm.get_train_records()
+    val_records = sm.get_val_records()
 
     tgn = build_or_load_tgne_ta()
     # Contract-bound. This was hardcoded to 60.0 while the shipped checkpoints
