@@ -183,7 +183,7 @@ def main():
     # samples.
     record_counts: Dict[str, int] = {}
 
-    def _samples_per_file(files, label):
+    def _store_per_capture(files, label):
         """Load -> extract -> free, one capture file at a time.
 
         Holding the whole split resident costs ~15.7 GB at full density (30.4M
@@ -237,15 +237,15 @@ def main():
 
     import gc
     t0 = time.time()
-    train_store = _samples_per_file(train_files, "train")
+    train_store = _store_per_capture(train_files, "train")
     train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1)
     print(f"train done in {time.time()-t0:.1f}s ({len(train_ds)} samples)", flush=True)
     t0 = time.time()
-    val_store = _samples_per_file(val_files, "val")
+    val_store = _store_per_capture(val_files, "val")
     val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1)
     print(f"val done in {time.time()-t0:.1f}s ({len(val_ds)} samples)", flush=True)
     t0 = time.time()
-    test_store = _samples_per_file(test_files, "test")
+    test_store = _store_per_capture(test_files, "test")
     test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1)
     print(f"test done in {time.time()-t0:.1f}s ({len(test_ds)} samples)", flush=True)
 
