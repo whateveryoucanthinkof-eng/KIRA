@@ -240,6 +240,7 @@ def load_and_preprocess_unified_dataset(
     ctu13_dir=None,
     max_rows_per_file=None,
     stride=1,
+    splits=("train",),
 ):
     """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
 
@@ -250,11 +251,26 @@ def load_and_preprocess_unified_dataset(
     host can be both. Edge features come from each record's real bidirectional
     bytes/packets/duration via extract_canonical_edge_features -- not the flow-count
     proxy Warden's loader uses, since these datasets carry real flow statistics.
+
+    `splits` restricts which frozen captures are read. It defaults to
+    ("train",) and that default is load-bearing.
+
+    TGNE is not purely self-supervised: alongside link prediction it trains a
+    category head on each edge's `coarse_category`. Training it over the whole
+    corpus therefore pushed LABEL information from the captures the frozen lock
+    reserves for validation and test into the encoder -- and Branch A, Branch B
+    and DeepOP all consume its embeddings. Every downstream "held-out" number
+    would have been contaminated at the encoder, where it is invisible.
+
+    Restricting to the frozen train captures keeps val and test captures
+    entirely unseen by the encoder. TGN's own 70/85 temporal split then runs
+    *within* the training captures, which is what it is for.
     """
     from data_unification.cic2017_adapter import CIC2017Adapter
     from data_unification.cic2018_adapter import CIC2018Adapter
     from data_unification.ctu13_adapter import CTU13Adapter
     from data_unification.ip_features import build_node_feature_matrix
+    from data_unification.split_policy import split_of_path
 
     # Stride is applied DURING ingestion, per file, not after.
     #
@@ -283,17 +299,45 @@ def load_and_preprocess_unified_dataset(
             if max_rows_per_file is not None and kept >= max_rows_per_file:
                 return
 
+    wanted = set(splits) if splits else None
+
+    def _in_split(path):
+        """True when the frozen lock assigns `path` to one of `splits`."""
+        if wanted is None:
+            return True
+        try:
+            return split_of_path(path) in wanted
+        except (KeyError, ValueError):
+            logging.warning("%s is not in the frozen split -- skipped", path)
+            return False
+
     records = []
+    skipped = []
+    n_read = 0
     if cic2017_dir:
         for f in sorted(glob.glob(os.path.join(cic2017_dir, "*.csv"))):
-            records.extend(_take(CIC2017Adapter().parse_file(f, max_rows=None)))
+            if not _in_split(f):
+                skipped.append(os.path.basename(f)); continue
+            records.extend(_take(CIC2017Adapter().parse_file(f, max_rows=None))); n_read += 1
     if cic2018_dir:
         for f in sorted(glob.glob(os.path.join(cic2018_dir, "*.csv"))):
-            records.extend(_take(CIC2018Adapter().parse_file(f, max_rows=None)))
+            if not _in_split(f):
+                skipped.append(os.path.basename(f)); continue
+            records.extend(_take(CIC2018Adapter().parse_file(f, max_rows=None))); n_read += 1
     if ctu13_dir:
         ctu_adapter = CTU13Adapter()
         for f in sorted(glob.glob(os.path.join(ctu13_dir, "*", "*.binetflow"))):
-            records.extend(_take(ctu_adapter.parse_netflow_csv(f, max_rows=None)))
+            if not _in_split(f):
+                skipped.append(os.path.basename(f)); continue
+            records.extend(_take(ctu_adapter.parse_netflow_csv(f, max_rows=None))); n_read += 1
+
+    logging.info(
+        "Frozen split %s: %d capture(s) read, %d held out from the encoder%s",
+        ",".join(sorted(wanted)) if wanted else "ALL",
+        n_read,
+        len(skipped),
+        (": " + ", ".join(skipped)) if skipped else "",
+    )
 
     if not records:
         raise FileNotFoundError(
@@ -484,6 +528,7 @@ def train(args):
             ctu13_dir=args.ctu13_dir,
             max_rows_per_file=args.rows_per_file,
             stride=args.stride,
+            splits=tuple(args.train_splits.split(",")) if args.train_splits else None,
         )
     else:
         graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
@@ -856,6 +901,7 @@ if __name__ == '__main__':
     parser.add_argument('--ctu13_dir', type=str, default=None, help='CTU-13 directory of <scenario>/*.binetflow files (switches to the unified, non-bipartite loader)')
     parser.add_argument('--rows_per_file', type=int, default=None, help='Max records KEPT per source file, after striding (not a row prefix)')
     parser.add_argument('--stride', type=int, default=1, help='Keep every Nth record DURING ingestion: spans the whole capture and bounds peak memory')
+    parser.add_argument('--train_splits', type=str, default='train', help="Frozen-lock splits to read (comma separated). Default 'train' keeps val/test captures unseen by the encoder; pass '' to read everything (leaks labels downstream).")
     parser.add_argument('--prefix', type=str, default='bita_bigru_transformer', help='Prefix for saved artifacts')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
     parser.add_argument('--n_epoch', type=int, default=30, help='Maximum number of epochs')
