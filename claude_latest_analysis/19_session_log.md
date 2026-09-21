@@ -263,3 +263,47 @@ labels if any appear.
 
 Third instance of the same pattern today (computed → discarded): credibility
 verdict, the two loss terms, and now this.
+
+### 16:39 — Weighted loss ruled out its own hypothesis. Found the real cause.
+Epoch 0 with `cat_loss_weight=15`:
+
+| | before | now |
+|---|---|---|
+| Val AUC | 0.8212 | **0.9374** |
+| Inductive Val AUC | 0.7911 | **0.9187** |
+| Val AP | 0.8376 | **0.9524** |
+| C2/Impact/Recon recall | 0.0 | **still 0.0** |
+
+Link prediction improved a lot. The category head did not — and the new loss
+logging **disproved my hypothesis**: `edge 0.1154, cat 0.0188 ×15 = 0.282`.
+The category term now dominates 2.4:1 and three classes still sit at zero. It
+was never gradient starvation.
+
+**Ruled out, by measurement:**
+- val genuinely contains all five classes (Benign 92.1%, C2 1.66%, **Impact
+  3.41%**, IA 2.70%, Recon 0.12%) — so 0.0 on Impact is a real failure, not an
+  absent class;
+- the arithmetic matches exactly: `0.9211×0.251 + 0.027×0.997 = 0.258` = the
+  observed CatAcc, i.e. it predicts Benign ~25% and InitialAccess for nearly
+  everything else;
+- no train/eval `n_neighbors` mismatch.
+
+**Actual cause: 58.6% of training batches contain a single class.** TGN slices
+batches contiguously in time and attacks are time-localised, so most gradient
+steps see 128 samples with one label — "predict X for all of these", no
+contrast. The head oscillates and never learns a discriminative rule, while a
+tree on the same features *shuffled* gets 0.9997.
+
+**Fix: permute samples each epoch. 58.6% → 0.0% single-class batches.**
+
+Two things worth recording:
+- It must shuffle **samples, not batch order**. I wrote the batch-order
+  version first and it would have done nothing — reordering contiguous blocks
+  leaves every block single-class. Caught it before it shipped; a test now
+  pins the distinction.
+- Valid **only** because the memory module is off. With memory on, batch N
+  depends on batch N−1 and shuffling would train on states that never
+  existed. That combination now raises.
+
+### 16:49 — Restarted (v3). `logs/tgne_final.out`
+Previous logs archived: `tgne_final_PRE_CATWEIGHT.out`, `..._PRE_SHUFFLE.out`.
