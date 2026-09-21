@@ -52,14 +52,45 @@ class InfiltrationRiskHead(nn.Module):
             h_rollout: [batch_size, K, d_latent]
         Returns:
             step_risks: [batch_size, K] per-step severity scores S_{t+k} in [0, 1]
-            cumulative_risk: [batch_size] peak forecast severity over horizon max_k S_{t+k}
+            cumulative_risk: [batch_size] accumulated hazard over the horizon,
+                1 - prod_k (1 - S_{t+k}). Use peak_risk() for the max.
         """
         B, K, D = h_rollout.shape
         h_flat = h_rollout.reshape(B * K, D)
         step_risks = self.mlp(h_flat).reshape(B, K)
 
-        # Peak forecast severity across horizon K (deterministic peak risk)
-        peak_risk = torch.max(step_risks, dim=-1)[0]
-        cumulative_risk = peak_risk
+        # Cumulative hazard over the horizon: 1 - prod_k (1 - r_k).
+        #
+        # This returned max(step_risks) -- the PEAK -- under the name
+        # `cumulative_risk`, contradicting this class's own docstring and the
+        # v4 metrics module, whose test
+        # (tests/test_v4_metrics.py::test_cumulative_onset_uses_one_minus_product_not_max)
+        # demonstrates why peak is the wrong statistic here:
+        #
+        #   [0.50, 0, 0, 0, 0]        peak 0.50, cumulative 0.500
+        #   [0.30, 0.30, 0.30, 0, 0]  peak 0.30, cumulative 0.657  <- the real onset
+        #
+        # Peak ranks the single spike above the sustained threat; the product
+        # form ranks them correctly. That matters precisely where this value
+        # is used -- correlation/trajectory_assembler.py feeds it to
+        # HostAttackTrajectory.cumulative_forecast_risk, which is how hosts
+        # are ordered for an analyst. A host under persistent moderate
+        # pressure should outrank one with a single noisy spike.
+        #
+        # Computed in log space for numerical stability across the horizon.
+        cumulative_risk = 1.0 - torch.exp(
+            torch.log1p(-step_risks.clamp(max=1.0 - 1e-6)).sum(dim=-1)
+        )
 
         return step_risks, cumulative_risk
+
+    @staticmethod
+    def peak_risk(step_risks: torch.Tensor) -> torch.Tensor:
+        """Largest single-step risk over the horizon.
+
+        Kept available because it answers a different question -- "how bad
+        does it get at worst" rather than "how likely is compromise at all
+        across the horizon". It is NOT the cumulative figure and must not be
+        used to rank hosts by onset risk.
+        """
+        return torch.max(step_risks, dim=-1)[0]
