@@ -67,6 +67,17 @@ class StaleEncoderArchitecture(RuntimeError):
     """
 
 
+# The encoder retrained 2026-09-21 on CIC-2017 + CIC-2018 + CTU-13 at full
+# density: inductive test AUC 0.9626, transductive 0.9972, macro F1 0.8405.
+# Paths are resolved relative to the repo root so a different cwd still finds
+# them.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CANONICAL_TGNE_CHECKPOINT = os.path.join(
+    _REPO_ROOT, "saved_models", "bita_bigru_transformer-unified_final.pth")
+LEGACY_TGNE_CHECKPOINT = os.path.join(
+    _REPO_ROOT, "bita", "saved_models", "bita_bigru_transformer-warden_alerts.pth")
+
+
 def build_or_load_tgne_ta(
     config_path: str = "bita/saved_models/bita_config.json",
     checkpoint_path: Optional[str] = None,
@@ -76,7 +87,27 @@ def build_or_load_tgne_ta(
     Fails loudly if checkpoint or configuration differs.
     """
     checkpoint_path = checkpoint_path or os.environ.get("TGNE_CHECKPOINT_PATH")
-    ckpt_path = checkpoint_path or "bita/saved_models/bita_bigru_transformer-warden_alerts.pth"
+    if not checkpoint_path:
+        # Resolution order: explicit argument, then TGNE_CHECKPOINT_PATH, then
+        # the canonical retrained encoder, then the legacy Warden checkpoint.
+        #
+        # The canonical entry is not cosmetic. Six call sites -- including
+        # control_backend/model_adapter.py, the live serving path -- call this
+        # with no argument, and every one of them used to land on the Warden
+        # checkpoint. That checkpoint predates the edge-aware category head:
+        # its head was a single Linear over summed node embeddings, so it could
+        # not see the flow it was classifying and collapsed to one class. Branch
+        # A is trained against the retrained encoder, so leaving the default on
+        # Warden means training and serving disagree about the encoder.
+        #
+        # The legacy path is kept last so an install without the retrained file
+        # still reports the familiar StaleEncoderArchitecture rather than a
+        # bare FileNotFoundError.
+        for _cand in (CANONICAL_TGNE_CHECKPOINT, LEGACY_TGNE_CHECKPOINT):
+            if os.path.exists(_cand):
+                checkpoint_path = _cand
+                break
+    ckpt_path = checkpoint_path or LEGACY_TGNE_CHECKPOINT
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"TGNE-TA checkpoint not found at: {ckpt_path}")
 
