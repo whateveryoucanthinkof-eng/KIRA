@@ -941,6 +941,14 @@ def train(args):
 
     early_stopper = EarlyStopMonitor(max_round=args.patience, higher_better=True)
 
+    if args.shuffle_batches and args.use_memory:
+        raise ValueError(
+            "--shuffle_batches cannot be combined with --use_memory: TGN's memory "
+            "module makes batch N depend on batch N-1, so shuffling would train on "
+            "memory states that never existed. Use --no_shuffle_batches with memory."
+        )
+    logging.info("Batch sampling: %s",
+                 "SHUFFLED (memory off)" if args.shuffle_batches else "time-ordered")
     logging.info("Starting training loop...")
     for epoch in range(args.n_epoch):
         start_epoch = time.time()
@@ -952,6 +960,30 @@ def train(args):
         tgn.set_neighbor_finder(train_ngh_finder)
         m_loss = []
         m_edge_loss, m_cat_loss = [], []
+
+        # Sample order for this epoch.
+        #
+        # TGN slices batches contiguously in TIME, and attacks are
+        # time-localised, so most batches contain a SINGLE class. Measured on
+        # fri_16: **58.6% of 128-sample batches are single-class**. The
+        # category head then receives "predict X for all of these" with no
+        # contrast, and oscillates across batches -- which is why it collapsed
+        # to one class while a tree on the same features, shuffled, reaches
+        # 0.9997 balanced accuracy.
+        #
+        # Note this must permute SAMPLES, not batch order: reordering
+        # contiguous batches leaves each one single-class and changes nothing.
+        #
+        # Valid here only because the memory module is disabled. TGN's memory
+        # is what makes batch N depend on batch N-1; with use_memory=False the
+        # remaining order-sensitive piece is the neighbour lookup, which cuts
+        # on each edge's OWN timestamp and is therefore order-independent. The
+        # negative sampler is random either way. With memory enabled this
+        # would corrupt the memory state, so it is refused.
+        if args.shuffle_batches and not args.use_memory:
+            perm = np.random.permutation(num_instance)
+        else:
+            perm = np.arange(num_instance)
 
         for k in range(0, num_batch, args.backprop_every):
             loss = 0.0
@@ -965,12 +997,13 @@ def train(args):
 
                 start_idx = batch_idx * args.batch_size
                 end_idx = min(num_instance, start_idx + args.batch_size)
+                sel = perm[start_idx:end_idx]
 
-                sources_batch = train_data.sources[start_idx:end_idx]
-                destinations_batch = train_data.destinations[start_idx:end_idx]
-                edge_idxs_batch = train_data.edge_idxs[start_idx:end_idx]
-                timestamps_batch = train_data.timestamps[start_idx:end_idx]
-                categories_batch = train_data.labels[start_idx:end_idx]
+                sources_batch = train_data.sources[sel]
+                destinations_batch = train_data.destinations[sel]
+                edge_idxs_batch = train_data.edge_idxs[sel]
+                timestamps_batch = train_data.timestamps[sel]
+                categories_batch = train_data.labels[sel]
 
                 size = len(sources_batch)
                 _, negatives_batch = train_rand_sampler.sample(size)
@@ -1270,6 +1303,12 @@ if __name__ == '__main__':
     parser.add_argument('--ctu13_dir', type=str, default=None, help='CTU-13 directory of <scenario>/*.binetflow files (switches to the unified, non-bipartite loader)')
     parser.add_argument('--rows_per_file', type=int, default=None, help='Max records KEPT per source file, after striding (not a row prefix)')
     parser.add_argument('--stride', type=int, default=1, help='Keep every Nth record DURING ingestion: spans the whole capture and bounds peak memory')
+    parser.add_argument('--shuffle_batches', action='store_true', default=True,
+                        help='Shuffle batch ORDER within an epoch. Valid only with '
+                             'use_memory=False; TGN batches are contiguous in time and '
+                             '58%% of them are single-class, which collapses the category head.')
+    parser.add_argument('--no_shuffle_batches', dest='shuffle_batches', action='store_false',
+                        help='Keep the original time-ordered batch sequence.')
     parser.add_argument('--cat_loss_weight', type=float, default=15.0,
                         help='Weight on the auxiliary category loss. The two terms were '
                              'summed equally, but focal loss drives the category term ~14x '
