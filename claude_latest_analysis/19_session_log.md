@@ -249,3 +249,17 @@ Clamped `log_var` to [−3, 3] (precision 0.05–20). Same scenario now settles 
 **24×**. Checked the clamp doesn't disable the mechanism: equal losses still
 give equal weights, and a genuinely easier task still earns more precision.
 *7 tests.*
+
+### 16:30 — Label-mapping coverage was tracked but never reported
+`LabelResolver.unresolved_report()` had **zero callers**. Unmapped labels
+become `UNKNOWN`/`is_attack=False` — the right default (asserts nothing) but
+silent label noise if the rate is material.
+
+**Measured: 0.0% unresolved across 450,000 records, all three corpora.** So
+this is a safeguard, not a fix. It matters when your fresh CIC data arrives
+with label strings the maps have not seen — precisely the case nobody would
+think to check. Trainer now logs coverage, and WARNs with the offending
+labels if any appear.
+
+Third instance of the same pattern today (computed → discarded): credibility
+verdict, the two loss terms, and now this.
