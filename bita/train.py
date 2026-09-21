@@ -699,6 +699,57 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
     observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
 
+    # A class must not be annihilated by the inductive node draw.
+    #
+    # Holding out a node removes EVERY edge it touches from training. When one
+    # host carries an entire class that is all-or-nothing -- and CIC-2017's
+    # Recon class is exactly that: all 158,930 PortScan records come from the
+    # single source 172.16.0.1. Whether Recon appeared in training was
+    # therefore a coin flip on one random draw (~22% of nodes are held out),
+    # and on this seed it lost: Recon went to ZERO training samples.
+    #
+    # Re-draw, excluding the offending hosts, until no class is wiped out.
+    # This does not manufacture generalisation -- see the warning below -- it
+    # only stops the split from silently deleting a class.
+    def _classes_lost(mask):
+        in_train = set(np.unique(labels[np.logical_and(train_mask_t, mask)]))
+        return set(np.unique(labels)) - in_train
+
+    lost = _classes_lost(observed_edges_mask)
+    if lost:
+        protect = set()
+        for c in lost:
+            edges_c = labels == c
+            protect |= set(np.unique(sources[edges_c]).tolist())
+            protect |= set(np.unique(destinations[edges_c]).tolist())
+        kept = new_test_node_set - protect
+        logging.warning(
+            "Inductive draw removed class(es) %s from training entirely; "
+            "re-drawing without their %d carrier host(s).",
+            sorted(lost), len(new_test_node_set) - len(kept),
+        )
+        new_test_node_set = kept
+        new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
+        new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
+        observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
+        still = _classes_lost(observed_edges_mask)
+        if still:
+            logging.error("Class(es) %s STILL absent from training after re-draw.", sorted(still))
+
+    # Name any class carried by a single host. Such a class cannot be learned
+    # as a behaviour -- a model that scores well on it has memorised that host
+    # -- so its metrics must never be reported as detection performance.
+    for c in np.unique(labels):
+        srcs = np.unique(sources[labels == c])
+        if len(srcs) <= 2 and c != 0:
+            logging.warning(
+                "Class %s is carried by only %d source host(s). Its metrics "
+                "measure host memorisation, not generalisation, and must not "
+                "be reported as detection performance.",
+                category_mapping.get(int(c), int(c)) if "category_mapping" in dir() else int(c),
+                len(srcs),
+            )
+
     train_mask = np.logical_and(train_mask_t, observed_edges_mask)
     train_data = Data(sources[train_mask], destinations[train_mask], timestamps[train_mask], edge_idxs[train_mask], labels[train_mask])
 

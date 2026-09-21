@@ -113,3 +113,45 @@ def test_falls_back_to_corpus_then_global_when_capture_is_absent():
     df2 = _frame().drop(columns=["capture", "source"])
     _full2, train2, val2, test2 = _split(df2)
     assert train2.n_interactions > 0 and val2.n_interactions > 0 and test2.n_interactions > 0
+
+
+# ---------------------------------------------------------------------------
+# The inductive node draw must not delete a class either
+# ---------------------------------------------------------------------------
+
+def _single_carrier_frame(n=4000):
+    """A class carried entirely by ONE source host -- CIC-2017's Recon is
+    exactly this: all 158,930 PortScan records come from 172.16.0.1."""
+    rng = np.random.default_rng(0)
+    rows = []
+    for i in range(n):                      # benign, many hosts
+        rows.append((0, BASE + i, BENIGN, int(rng.integers(2, 150)), int(rng.integers(2, 150))))
+    for i in range(n):                      # Recon, ONE source, many targets
+        rows.append((1, BASE + n + i, RECON, 1, int(rng.integers(2, 150))))
+    df = pd.DataFrame(rows, columns=["capture", "ts", "label", "u", "i"])
+    df = df.sort_values("ts").reset_index(drop=True)
+    df["idx"] = np.arange(1, len(df) + 1)
+    df["source"] = 0
+    return df
+
+
+def test_a_single_carrier_class_survives_the_inductive_draw():
+    """Holding out one node removes EVERY edge it touches. When one host
+    carries a whole class that is all-or-nothing, and Recon lost the coin
+    flip: it went to ZERO training samples on the real corpus."""
+    _full, train, _val, _test = _split(_single_carrier_frame())
+    counts = np.bincount(train.labels.astype(int), minlength=2)
+    assert counts[RECON] > 0, (
+        "the inductive node draw deleted the single-carrier class from training"
+    )
+
+
+def test_the_guard_warns_about_single_carrier_classes(caplog):
+    """A class with one source host cannot be learned as a behaviour; its
+    metrics measure memorisation. That must be stated, not inferred."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="root"):
+        _split(_single_carrier_frame())
+    assert any("carried by only" in r.message for r in caplog.records), (
+        "a single-carrier class must be named in the log"
+    )
