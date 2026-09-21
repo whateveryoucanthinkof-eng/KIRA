@@ -1,6 +1,7 @@
 """Retrain Branch B and DeepOP on the canonical live TGNE latent space."""
 
 import argparse
+import gc
 import shutil
 import time
 import os
@@ -71,6 +72,22 @@ def _strided(gen, stride: int, want=None):
             if want is not None and len(out) >= want:
                 break
     return out
+
+
+def read_one_capture(path, cic, ctu, rows_per_file, stride=1):
+    """Parse a single capture file. Kept separate so a caller can stream."""
+    _cap = None if rows_per_file is None else rows_per_file * stride
+    gen = (cic.parse_file(str(path), max_rows=_cap)
+           if path.suffix == ".csv"
+           else ctu.parse_netflow_csv(str(path), max_rows=_cap))
+    return _strided(gen, stride, rows_per_file)
+
+
+def split_capture_files(cic_dir, ctu_dir):
+    """The frozen split's train/val capture paths."""
+    files = sorted(cic_dir.glob("*.csv")) + sorted(ctu_dir.glob("*/*.binetflow"))
+    part = partition_paths(files)
+    return part["train"], part["val"]
 
 
 def load_records(cic_dir, ctu_dir, rows_per_file, stride=1):
@@ -428,11 +445,57 @@ def main():
     else:
         if not (args.cic_dir and args.ctu_dir):
             parser.error("either --pcap-root/--cic2018-csv-dir or --cic-dir/--ctu-dir is required")
-        train_records, val_records = load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, args.stride)
-        print(f"loaded {len(train_records)} train + {len(val_records)} val records in {time.time()-t0:.1f}s", flush=True)
-        t0=time.time(); train_traj = extractor.extract_trajectories(train_records)
+        # Stream one capture at a time.
+        #
+        # This used to call load_records(), which returned every record of a
+        # split as one Python list, and only then built the trajectory store on
+        # top of it -- so the 32,461,461-record list (~9.7 GiB at ~300 B each)
+        # and the store were resident together. Measured on the 2026-09-21
+        # run: the job sat at memory.current == memory.max == 17 GiB, was
+        # throttled 983,985 times, and spent 57.7% of its wall clock fully
+        # stalled in reclaim. It was not going to finish.
+        #
+        # Branch A already loads per capture for exactly this reason; that is
+        # what this mirrors. Peak becomes the largest single capture instead of
+        # a whole split, and the feature block goes to the spill memmap.
+        #
+        # Building the TGNE neighbour graph per capture is also more faithful:
+        # a CIC-2018 day and a CTU-13 scenario are unrelated networks, and a
+        # merged graph would make their hosts each other's temporal neighbours.
+        _train_files, _val_files = split_capture_files(args.cic_dir, args.ctu_dir)
+        for _n, _f in (("train", _train_files), ("val", _val_files)):
+            if not _f:
+                parser.error(f"frozen split '{_n}' matched no capture files under "
+                             f"{args.cic_dir} / {args.ctu_dir}")
+        print(f"frozen split: {len(_train_files)} train / {len(_val_files)} val captures",
+              flush=True)
+
+        from data_unification.trajectory_store import TrajectoryStoreBuilder
+        _cic, _ctu = CIC2018Adapter(), CTU13Adapter()
+        _spill = str(args.spill_dir) if args.spill_dir else None
+
+        def _store_per_capture(files, label):
+            shared = TrajectoryStoreBuilder(spill_dir=_spill)
+            widx_base, total = 0, 0
+            for i, f in enumerate(files):
+                t = time.time()
+                recs = read_one_capture(f, _cic, _ctu, args.rows_per_file, args.stride)
+                total += len(recs)
+                extractor.extract_trajectories(recs, builder=shared,
+                                               window_idx_base=widx_base)
+                if shared._window_idx.n:
+                    widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
+                print(f"  [{label} {i+1}/{len(files)}] {f.name}: {len(recs)} recs, "
+                      f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
+                del recs
+                gc.collect()
+            store = shared.finalize()
+            print(f"{label}: {total} records -> {store.n_snapshots} snapshots", flush=True)
+            return store
+
+        t0=time.time(); train_traj = _store_per_capture(_train_files, "train")
         print(f"train trajectories extracted in {time.time()-t0:.1f}s ({len(train_traj)} hosts)", flush=True)
-        t0=time.time(); val_traj = extractor.extract_trajectories(val_records)
+        t0=time.time(); val_traj = _store_per_capture(_val_files, "val")
         print(f"val trajectories extracted in {time.time()-t0:.1f}s ({len(val_traj)} hosts)", flush=True)
 
     # Gate the data before spending hours training on it. The v4 trainer has
