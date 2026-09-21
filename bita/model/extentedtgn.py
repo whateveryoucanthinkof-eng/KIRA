@@ -68,7 +68,44 @@ class ExtendedTGN(TGN):
         )
 
         self.num_categories = num_categories
-        self.category_predictor = nn.Linear(self.embedding_dimension, num_categories)
+
+        # Category head: [src_emb ; dst_emb ; edge_features] -> class.
+        #
+        # This was `nn.Linear(embedding_dimension, num_categories)` applied to
+        # `src_emb + dst_emb`. Two defects, the first fatal:
+        #
+        #   1. It never saw the EDGE. The label (Benign / C2 / Impact /
+        #      InitialAccess / Recon) is a property of the FLOW -- its ports,
+        #      byte volumes, duration, protocol. With only node embeddings, a
+        #      benign flow and an attack flow between the SAME host pair are
+        #      literally identical inputs. The head could not separate them
+        #      even in principle, so it collapsed to a constant prediction.
+        #
+        #   2. Addition is symmetric, so A->B and B->A were indistinguishable.
+        #      Direction is most of what separates a scanner from its target.
+        #
+        # Measured collapse, both runs predicting one class for everything:
+        #   old alpha  -> always Benign,        aggregate CatAcc 0.8351 (looked fine)
+        #   new alpha  -> always InitialAccess, aggregate CatAcc 0.2115
+        # Only which class it collapsed onto changed, following whichever the
+        # loss favoured -- the signature of a head with no discriminative
+        # signal.
+        #
+        # Concatenation keeps direction; the edge features supply the flow;
+        # the hidden layer adds the nonlinearity a single Linear lacked.
+        edge_dim = (
+            self.edge_raw_features.shape[1]
+            if self.edge_raw_features is not None
+            else self.embedding_dimension
+        )
+        cat_in = self.embedding_dimension * 2 + edge_dim
+        hidden = max(32, cat_in)
+        self.category_predictor = nn.Sequential(
+            nn.Linear(cat_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden, num_categories),
+        )
 
     def compute_edge_probabilities_and_categories(
         self,
@@ -87,7 +124,14 @@ class ExtendedTGN(TGN):
             source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
         )
 
-        combined_embeddings = source_node_embedding + destination_node_embedding
+        # Concatenate, do not sum: summing erases direction. Append the edge's
+        # own features so the head can see what the flow actually is.
+        edge_feat = self.edge_raw_features[edge_idxs]
+        if edge_feat.device != source_node_embedding.device:
+            edge_feat = edge_feat.to(source_node_embedding.device)
+        combined_embeddings = torch.cat(
+            [source_node_embedding, destination_node_embedding, edge_feat.float()], dim=1
+        )
         category_logits = self.category_predictor(combined_embeddings)
 
         return pos_score, neg_score, category_logits

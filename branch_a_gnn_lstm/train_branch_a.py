@@ -59,6 +59,14 @@ def load_sample_multi_dataset_records(max_per_source: int = 500):
     return records
 
 
+class StaleEncoderArchitecture(RuntimeError):
+    """A TGNE checkpoint whose architecture predates the current model.
+
+    Distinct from a contract mismatch (right shapes, wrong temporal
+    granularity): here the weights cannot be loaded at all.
+    """
+
+
 def build_or_load_tgne_ta(
     config_path: str = "bita/saved_models/bita_config.json",
     checkpoint_path: Optional[str] = None,
@@ -132,7 +140,25 @@ def build_or_load_tgne_ta(
     )
 
     state_dict = torch.load(ckpt_path, map_location="cpu")
-    tgn.load_state_dict(state_dict, strict=True)
+    try:
+        tgn.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        # The category head changed shape: it used to be a single Linear over
+        # `src_emb + dst_emb` (12-D, direction-blind, edge-blind) and is now an
+        # MLP over [src ; dst ; edge_features]. The old head could not see the
+        # flow at all, so it collapsed to predicting one class for everything.
+        #
+        # Say that plainly instead of surfacing a raw state_dict diff.
+        if "category_predictor" in str(exc):
+            raise StaleEncoderArchitecture(
+                f"TGNE checkpoint {ckpt_path} predates the edge-aware category "
+                f"head. The old head was a single Linear on summed node "
+                f"embeddings, which could not distinguish two flows between the "
+                f"same pair of hosts and collapsed to a constant prediction. "
+                f"Retrain the encoder (see claude_latest_analysis/"
+                f"16_downstream_retrain_runbook.md).\n\nUnderlying: {exc}"
+            ) from exc
+        raise
     tgn.eval()
     return tgn
 
