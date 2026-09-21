@@ -181,3 +181,47 @@ as a real string literal (docstrings excluded — they legitimately quote the
 old names when explaining the bug).
 
 *A duplicated name list drifts. The fix is to not have one.* *2 tests.*
+
+### 16:14 — Head fix helped, but three classes still at zero. Found why.
+Epoch 0 with the edge-aware head:
+
+| | old head | new head |
+|---|---|---|
+| Val CatAcc | 0.2115 | **0.4409** |
+| Val MRR | 0.5957 | **0.7103** |
+| Benign recall | 0.20 | **0.449** |
+| Inductive CatAcc | 0.3557 | **0.5318** |
+| C2 / Impact / Recon | 0.0 | **still 0.0** |
+
+Real improvement, and no longer a single-class collapse — but Impact has
+**1.3M training samples** and 0.0 recall. That is not undertraining.
+
+**Ruled out by measurement, not guesswork:**
+- a gradient-boosted tree separates these classes from the 12 edge features at
+  **0.9997** balanced accuracy → the signal is there;
+- the *same architecture* as the shipped head reaches **0.998** on those
+  features standalone, raw or standardised → the head is capable, and the 20x
+  feature-scale spread is not the problem.
+
+**Actual cause — the category loss was contributing almost nothing.** Edge and
+category losses were summed with equal weight and never logged separately:
+
+| | value |
+|---|---|
+| edge loss at AUC ~0.82 | 0.5754 |
+| category focal loss, mediocre | 0.0420 (**14x smaller**) |
+| category focal loss, confident | 0.0001 (**~5700x smaller**) |
+
+Focal γ=2 down-weights easy examples — but 89% of this corpus is one easy
+class, so it drives the whole *term* to irrelevance beside a co-summed task.
+C2 compounds it at 0.3% of data: a batch of 128 holds ~0.4 C2 examples.
+
+**Fix:** `--cat_loss_weight` (default 15, so 0.042×15 ≈ 0.63 sits alongside the
+0.575 edge loss rather than dominating it), and **both terms now print in the
+epoch line** so this can never again be invisible. `1.0` reproduces the old
+behaviour. *5 tests, one of which establishes the premise by measurement.*
+
+### 16:17 — Restarted with the weighted loss
+`logs/tgne_final.out`. Previous run archived as `tgne_final_PRE_CATWEIGHT.out`.
+Restarted at 1.2 epochs in — cheap, and the category task is what injects
+attack-class information into the embeddings Branch A consumes.
