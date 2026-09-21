@@ -34,6 +34,20 @@ class CoarseCategory(str, Enum):
     UNKNOWN = "Unknown"
 
 
+def _interned(v):
+    """Intern any string-like value, including numpy.str_.
+
+    `sys.intern` requires an exact `str`. numpy string scalars are str
+    subclasses, so they must be coerced before interning -- otherwise the call
+    is skipped and every row keeps its own copy.
+    """
+    if type(v) is str:
+        return _sys.intern(v)
+    if isinstance(v, str):          # numpy.str_ and other str subclasses
+        return _sys.intern(str(v))
+    return v
+
+
 @dataclass(slots=True)
 class UnifiedFlowRecord:
     """One normalized flow.
@@ -72,11 +86,23 @@ class UnifiedFlowRecord:
         # Share one object per distinct string. These fields are drawn from
         # small vocabularies (hosts, labels, sources, categories) but are
         # created fresh per row by the pandas-based adapters.
-        self.src_ip = _sys.intern(self.src_ip) if type(self.src_ip) is str else self.src_ip
-        self.dst_ip = _sys.intern(self.dst_ip) if type(self.dst_ip) is str else self.dst_ip
-        self.raw_label = _sys.intern(self.raw_label) if type(self.raw_label) is str else self.raw_label
-        self.raw_label_source = _sys.intern(self.raw_label_source) if type(self.raw_label_source) is str else self.raw_label_source
-        self.coarse_category = _sys.intern(self.coarse_category) if type(self.coarse_category) is str else self.coarse_category
+        #
+        # This used to guard on `type(x) is str`, which is False for
+        # numpy.str_ -- and numpy.str_ is exactly what the pandas adapters hand
+        # over for src_ip and dst_ip. So interning silently skipped the two
+        # highest-cardinality, highest-volume fields in the record while
+        # appearing to work: measured on wed_29, raw_label collapsed to ONE
+        # object across 5,000 records while src_ip kept 5,000 distinct objects
+        # for 250 unique values.
+        #
+        # _interned() accepts any str subclass and coerces it to an exact str
+        # first, which both enables interning and drops the heavier numpy
+        # scalar wrapper.
+        self.src_ip = _interned(self.src_ip)
+        self.dst_ip = _interned(self.dst_ip)
+        self.raw_label = _interned(self.raw_label)
+        self.raw_label_source = _interned(self.raw_label_source)
+        self.coarse_category = _interned(self.coarse_category)
 
         # Validate critical numerical invariants
         if self.start_time > self.end_time:

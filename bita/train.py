@@ -323,26 +323,34 @@ def load_and_preprocess_unified_dataset(
 
     graph_df = pd.DataFrame({'u': u_list, 'i': i_list, 'ts': ts_list, 'label': label_list, 'idx': idx_list})
 
-    raw_edge_features = np.stack(
-        [
-            extract_canonical_edge_features(
-                fwd_bytes=r.fwd_bytes,
-                bwd_bytes=r.bwd_bytes,
-                fwd_packets=r.fwd_packets,
-                bwd_packets=r.bwd_packets,
-                duration_sec=r.duration,
-                byte_rate=r.byte_rate,
-                packet_rate=r.packet_rate,
-                protocol=r.protocol,
-                dst_port=r.dst_port,
-            )
-            for r in records
-        ],
-        axis=0,
-    ).astype(np.float32)
-
-    empty_edge = np.zeros((1, raw_edge_features.shape[1]), dtype=np.float32)
-    edge_features = np.vstack([empty_edge, raw_edge_features])
+    # Edge features are written straight into one preallocated array.
+    #
+    # This used to build a Python list of N separate 12-element arrays, np.stack
+    # it, then np.vstack a padding row on top -- three full copies of the
+    # feature block alive at once plus ~150 B of numpy object overhead per row.
+    # At ~10M records that is several GB of peak on a 22 GiB machine, and peak
+    # is what decides whether the job survives.
+    #
+    # Row 0 is the padding edge and stays zero, which is why the destination
+    # offset is i + 1 and no vstack is needed.
+    _probe = extract_canonical_edge_features(
+        fwd_bytes=0, bwd_bytes=0, fwd_packets=0, bwd_packets=0, duration_sec=0.0,
+        byte_rate=0.0, packet_rate=0.0, protocol=6, dst_port=0,
+    )
+    edge_dim = len(_probe)
+    edge_features = np.zeros((len(records) + 1, edge_dim), dtype=np.float32)
+    for i, r in enumerate(records):
+        edge_features[i + 1] = extract_canonical_edge_features(
+            fwd_bytes=r.fwd_bytes,
+            bwd_bytes=r.bwd_bytes,
+            fwd_packets=r.fwd_packets,
+            bwd_packets=r.bwd_packets,
+            duration_sec=r.duration,
+            byte_rate=r.byte_rate,
+            packet_rate=r.packet_rate,
+            protocol=r.protocol,
+            dst_port=r.dst_port,
+        )
 
     # Node features were np.zeros(...). Every one of them. In TGN a node's
     # embedding is a function of its memory, its node features and its
