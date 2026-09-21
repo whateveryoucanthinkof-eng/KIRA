@@ -32,7 +32,7 @@ from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
-def _strided(gen, stride: int, want: int):
+def _strided(gen, stride: int, want=None):
     """Samples every Nth record across a wider read instead of a plain file-prefix.
 
     max_rows in the adapters is a prefix (pandas nrows); CIC-2018 CSVs are
@@ -45,7 +45,10 @@ def _strided(gen, stride: int, want: int):
     for i, r in enumerate(gen):
         if i % stride == 0:
             out.append(r)
-            if len(out) >= want:
+            # want is None at FULL DENSITY -- keep everything. Comparing an
+            # int to None raises, and defaulting it to 0 would silently
+            # return an empty list, which is worse.
+            if want is not None and len(out) >= want:
                 break
     return out
 

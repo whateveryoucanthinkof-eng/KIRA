@@ -159,3 +159,34 @@ def test_the_guard_keeps_none_as_none():
     for rows_per_file, stride, expected in [(None, 20, None), (100, 20, 2000), (50, 1, 50)]:
         cap = None if rows_per_file is None else rows_per_file * stride
         assert cap == expected
+
+
+@pytest.mark.parametrize("script", ["retrain_branch_a_live", "retrain_future_models_live"])
+def test_strided_keeps_everything_when_want_is_none(script):
+    """`want` is None at full density. Comparing int >= None raises, and
+    defaulting it to 0 would silently return an empty list -- worse than the
+    crash, because training would proceed on nothing.
+
+    This crashed the Branch A retrain on launch, twice: once on
+    `rows_per_file * stride` and once here on `len(out) >= want`.
+    """
+    import importlib
+    import sys
+    sys.path.insert(0, "scripts")
+    _strided = importlib.import_module(script)._strided
+
+    assert len(_strided(iter(range(100)), 1, None)) == 100
+    assert len(_strided(iter(range(100)), 5, None)) == 20
+    assert len(_strided(iter(range(100)), 1, 10)) == 10
+    assert _strided(iter([]), 1, None) == []
+
+
+@pytest.mark.parametrize("script", ["retrain_branch_a_live", "retrain_future_models_live"])
+def test_strided_defaults_want_to_none(script):
+    """The default must be 'no cap', matching full density."""
+    import importlib
+    import inspect
+    import sys
+    sys.path.insert(0, "scripts")
+    sig = inspect.signature(importlib.import_module(script)._strided)
+    assert sig.parameters["want"].default is None

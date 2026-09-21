@@ -56,14 +56,17 @@ from deepop_decoder.train_cwa_decoder import (
 from cyberworld_v4.config import get_contract
 
 
-def _strided(gen, stride: int, want: int):
+def _strided(gen, stride: int, want=None):
     """Samples every Nth record across a wider read instead of a plain file-prefix
     (see scripts/retrain_branch_a_live.py::_strided for why -- D6, row-prefix sampling)."""
     out = []
     for i, r in enumerate(gen):
         if i % stride == 0:
             out.append(r)
-            if len(out) >= want:
+            # want is None at FULL DENSITY -- keep everything. Comparing an
+            # int to None raises, and defaulting it to 0 would silently
+            # return an empty list, which is worse.
+            if want is not None and len(out) >= want:
                 break
     return out
 
