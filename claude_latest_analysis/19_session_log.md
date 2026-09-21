@@ -56,3 +56,31 @@ proves nothing — 0.8351 and 0.2115 were both collapses.
 **231.9 s** vs **12.5 min** serial for the same 34,152,542 records → **3.23x**,
 matching the 3.14x measured in isolation. ~8.6 min saved per run, and it
 applies to every downstream retrain too. Output is bit-identical (6 tests).
+
+### 16:00 — Reviewed Branch A. Architecture is sound; one thing to flag
+Branch A's input is 27-D = 12 TGNE embedding **+ 15 behavioural attributes**
+(bytes, packets, ports, ratios), so unlike the encoder's category head it does
+see host behaviour. 2-layer LSTM + temporal attention, three heads with proper
+hidden layers. **No equivalent defect.** Target construction is also correct
+(target strictly after the input window — the nowcast bug is fixed).
+
+**Flag for you, not a bug — `risk_score` is derived from the label.**
+`multi_dataset_stream.py:345-347`:
+```python
+risk = min(1.0, max(0.20, base_sev + 0.04*atk_density + 0.04*vol_scale))  # attack
+risk = 0.0                                                                # benign
+```
+Benign is *exactly* 0.0; attack is *at least* 0.20. No sample lands in
+between. So the "risk regression" head is binary classification wearing a
+regression costume — its MAE will look good while adding nothing over
+`is_attack`. Corroborated by the smoke run: `risk_mean 0.428, risk_std 0.468`
+(std ≈ mean = a two-point distribution).
+
+Not leakage in the train/test sense, and deriving a risk target from severity
+is a normal thing to do. But **risk MAE should not be reported as a separate
+capability** from technique/gradation accuracy — it is the same signal.
+
+Also a missed opportunity for a *forecaster*: a host under reconnaissance that
+is not yet labelled attack gets risk exactly 0.0, so the target carries no
+early-warning gradient. Making risk graded would be a research change to the
+target definition, so I am flagging it rather than changing it unilaterally.
