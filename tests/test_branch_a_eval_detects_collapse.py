@@ -133,3 +133,44 @@ def test_no_warning_when_the_head_works(capsys):
     m = bra._evaluate(_OracleModel(loader), loader, "cpu", num_techniques=C)
     bra._warn_if_head_collapsed(m, "unit test")
     assert "WARNING" not in capsys.readouterr().out
+
+
+# --- selecting a checkpoint on a single noisy reading -----------------------
+
+# The real validation losses from the full-density run of 2026-09-21. Epoch 6
+# won selection at 0.6601 and then scored 26.36 on the held-out test.
+REAL_RUN_LOSSES = [1.8819, 2.0814, 1.3938, 1.2351, 1.3904, 0.6601, 1.4085, 1.2117]
+
+
+def _history(losses):
+    return [{"loss": l, "epoch": i + 1} for i, l in enumerate(losses)]
+
+
+def test_outlier_selection_is_flagged_on_the_real_run(capsys):
+    bra._flag_outlier_selection(_history(REAL_RUN_LOSSES),
+                                {"loss": 0.6601, "epoch": 6})
+    out = capsys.readouterr().out
+    assert "NOTE" in out and "epoch (6)" in out
+    assert "epoch_history" in out, "must say where the other epochs' metrics are"
+
+
+def test_a_typical_winner_is_not_flagged(capsys):
+    bra._flag_outlier_selection(_history(REAL_RUN_LOSSES),
+                                {"loss": 1.2351, "epoch": 4})
+    assert "NOTE" not in capsys.readouterr().out
+
+
+def test_short_runs_are_not_flagged(capsys):
+    """Three epochs cannot establish a trend to be an outlier against."""
+    bra._flag_outlier_selection(_history([2.0, 1.5, 0.2]), {"loss": 0.2, "epoch": 3})
+    assert "NOTE" not in capsys.readouterr().out
+
+
+def test_flagging_never_changes_the_selection():
+    """It reports; it must not pick a different checkpoint."""
+    hist = _history(REAL_RUN_LOSSES)
+    best = {"loss": 0.6601, "epoch": 6}
+    before = dict(best)
+    bra._flag_outlier_selection(hist, best)
+    assert best == before
+    assert len(hist) == len(REAL_RUN_LOSSES)

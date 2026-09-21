@@ -83,6 +83,42 @@ def _make_samples(records, extractor, seq_len: int):
     )
 
 
+def _flag_outlier_selection(history, best):
+    """Warn when the winning epoch's val loss is far off the run's own trend.
+
+    The 2026-09-21 run produced val losses 1.88, 2.08, 1.39, 1.24, 1.39, 0.66,
+    1.41, 1.21. Epoch 6 at 0.66 is roughly half the median of every other
+    epoch, and picking the single best reading selected exactly that outlier --
+    which then scored 26.36 on the held-out test against 0.66 on validation.
+
+    A one-off low reading on a multi-task loss with learned log-variance terms
+    is at least as likely to be noise as a genuinely better model. This does
+    not change the selection -- that would be a modelling decision, not a
+    reporting one -- it states when the result deserves suspicion.
+    """
+    if not history or not best or len(history) < 4:
+        return
+    losses = [h["loss"] for h in history if "loss" in h]
+    chosen = best.get("loss")
+    if chosen is None or len(losses) < 4:
+        return
+    others = sorted(l for l in losses if l != chosen)
+    if not others:
+        return
+    median = others[len(others) // 2]
+    if median <= 0:
+        return
+    if chosen < 0.6 * median:
+        print(
+            f"\nNOTE: the selected epoch ({best.get('epoch')}) had validation "
+            f"loss {chosen:.4f}, against a median of {median:.4f} across the "
+            f"other epochs -- {median / max(chosen, 1e-9):.1f}x lower. A single "
+            f"outlier reading may be noise rather than a better model; compare "
+            f"the held-out test result before quoting this checkpoint. Every "
+            f"epoch's metrics are in ckpt['epoch_history'].",
+            flush=True)
+
+
 def _print_per_class(per_class, where):
     """Per-class precision/recall/f1/support, largest class first."""
     if not per_class:
@@ -442,6 +478,7 @@ def main():
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     best_loss = float("inf")
+    _history: List[Dict[str, float]] = []
     best_metrics: Dict[str, float] = {}
 
     print(
@@ -464,11 +501,31 @@ def main():
         print(f"EVAL-ONLY: scoring {_src} (no training)", flush=True)
         _ck = torch.load(_src, map_location=device, weights_only=False)
         model.load_state_dict(_ck["model_state_dict"])
-        _vm = _evaluate(model, val_loader, device, num_techniques=len(TECHNIQUE_VOCAB))
-        _vpc = _vm.pop("tech_per_class", {})
-        print(f"VALIDATION (checkpoint epoch {_ck.get('epoch')}): {_vm}", flush=True)
-        _warn_if_head_collapsed(_vm, "validation")
-        _print_per_class(_vpc, "validation")
+        print(f"checkpoint epoch={_ck.get('epoch')} "
+              f"recorded_metrics={_ck.get('metrics')}", flush=True)
+
+        # Score BOTH splits. The 2026-09-21 run selected on validation loss and
+        # then scored 0.6601 on validation against 26.36 on the held-out test --
+        # a 40x gap. Reporting only one split cannot show whether that is a
+        # collapsed head, a distribution shift between capture days, or a
+        # checkpoint picked on an outlier epoch, so both are printed side by
+        # side with the same metric set.
+        _tl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                         **_loader_kw)
+        for _name, _ldr in (("validation", val_loader), ("held-out test", _tl)):
+            _m = _evaluate(model, _ldr, device, num_techniques=len(TECHNIQUE_VOCAB))
+            _pc = _m.pop("tech_per_class", {})
+            print(f"\n{_name.upper()}: "
+                  f"loss={_m['loss']:.4f} risk_mae={_m['risk_mae']:.4f} "
+                  f"acc={_m['tech_accuracy']:.4f} "
+                  f"macro_f1={_m['tech_macro_f1']:.4f} "
+                  f"baseline={_m['tech_majority_baseline']:.4f} "
+                  f"lift={_m['tech_lift_over_baseline']:+.4f} "
+                  f"classes_pred={_m['tech_classes_predicted']}"
+                  f"/{_m['tech_classes_present']} "
+                  f"gradation_acc={_m['gradation_accuracy']}", flush=True)
+            _warn_if_head_collapsed(_m, _name)
+            _print_per_class(_pc, _name)
         return
 
     for epoch in range(1, args.epochs + 1):
@@ -520,6 +577,10 @@ def main():
             f"wall={metrics['epoch_seconds'] / 60:.1f}m"
         )
         _warn_if_head_collapsed(metrics, f"epoch {epoch}")
+        # Keep every epoch's validation metrics. Only the best-scoring weights
+        # are written, so without this the other epochs are unrecoverable and
+        # a selection decision cannot be revisited without a full retrain.
+        _history.append({k: v for k, v in metrics.items() if k != "tech_per_class"})
         if metrics["loss"] < best_loss:
             best_loss = metrics["loss"]
             best_metrics = metrics
@@ -529,6 +590,7 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
                     "metrics": metrics,
+                    "epoch_history": list(_history),
                     # Written from the contract actually in force, not from
                     # literals. These were hardcoded to 2.0/5 regardless of what
                     # the run used, so the metadata could describe a model that
@@ -550,6 +612,8 @@ def main():
 
     # Held-out test: scored once, on the restored best checkpoint, after
     # training is finished. This is the only number that is a generalisation
+    _flag_outlier_selection(_history, best_metrics)
+
     # estimate rather than a selection artefact.
     ckpt = torch.load(args.output, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
