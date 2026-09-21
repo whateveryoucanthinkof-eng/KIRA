@@ -20,6 +20,7 @@ from branch_a_gnn_lstm.sequence_dataset import (
     TECHNIQUE_VOCAB,
     HostSequenceDataset,
     create_host_sequence_samples,
+    LazyHostSequenceDataset,
 )
 from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.cic2018_adapter import CIC2018Adapter
@@ -220,37 +221,52 @@ def main():
         # non-credible run therefore died with NameError instead of reporting
         # the credibility verdict it had just computed.
         record_counts[label] = total_recs
-        return create_host_sequence_samples(store, seq_len=_c.history_steps, min_trajectory_len=1)
+        # Return the STORE, not materialised samples.
+        #
+        # create_host_sequence_samples builds a [15, 27] float32 array per
+        # sample -- 2,053 bytes each. At full corpus density Branch A produces
+        # roughly 42M samples (measured snapshot ratios: 1.99 per record for
+        # CIC-2018, 0.72 for CTU-13), which is **80.3 GiB**. It does not fit,
+        # and thinning the data is not an option.
+        #
+        # LazyHostSequenceDataset keeps two int32 columns (~8 B/sample, 336 MB
+        # at 42M) and gathers each window from the memmapped feature block on
+        # __getitem__ -- which is what DataLoader workers are for. Verified to
+        # produce identical samples.
+        return store
 
     import gc
     t0 = time.time()
-    train_samples = _samples_per_file(train_files, "train")
-    print(f"train done in {time.time()-t0:.1f}s ({len(train_samples)} samples)", flush=True)
+    train_store = _samples_per_file(train_files, "train")
+    train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    print(f"train done in {time.time()-t0:.1f}s ({len(train_ds)} samples)", flush=True)
     t0 = time.time()
-    val_samples = _samples_per_file(val_files, "val")
-    print(f"val done in {time.time()-t0:.1f}s ({len(val_samples)} samples)", flush=True)
+    val_store = _samples_per_file(val_files, "val")
+    val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    print(f"val done in {time.time()-t0:.1f}s ({len(val_ds)} samples)", flush=True)
     t0 = time.time()
-    test_samples = _samples_per_file(test_files, "test")
-    print(f"test done in {time.time()-t0:.1f}s ({len(test_samples)} samples)", flush=True)
+    test_store = _samples_per_file(test_files, "test")
+    test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    print(f"test done in {time.time()-t0:.1f}s ({len(test_ds)} samples)", flush=True)
 
     # Gate the data before training on it.
     try:
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
-        from credibility_check import evaluate_samples, gate as _gate, report as _report
-        _stats = evaluate_samples(train_samples, val_samples)
+        from credibility_check import evaluate_store, gate as _gate, report as _report
+        _stats = evaluate_store(train_store, val_store)
         _report(_stats, _gate(_stats))
     except Exception as _e:
         print(f"credibility check skipped: {_e}", flush=True)
-    if not train_samples or not val_samples:
+    if len(train_ds) == 0 or len(val_ds) == 0:
         raise RuntimeError("The 2-second pipeline produced no train/validation samples")
 
     train_loader = DataLoader(
-        HostSequenceDataset(train_samples, seq_len=_c.history_steps),
+        train_ds,
         batch_size=args.batch_size,
         shuffle=True,
     )
     val_loader = DataLoader(
-        HostSequenceDataset(val_samples, seq_len=_c.history_steps),
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -270,7 +286,7 @@ def main():
     print(
         f"train_records={record_counts.get('train', 0)} "
         f"val_records={record_counts.get('val', 0)} "
-        f"train_samples={len(train_samples)} val_samples={len(val_samples)} device={device}"
+        f"train_samples={len(train_ds)} val_samples={len(val_ds)} device={device}"
     )
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -330,7 +346,7 @@ def main():
     # estimate rather than a selection artefact.
     ckpt = torch.load(args.output, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
-    test_loader = DataLoader(HostSequenceDataset(test_samples, seq_len=_c.history_steps),
+    test_loader = DataLoader(test_ds,
                              batch_size=args.batch_size, shuffle=False)
     test_metrics = _evaluate(model, test_loader, device)
     print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): {test_metrics}", flush=True)
@@ -344,8 +360,8 @@ def main():
     # 0.83 CatAcc, or a class with seven training samples.
     credibility = {"checked": False}
     try:
-        from credibility_check import evaluate_samples as _es, gate as _g, report as _r
-        _ts = _es(train_samples, test_samples)
+        from credibility_check import evaluate_store as _es, gate as _g, report as _r
+        _ts = _es(train_store, test_store)
         _problems = _g(_ts, model_accuracy=test_metrics.get("tech_accuracy"))
         _r(_ts, _problems)
         credibility = {
