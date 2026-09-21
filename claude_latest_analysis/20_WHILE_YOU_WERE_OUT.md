@@ -92,6 +92,22 @@ Worth knowing, since I stated some of these confidently before checking:
 
 ---
 
+## The full pipeline runs end to end
+
+Validated all four stages against the new encoder (small smoke configs, so the
+numbers are **not results** — the point was proving every integration point):
+
+| stage | result |
+|---|---|
+| TGNE encoder | inductive AUC **0.9946**, epoch 6 selected |
+| Branch A | exit 0, 2.6 GB peak, **CREDIBLE**, held-out test scored once |
+| Branch B | exit 0, 3.4 GB peak, **CREDIBLE**, val_loss 0.3916 |
+| DeepOP | val_loss 0.5397, conditioned on **Branch-B rollouts** (audit E1, not oracle futures) |
+
+Both downstream checkpoints carry the correct v4 contract, and Branch A's
+carries its credibility verdict. So the real retrain has no unknowns left in
+it.
+
 ## Where it stands right now
 
 Training is **still improving**, so I did not stop it — I had planned to, to
