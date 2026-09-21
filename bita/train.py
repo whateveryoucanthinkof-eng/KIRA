@@ -279,6 +279,7 @@ def load_and_preprocess_unified_dataset(
     max_rows_per_file=None,
     stride=1,
     splits=("train",),
+    parallel_workers=0,
 ):
     """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
 
@@ -386,6 +387,21 @@ def load_and_preprocess_unified_dataset(
             self.buf[self.n] = v
             self.n += 1
 
+        def extend(self, arr):
+            """Bulk append. The parallel path adds a whole capture at once,
+            and per-element append() would put the Python loop straight back."""
+            arr = np.asarray(arr)
+            need = self.n + len(arr)
+            if need > len(self.buf):
+                cap = len(self.buf)
+                while cap < need:
+                    cap *= 2
+                bigger = np.empty((cap,) + self.buf.shape[1:], self.buf.dtype)
+                bigger[: self.n] = self.buf[: self.n]
+                self.buf = bigger
+            self.buf[self.n:need] = arr
+            self.n = need
+
         def done(self):
             return self.buf[: self.n]
 
@@ -430,24 +446,65 @@ def load_and_preprocess_unified_dataset(
                 dst_port=r.dst_port,
             ))
 
-    skipped = []
-    n_read = 0
+    # The capture list, in the FIXED order serial parsing would visit. Node ids
+    # are assigned in encounter order, so this order is what makes the run
+    # reproducible -- parallel parsing must merge in exactly this sequence.
+    captures = []
     if cic2017_dir:
-        for f in sorted(glob.glob(os.path.join(cic2017_dir, "*.csv"))):
-            if not _in_split(f):
-                skipped.append(os.path.basename(f)); continue
-            _consume(_take(CIC2017Adapter().parse_file(f, max_rows=None))); n_read += 1
+        captures += [("CIC2017", f) for f in sorted(glob.glob(os.path.join(cic2017_dir, "*.csv")))]
     if cic2018_dir:
-        for f in sorted(glob.glob(os.path.join(cic2018_dir, "*.csv"))):
-            if not _in_split(f):
-                skipped.append(os.path.basename(f)); continue
-            _consume(_take(CIC2018Adapter().parse_file(f, max_rows=None))); n_read += 1
+        captures += [("CIC2018", f) for f in sorted(glob.glob(os.path.join(cic2018_dir, "*.csv")))]
     if ctu13_dir:
-        ctu_adapter = CTU13Adapter()
-        for f in sorted(glob.glob(os.path.join(ctu13_dir, "*", "*.binetflow"))):
-            if not _in_split(f):
-                skipped.append(os.path.basename(f)); continue
-            _consume(_take(ctu_adapter.parse_netflow_csv(f, max_rows=None))); n_read += 1
+        captures += [("CTU13", f) for f in sorted(glob.glob(os.path.join(ctu13_dir, "*", "*.binetflow")))]
+
+    skipped = [os.path.basename(f) for _k, f in captures if not _in_split(f)]
+    captures = [(k, f) for k, f in captures if _in_split(f)]
+    n_read = len(captures)
+
+    if parallel_workers and len(captures) > 1:
+        # Parallel path. Workers return LOCAL vocabularies; the merge below
+        # assigns global ids in capture order, so the result is identical to
+        # the serial path. See data_unification/parallel_ingest.py.
+        from data_unification.parallel_ingest import parse_captures_parallel
+        import time as _t
+        _t0 = _t.time()
+        for res in parse_captures_parallel(
+            captures, stride=stride, max_rows_per_file=max_rows_per_file,
+            edge_dim=edge_dim, workers=parallel_workers,
+        ):
+            # local ip id -> global node id, in this capture's own order
+            ip_map = np.empty(len(res["ips"]), dtype=np.int64)
+            for local, ip in enumerate(res["ips"]):
+                gid = ip_to_id.get(ip)
+                if gid is None:
+                    gid = ip_to_id[ip] = len(ip_to_id) + 1
+                ip_map[local] = gid
+            cat_map = np.empty(len(res["cats"]), dtype=np.int32)
+            for local, c in enumerate(res["cats"]):
+                cid = cat_to_id.get(c)
+                if cid is None:
+                    cid = cat_to_id[c] = len(cat_to_id)
+                cat_map[local] = cid
+            si = src_to_id.get(res["kind"])
+            if si is None:
+                si = src_to_id[res["kind"]] = len(src_to_id)
+
+            col_u.extend(ip_map[res["u"]])
+            col_i.extend(ip_map[res["i"]])
+            col_ts.extend(res["ts"])
+            col_lbl.extend(cat_map[res["lbl"]])
+            col_edge.extend(res["edge"])
+            col_src.extend(np.full(res["n"], si, dtype=np.int8))
+            logging.info("  %s: %d records", os.path.basename(res["path"]), res["n"])
+        logging.info("Parallel ingest finished in %.1fs", _t.time() - _t0)
+    else:
+        for kind, f in captures:
+            if kind == "CIC2017":
+                _consume(_take(CIC2017Adapter().parse_file(f, max_rows=None)))
+            elif kind == "CIC2018":
+                _consume(_take(CIC2018Adapter().parse_file(f, max_rows=None)))
+            else:
+                _consume(_take(CTU13Adapter().parse_netflow_csv(f, max_rows=None)))
 
     logging.info(
         "Frozen split %s: %d capture(s) read, %d held out from the encoder%s",
@@ -692,6 +749,7 @@ def train(args):
             max_rows_per_file=args.rows_per_file,
             stride=args.stride,
             splits=tuple(args.train_splits.split(",")) if args.train_splits else None,
+            parallel_workers=args.ingest_workers,
         )
     else:
         graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
@@ -1080,6 +1138,10 @@ if __name__ == '__main__':
     parser.add_argument('--ctu13_dir', type=str, default=None, help='CTU-13 directory of <scenario>/*.binetflow files (switches to the unified, non-bipartite loader)')
     parser.add_argument('--rows_per_file', type=int, default=None, help='Max records KEPT per source file, after striding (not a row prefix)')
     parser.add_argument('--stride', type=int, default=1, help='Keep every Nth record DURING ingestion: spans the whole capture and bounds peak memory')
+    parser.add_argument('--ingest_workers', type=int, default=0,
+                        help='Parse captures across N worker processes. 0 = serial. '
+                             'Results are identical either way: workers return local '
+                             'vocabularies and the parent merges in fixed capture order.')
     parser.add_argument('--train_splits', type=str, default='train', help="Frozen-lock splits to read (comma separated). Default 'train' keeps val/test captures unseen by the encoder; pass '' to read everything (leaks labels downstream).")
     parser.add_argument('--prefix', type=str, default='bita_bigru_transformer', help='Prefix for saved artifacts')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
