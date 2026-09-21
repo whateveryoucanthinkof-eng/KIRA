@@ -319,3 +319,91 @@ All 18 verdicts (10 CIC-2018 + 8 CIC-2017) confirmed True afterwards.
 - `scripts/retrain_branch_a_live.py` smoke-tested end to end. The credibility
   gate fires correctly: it refused a run where model accuracy 0.7221 did not
   beat the 0.9666 persistence baseline.
+
+---
+
+## Addendum 2 — full density, and what it exposed
+
+Removing the stride was not just a volume change. It changed which defects were
+visible.
+
+### The eleven places data was being thinned
+
+The user caught `--stride 4` on the TGNE run. Auditing for it found ten more,
+three of them introduced the same day by me:
+
+| where | mechanism | discarded |
+|---|---|---:|
+| `split_manager` train/val/test *(mine)* | `stride=20` | **95%** |
+| TGNE invocation *(mine)* | `--stride 4` | **75%** |
+| `retrain_branch_a_live.py` | `--rows-per-file 1000` | most of a capture |
+| `retrain_future_models_live.py` | `--rows-per-file 1000` | most of a capture |
+| `build_tgne_live_dataset.py` | `--rows-per-file 1000` | most of a capture |
+| `train_branch_b.py` | `max_per_source` 600 / 200 | most of a capture |
+| `train_cwa_decoder.py` | `max_per_source 1000` | most of a capture |
+| `flow_table.snapshot_flows` | `max_flows=256` | flows past the 256th |
+| `pcap_bridge` ×2, `pcap_adapter` ×2 | `max_flows=256` | flows past the 256th |
+| `retrain_future_models_live.py` | `max_packets_per_host=20000` | rest of the capture |
+
+`snapshot_flows(max_flows=256)` was the worst of them: silent structural
+truncation inside PCAP ingestion, with nothing in any log to indicate flows had
+been dropped.
+
+`data_unification/density.py` now enforces the rule. `require_full_density()`
+runs at the top of all three trainers and raises on any active cap or stride;
+`CYBERWORLD_ALLOW_SUBSAMPLING=1` is the only bypass and logs
+"SUBSAMPLED RUN, NOT A RESULT".
+
+### What made full density possible
+
+| fix | before | after |
+|---|---|---|
+| clock detection pre-pass | 13.91 GiB | 0.23 GiB |
+| neighbour finder (`adj_list` of Python tuples → CSR) | 293 B/edge = **9.3 GiB** | 48 B/edge = **1.5 GiB** |
+| record interning (`numpy.str_` skipped the guard) | 479 B/record | 300 B/record |
+| edge features (list → stack → vstack) | 3 copies | 1 preallocated array |
+
+Measured on the real run: **34,152,542 records, 2,186,177 hosts, peak ~9.6 GiB
+against an 18 GiB ceiling.** No memmap required. Load 12.7 min, epoch ~13 min
+(92,132 batches at ~114 batch/s).
+
+### Two defects only full density could reveal
+
+**1. The temporal split was a split by corpus.** CTU-13 is 2011, CIC-2017 is
+2017, CIC-2018 is 2018 — disjoint ranges. A global
+`np.quantile(ts, [.70, .85])` trained on 2011 Czech university botnet traffic
+and tested on 2018 AWS enterprise traffic. Now cut per corpus:
+
+```
+CIC-2017   1,691,081 edges   val cut 2017-07-07
+CIC-2018  14,357,106 edges   val cut 2018-02-20
+CTU-13    18,104,355 edges   val cut 2011-08-16
+```
+
+**2. The focal alpha collapsed four of five classes onto the clip floor.**
+
+```
+{Benign: 0.2, C2: 0.2, Impact: 0.2, InitialAccess: 0.2, Recon: 4.911}
+```
+
+Pinned classes are weighted identically, so the loss was doing no balancing at
+all between the four classes carrying the data. The weights were normalised by
+the arithmetic mean; they are multiplicative, and Recon is ~5 orders of
+magnitude rarer than Benign, so that one outlier set the scale for everyone.
+Geometric-mean centring gives
+`{0.2, 0.381, 0.466, 0.851, 5.0}` — four distinct weights where there was one.
+
+This function has now failed twice in opposite directions (plain 1/frequency
+previously drove the majority classes to 0.0), both times because the
+normaliser was a statistic one extreme class controlled. It now logs the class
+counts and warns when more than half the classes pin at a bound.
+
+### Reading the diagnostics
+
+| observation | meaning |
+|---|---|
+| focal weight exactly **1.0** | that class had **zero** training samples |
+| more than half the classes at a clip bound | the loss is not balancing them |
+| transductive AUC ~0.99 alone | says nothing; it was true while the model was a lookup table |
+| inductive AUC ~0.50 | chance — the encoder cannot generalise to unseen hosts |
+| CatAcc stable to 4 decimals | a constant prediction, not learning |
