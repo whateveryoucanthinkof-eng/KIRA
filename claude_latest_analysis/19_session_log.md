@@ -433,3 +433,22 @@ thing still getting better. Confirmed by feeding the real sequence to
 **Deliberately not restarting for this.** The current run will stop around
 epoch 5 and show whether the category head plateaus by itself — that is the
 data needed to know whether the change matters. Applying it to the next run.
+
+### 17:55 — InitialAccess: an optimisation gap, not a data limit
+Investigated the oscillation (0.505 → 0.714 → 0.578). Two hypotheses tested:
+
+1. **Heterogeneous class?** No. In CIC-2018 InitialAccess is 99%
+   `Infilteration` (93,063 of ~94,000); Brute-Force-Web/XSS and SQL Injection
+   contribute under 1,000 between them. Not a taxonomy problem.
+2. **Unlearnable class?** No. The earlier separability test measured
+   **0.9997** balanced accuracy for Benign vs InitialAccess with a tree on the
+   same 12 edge features.
+
+So the ceiling is ~1.0 and the model sits at 0.58. **That is an optimisation
+gap, not a corpus gap** — unlike Recon (1 carrier host) and C2 (10), which are
+genuinely data-limited.
+
+Distinguishing these matters: Recon and C2 need a different corpus, whereas
+InitialAccess should be recoverable with training changes. Not acting on it
+yet — the run is still improving and I do not want to change two things at
+once.
