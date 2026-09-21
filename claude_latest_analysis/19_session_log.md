@@ -225,3 +225,27 @@ behaviour. *5 tests, one of which establishes the premise by measurement.*
 `logs/tgne_final.out`. Previous run archived as `tgne_final_PRE_CATWEIGHT.out`.
 Restarted at 1.2 epochs in — cheap, and the category task is what injects
 attack-class information into the embeddings Branch A consumes.
+
+### 16:25 — Branch A's multi-task loss could run away
+Kendall & Gal uncertainty weighting is **unbounded below**. For a task with
+loss L the optimum is `log_var = log(L)` worth `1 + log(L)`, so as L→0 the
+total dives to −∞ and that task's precision explodes. Measured with
+`risk_loss=1e-4`:
+
+| step | total | prec_risk | prec_tech |
+|---|---|---|---|
+| 1 | 2.100 | 1.0 | 1.000 |
+| 300 | −6.133 | **9993.5** | 0.833 |
+
+A **12,000× imbalance** — and the logged loss falls the whole time, so it
+looks like training is going well.
+
+Not hypothetical here: `risk_score` is derived from `is_attack`, so risk is
+the **easiest and least informative** of the three tasks — exactly the one
+that runs away, at the expense of technique and gradation, which are the ones
+that matter.
+
+Clamped `log_var` to [−3, 3] (precision 0.05–20). Same scenario now settles at
+**24×**. Checked the clamp doesn't disable the mechanism: equal losses still
+give equal weights, and a genuinely easier task still earns more precision.
+*7 tests.*
