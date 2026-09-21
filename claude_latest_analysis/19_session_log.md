@@ -484,3 +484,31 @@ data-limited, in three different ways:
 **Method note:** the first test was cheap and I trusted it too quickly. A
 per-file breakdown would have caught it immediately — averaging over a corpus
 whose files have different attack types hides exactly this.
+
+### 18:05 — Epoch 3 breaks the "plateau", and corrects me again
+
+| | ep 0 | ep 1 | ep 2 | **ep 3** |
+|---|---|---|---|---|
+| Val AP | 0.9971 | 0.9968 | 0.9968 | **0.9973** |
+| Inductive AP | 0.9926 | 0.9921 | 0.9918 | **0.9935** |
+| Inductive AUC | 0.9923 | 0.9918 | 0.9916 | **0.9936** |
+| C2 val | 0.677 | 0.674 | 0.761 | **0.779** |
+| C2 inductive | 0.325 | 0.319 | 0.517 | **0.565** |
+| InitialAccess | 0.505 | 0.714 | 0.578 | **0.612** |
+
+**Correction to the 17:50 entry.** I called `val_ap` "saturated" from three
+points (0.9971, 0.9968, 0.9968) and argued the run would stop and restore
+epoch 0. Epoch 3 beat all three. It was **noise, not saturation** — three
+points is not a trend, and I should not have drawn one from them.
+
+Consequences:
+- Early stopping now selects epoch 3, so the "restores a worse checkpoint"
+  concern is gone. **No restart needed.**
+- The selection-metric change is still worth keeping (macro-F1 catches
+  minority collapse that aggregate accuracy hides), but my *justification*
+  for it was premature.
+
+**C2 inductive has nearly doubled (0.325 → 0.565)**, which weakens the
+host-diversity explanation I gave for it — 10 distinct bot hosts appear to be
+enough to learn transferable structure. Recon (1 host) remains the only class
+that is structurally unable to generalise.
