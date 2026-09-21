@@ -56,6 +56,12 @@ pandas' chunk buffers, not your objects. It reported 5,103 B/record for a
 record that actually costs 300 B — a 17x error that would have forced a
 needless stride of 20. Read `/proc/self/statm` after `gc.collect()` instead.
 
+**Never run two data-heavy jobs at once.** A smoke test launched while the
+trainer was loading drove system-available memory to 0.4 GiB and the trainer
+was OOM-killed at 14.3 GiB. The cgroup cap contained it -- the desktop
+survived -- but the lesson stands: while a training unit is active, do only
+work that costs megabytes (tests, edits, docs).
+
 **Never write outputs to `/tmp`** — it is tmpfs and was wiped by a reboot, losing completed
 Branch B and DeepOP checkpoints. Everything goes to `saved_models/`.
 
@@ -151,6 +157,7 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 | D | Branch A / B / DeepOP not yet retrained under the fixed pipeline | Everything above changes their inputs. |
 | E | PCAP bridge not wired into the live retrain scripts | `pcap_bridge.py` exists and works; `--pcap-dir` is not plumbed through. |
 | F | 266 corrupt PCAP files (28.8 GB) | User is re-downloading. 262 of 266 come from one capture agent (`capDESKTOP-AN3U28N`). |
+| G | `NeighborFinder` is handed an `adj_list` of Python **tuples** | 2 tuples per edge at ~156 B each = ~2.4 GB of transient peak at 7.8M edges, allocated right after loading. Not yet fixed; it is the remaining obstacle to full density. |
 
 ### A consequence of #10 worth stating separately
 
