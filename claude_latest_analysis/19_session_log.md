@@ -328,3 +328,41 @@ for this purpose.
 
 Branch A also needs `--spill-dir` at full density (store is ~6.3 GB on disk,
 ~1 GB resident).
+
+### 17:12 — The shuffle fix worked. First good epoch of the project.
+
+| metric | v2 (time-ordered) | **v3 (shuffled)** |
+|---|---|---|
+| Val AUC | 0.9374 | **0.9970** |
+| Inductive Val AUC | 0.9187 | **0.9923** |
+| Val CatAcc | 0.2581 | **0.9758** |
+| Inductive CatAcc | 0.4594 | **0.9718** |
+| Val MRR | 0.6185 | **0.9878** |
+
+```
+per-class val: {Benign 0.994, C2 0.677, Impact 1.000, InitialAccess 0.505, Recon 0.995}
+inductive:     {Benign 0.995, C2 0.325, Impact 1.000, InitialAccess 0.509, Recon 0.0}
+```
+
+Three classes went from **exactly 0.0** to learning. The single-class-batch
+diagnosis was right.
+
+**Two caveats, so the numbers are not oversold:**
+
+1. **Inductive Recon = 0.0 is CORRECT, not a failure.** Recon comes from one
+   host (172.16.0.1), so evaluating it on *unseen hosts* is meaningless —
+   there are no other Recon hosts to generalise to. The documented limitation
+   surfacing exactly where it should.
+
+2. **CatAcc is probably reading the edge features, not the embeddings.** A
+   tree on those 12 features alone gets 0.9997, and the category loss sits at
+   0.0093 — the task is easy once you can see the flow. So 0.9758 must not be
+   read as "the embeddings encode attack class".
+
+**What actually validates the encoder is link prediction:** inductive 0.9923
+vs transductive 0.9970 — a **0.005 gap**, against the 0.49 gap when it was
+memorising hosts (0.9981 vs 0.5043). That is the number that says it learned
+transferable structure.
+
+Weakest classes: InitialAccess 0.505 and C2 0.677/0.325. Worth watching
+across epochs.
