@@ -254,6 +254,7 @@ def load_and_preprocess_unified_dataset(
     from data_unification.cic2017_adapter import CIC2017Adapter
     from data_unification.cic2018_adapter import CIC2018Adapter
     from data_unification.ctu13_adapter import CTU13Adapter
+    from data_unification.ip_features import build_node_feature_matrix
 
     # Stride is applied DURING ingestion, per file, not after.
     #
@@ -343,9 +344,29 @@ def load_and_preprocess_unified_dataset(
     empty_edge = np.zeros((1, raw_edge_features.shape[1]), dtype=np.float32)
     edge_features = np.vstack([empty_edge, raw_edge_features])
 
-    total_nodes = len(ip_to_id) + 1
-    node_feat_dim = edge_features.shape[1]
-    node_features = np.zeros((total_nodes, node_feat_dim), dtype=np.float32)
+    # Node features were np.zeros(...). Every one of them. In TGN a node's
+    # embedding is a function of its memory, its node features and its
+    # neighbours; for a node never seen in training the memory is zero too, so
+    # an unseen host carried NO signal at all and the link decoder scored it at
+    # chance. Measured: transductive val AUC 0.9981 vs inductive val AUC 0.5043.
+    #
+    # These features are pure functions of the IP string, so they introduce no
+    # label leakage and no temporal leakage across the 70/85 quantile split.
+    # The octets are what buys inductive generalisation: an unseen host in a
+    # /24 the model has already seen arrives close to its neighbours in feature
+    # space. See data_unification/ip_features.py.
+    node_features = build_node_feature_matrix(ip_to_id)
+    if node_features.shape[1] != edge_features.shape[1]:
+        raise ValueError(
+            f"node feature width {node_features.shape[1]} != edge feature width "
+            f"{edge_features.shape[1]}; tgn.py sets embedding_dimension from the "
+            f"node width, so the 12-D latent contract would break."
+        )
+    logging.info(
+        "Node features: %d hosts x %dD intrinsic IP features (was all-zero, "
+        "which made inductive link prediction impossible)",
+        node_features.shape[0] - 1, node_features.shape[1],
+    )
 
     return graph_df, edge_features, node_features, category_mapping
 
