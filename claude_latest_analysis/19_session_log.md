@@ -538,3 +538,34 @@ One thing to watch at full density: `val_traj_len_median = 1` and only 6 hosts
 with 16+ snapshots at this stride. Branch B needs T+1 = 16 snapshots per host,
 so at low density it would have almost nothing to train on. Full density
 should fix it, but worth checking when Branch B runs.
+
+### 18:30 — Quantified why Branch B needs the PCAP path
+Checked host-trajectory lengths before running Branch B, since it needs
+T+1 = 16 snapshots per host:
+
+| source | hosts | real identity? | ≥16 snapshots |
+|---|---|---|---|
+| CIC-2018 ×9 days | **350** | ✗ fabricated | 100% |
+| CIC-2018 `tue_20` | 37 | ✓ real | 11 |
+| CTU-13 scen 9 | 127,730 | ✓ real | **0.6%** |
+
+**The 350 is the tell.** `cic2018_adapter` fabricates
+`192.168.10.{i%250+1}` and `172.16.0.{i%100+1}` — exactly 250 + 100. Every
+long, clean trajectory on those days is an artefact of assigning host identity
+by row index, not network behaviour.
+
+So on the CSV path Branch B would train almost entirely on a synthetic
+350-host graph, while the genuinely-identified sources give either very few
+hosts (tue_20: 37) or very few sustained ones (CTU-13: 0.6% reach 16).
+
+**Plan (pragmatic, and stated honestly rather than hidden):**
+1. Run Branch B/DeepOP on the CSV path first, to validate the pipeline
+   end-to-end and produce loadable checkpoints.
+2. **Label those results as fabricated-identity for 9 of 10 CIC-2018 days.**
+   They demonstrate the pipeline, not the science.
+3. The scientifically valid run needs `--pcap-root`. Rough cost estimate:
+   ~1.2B packets across 600 GB, so several hours of parsing — an overnight
+   job, and better done once the 266 corrupt files are replaced.
+
+This confirms the original plan's Phase 2/3 rationale with numbers rather than
+argument.
