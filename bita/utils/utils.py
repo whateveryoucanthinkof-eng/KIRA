@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 
@@ -244,7 +246,11 @@ class NeighborFinder:
     `_get_temporal_neighbor_reference` below is the original, kept verbatim as
     the oracle that tests/test_temporal_neighbor_vectorised.py checks against.
     """
-    if self._csr is None or n_neighbors <= 0:
+    # TGNE_REFERENCE_SAMPLER=1 forces the original per-node Python loop. It
+    # exists so a controlled A/B run can compare the two end to end, not just
+    # in unit tests -- the vectorised path is the default.
+    if (self._csr is None or n_neighbors <= 0
+            or os.environ.get("TGNE_REFERENCE_SAMPLER", "") in ("1", "true", "True")):
       return self._get_temporal_neighbor_reference(source_nodes, timestamps, n_neighbors)
 
     flat_nbr, flat_eidx, flat_ts, offsets = self._csr
