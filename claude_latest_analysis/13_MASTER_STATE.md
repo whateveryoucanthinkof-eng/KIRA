@@ -28,7 +28,7 @@ correct, and prove it.
 
 | Resource | Value | Rule |
 |---|---|---|
-| RAM | 22 GiB total, ~12 GiB available | Cap heavy jobs at **17-18 GiB** under `systemd-run`. 19 GiB starved the desktop and froze it. |
+| RAM | 22 GiB total, ~12-17 GiB available | Cap heavy jobs at **16 GiB** (`MemoryHigh=14G`). 19 GiB froze the desktop twice; a stride-4 run reached **15.28 GiB** with only 2 GiB left system-wide and was stopped before it hit the cap. |
 | Swap | 8 GiB **zram only** | zram means OOM presents as *livelock*, not a clean kill. Always set `MemorySwapMax=0` on training units. |
 | Disk | 952 GB, **79 GB free (92% used)** | Tight. The memmap spill (`.spill/`) and the 29 GB PCAP re-download both land here. Check before large writes. |
 | GPU | RTX 4060 Laptop, 8 GiB | Currently 660 MiB used. Batch sizes are nowhere near the limit. |
@@ -42,6 +42,19 @@ systemd-run --user --unit=<name> -p MemoryMax=17G -p MemorySwapMax=0 \
 ```
 Use the **absolute pyenv python path** — `bash -c python3` resolves to `/usr/bin/python3`, which
 has no torch (this already cost one failed run).
+
+### Measured costs — use these, do not estimate
+
+| Thing | Measured | How |
+|---|---|---|
+| `UnifiedFlowRecord` | **300 B** (was 479 before the interning fix) | current RSS delta over 200k records, after a 50k warm-up so pandas buffers are already allocated |
+| Full corpus | 39M records (CIC-2018 16.2M + CIC-2017 2.8M + CTU-13 20.0M) | row counts from report 09 |
+| stride 4 | ~9.7M records -> ~2.9 GB of records | 300 B x 9.7M |
+
+**Do not measure memory with `ru_maxrss`.** It is *peak* RSS and will capture
+pandas' chunk buffers, not your objects. It reported 5,103 B/record for a
+record that actually costs 300 B — a 17x error that would have forced a
+needless stride of 20. Read `/proc/self/statm` after `gc.collect()` instead.
 
 **Never write outputs to `/tmp`** — it is tmpfs and was wiped by a reboot, losing completed
 Branch B and DeepOP checkpoints. Everything goes to `saved_models/`.
@@ -119,6 +132,11 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 | 20 | Prefix sampling was label-biased | `split_manager.py`, `bita/train.py` | Frozen val split measured **0% attack** at 2000 rows/capture |
 | 21 | `stride` applied after loading, so peak memory was the full corpus | `bita/train.py:274` | Striding saved nothing at the peak |
 | 22 | Hits@K / MRR were O(N x P x C) Python loops | `bita/evaluation/eval_edge_prediction_with_categories.py` | Eval took longer than training: 12+ min after a 4 min epoch. 288x / 72x faster |
+| 23 | Node features were **all zero** -> inductive learning impossible | `bita/train.py`, `data_unification/ip_features.py` (new) | Transductive AUC 0.9981 vs inductive 0.5043 (chance) |
+| 24 | Trainers invented 5 splits; none matched the lock | `retrain_branch_a_live.py`, `retrain_future_models_live.py`, `split_policy.py` | Branch A sliced a **sorted** list 70/15/15; 3 more 80/20 slices |
+| 25 | PCAP test day would `KeyError` or be folded into train | `retrain_future_models_live.py` | Lock assigns `thu_1_pcap` to test; only train/val stores existed |
+| 26 | **String interning never fired for IPs** | `data_unification/unified_schema.py` | Guard was `type(x) is str`; adapters emit `numpy.str_`. 479 -> 300 B/record |
+| 27 | Edge features copied three times at peak | `bita/train.py` | list of N small arrays -> np.stack -> np.vstack |
 
 ### Still open
 
