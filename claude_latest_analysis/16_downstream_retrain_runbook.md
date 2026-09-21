@@ -55,6 +55,32 @@ features beyond the 12 intrinsic IP ones.
 
 ---
 
+## 1b. Pick the encoder epoch — do NOT just take the final checkpoint
+
+```bash
+python scripts/select_best_encoder.py logs/tgne_final.out \
+    --copy saved_models/bita_bigru_transformer-unified_final.pth
+```
+
+The two objectives diverge on this corpus. Measured over six epochs:
+
+| epoch | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| val_ap | .9971 | .9968 | .9968 | .9973 | .9974 | **.9975** |
+| inductive AP | .9926 | .9921 | .9918 | .9935 | **.9936** | .9934 |
+| C2 inductive | .325 | .319 | .517 | .565 | **.586** | .480 |
+| InitialAccess | .505 | **.714** | .578 | .612 | .561 | .510 |
+
+`val_ap` rises to the end while classification degrades after epoch 4, so the
+final checkpoint is **not** the best one. Every epoch is saved, so the choice
+is made after the fact: the script scores
+`0.5 × inductive AP + 0.5 × macro recall` and prints what `val_ap` alone would
+have picked, so the gap is visible.
+
+Then export `TGNE_CHECKPOINT_PATH` to the winning checkpoint for stages 2-3,
+and make sure a matching `<checkpoint>_config.json` sits beside it --
+`build_or_load_tgne_ta` reads it and will refuse a mismatched one.
+
 ## 2. Branch A
 
 ```bash
@@ -63,7 +89,7 @@ python scripts/retrain_branch_a_live.py \
   --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
   --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
   --output saved_models/branch_a/branch_a_lstm.pt \
-  --epochs 8 --batch-size 128 \
+  --epochs 8 --batch-size 128 --spill-dir .spill \
   --spill-dir .spill
 ```
 
@@ -88,7 +114,7 @@ python scripts/retrain_future_models_live.py \
   --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
   --tgne saved_models/bita_bigru_transformer-unified_v5.pth \
   --out-dir saved_models \
-  --epochs 6 \
+  --epochs 6 --spill-dir .spill \
   --spill-dir .spill
 ```
 
@@ -141,3 +167,25 @@ For each model: the held-out **test** number (scored once), the persistence
 baseline it must beat, and the credibility verdict. A number without its
 baseline is not a result — the gate exists because three earlier training runs
 produced numbers that looked fine and meant nothing.
+
+
+---
+
+## 7. What the Branch B / DeepOP numbers will and will not mean
+
+Measured host-trajectory lengths, which decide what those models can learn:
+
+| source | hosts | real identity? | ≥16 snapshots (Branch B needs T+1) |
+|---|---|---|---|
+| CIC-2018 ×9 days | **350** | ✗ fabricated `i%250` / `i%100` | 100% |
+| CIC-2018 `tue_20` | 37 | ✓ | 11 |
+| CTU-13 scen 9 | 127,730 | ✓ | **0.6%** |
+
+On the CSV path Branch B trains almost entirely on a **synthetic 350-host
+graph** — those long clean trajectories are an artefact of assigning host
+identity by row index. Report CSV-path Branch B/DeepOP results as **pipeline
+validation, not science**.
+
+The scientifically valid run needs `--pcap-root`, which gives real per-host
+captures. Rough cost: ~1.2B packets over 600 GB, several hours — an overnight
+job, and better after the 266 corrupt files are replaced.
