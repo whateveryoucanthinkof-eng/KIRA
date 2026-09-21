@@ -61,8 +61,14 @@ class MultiTaskUncertaintyLoss(nn.Module):
         exp(-s_grad) * L_grad + s_grad
     """
 
-    def __init__(self):
+    #: log-variance bounds. exp(3) ~ 20 and exp(-3) ~ 0.05, so one task can
+    #: outweigh another by at most ~400x -- wide enough for genuine
+    #: differences in task scale, narrow enough to prevent a runaway.
+    LOG_VAR_MIN, LOG_VAR_MAX = -3.0, 3.0
+
+    def __init__(self, clamp: bool = True):
         super(MultiTaskUncertaintyLoss, self).__init__()
+        self.clamp = clamp
         self.log_var_risk = nn.Parameter(torch.zeros(1))
         self.log_var_tech = nn.Parameter(torch.zeros(1))
         self.log_var_grad = nn.Parameter(torch.zeros(1))
@@ -73,14 +79,38 @@ class MultiTaskUncertaintyLoss(nn.Module):
         tech_loss: torch.Tensor,
         grad_loss: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        prec_risk = torch.exp(-self.log_var_risk)
-        prec_tech = torch.exp(-self.log_var_tech)
-        prec_grad = torch.exp(-self.log_var_grad)
+        # Bound the log-variances.
+        #
+        # Kendall & Gal's objective is unbounded below. For a task with loss L
+        # the optimum is log_var = log(L), worth 1 + log(L) -- so as L -> 0 the
+        # total dives to -inf and that task's precision exp(-log_var) explodes,
+        # starving the others. Measured with risk_loss = 1e-4 and the other two
+        # at realistic values:
+        #
+        #     step   total    prec_risk   prec_tech
+        #        1    2.100         1.0       1.000
+        #      300   -6.133      9993.5       0.833
+        #
+        # Risk would outweigh technique classification by ~12,000x, and the
+        # logged loss falls the whole time, so it reads as healthy training.
+        #
+        # That matters here specifically: risk_score is derived from is_attack
+        # (benign exactly 0.0, attack >= 0.20), so it is the EASIEST task and
+        # the least informative -- exactly the one that would run away.
+        lv_risk, lv_tech, lv_grad = self.log_var_risk, self.log_var_tech, self.log_var_grad
+        if self.clamp:
+            lv_risk = lv_risk.clamp(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
+            lv_tech = lv_tech.clamp(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
+            lv_grad = lv_grad.clamp(self.LOG_VAR_MIN, self.LOG_VAR_MAX)
+
+        prec_risk = torch.exp(-lv_risk)
+        prec_tech = torch.exp(-lv_tech)
+        prec_grad = torch.exp(-lv_grad)
 
         total_loss = (
-            prec_risk * risk_loss + self.log_var_risk +
-            prec_tech * tech_loss + self.log_var_tech +
-            prec_grad * grad_loss + self.log_var_grad
+            prec_risk * risk_loss + lv_risk +
+            prec_tech * tech_loss + lv_tech +
+            prec_grad * grad_loss + lv_grad
         )
 
         metrics = {
