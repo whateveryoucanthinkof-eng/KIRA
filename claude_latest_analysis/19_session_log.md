@@ -452,3 +452,35 @@ Distinguishing these matters: Recon and C2 need a different corpus, whereas
 InitialAccess should be recoverable with training changes. Not acting on it
 yet — the run is still improving and I do not want to change two things at
 once.
+
+### 18:00 — CORRECTION to the 17:55 entry on InitialAccess
+I said InitialAccess had a **0.9997 ceiling** and was therefore an
+"optimisation gap, not a data limit". **That was wrong.** The separability
+test sampled the first six CIC-2018 files alphabetically, which **excludes
+`wed_14`**, and I generalised from a subset dominated by the easy behaviour.
+
+Measured per file, both labelled InitialAccess:
+
+| file | content | tree balanced acc | IA recall |
+|---|---|---|---|
+| `wed_14` | FTP/SSH brute force | **1.0000** | 1.000 |
+| `thu_1` | **Infilteration** | **0.6322** | **0.278** |
+
+The class conflates a trivially separable behaviour with one a
+gradient-boosted tree can barely detect. Infiltration being undetectable from
+flow features is a documented property of CSE-CIC-IDS2018 — the compromise is
+host-level and the network flows look benign.
+
+**Revised: the model's 0.58 on InitialAccess is plausibly near its practical
+ceiling**, not an optimisation failure. So all three weak classes are
+data-limited, in three different ways:
+
+| class | limit |
+|---|---|
+| Recon | 1 carrier host — cannot generalise |
+| C2 | 10 hosts across all of CTU-13 — improving but capped |
+| InitialAccess | conflates brute force (easy) with Infiltration (≈undetectable from flows) |
+
+**Method note:** the first test was cheap and I trusted it too quickly. A
+per-file breakdown would have caught it immediately — averaging over a corpus
+whose files have different attack types hides exactly this.
