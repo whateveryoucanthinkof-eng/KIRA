@@ -388,3 +388,23 @@ Recon, less extreme.
 Recon (1 host) and C2 (10 hosts across all of CTU-13). No amount of training
 fixes that; it needs a corpus with more distinct attackers (CIDDS-001 was the
 candidate identified earlier).
+
+### 17:35 — All three downstream stages had the same 80/38/52 GiB blocker
+Checked Branch B and DeepOP rather than waiting to hit it:
+
+| stage | materialised | lazy |
+|---|---|---|
+| Branch A | **80.3 GiB** | 336 MB |
+| Branch B | **37.9 GiB** | ~280 MB |
+| DeepOP | **~52 GiB** | ~340 MB |
+
+None of them would have run at full density. Each keeps int32 index columns
+and gathers windows from the store's memmapped block in `__getitem__`.
+
+DeepOP needed one extra care: it 2x-oversamples non-Benign windows to stop the
+decoder collapsing to the quiescent sequence. That is preserved by listing
+those positions twice in the index, and the index is built from the store's
+`cat_id` column directly so no row is materialised to decide it.
+
+*22 tests across the three, each asserting equivalence with the eager path
+rather than just "it runs".*
