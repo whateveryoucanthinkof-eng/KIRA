@@ -148,3 +148,18 @@ an analyst** — so a host under persistent pressure was being ranked below one
 with a noisy spike. Now `1 - prod(1-r)` in log space; `peak_risk()` kept
 separately since it answers a different question.
 Training unaffected (every trainer discarded this value). *7 tests.*
+
+### 16:00 — Vectorised sampler measured in the real training loop
+| | Exp A (reference sampler) | Final (vectorised) |
+|---|---|---|
+| throughput | 113 batch/s | **158.4 batch/s** |
+| batches/epoch | 115,693 | 118,029 *(more data)* |
+| epoch time | ~17.0 min | **~12.4 min** |
+
+**+40% throughput**, and that is *despite* the new category head being a
+bigger MLP and there being more training edges. My earlier estimate from the
+isolated benchmark (~11%) was conservative — in the real loop the Python
+sampling loop was costing more than the microbenchmark suggested.
+
+Combined with parallel ingest (12.5 min -> 3.9 min), a full 30-epoch run goes
+from roughly 8.7 h to **6.3 h**.
