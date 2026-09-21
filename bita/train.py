@@ -924,6 +924,7 @@ def train(args):
 
         tgn.set_neighbor_finder(train_ngh_finder)
         m_loss = []
+        m_edge_loss, m_cat_loss = [], []
 
         for k in range(0, num_batch, args.backprop_every):
             loss = 0.0
@@ -964,10 +965,31 @@ def train(args):
                 loss += batch_edge_loss
                 category_loss_total += batch_cat_loss
 
-            total_loss = (loss + category_loss_total) / args.backprop_every
+            # Weight the auxiliary category term.
+            #
+            # The two losses used to be summed with EQUAL weight, and never
+            # logged separately, so the imbalance was invisible. Measured at
+            # this corpus's class distribution:
+            #
+            #     edge loss  (AUC ~0.82)      0.5754
+            #     category loss, mediocre     0.0420   ~14x smaller
+            #     category loss, confident    0.0001   ~5700x smaller
+            #
+            # Focal loss with gamma=2 exists to down-weight easy examples, but
+            # 89% of this corpus is one easy class, so it drives the whole
+            # term toward zero next to a co-summed task. C2 compounds it at
+            # 0.3% of samples -- a batch of 128 holds ~0.4 C2 examples.
+            #
+            # The category head therefore stopped learning: three of five
+            # classes sat at exactly 0.0 recall while the head was perfectly
+            # capable (the same architecture reaches 0.998 on these features
+            # standalone).
+            total_loss = (loss + args.cat_loss_weight * category_loss_total) / args.backprop_every
             total_loss.backward()
             optimizer.step()
             m_loss.append(total_loss.item())
+            m_edge_loss.append(float(loss.item()) / args.backprop_every)
+            m_cat_loss.append(float(category_loss_total.item()) / args.backprop_every)
 
             if k % 500 == 0:
                 elapsed = time.time() - start_epoch
@@ -1033,7 +1055,7 @@ def train(args):
         new_nodes_val_accuracies.append(nn_val_cat_acc)
         new_nodes_val_mrrs.append(nn_val_mrr)
 
-        logging.info(f"Epoch {epoch:02d} [{epoch_time:.2f}s] Loss: {mean_train_loss:.4f} | "
+        logging.info(f"Epoch {epoch:02d} [{epoch_time:.2f}s] Loss: {mean_train_loss:.4f} (edge {np.mean(m_edge_loss):.4f} cat {np.mean(m_cat_loss):.4f} x{args.cat_loss_weight:g}) | "
                      f"Val AUC: {val_auc:.4f}, AP: {val_ap:.4f}, CatAcc: {val_cat_acc:.4f}, MRR: {val_mrr:.4f} | "
                      f"Inductive Val AUC: {nn_val_auc:.4f}, AP: {nn_val_ap:.4f}, CatAcc: {nn_val_cat_acc:.4f}")
 
@@ -1221,6 +1243,11 @@ if __name__ == '__main__':
     parser.add_argument('--ctu13_dir', type=str, default=None, help='CTU-13 directory of <scenario>/*.binetflow files (switches to the unified, non-bipartite loader)')
     parser.add_argument('--rows_per_file', type=int, default=None, help='Max records KEPT per source file, after striding (not a row prefix)')
     parser.add_argument('--stride', type=int, default=1, help='Keep every Nth record DURING ingestion: spans the whole capture and bounds peak memory')
+    parser.add_argument('--cat_loss_weight', type=float, default=15.0,
+                        help='Weight on the auxiliary category loss. The two terms were '
+                             'summed equally, but focal loss drives the category term ~14x '
+                             'below the edge loss (5700x once confident), so the head stopped '
+                             'learning. 1.0 restores the old behaviour.')
     parser.add_argument('--ingest_workers', type=int, default=0,
                         help='Parse captures across N worker processes. 0 = serial. '
                              'Results are identical either way: workers return local '
