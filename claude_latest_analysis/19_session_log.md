@@ -1,0 +1,53 @@
+# Session log — while you were away
+
+Short entries. Newest at the bottom. Started ~15:40.
+
+---
+
+### 15:41 — Credibility verdict now saved with the checkpoint
+**Was:** the gate computed a verdict, printed it, threw it away. A model its
+own training run judged unsound could be served with nothing recording that.
+**Now:** checkpoint carries `{credible, problems, stats}`; the serving adapter
+logs ERROR when it loads an unsound one, and flags a checkpoint with no
+verdict at all. Gate stays advisory (a demo may want a weak model) — you just
+can't serve one unknowingly. *6 tests.*
+
+### 15:48 — Experiment A finished, and it found something big
+Epoch 0: Val AUC 0.8168, **Inductive Val AUC 0.7961**, 1022 s/epoch.
+Per-class: `{Benign 0.2, C2 0.0, Impact 0.0, InitialAccess 1.0, Recon 0.0}`
+→ **the category head predicts InitialAccess for everything.**
+Also means the earlier "good" CatAcc 0.8351 was *also* a collapse — onto
+Benign, which is ~80% of the data. Both constant predictors.
+
+### 15:50 — Root cause: the head couldn't see the flow *(biggest fix today)*
+```python
+combined = src_emb + dst_emb          # 12-D
+logits   = nn.Linear(12, n_classes)(combined)
+```
+The label (Benign/C2/Impact/InitialAccess/Recon) is a property of the **flow**
+— ports, bytes, duration, protocol. The head only saw node embeddings, so a
+benign flow and an attack flow *between the same host pair* were identical
+inputs. Unseparable in principle → collapse. Addition also erased direction
+(A→B == B→A).
+**Now:** `[src ; dst ; edge_features] → Linear → ReLU → Dropout → Linear`.
+Verified: logits change when only the edge changes. *7 tests, two of which
+prove the old design had the flaw so the new ones can't pass vacuously.*
+
+**Consequence:** Sep-10 checkpoints can't load (head shape changed). They
+already failed `validate_checkpoint`. Loader now raises
+`StaleEncoderArchitecture` with a plain explanation instead of a state_dict
+diff; 3 adapter test modules skip with a stated reason until retrain.
+
+### 15:52 — Final TGNE run launched
+Edge-aware head + per-capture split + full density (34,152,542 records) +
+parallel ingest + vectorised sampler. 30 epochs, patience 5, seed 0.
+`logs/tgne_final.out`
+
+**Dropped the strict perf A/B.** A was a baseline for an architecture we just
+replaced, so it's no longer valid for comparison. Both speedups are already
+proven lossless by 25 + 6 equivalence tests; I'll read wall-clock off this run
+instead. Recorded the reasoning in `17_perf_experiments.md`.
+
+### What to check at epoch 0
+**Per-class accuracy with more than one class above zero.** Aggregate CatAcc
+proves nothing — 0.8351 and 0.2115 were both collapses.
