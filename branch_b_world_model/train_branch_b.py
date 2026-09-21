@@ -291,10 +291,10 @@ class LazyHostRolloutDataset(Dataset):
 
         fut_rows = rows[i:i + self.K]
         h_fut = self.store.feats[fut_rows, :12]
-        r_fut = np.asarray(
-            [self.store._materialize(int(r)).risk_score for r in fut_rows],
-            dtype=np.float32,
-        )
+        # risk_score is its own column -- one fancy-index, not K snapshot
+        # builds. `_materialize` would construct K full HostWindowSnapshots
+        # per sample and read one float off each.
+        r_fut = np.asarray(self.store.risk_score[fut_rows], dtype=np.float32)
         if len(fut_rows) < self.K:
             pad = self.K - len(fut_rows)
             h_fut = np.pad(h_fut, ((0, pad), (0, 0)), mode="edge")

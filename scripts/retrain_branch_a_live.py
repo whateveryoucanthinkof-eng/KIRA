@@ -4,6 +4,7 @@ import argparse
 import os
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -82,34 +83,45 @@ def _make_samples(records, extractor, seq_len: int):
 
 
 def _evaluate(model, loader, device):
+    """Validation pass.
+
+    Accumulators live on the device and are read once at the end. The previous
+    version called `.item()` for the loss, `.cpu().numpy()` for the risk errors
+    and `.item()` for the technique hits -- three host-device syncs per batch --
+    and grew a Python list to one float per validation sample (1.02M of them).
+    The reported metrics are unchanged.
+    """
     model.eval()
-    losses = []
-    risk_errors = []
-    correct_tech = 0
+    nb = 0
     total = 0
+    non_blocking = (device == "cuda")
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    abs_err_sum = torch.zeros((), device=device, dtype=torch.float64)
+    n_risk = 0
+    correct_tech_t = torch.zeros((), device=device, dtype=torch.long)
     with torch.no_grad():
         for batch in loader:
-            x = batch["features"].to(device)
+            x = batch["features"].to(device, non_blocking=non_blocking)
             targets = {
-                "risk": batch["risk"].to(device),
-                "technique": batch["technique"].to(device),
-                "gradation": batch["gradation"].to(device),
+                "risk": batch["risk"].to(device, non_blocking=non_blocking),
+                "technique": batch["technique"].to(device, non_blocking=non_blocking),
+                "gradation": batch["gradation"].to(device, non_blocking=non_blocking),
             }
             predictions = model(x)
             loss, _ = model.compute_loss(predictions, targets)
-            losses.append(float(loss.item()))
-            risk_errors.extend(
-                (predictions["risk_score"] - targets["risk"]).abs().cpu().numpy()
-            )
-            correct_tech += int(
-                (predictions["technique_logits"].argmax(dim=-1) == targets["technique"])
-                .sum()
-                .item()
-            )
+            loss_sum += loss.detach().double().sum()
+            nb += 1
+            err = (predictions["risk_score"] - targets["risk"]).abs()
+            abs_err_sum += err.double().sum()
+            n_risk += int(err.numel())
+            correct_tech_t += (
+                predictions["technique_logits"].argmax(dim=-1) == targets["technique"]
+            ).sum()
             total += int(targets["technique"].numel())
+    correct_tech = int(correct_tech_t.item())
     return {
-        "loss": float(np.mean(losses)) if losses else 0.0,
-        "risk_mae": float(np.mean(risk_errors)) if risk_errors else 0.0,
+        "loss": float((loss_sum / nb).item()) if nb else 0.0,
+        "risk_mae": float((abs_err_sum / n_risk).item()) if n_risk else 0.0,
         "tech_accuracy": correct_tech / max(1, total),
     }
 
@@ -125,6 +137,18 @@ def main():
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader worker processes. 0 loads in the main "
+                             "process, which serialises data loading with GPU "
+                             "compute -- measured at 35.7%% of wall clock on the "
+                             "full-density run, i.e. the GPU idled for a third "
+                             "of every epoch. Default 4 is deliberately modest: "
+                             "loading costs ~1.0x compute, so 2 already hide it, "
+                             "and this box has ~9 GiB free under a 17 GiB cap.")
+    parser.add_argument("--log-every", type=int, default=2000,
+                        help="Print a progress line every N batches. At full "
+                             "density an epoch is ~161k batches; with no "
+                             "progress line a run is unobservable for an hour.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -267,18 +291,30 @@ def main():
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise RuntimeError("The 2-second pipeline produced no train/validation samples")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Workers matter more than anything else in this loop: profiling the
+    # full-density run showed 35.7% of wall clock inside the dataset/collate
+    # path, all of it in the main process and therefore serialised with the
+    # GPU. The dataset is lazy by design (336 MB of indices instead of an
+    # 80.3 GiB materialised array), which trades memory for per-item work --
+    # that trade only pays if the work is overlapped.
+    _loader_kw = dict(num_workers=args.num_workers, pin_memory=(device == "cuda"))
+    if args.num_workers > 0:
+        _loader_kw.update(persistent_workers=True, prefetch_factor=4)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
+        **_loader_kw,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
+        **_loader_kw,
     )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model = MultiTaskLSTM(
         input_dim=27,
         hidden_dim=64,
@@ -295,30 +331,51 @@ def main():
         f"val_records={record_counts.get('val', 0)} "
         f"train_samples={len(train_ds)} val_samples={len(val_ds)} device={device}"
     )
+    _n_train_batches = len(train_loader)
     for epoch in range(1, args.epochs + 1):
         model.train()
-        train_losses = []
+        # Loss is accumulated as a GPU tensor and read once at the end of the
+        # epoch. `float(loss.item())` per batch forces a host-device sync on
+        # every one of ~161k batches, which serialises the CPU against the GPU
+        # and defeats the prefetching the workers above are there to provide.
+        # The reported value is unchanged: still the unweighted mean over
+        # batches.
+        _nb = 0
+        _loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        _t_epoch = time.time()
+        _non_blocking = (device == "cuda")
         for batch in train_loader:
-            x = batch["features"].to(device)
+            x = batch["features"].to(device, non_blocking=_non_blocking)
             targets = {
-                "risk": batch["risk"].to(device),
-                "technique": batch["technique"].to(device),
-                "gradation": batch["gradation"].to(device),
+                "risk": batch["risk"].to(device, non_blocking=_non_blocking),
+                "technique": batch["technique"].to(device, non_blocking=_non_blocking),
+                "gradation": batch["gradation"].to(device, non_blocking=_non_blocking),
             }
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             predictions = model(x)
             loss, _ = model.compute_loss(predictions, targets)
             loss.backward()
             optimizer.step()
-            train_losses.append(float(loss.item()))
+            _loss_sum += loss.detach().double().sum()
+            _nb += 1
+            if args.log_every and _nb % args.log_every == 0:
+                _el = time.time() - _t_epoch
+                _rate = _nb / max(_el, 1e-9)
+                _eta = (_n_train_batches - _nb) / max(_rate, 1e-9)
+                print(f"  epoch={epoch} batch={_nb}/{_n_train_batches} "
+                      f"({100.0 * _nb / max(_n_train_batches, 1):.1f}%) "
+                      f"{_rate:.1f} batch/s elapsed={_el / 60:.1f}m "
+                      f"eta={_eta / 60:.1f}m", flush=True)
 
         metrics = _evaluate(model, val_loader, device)
         metrics["epoch"] = epoch
-        metrics["train_loss"] = float(np.mean(train_losses))
+        metrics["train_loss"] = float((_loss_sum / max(_nb, 1)).item())
+        metrics["epoch_seconds"] = float(time.time() - _t_epoch)
         print(
             f"epoch={epoch} train_loss={metrics['train_loss']:.4f} "
             f"val_loss={metrics['loss']:.4f} risk_mae={metrics['risk_mae']:.4f} "
-            f"tech_accuracy={metrics['tech_accuracy']:.3f}"
+            f"tech_accuracy={metrics['tech_accuracy']:.3f} "
+            f"wall={metrics['epoch_seconds'] / 60:.1f}m"
         )
         if metrics["loss"] < best_loss:
             best_loss = metrics["loss"]
@@ -354,7 +411,7 @@ def main():
     ckpt = torch.load(args.output, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     test_loader = DataLoader(test_ds,
-                             batch_size=args.batch_size, shuffle=False)
+                             batch_size=args.batch_size, shuffle=False, **_loader_kw)
     test_metrics = _evaluate(model, test_loader, device)
     print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): {test_metrics}", flush=True)
     # The credibility verdict travels WITH the checkpoint.

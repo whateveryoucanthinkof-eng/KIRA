@@ -140,6 +140,26 @@ class TrajectoryStore(Mapping):
             risk_score=float(self.risk_score[row]),
         )
 
+    def target_fields(self, row: int):
+        """(risk, coarse_category, first_technique_or_None, window_idx) for one row.
+
+        `_materialize` costs ~86us per call; the two memmap feature slices and
+        the dataclass construction dominate it, and a *target* uses none of
+        them. Reading these four columns directly measures ~1.0us. Branch A
+        asks for one target per sample, so at 20.66M samples that is 29.6
+        minutes per epoch of main-process time -- time the GPU spends idle.
+
+        Returns the first technique or None; the caller owns the default,
+        because "no technique" is not the store's concept to name.
+        """
+        lo, hi = int(self.tech_off[row]), int(self.tech_off[row + 1])
+        return (
+            float(self.risk_score[row]),
+            self.categories[int(self.cat_id[row])],
+            self.techniques[int(self.tech_flat[lo])] if hi > lo else None,
+            int(self.window_idx[row]),
+        )
+
     @property
     def n_snapshots(self) -> int:
         return int(self.feats.shape[0])

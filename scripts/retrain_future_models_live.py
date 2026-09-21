@@ -1,6 +1,7 @@
 """Retrain Branch B and DeepOP on the canonical live TGNE latent space."""
 
 import argparse
+import time
 import os
 import random
 import re
@@ -200,7 +201,22 @@ def iter_pcap_day_records(pcap_root, csv_label_dir, window_seconds, max_windows_
         yield split, day, recs
 
 
-def train_branch_b_live(train_traj, val_traj, output, epochs, device):
+def _loader_kwargs(device, num_workers: int):
+    """DataLoader settings that keep the GPU fed.
+
+    Both lazy datasets trade memory for per-item work (38 GiB -> 280 MB for
+    Branch B, 52 GiB -> 340 MB for DeepOP). That trade only pays if the work
+    overlaps GPU compute. With the PyTorch default of num_workers=0 it does
+    not: profiling Branch A's full-density run put 35.7% of wall clock in the
+    dataset/collate path, all of it in the main process.
+    """
+    kw = dict(num_workers=num_workers, pin_memory=(str(device) == "cuda"))
+    if num_workers > 0:
+        kw.update(persistent_workers=True, prefetch_factor=4)
+    return kw
+
+
+def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4):
     _c = get_contract()
     # Lazy: create_rollout_samples materialises h_history [15,12],
     # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
@@ -209,30 +225,54 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device):
     train_ds = LazyHostRolloutDataset(train_traj, T=_c.history_steps, K=_c.forecast_steps)
     val_ds = LazyHostRolloutDataset(val_traj, T=_c.history_steps, K=_c.forecast_steps)
     print(f"Branch B samples: train={len(train_ds)} val={len(val_ds)}", flush=True)
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=128)
+    _lk = _loader_kwargs(device, num_workers)
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, **_lk)
+    val_loader = DataLoader(val_ds, batch_size=128, **_lk)
     wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64, n_heads=4, n_layers=3).to(device)
     risk = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(device)
     optimizer = torch.optim.Adam(list(wdt.parameters()) + list(risk.parameters()), lr=1e-3, weight_decay=1e-4)
     best = float("inf")
     best_state = {k: v.detach().clone() for k, v in wdt.state_dict().items()}
+    _nb_total = len(train_loader)
+    _nblk = (str(device) == "cuda")
     for epoch in range(epochs):
         wdt.train(); risk.train()
+        # Accumulated on device and read once per epoch: a `.item()` per batch
+        # forces a host-device sync that stalls the prefetch queue. The train
+        # loss was previously not tracked at all here, so an epoch reported
+        # nothing until validation finished.
+        _tr_sum = torch.zeros((), device=device, dtype=torch.float64); _nb = 0
+        _t0 = time.time()
         for batch in train_loader:
-            h = batch["h_history"].to(device); target = batch["h_future"].to(device); target_risk = batch["risk_future"].to(device)
-            optimizer.zero_grad()
+            h = batch["h_history"].to(device, non_blocking=_nblk)
+            target = batch["h_future"].to(device, non_blocking=_nblk)
+            target_risk = batch["risk_future"].to(device, non_blocking=_nblk)
+            optimizer.zero_grad(set_to_none=True)
             pred = wdt.rollout(h, K=_c.forecast_steps)
             pred_risk, _ = risk.forward_trajectory(pred)
             loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
             loss = loss + F.binary_cross_entropy(pred_risk, target_risk)
             loss.backward(); optimizer.step()
-        wdt.eval(); risk.eval(); losses=[]
+            _tr_sum += loss.detach().double().sum(); _nb += 1
+            if _nb % 2000 == 0:
+                _el = time.time() - _t0; _r = _nb / max(_el, 1e-9)
+                print(f"  Branch B epoch={epoch+1} batch={_nb}/{_nb_total} "
+                      f"({100.0*_nb/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
+                      f"eta={(_nb_total-_nb)/max(_r,1e-9)/60:.1f}m", flush=True)
+        wdt.eval(); risk.eval()
+        _v_sum = torch.zeros((), device=device, dtype=torch.float64); _vn = 0
         with torch.no_grad():
             for batch in val_loader:
-                h=batch["h_history"].to(device); target=batch["h_future"].to(device); target_risk=batch["risk_future"].to(device)
+                h=batch["h_history"].to(device, non_blocking=_nblk)
+                target=batch["h_future"].to(device, non_blocking=_nblk)
+                target_risk=batch["risk_future"].to(device, non_blocking=_nblk)
                 pred=wdt.rollout(h,K=_c.forecast_steps); pred_risk,_=risk.forward_trajectory(pred)
-                losses.append((F.mse_loss(pred,target)+F.binary_cross_entropy(pred_risk,target_risk)).item())
-        score=float(np.mean(losses)); print(f"Branch B epoch={epoch+1} val_loss={score:.4f}")
+                _v_sum += (F.mse_loss(pred,target)+F.binary_cross_entropy(pred_risk,target_risk)).double().sum()
+                _vn += 1
+        score=float((_v_sum/max(_vn,1)).item())
+        _trl=float((_tr_sum/max(_nb,1)).item())
+        print(f"Branch B epoch={epoch+1} train_loss={_trl:.4f} val_loss={score:.4f} "
+              f"wall={(time.time()-_t0)/60:.1f}m", flush=True)
         if score < best:
             best=score; output.parent.mkdir(parents=True,exist_ok=True)
             torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds},output)
@@ -242,7 +282,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device):
     return wdt
 
 
-def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None):
+def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4):
     vocab=get_joint_vocab(network_observable_only=True)
     _c=get_contract()
     # T>0 makes samples carry h_history so we can condition on Branch B's own
@@ -257,32 +297,51 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None):
     val_ds=LazyCWADataset(val_traj,vocab,K=_c.forecast_steps,T=_T)
     print(f"DeepOP samples: train={len(train_ds)} val={len(val_ds)}",flush=True)
     print(f"DeepOP conditioning: {'Branch-B rollouts (E1 fixed)' if wdt is not None else 'oracle + noise (interim)'}",flush=True)
-    train_loader=DataLoader(train_ds,batch_size=64,shuffle=True)
-    val_loader=DataLoader(val_ds,batch_size=64)
+    _lk=_loader_kwargs(device,num_workers)
+    train_loader=DataLoader(train_ds,batch_size=64,shuffle=True,**_lk)
+    val_loader=DataLoader(val_ds,batch_size=64,**_lk)
     decoder=DeepOPForecastDecoder(d_latent=12,d_model=72,vocab_size=vocab.vocab_size,n_heads=6,num_layers=2,window_sizes=[2,4,8],dim_feedforward=144).to(device)
     optimizer=torch.optim.AdamW(decoder.parameters(),lr=5e-4,weight_decay=1e-4)
     best=float("inf")
+    _nb_total=len(train_loader); _nblk=(str(device)=="cuda")
     for epoch in range(epochs):
-        decoder.train(); train_losses=[]
+        decoder.train()
+        # On-device accumulation: `loss.item()` per batch synced the host to
+        # the GPU on every step and defeated the worker prefetch queue.
+        _tr_sum=torch.zeros((),device=device,dtype=torch.float64); _nb=0
+        _t0=time.time()
         for batch in train_loader:
-            h=batch["h_future"].to(device); inp=batch["input_tokens"].to(device); tgt=batch["target_tokens"].to(device)
+            h=batch["h_future"].to(device,non_blocking=_nblk)
+            inp=batch["input_tokens"].to(device,non_blocking=_nblk)
+            tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
             if wdt is not None and "h_history" in batch:
                 # Condition on what Branch B actually predicts, which is what
                 # DeepOP receives in production.
                 with torch.no_grad():
-                    h_aug=wdt.rollout(batch["h_history"].to(device), K=h.shape[1]).detach()
+                    h_aug=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=h.shape[1]).detach()
             else:
                 step_sigma=torch.linspace(0.015,0.055,steps=h.shape[1],device=device).unsqueeze(0).unsqueeze(-1)
                 h_aug=h+torch.randn_like(h)*step_sigma
-            optimizer.zero_grad(); logits=decoder(h_aug,inp); loss=F.cross_entropy(logits.reshape(-1,vocab.vocab_size),tgt.reshape(-1),label_smoothing=0.04); loss.backward(); torch.nn.utils.clip_grad_norm_(decoder.parameters(),1.0); optimizer.step(); train_losses.append(loss.item())
-        decoder.eval(); val_losses=[]
+            optimizer.zero_grad(set_to_none=True); logits=decoder(h_aug,inp); loss=F.cross_entropy(logits.reshape(-1,vocab.vocab_size),tgt.reshape(-1),label_smoothing=0.04); loss.backward(); torch.nn.utils.clip_grad_norm_(decoder.parameters(),1.0); optimizer.step()
+            _tr_sum+=loss.detach().double().sum(); _nb+=1
+            if _nb % 2000 == 0:
+                _el=time.time()-_t0; _r=_nb/max(_el,1e-9)
+                print(f"  DeepOP epoch={epoch+1} batch={_nb}/{_nb_total} "
+                      f"({100.0*_nb/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
+                      f"eta={(_nb_total-_nb)/max(_r,1e-9)/60:.1f}m",flush=True)
+        decoder.eval()
+        _v_sum=torch.zeros((),device=device,dtype=torch.float64); _vn=0
         with torch.no_grad():
             for batch in val_loader:
-                hv=batch["h_future"].to(device)
+                hv=batch["h_future"].to(device,non_blocking=_nblk)
                 if wdt is not None and "h_history" in batch:
-                    hv=wdt.rollout(batch["h_history"].to(device), K=hv.shape[1]).detach()
-                logits=decoder(hv,batch["input_tokens"].to(device)); val_losses.append(F.cross_entropy(logits.reshape(-1,vocab.vocab_size),batch["target_tokens"].to(device).reshape(-1)).item())
-        score=float(np.mean(val_losses)); print(f"DeepOP epoch={epoch+1} train_loss={np.mean(train_losses):.4f} val_loss={score:.4f}")
+                    hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1]).detach()
+                logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk))
+                _v_sum+=F.cross_entropy(logits.reshape(-1,vocab.vocab_size),batch["target_tokens"].to(device,non_blocking=_nblk).reshape(-1)).double().sum()
+                _vn+=1
+        score=float((_v_sum/max(_vn,1)).item())
+        print(f"DeepOP epoch={epoch+1} train_loss={float((_tr_sum/max(_nb,1)).item()):.4f} "
+              f"val_loss={score:.4f} wall={(time.time()-_t0)/60:.1f}m",flush=True)
         if score < best:
             best=score; output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size},output)
 
@@ -336,6 +395,9 @@ def main():
     parser.add_argument("--stride",type=int,default=1)
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=3)
+    parser.add_argument("--num-workers",type=int,default=4,
+                        help="DataLoader worker processes; 0 loads in the main "
+                             "process and serialises loading with GPU compute.")
     args=parser.parse_args(); random.seed(42); np.random.seed(42); torch.manual_seed(42)
     import time
     t0=time.time()
@@ -386,8 +448,8 @@ def main():
 
     device="cuda" if torch.cuda.is_available() else "cpu"
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    wdt = train_branch_b_live(train_traj,val_traj,args.out_dir/"host_wdt.canonical-tgne.pt",args.epochs,device)
-    train_deepop_live(train_traj,val_traj,args.out_dir/"cwa_forecast_decoder.canonical-tgne.pt",args.epochs,device,wdt=wdt)
+    wdt = train_branch_b_live(train_traj,val_traj,args.out_dir/"host_wdt.canonical-tgne.pt",args.epochs,device,num_workers=args.num_workers)
+    train_deepop_live(train_traj,val_traj,args.out_dir/"cwa_forecast_decoder.canonical-tgne.pt",args.epochs,device,wdt=wdt,num_workers=args.num_workers)
 
 
 if __name__ == "__main__":

@@ -187,6 +187,9 @@ class LazyHostSequenceDataset(Dataset):
             pos.append(np.arange(1, n, dtype=np.int32))
 
         self.hosts = hosts
+        # Row arrays already exist in the store; holding references to them
+        # here costs nothing and saves a dict hash on every __getitem__.
+        self._rows = [store._rows_by_host[h] for h in hosts]
         self._host_idx = np.concatenate(host_idx) if host_idx else np.zeros(0, np.int32)
         self._pos = np.concatenate(pos) if pos else np.zeros(0, np.int32)
 
@@ -194,9 +197,10 @@ class LazyHostSequenceDataset(Dataset):
         return int(len(self._pos))
 
     def __getitem__(self, idx: int):
-        host = self.hosts[int(self._host_idx[idx])]
+        h = int(self._host_idx[idx])
+        host = self.hosts[h]
         end = int(self._pos[idx])
-        rows = self.store._rows_by_host[host]
+        rows = self._rows[h]
         start = max(0, end - self.seq_len)
 
         feats = self.store.feats[rows[start:end]]          # (<=seq_len, 27)
@@ -204,15 +208,18 @@ class LazyHostSequenceDataset(Dataset):
             pad = np.zeros((self.seq_len - len(feats), feats.shape[1]), dtype=np.float32)
             feats = np.concatenate([pad, feats], axis=0)
 
-        target = self.store._materialize(int(rows[end]))
-        tech = target.technique_ids[0] if target.technique_ids else "Benign"
+        # Four scalars, read straight off the columns. `_materialize` would
+        # build a whole HostWindowSnapshot -- including both feature slices --
+        # to have all but four of its fields discarded here, at 87x the cost.
+        risk, category, first_tech, window_idx = self.store.target_fields(int(rows[end]))
+        tech = first_tech if first_tech is not None else "Benign"
         return {
             "features": torch.from_numpy(np.ascontiguousarray(feats, dtype=np.float32)),
-            "risk": torch.tensor(target.risk_score, dtype=torch.float),
+            "risk": torch.tensor(risk, dtype=torch.float),
             "technique": torch.tensor(
                 TECH_TO_IDX.get(tech, TECH_TO_IDX.get("Benign", 0)), dtype=torch.long),
             "gradation": torch.tensor(
-                GRADATION_LEVELS.get(target.coarse_category, 0), dtype=torch.long),
+                GRADATION_LEVELS.get(category, 0), dtype=torch.long),
             "host_ip": host,
-            "window_idx": int(target.window_idx),
+            "window_idx": window_idx,
         }
