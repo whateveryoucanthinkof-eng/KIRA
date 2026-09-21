@@ -169,6 +169,17 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 | 37 | Focal alpha pinned 4 of 5 classes to the clip floor | `bita/train.py::inverse_frequency_alpha` | Arithmetic-mean normalisation of multiplicative weights; one ultra-rare class set the scale. Geometric mean fixes it |
 | 38 | Sampler was a per-node Python loop | `bita/utils/utils.py` | 384 iterations/batch, ~35M/epoch, GIL-bound. Vectorised: 4.7x at batch 128, 13.3x at 512 |
 | 39 | Ingest was single-core | `data_unification/parallel_ingest.py` (new) | 12.7 min on 1 of 16 cores. Parallel + bit-identical: 3.14x measured |
+| 40 | **Category head could not see the flow** | `bita/model/extentedtgn.py` | `Linear(12)` on `src+dst` — benign and attack flows between the same pair were identical inputs. Now `[src;dst;edge]` MLP |
+| 41 | **58.6% of batches were single-class** | `bita/train.py` | TGN batches contiguously in time; attacks are time-localised. Shuffling samples → 0.0%. Valid only with memory off |
+| 42 | Category loss ~14x below the edge loss | `bita/train.py` | Summed equally, never logged apart. `--cat_loss_weight 15` + per-term logging |
+| 43 | Multi-task uncertainty loss could run away | `branch_a_gnn_lstm/lstm_multitask.py` | Unbounded below; measured 12,000x imbalance. Clamped to 24x |
+| 44 | Cumulative risk returned the PEAK | `branch_b_world_model/infiltration_head.py` | Ranked a single spike above sustained threat, in the value that orders hosts for the analyst |
+| 45 | Two more drifted copies of the attribute names | `explainability/`, `control_backend/` | One broke dashboard grouping silently |
+| 46 | **Branch A needed 80 GiB at full density** | `branch_a_gnn_lstm/sequence_dataset.py` | 42M samples x 2,053 B materialised. `LazyHostSequenceDataset` → 336 MB |
+| 47 | Credibility verdict discarded | `scripts/retrain_branch_a_live.py` | Unsound checkpoints could be served with no trace |
+| 48 | Spill files never reclaimed | `data_unification/trajectory_store.py` | Multi-GB leak per run on a 90%-full disk |
+| 49 | Inference fed the encoder ZERO node features | `data_unification/multi_dataset_stream.py` | Train/serve mismatch that would have cancelled the inductive gain |
+| 50 | Label coverage tracked, never reported | `bita/train.py` | 0.0% today; matters when new data lands |
 
 ### Still open
 
@@ -181,25 +192,32 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 
 ### Resolved: the encoder works
 
-First valid full-density epoch, after four fixes that all had to land together
-(clock repair, IP node features, held-out captures excluded, per-corpus split):
+Full-density run (34,152,542 records), epoch 0, after every fix below:
 
-| metric | broken | epoch 0 |
+| metric | broken | **now** |
 |---|---|---|
-| Inductive Val AUC | 0.5043 *(chance)* | **0.8330** |
-| Inductive CatAcc | 0.4342 | **0.8712** |
-| Val CatAcc | 0.3327 | **0.8351** |
-| Val MRR | 0.5536 | **0.8845** |
-| Val AUC | 0.9981 | 0.9321 |
+| Inductive Val AUC | 0.5043 *(chance)* | **0.9923** |
+| Val AUC | 0.9981 *(memorising)* | **0.9970** |
+| Val CatAcc | 0.3327 *(collapsed)* | **0.9758** |
+| Inductive CatAcc | 0.4342 | **0.9718** |
+| Val MRR | 0.5536 | **0.9878** |
+| per-class val | 3 classes at 0.0 | all five learning |
 
-Transductive AUC **fell**, and that is the healthy signal: 0.9981 was a model
-memorising hosts it had seen. Transductive and inductive now sit close
-together, which is what generalisation looks like.
+**The number that matters is the GAP**: inductive 0.9923 vs transductive
+0.9970 = **0.005**. It was 0.49 when the model was a lookup table. A small gap
+is what generalisation looks like; a high transductive score alone means
+nothing.
 
-**Caveat on that epoch:** it ran with the per-CORPUS split, so Recon had 7
-training samples. The aggregate CatAcc of 0.8351 looked fine anyway. Never
-report a headline metric from this pipeline without the per-class counts
-beside it.
+**Two honest caveats:**
+
+1. **CatAcc is largely the head reading the edge features**, not evidence that
+   the embeddings encode attack class. A tree on those 12 features alone gets
+   0.9997 and the category loss sits at 0.0093. Link prediction is what
+   validates the encoder.
+2. **Inductive Recon = 0.0 is correct.** One carrier host, so there is nothing
+   to generalise to. Documented limitation surfacing where it should.
+
+Weakest classes to watch: InitialAccess 0.505, C2 0.677 (0.325 inductive).
 
 ### A consequence of #10 worth stating separately
 
