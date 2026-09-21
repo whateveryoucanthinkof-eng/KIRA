@@ -182,24 +182,54 @@ class AntigravityModelAdapter:
         ckpt = torch.load(dp_path, map_location=self.device, weights_only=False)
         self.deepop.load_state_dict(ckpt["decoder_state_dict"])
         self.deepop.eval()
+        # DeepOP was the only checkpoint whose contract was never adopted, even
+        # though its horizon is what defines the served forecast length.
+        self._adopt_contract(ckpt, "deepop")
 
         from cyberworld_v4.config import get_contract
 
-        served = get_contract().matches(
-            {
-                "window_seconds": self.window_seconds,
-                "history_steps": self.history_steps,
-                "forecast_steps": self.forecast_steps,
-            }
-        )
+        # The extractor was constructed above from the PROVISIONAL window, before
+        # any checkpoint had been read. If a checkpoint carries a different
+        # window, _adopt_contract updated self.window_seconds but left the
+        # extractor bucketing at the old one -- so features were built on a
+        # different grid than the models were trained on. Rebind it now that the
+        # real contract is known.
+        if abs(self.extractor.window_size_sec - self.window_seconds) > 1e-9:
+            logger.warning(
+                "Rebinding extractor window %ss -> %ss to match the checkpoint contract",
+                self.extractor.window_size_sec, self.window_seconds,
+            )
+            self.extractor.window_size_sec = self.window_seconds
+
+        served_contract = {
+            "window_seconds": self.window_seconds,
+            "history_steps": self.history_steps,
+            "forecast_steps": self.forecast_steps,
+        }
+        served = get_contract().matches(served_contract)
+
         logger.info(
-            "Models loaded (device=%s) serving contract: %ss windows | %s history | %s forecast — %s",
-            self.device,
-            self.window_seconds,
-            self.history_steps,
-            self.forecast_steps,
-            "v4" if served else "v3 (pre-v4 checkpoints; retrain for the v4 contract)",
+            "Models loaded (device=%s) serving contract: %ss windows | %s history | %s forecast",
+            self.device, self.window_seconds, self.history_steps, self.forecast_steps,
         )
+
+        if not served:
+            # This used to be a parenthetical in a log line. Serving weights that
+            # disagree with the contract produces confident, wrong forecasts --
+            # the horizon and the history length are not cosmetic. Refuse by
+            # default; the escape hatch exists only so a demo can still run on
+            # known-stale checkpoints, and it says so loudly.
+            msg = (
+                f"Checkpoint contract mismatch: the loaded checkpoints serve "
+                f"{served_contract} but the authoritative contract is "
+                f"{get_contract().to_dict()}. These weights were trained for a "
+                f"different temporal granularity and their forecasts are not valid. "
+                f"Retrain, or set CYBERWORLD_ALLOW_CONTRACT_MISMATCH=1 to serve anyway."
+            )
+            if os.environ.get("CYBERWORLD_ALLOW_CONTRACT_MISMATCH", "") in ("1", "true", "True"):
+                logger.error("SERVING STALE CHECKPOINTS ANYWAY. %s", msg)
+            else:
+                raise RuntimeError(msg)
 
     def _adopt_contract(self, ckpt: Dict[str, Any], name: str) -> None:
         """Take the temporal contract from the checkpoint being loaded.

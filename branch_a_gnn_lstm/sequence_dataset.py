@@ -42,6 +42,10 @@ GRADATION_LEVELS = {
     "Exfiltration": 3,
     "Impact": 3,
     "Unknown": 1,
+    # label_resolver emits the upper-case "UNKNOWN" (label_resolver.py:14); without
+    # this key an unresolved label fell through .get(..., 0) and was silently
+    # graded Benign, which is the opposite of unknown.
+    "UNKNOWN": 1,
 }
 
 
@@ -93,7 +97,9 @@ def create_host_sequence_samples(
         snapshots = sorted(snapshots, key=lambda s: s.window_idx)
         n_snaps = len(snapshots)
 
-        for end_idx in range(1, n_snaps + 1):
+        # end_idx stops one short of n_snaps so snapshots[end_idx] is always a
+        # real future snapshot, never the window's own last input step (nowcast bug).
+        for end_idx in range(1, n_snaps):
             start_idx = max(0, end_idx - seq_len)
             window_slice = snapshots[start_idx:end_idx]
 
@@ -113,7 +119,7 @@ def create_host_sequence_samples(
             else:
                 feature_seq = np.array(feature_vectors[-seq_len:], dtype=np.float32)
 
-            target_snap = window_slice[-1]
+            target_snap = snapshots[end_idx]
 
             # Technique index
             tech_id = "Benign"

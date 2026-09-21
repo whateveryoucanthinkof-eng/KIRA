@@ -6,12 +6,86 @@ Handles stripped column names, Windows-1252/latin1 encoding, microsecond duratio
 and timestamp normalization to UTC epoch seconds.
 """
 
+import logging
 import os
 import glob
 from typing import Iterator, List, Optional, Union
 import pandas as pd
 import numpy as np
 
+from data_unification.row_guards import rejection_breakdown, valid_row_mask
+from data_unification.time_utils import (
+    detect_12h_clock_in_group,
+    repair_12h_clock,
+    to_epoch_seconds,
+)
+
+
+# CIC-2017 splits Thursday and Friday into separate morning/afternoon files.
+# An afternoon-only file holds hours 01-05 and is individually ambiguous -- a
+# 12-hour dial and a genuine 01:00-05:00 capture look identical. Pooling a whole
+# capture day resolves it: Friday's three files together span 01-05 and 08-12,
+# which only a 12-hour dial produces. The verdict then applies to every file of
+# that day, because they are one capture split across files.
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+_CLOCK_REPAIR_CACHE: dict = {}
+
+
+def _capture_day(filepath: str) -> Optional[str]:
+    """The weekday this file belongs to, from its name (the corpus convention)."""
+    name = os.path.basename(filepath).lower()
+    for day in _WEEKDAYS:
+        if name.startswith(day):
+            return day
+    return None
+
+
+def _timestamp_column(filepath: str) -> Optional[str]:
+    try:
+        hdr = pd.read_csv(filepath, nrows=0, encoding="latin1")
+    except Exception:
+        return None
+    for c in hdr.columns:
+        if c.strip().lower() == "timestamp":
+            return c
+    return None
+
+
+def _file_needs_clock_repair(filepath: str) -> bool:
+    """12-hour-dial verdict for this file, decided over its whole capture day."""
+    key = os.path.abspath(filepath)
+    if key in _CLOCK_REPAIR_CACHE:
+        return _CLOCK_REPAIR_CACHE[key]
+
+    day = _capture_day(filepath)
+    directory = os.path.dirname(key)
+    if day:
+        siblings = [
+            f for f in sorted(glob.glob(os.path.join(directory, "*.csv")))
+            if _capture_day(f) == day
+        ]
+    else:
+        siblings = [key]
+
+    pairs = [(f, _timestamp_column(f)) for f in siblings]
+    pairs = [(f, c) for f, c in pairs if c]
+    try:
+        verdict = detect_12h_clock_in_group(pairs, utc=True) if pairs else False
+    except Exception:
+        verdict = False
+
+    # One verdict for the whole day, cached against every file in it.
+    for f, _c in pairs:
+        _CLOCK_REPAIR_CACHE[os.path.abspath(f)] = verdict
+    _CLOCK_REPAIR_CACHE[key] = verdict
+
+    if verdict:
+        logging.getLogger(__name__).warning(
+            "%s capture day is on a 12-hour clock with no AM/PM (decided over %d file(s)); "
+            "shifting 01:00-07:59 forward 12h.", day or os.path.basename(filepath), len(pairs),
+        )
+    return verdict
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
 
@@ -33,6 +107,9 @@ class CIC2017Adapter:
         """
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
+
+        # One verdict for the whole capture day; see _file_needs_clock_repair.
+        needs_clock_repair = _file_needs_clock_repair(filepath)
 
         # Read in chunks to prevent high memory usage on large files
         chunks = pd.read_csv(
@@ -67,8 +144,16 @@ class CIC2017Adapter:
             # Parse timestamps
             try:
                 ts_series = pd.to_datetime(chunk[ts_col], dayfirst=True, utc=True, errors="coerce")
-                start_timestamps = (ts_series.astype("int64") / 1e9).to_numpy()
+                # pandas >= 2 returns datetime64[us] (or [s]/[ms]) depending on input, not
+                # always [ns]. astype("int64") therefore yields MICROseconds here, and the
+                # old "/ 1e9" produced epoch seconds 1000x too small -- a 12-hour capture
+                # collapsed into 43 apparent seconds, so ~21,600 two-second windows became
+                # ~22 and every host trajectory was meaningless. Upcast to [ns] explicitly
+                # so the divisor is correct regardless of the parsed resolution.
+                start_timestamps = to_epoch_seconds(ts_series)
                 start_timestamps = np.nan_to_num(start_timestamps, nan=0.0)
+                if needs_clock_repair:
+                    start_timestamps = repair_12h_clock(start_timestamps)
             except Exception:
                 start_timestamps = np.zeros(len(chunk), dtype=float)
 
@@ -89,7 +174,23 @@ class CIC2017Adapter:
             bwd_bytes = pd.to_numeric(chunk[bwd_bytes_col], errors="coerce").fillna(0).astype(int).to_numpy()
             labels = chunk[lbl_col].astype(str).to_numpy()
 
+            # Vectorised row guard. The previous per-row check tested only
+            # `start_timestamps[i] <= 0`, which misses epoch-1970 rows (their
+            # stamps are positive) and all CICFlowMeter TSO failures
+            # (protocol 0 / port 0). One CIC-2017 file is 63% blank padding
+            # rows appended by a spreadsheet -- 288,602 phantom records.
+            keep = valid_row_mask(start_timestamps, protocols, dst_ports, src_ips)
+            n_dropped = int((~keep).sum())
+            if n_dropped:
+                self._rejections = getattr(self, "_rejections", {})
+                for k, v in rejection_breakdown(
+                    start_timestamps, protocols, dst_ports, src_ips
+                ).items():
+                    self._rejections[k] = self._rejections.get(k, 0) + v
+
             for i in range(len(chunk)):
+                if not keep[i]:
+                    continue
                 raw_lbl = labels[i]
                 coarse, attck, is_attack = self.resolver.resolve(raw_lbl, source=LabelSource.CIC2017)
 

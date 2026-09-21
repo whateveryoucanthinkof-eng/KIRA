@@ -192,7 +192,7 @@ class HostWorldDynamicsTransformer(nn.Module):
         delta_t_step: float = LIVE_WINDOW_SIZE_SEC,
         stabilize_horizon: bool = True,
         decay_factor: float = 0.95,
-        max_context_len: int = 10,
+        max_context_len: int = None,   # None -> contract history_steps (15); 10 silently truncated it
     ) -> torch.Tensor:
         """
         Autoregressive multi-step latent rollout predicting H_{t+1..t+K}.
@@ -208,6 +208,11 @@ class HostWorldDynamicsTransformer(nn.Module):
         Returns:
             rollout_predictions: [batch_size, K, d_latent]
         """
+        # A literal 10 here silently truncated the contract's 15-step history,
+        # so the rollout never saw the 5 oldest steps it was trained to use.
+        if max_context_len is None:
+            from cyberworld_v4.config import get_contract
+            max_context_len = get_contract().history_steps
         curr_seq = h_seq.clone()
         predictions = []
 
@@ -277,7 +282,7 @@ class HostWorldDynamicsTransformer(nn.Module):
         lateral_weight: float = 0.35,
         stabilize_horizon: bool = True,
         decay_factor: float = 0.95,
-        max_context_len: int = 10,
+        max_context_len: int = None,   # None -> contract history_steps (15); 10 silently truncated it
     ) -> torch.Tensor:
         """
         Multi-host coupled autoregressive rollout predicting H_{t+1..t+K} across the network topology.
@@ -296,6 +301,9 @@ class HostWorldDynamicsTransformer(nn.Module):
         Returns:
             rollout_predictions: [N_hosts, K, d_latent]
         """
+        if max_context_len is None:
+            from cyberworld_v4.config import get_contract
+            max_context_len = get_contract().history_steps
         N, S, D = h_seq_batch.shape
         curr_seq = h_seq_batch.clone()
         predictions = []

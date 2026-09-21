@@ -12,6 +12,7 @@ from typing import Iterator, Optional
 import pandas as pd
 import numpy as np
 
+from data_unification.time_utils import to_epoch_seconds
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
 
@@ -51,7 +52,13 @@ class WardenAdapter:
             # Parse timestamps with timezone normalization to UTC epoch
             try:
                 dt_series = pd.to_datetime(chunk[dt_col], utc=True, errors="coerce")
-                start_timestamps = (dt_series.astype("int64") / 1e9).to_numpy()
+                # pandas >= 2 returns datetime64[us] (or [s]/[ms]) depending on input, not
+                # always [ns]. astype("int64") therefore yields MICROseconds here, and the
+                # old "/ 1e9" produced epoch seconds 1000x too small -- a 12-hour capture
+                # collapsed into 43 apparent seconds, so ~21,600 two-second windows became
+                # ~22 and every host trajectory was meaningless. Upcast to [ns] explicitly
+                # so the divisor is correct regardless of the parsed resolution.
+                start_timestamps = to_epoch_seconds(dt_series)
                 start_timestamps = np.nan_to_num(start_timestamps, nan=0.0)
             except Exception:
                 start_timestamps = np.zeros(len(chunk), dtype=float)

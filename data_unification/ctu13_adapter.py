@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 
 from cyberworld_v4.identity import stable_id
 
+from data_unification.time_utils import to_epoch_seconds
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
 
@@ -43,7 +44,13 @@ class CTU13Adapter:
             df = batch.to_pandas()
 
             # Extract fields
-            timestamps = pd.to_datetime(df["timestamp"], utc=True).astype("int64") / 1e9
+            # pandas >= 2 returns datetime64[us] (or [s]/[ms]) depending on input, not
+            # always [ns]. astype("int64") therefore yields MICROseconds here, and the
+            # old "/ 1e9" produced epoch seconds 1000x too small -- a 12-hour capture
+            # collapsed into 43 apparent seconds, so ~21,600 two-second windows became
+            # ~22 and every host trajectory was meaningless. Upcast to [ns] explicitly
+            # so the divisor is correct regardless of the parsed resolution.
+            timestamps = pd.Series(to_epoch_seconds(pd.to_datetime(df["timestamp"], utc=True)))
             scenario_ids = df["scenario_id"].astype(str).to_numpy()
             malware_families = df["malware_family"].astype(str).to_numpy()
 
@@ -140,12 +147,7 @@ class CTU13Adapter:
             src_bytes_col = cols.get("srcbytes", "SrcBytes")
             lbl_col = cols.get("label", "Label")
 
-            start_timestamps = (
-                pd.to_datetime(chunk[ts_col], errors="coerce")
-                .astype("int64", copy=False)
-                .to_numpy()
-                / 1e9
-            )
+            start_timestamps = to_epoch_seconds(pd.to_datetime(chunk[ts_col], errors="coerce"))
             durations = pd.to_numeric(chunk[dur_col], errors="coerce").fillna(0.0).to_numpy()
             end_timestamps = start_timestamps + durations
 

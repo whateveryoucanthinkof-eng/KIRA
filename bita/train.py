@@ -31,22 +31,71 @@ from data_unification.tgne_features import (
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+    """Multi-class focal loss with per-class alpha.
+
+    The previous implementation applied *binary* focal-loss weighting to a
+    6-class problem:
+
+        at = ones_like(targets) * (1 - alpha)   # 0.75 for every class
+        at[targets == 1] = alpha                # 0.25 for class index 1 only
+
+    With classes {0: Benign, 1: C2, 2: Impact, 3: InitialAccess, 4: Recon,
+    5: UNKNOWN} that up-weights Benign -- the majority class -- to 0.75 while
+    down-weighting C2 to 0.25, so the loss rewarded predicting Benign for
+    everything. Measured result: per-class accuracy {0: 1.0, 1..5: 0.0} and
+    macro F1 0.158 on the test split, i.e. a collapsed head.
+
+    alpha is now a per-class weight vector (inverse class frequency by
+    default), which is what focal loss means for more than two classes.
+    """
+
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean', num_classes=None):
         super(FocalLoss, self).__init__()
-        self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        if alpha is None:
+            self.register_buffer("alpha", None)
+        else:
+            a = torch.as_tensor(alpha, dtype=torch.float)
+            if a.ndim == 0:
+                if num_classes is None:
+                    raise ValueError("scalar alpha needs num_classes")
+                a = torch.full((num_classes,), float(a))
+            self.register_buffer("alpha", a)
+
+    @staticmethod
+    def inverse_frequency_alpha(labels, num_classes: int, *, power: float = 0.5,
+                                clip: tuple = (0.2, 5.0)) -> torch.Tensor:
+        """Damped, clipped inverse-frequency per-class weights.
+
+        Plain 1/frequency is unstable on this corpus. Classes absent (or nearly
+        absent) from a split get astronomically large raw weights, and after
+        normalising by the mean every other class collapses to ~0 -- measured
+        alpha was {Benign: 0.0, C2: 0.0, Impact: 2.0, ...}, i.e. the majority
+        classes contributed no loss at all. That is the original collapse
+        inverted, not fixed.
+
+        So: weights are computed over *present* classes only (an absent class
+        is never a target, so its weight is irrelevant and must not skew the
+        normalisation), damped by `power` (sqrt by default) to keep the ratio
+        sane, and clipped to a bounded range.
+        """
+        counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=num_classes).astype(np.float64)
+        w = np.ones(num_classes, dtype=np.float64)
+        present = counts > 0
+        if present.any():
+            inv = (counts[present].sum() / counts[present]) ** power
+            w[present] = inv / inv.mean()
+        w = np.clip(w, clip[0], clip[1])
+        return torch.as_tensor(w, dtype=torch.float)
 
     def forward(self, inputs, targets):
         logpt = -F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(logpt)
         loss = -((1 - pt) ** self.gamma) * logpt
-
         if self.alpha is not None:
-            at = torch.ones_like(targets, dtype=torch.float).to(inputs.device) * (1 - self.alpha)
-            at[targets == 1] = self.alpha
-            loss *= at
-
+            at = self.alpha.to(inputs.device)[targets]
+            loss = loss * at
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
@@ -185,6 +234,96 @@ def load_and_preprocess_dataset(dataset_dir="Dataset", embedding_dim=4):
     return graph_df, edge_features, node_features, category_mapping
 
 
+def load_and_preprocess_unified_dataset(
+    cic2017_dir=None,
+    cic2018_dir=None,
+    ctu13_dir=None,
+    max_rows_per_file=None,
+    stride=1,
+):
+    """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
+
+    Unlike load_and_preprocess_dataset (Warden), node ids share ONE namespace across
+    source and destination: a host seen as both a source and a destination gets the
+    same node id. Warden's loader instead builds a bipartite graph (disjoint id ranges
+    for source vs. destination), which does not match CIC/CTU/live traffic, where any
+    host can be both. Edge features come from each record's real bidirectional
+    bytes/packets/duration via extract_canonical_edge_features -- not the flow-count
+    proxy Warden's loader uses, since these datasets carry real flow statistics.
+    """
+    from data_unification.cic2017_adapter import CIC2017Adapter
+    from data_unification.cic2018_adapter import CIC2018Adapter
+    from data_unification.ctu13_adapter import CTU13Adapter
+
+    records = []
+    if cic2017_dir:
+        records.extend(CIC2017Adapter().parse_directory(cic2017_dir, max_rows_per_file=max_rows_per_file))
+    if cic2018_dir:
+        records.extend(CIC2018Adapter().parse_directory(cic2018_dir, max_rows_per_file=max_rows_per_file))
+    if ctu13_dir:
+        ctu_adapter = CTU13Adapter()
+        for f in sorted(glob.glob(os.path.join(ctu13_dir, "*", "*.binetflow"))):
+            records.extend(ctu_adapter.parse_netflow_csv(f, max_rows=max_rows_per_file))
+
+    if not records:
+        raise FileNotFoundError(
+            f"No records loaded (cic2017_dir={cic2017_dir}, cic2018_dir={cic2018_dir}, ctu13_dir={ctu13_dir})"
+        )
+
+    if stride > 1:
+        records = records[::stride]
+
+    records.sort(key=lambda r: r.start_time)
+    logging.info(f"Loaded {len(records)} unified flow records from CIC-2017/CIC-2018/CTU-13")
+
+    # Shared node namespace, 1-based (0 reserved for padding).
+    ip_to_id = {}
+    for r in records:
+        if r.src_ip not in ip_to_id:
+            ip_to_id[r.src_ip] = len(ip_to_id) + 1
+        if r.dst_ip not in ip_to_id:
+            ip_to_id[r.dst_ip] = len(ip_to_id) + 1
+
+    u_list = np.array([ip_to_id[r.src_ip] for r in records], dtype=np.int64)
+    i_list = np.array([ip_to_id[r.dst_ip] for r in records], dtype=np.int64)
+    ts_list = np.array([r.start_time for r in records], dtype=np.float64)
+    idx_list = np.arange(1, len(records) + 1)
+
+    label_encoder = LabelEncoder()
+    label_list = label_encoder.fit_transform([r.coarse_category for r in records])
+    category_mapping = {index: label for index, label in enumerate(label_encoder.classes_)}
+    logging.info(f"Detected coarse categories: {category_mapping}")
+
+    graph_df = pd.DataFrame({'u': u_list, 'i': i_list, 'ts': ts_list, 'label': label_list, 'idx': idx_list})
+
+    raw_edge_features = np.stack(
+        [
+            extract_canonical_edge_features(
+                fwd_bytes=r.fwd_bytes,
+                bwd_bytes=r.bwd_bytes,
+                fwd_packets=r.fwd_packets,
+                bwd_packets=r.bwd_packets,
+                duration_sec=r.duration,
+                byte_rate=r.byte_rate,
+                packet_rate=r.packet_rate,
+                protocol=r.protocol,
+                dst_port=r.dst_port,
+            )
+            for r in records
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    empty_edge = np.zeros((1, raw_edge_features.shape[1]), dtype=np.float32)
+    edge_features = np.vstack([empty_edge, raw_edge_features])
+
+    total_nodes = len(ip_to_id) + 1
+    node_feat_dim = edge_features.shape[1]
+    node_features = np.zeros((total_nodes, node_feat_dim), dtype=np.float32)
+
+    return graph_df, edge_features, node_features, category_mapping
+
+
 def split_data(graph_df, edge_features, node_features, different_new_nodes=True, randomize_features=False):
     if randomize_features:
         node_features = np.random.rand(node_features.shape[0], node_features.shape[1]).astype(np.float32)
@@ -281,9 +420,20 @@ def train(args):
     logging.info(f"Training on device: {device}")
 
     # Load and Preprocess Data
-    graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
-        dataset_dir=args.dataset_dir, embedding_dim=args.feature_dim
-    )
+    if args.cic2017_dir or args.cic2018_dir or args.ctu13_dir:
+        if args.data_name == 'warden_alerts':  # still the default; unified run wasn't given its own name
+            args.data_name = 'unified_cic_ctu13'
+        graph_df, edge_features, node_features, category_mapping = load_and_preprocess_unified_dataset(
+            cic2017_dir=args.cic2017_dir,
+            cic2018_dir=args.cic2018_dir,
+            ctu13_dir=args.ctu13_dir,
+            max_rows_per_file=args.rows_per_file,
+            stride=args.stride,
+        )
+    else:
+        graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
+            dataset_dir=args.dataset_dir, embedding_dim=args.feature_dim
+        )
     num_categories = len(category_mapping)
 
     node_features, edge_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
@@ -339,7 +489,13 @@ def train(args):
 
     # Loss Functions & Optimizer
     edge_criterion = nn.BCELoss()
-    category_criterion = FocalLoss(alpha=0.25, gamma=2.0) if args.focal_loss else nn.CrossEntropyLoss()
+    if args.focal_loss:
+        _alpha = FocalLoss.inverse_frequency_alpha(train_data.labels, num_categories)
+        logging.info(f"focal-loss per-class alpha (inverse frequency): "
+                     f"{ {category_mapping.get(i, i): round(float(w), 3) for i, w in enumerate(_alpha)} }")
+        category_criterion = FocalLoss(alpha=_alpha, gamma=2.0)
+    else:
+        category_criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(tgn.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     num_instance = len(train_data.sources)
@@ -408,6 +564,16 @@ def train(args):
             total_loss.backward()
             optimizer.step()
             m_loss.append(total_loss.item())
+
+            if k % 500 == 0:
+                elapsed = time.time() - start_epoch
+                rate = (k + 1) / elapsed if elapsed > 0 else 0.0
+                remaining = (num_batch - k - 1) / rate if rate > 0 else float("nan")
+                logging.info(
+                    f"  epoch {epoch+1} batch {k}/{num_batch} "
+                    f"loss={np.mean(m_loss[-500:]):.4f} "
+                    f"{rate:.2f} batch/s, ~{remaining/60:.1f} min left this epoch"
+                )
 
             if args.use_memory:
                 tgn.memory.detach_memory()
@@ -628,8 +794,13 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="BiTA Temporal Graph Network for Network Alert Prediction")
-    parser.add_argument('--dataset_dir', type=str, default='Dataset', help='Directory containing dataset CSVs')
+    parser.add_argument('--dataset_dir', type=str, default='Dataset', help='Directory containing Warden dataset CSVs (ignored if any --cic*/--ctu13-dir is given)')
     parser.add_argument('--data_name', type=str, default='warden_alerts', help='Dataset identifier name')
+    parser.add_argument('--cic2017_dir', type=str, default=None, help='CIC-IDS2017 CSV directory (switches to the unified, non-bipartite loader)')
+    parser.add_argument('--cic2018_dir', type=str, default=None, help='CIC-IDS2018 CSV directory (switches to the unified, non-bipartite loader)')
+    parser.add_argument('--ctu13_dir', type=str, default=None, help='CTU-13 directory of <scenario>/*.binetflow files (switches to the unified, non-bipartite loader)')
+    parser.add_argument('--rows_per_file', type=int, default=None, help='Max rows read per source file (prefix; use --stride to sample the full file instead)')
+    parser.add_argument('--stride', type=int, default=1, help='Sample every Nth record after loading, to avoid row-prefix label bias')
     parser.add_argument('--prefix', type=str, default='bita_bigru_transformer', help='Prefix for saved artifacts')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
     parser.add_argument('--n_epoch', type=int, default=30, help='Maximum number of epochs')

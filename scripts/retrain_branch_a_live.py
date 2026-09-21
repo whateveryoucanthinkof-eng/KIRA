@@ -29,15 +29,36 @@ from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
-def _load_records(cic_dir: Path, ctu_dir: Path, rows_per_file: int, files: List[Path]):
+def _strided(gen, stride: int, want: int):
+    """Samples every Nth record across a wider read instead of a plain file-prefix.
+
+    max_rows in the adapters is a prefix (pandas nrows); CIC-2018 CSVs are
+    time-ordered with attacks in contiguous blocks, so a plain prefix is
+    87-100% single-label (see claude_latest_analysis/07_v4_audit_and_migration_plan.md,
+    D6). Reading stride*want rows and keeping every `stride`-th one instead
+    spans much more of the file's time range for the same record budget.
+    """
+    out = []
+    for i, r in enumerate(gen):
+        if i % stride == 0:
+            out.append(r)
+            if len(out) >= want:
+                break
+    return out
+
+
+def _load_records(cic_dir: Path, ctu_dir: Path, rows_per_file: int, files: List[Path], stride: int = 1):
+    import time
     cic = CIC2018Adapter()
     ctu = CTU13Adapter()
     records = []
-    for path in files:
-        if path.suffix.lower() == ".csv":
-            records.extend(cic.parse_file(str(path), max_rows=rows_per_file))
-        else:
-            records.extend(ctu.parse_netflow_csv(str(path), max_rows=rows_per_file))
+    for i, path in enumerate(files):
+        t0 = time.time()
+        gen = cic.parse_file(str(path), max_rows=rows_per_file * stride) if path.suffix.lower() == ".csv" \
+            else ctu.parse_netflow_csv(str(path), max_rows=rows_per_file * stride)
+        got = _strided(gen, stride, rows_per_file)
+        records.extend(got)
+        print(f"  [{i+1}/{len(files)}] {path.name}: {len(got)} records in {time.time()-t0:.1f}s (cumulative {len(records)})", flush=True)
     return records
 
 
@@ -89,6 +110,8 @@ def main():
     parser.add_argument("--ctu-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows-per-file", type=int, default=1000)
+    parser.add_argument("--spill-dir", type=Path, default=None, help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
+    parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
@@ -114,20 +137,82 @@ def main():
     if len(all_files) < 4:
         raise RuntimeError(f"Expected supplied SIH/CTU files, found {len(all_files)}")
 
-    split = max(1, int(len(all_files) * 0.8))
-    train_files = all_files[:split]
-    val_files = all_files[split:]
-    train_records = _load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, train_files)
-    val_records = _load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, val_files)
-
+    # Three-way, file-disjoint. Previously train/val only, which meant the
+    # reported number came from the same split used to pick the checkpoint --
+    # a selection estimate, not a generalisation estimate. Test is scored once,
+    # after the model is frozen, and never influences training.
+    n = len(all_files)
+    n_train = max(1, int(n * 0.7))
+    n_val = max(1, int(n * 0.15))
+    train_files = all_files[:n_train]
+    val_files = all_files[n_train:n_train + n_val]
+    test_files = all_files[n_train + n_val:] or all_files[-1:]
+    print(f"split: {len(train_files)} train / {len(val_files)} val / {len(test_files)} test files", flush=True)
+    import time
     tgn = build_or_load_tgne_ta()
     # Contract-bound (v4). Previously 2.0s / seq_len=5 hardcoded, which matched
     # the v3 contract by coincidence rather than by construction. Under v4 this
     # produces history_steps=15, so it yields a v4 checkpoint, not a v3 one.
     _c = get_contract()
-    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=_c.window_seconds)
-    train_samples = _make_samples(train_records, extractor, seq_len=_c.history_steps)
-    val_samples = _make_samples(val_records, extractor, seq_len=_c.history_steps)
+    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=_c.window_seconds,
+                                        spill_dir=str(args.spill_dir) if args.spill_dir else None)
+    # Load -> extract -> free, one split at a time. Holding both record lists
+    # at once costs an extra ~2.8 GB at full density for no reason: the val
+    # records are not needed until the train split has already been reduced to
+    # samples.
+    def _samples_per_file(files, label):
+        """Load -> extract -> free, one capture file at a time.
+
+        Holding the whole split resident costs ~15.7 GB at full density (30.4M
+        records x ~518 B measured), which does not fit alongside the snapshot
+        store and adapter arrays. Per-file keeps peak at the largest single
+        capture (~4.7M records, ~2.4 GB).
+
+        Processing per file also builds the TGNE neighbour graph per capture
+        rather than across all of them. That is more faithful, not less: a
+        CIC-2018 capture day and a CTU-13 botnet scenario are unrelated
+        networks, and a merged graph would make hosts from different captures
+        each other's temporal neighbours, which they never were.
+        """
+        from data_unification.trajectory_store import TrajectoryStoreBuilder
+        shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+        widx_base = 0
+        total_recs = 0
+        for i, f in enumerate(files):
+            t = time.time()
+            recs = _load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, [f], args.stride)
+            total_recs += len(recs)
+            extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
+            if shared._window_idx.n:
+                widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
+            print(f"  [{label} {i+1}/{len(files)}] {f.name}: {len(recs)} recs, "
+                  f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
+            del recs
+            gc.collect()
+        store = shared.finalize()
+        print(f"{label}: {total_recs} records -> {store.n_snapshots} snapshots "
+              f"over {len(store)} hosts | {store.memory_report()}", flush=True)
+        return create_host_sequence_samples(store, seq_len=_c.history_steps, min_trajectory_len=1)
+
+    import gc
+    t0 = time.time()
+    train_samples = _samples_per_file(train_files, "train")
+    print(f"train done in {time.time()-t0:.1f}s ({len(train_samples)} samples)", flush=True)
+    t0 = time.time()
+    val_samples = _samples_per_file(val_files, "val")
+    print(f"val done in {time.time()-t0:.1f}s ({len(val_samples)} samples)", flush=True)
+    t0 = time.time()
+    test_samples = _samples_per_file(test_files, "test")
+    print(f"test done in {time.time()-t0:.1f}s ({len(test_samples)} samples)", flush=True)
+
+    # Gate the data before training on it.
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        from credibility_check import evaluate_samples, gate as _gate, report as _report
+        _stats = evaluate_samples(train_samples, val_samples)
+        _report(_stats, _gate(_stats))
+    except Exception as _e:
+        print(f"credibility check skipped: {_e}", flush=True)
     if not train_samples or not val_samples:
         raise RuntimeError("The 2-second pipeline produced no train/validation samples")
 
@@ -211,7 +296,25 @@ def main():
                 args.output,
             )
 
-    print(f"saved={args.output} best_metrics={best_metrics}")
+    # Held-out test: scored once, on the restored best checkpoint, after
+    # training is finished. This is the only number that is a generalisation
+    # estimate rather than a selection artefact.
+    ckpt = torch.load(args.output, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    test_loader = DataLoader(HostSequenceDataset(test_samples, seq_len=_c.history_steps),
+                             batch_size=args.batch_size, shuffle=False)
+    test_metrics = _evaluate(model, test_loader, device)
+    print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): {test_metrics}", flush=True)
+    try:
+        from credibility_check import evaluate_samples as _es, gate as _g, report as _r
+        _ts = _es(train_samples, test_samples)
+        _r(_ts, _g(_ts, model_accuracy=test_metrics.get("tech_accuracy")))
+    except Exception as _e:
+        print(f"test credibility check skipped: {_e}", flush=True)
+    ckpt["test_metrics"] = test_metrics
+    torch.save(ckpt, args.output)
+
+    print(f"saved={args.output} best_metrics={best_metrics} test_metrics={test_metrics}")
 
 
 if __name__ == "__main__":

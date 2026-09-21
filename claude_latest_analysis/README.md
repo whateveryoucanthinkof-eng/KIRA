@@ -12,6 +12,10 @@ Assessment of this repo against **SIH PS 26153 (NTRO)** — *AI based Network At
 | 06 | [PCAP corruption scan](06_pcap_corruption_scan.md) | Full census: which files are corrupt and need re-downloading |
 | 07 | [v4 audit and migration plan](07_v4_audit_and_migration_plan.md) | Spec-mandated A–J audit before the v4 rebuild |
 | 08 | [Why the CSV path cannot benchmark](08_why_the_csv_path_cannot_benchmark.md) | Three training runs, three discarded results, and the reason |
+| 09 | [Data integrity audit](09_data_integrity_audit.md) | What is damaged in every corpus, and the acceptance checklist for fresh data |
+| 10 | [Contract and model consistency](10_contract_and_model_consistency.md) | Does every model/trainer/serving path agree on the contract |
+| 11 | [Full retrain execution plan](11_full_retrain_execution_plan.md) | Ordered plan to retrain everything on clean data |
+| 12 | [Bugs found and fixed (2026-09-21)](12_bugs_found_and_fixed.md) | Five defects that invalidated all prior checkpoints |
 
 ## Corruption scan (report 06) — supersedes report 05's integrity claim
 

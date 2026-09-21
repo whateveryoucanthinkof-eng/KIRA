@@ -21,12 +21,24 @@ from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.warden_adapter import WardenAdapter
 from data_unification.auth_log_adapter import AuthEventRecord, AuthLogAdapter, AuthEventType, AuthLogSource
 from data_unification.behavioral_fingerprint import BehavioralFlowFingerprinter, BehavioralProfile
+from data_unification.trajectory_store import TrajectoryStore, TrajectoryStoreBuilder
 from dataclasses import field
 
 
-@dataclass
+@dataclass(slots=True)
 class HostWindowSnapshot:
-    """Per-host state snapshot for a single time window t."""
+    """Per-host state snapshot for a single time window t.
+
+    slots=True and the absence of the old auth_metrics/behavioral_metrics dicts
+    are load-bearing, not style: a full-corpus run holds ~25M of these at once,
+    where the per-instance __dict__ plus two populated metric dicts cost ~305
+    bytes each (~7.6 GB measured). Those two dicts were written here but never
+    read by any consumer -- they are consumed locally in extract_trajectories to
+    adjust risk_score before the snapshot is built, and sequence_dataset /
+    train_branch_b / train_cwa_decoder only ever touch embedding, temporal_attrs,
+    is_attack, coarse_category, technique_ids, window_idx, window_end and
+    risk_score. Adding a field here is not free; check the memory budget first.
+    """
     host_ip: str
     host_id: int
     window_idx: int
@@ -38,8 +50,6 @@ class HostWindowSnapshot:
     coarse_category: str
     technique_ids: List[str]
     risk_score: float  # Ground truth compromise/risk score in [0, 1]
-    auth_metrics: Dict[str, float] = field(default_factory=dict)
-    behavioral_metrics: Dict[str, float] = field(default_factory=dict)
 
 
 class BoundedHostSlidingBuffer:
@@ -124,10 +134,14 @@ class HostTrajectoryExtractor:
         window_size_sec: float = 60.0,
         n_temporal_attrs: int = 15,
         auth_events: Optional[List[AuthEventRecord]] = None,
+        spill_dir: Optional[str] = None,
     ):
         self.tgn = tgne_ta_model
         self.window_size_sec = window_size_sec
         self.n_temporal_attrs = n_temporal_attrs
+        # When set, the bulk (N, 27) feature block is written here and mapped
+        # back read-only, so a full-density corpus does not have to fit in RAM.
+        self.spill_dir = spill_dir
         self.auth_events: List[AuthEventRecord] = list(auth_events) if auth_events else []
 
     def add_auth_events(self, events: List[AuthEventRecord]):
@@ -211,7 +225,10 @@ class HostTrajectoryExtractor:
         adapter: Optional[FlowToTemporalEventAdapter] = None,
         auth_events: Optional[List[AuthEventRecord]] = None,
         sliding_buffer: Optional["BoundedHostSlidingBuffer"] = None,
-    ) -> Dict[str, List[HostWindowSnapshot]]:
+        builder: Optional[TrajectoryStoreBuilder] = None,
+        emit_after: Optional[float] = None,
+        window_idx_base: int = 0,
+    ) -> "TrajectoryStore | Dict[str, List[HostWindowSnapshot]]":
         """
         Groups flows by 60s windows, extracts TGNE-TA embeddings H_t,
         correlates multimodal host authentication logs (breaking L4 visibility ceiling),
@@ -244,7 +261,15 @@ class HostTrajectoryExtractor:
             self.tgn.n_nodes = n_nodes
 
         # Map window boundaries to lists of records
-        window_snapshots_by_host: Dict[str, List[HostWindowSnapshot]] = {}
+        # `builder` lets a caller accumulate across several chunked calls, so a
+        # full-density corpus can be processed a slice at a time while the
+        # records for each slice are freed. `emit_after` drops snapshots from a
+        # chunk's warm-up overlap -- those windows were already emitted by the
+        # previous chunk, and the overlap exists only so TGNE sees the same
+        # neighbour history it would have seen processing everything at once.
+        owns_builder = builder is None
+        if builder is None:
+            builder = TrajectoryStoreBuilder(spill_dir=self.spill_dir)
         sorted_records = sorted(records, key=lambda r: r.start_time)
 
         for win_idx, (win_start, win_end, s_idx, e_idx) in enumerate(event_stream.window_boundaries):
@@ -335,29 +360,35 @@ class HostTrajectoryExtractor:
                         techs = ["T1059"] + techs
                     risk = max(risk, min(1.0, 0.65 + 0.35 * behavioral_metrics.get("behavioral_threat_score", 0.5)))
 
-                snapshot = HostWindowSnapshot(
-                    host_ip=ip,
-                    host_id=adapter.ip_to_id.get(ip, 0),
-                    window_idx=win_idx,
-                    window_start=win_start,
-                    window_end=win_end,
-                    embedding=H_t[idx],
-                    temporal_attrs=attrs,
-                    is_attack=is_atk,
-                    coarse_category=coarse,
-                    technique_ids=techs,
-                    risk_score=float(risk),
-                    auth_metrics=auth_metrics,
-                    behavioral_metrics=behavioral_metrics,
-                )
-
                 if sliding_buffer is not None:
-                    sliding_buffer.append(snapshot)
-                else:
-                    if ip not in window_snapshots_by_host:
-                        window_snapshots_by_host[ip] = []
-                    window_snapshots_by_host[ip].append(snapshot)
+                    sliding_buffer.append(HostWindowSnapshot(
+                        host_ip=ip,
+                        host_id=adapter.ip_to_id.get(ip, 0),
+                        window_idx=win_idx,
+                        window_start=win_start,
+                        window_end=win_end,
+                        embedding=H_t[idx],
+                        temporal_attrs=attrs,
+                        is_attack=is_atk,
+                        coarse_category=coarse,
+                        technique_ids=techs,
+                        risk_score=float(risk),
+                    ))
+                elif emit_after is None or win_start >= emit_after:
+                    builder.append(
+                        host_ip=ip,
+                        host_id=adapter.ip_to_id.get(ip, 0),
+                        window_idx=win_idx + window_idx_base,
+                        window_start=win_start,
+                        window_end=win_end,
+                        embedding=H_t[idx],
+                        temporal_attrs=attrs,
+                        is_attack=is_atk,
+                        coarse_category=coarse,
+                        technique_ids=techs,
+                        risk_score=float(risk),
+                    )
 
         if sliding_buffer is not None:
             return sliding_buffer.get_all_trajectories()
-        return window_snapshots_by_host
+        return builder.finalize() if owns_builder else builder
