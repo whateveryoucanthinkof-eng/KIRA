@@ -21,13 +21,27 @@ echo "[chain] $UNIT is no longer active ($(date -Is))"
 
 # "saved=" is the last line main() prints, after the held-out test evaluation
 # and the credibility stamp. Its absence means the run died part way.
-if ! grep -q "^saved=" "$LOG"; then
-    echo "[chain] ABORT: no 'saved=' line in $LOG -- Branch A did not complete."
+#
+# The unit logs with StandardOutput=append:, so this file accumulates across
+# runs. Checking the whole file would let a "saved=" from an earlier, unrelated
+# run mark a failed run as complete. Look only at the segment after the last
+# "train_records=" line -- that is the first thing main() prints once the data
+# is loaded, so it marks the start of the most recent run.
+LAST_RUN_AT=$(grep -n "^train_records=" "$LOG" | tail -1 | cut -d: -f1)
+if [ -z "$LAST_RUN_AT" ]; then
+    echo "[chain] ABORT: $LOG has no 'train_records=' line -- Branch A never got past loading."
     tail -25 "$LOG"
     exit 1
 fi
+LAST_RUN=$(tail -n "+$LAST_RUN_AT" "$LOG")
+
+if ! printf '%s\n' "$LAST_RUN" | grep -q "^saved="; then
+    echo "[chain] ABORT: no 'saved=' line in the most recent run -- Branch A did not complete."
+    printf '%s\n' "$LAST_RUN" | tail -25
+    exit 1
+fi
 echo "[chain] Branch A completed:"
-grep -E "^epoch=|^HELD-OUT TEST|^saved=" "$LOG" | tail -12
+printf '%s\n' "$LAST_RUN" | grep -E "^epoch=|^HELD-OUT TEST|^saved=" | tail -12
 
 systemd-run --user --unit=downstream-retrain \
     --description="Branch B + DeepOP retrain, full density, canonical encoder" \
