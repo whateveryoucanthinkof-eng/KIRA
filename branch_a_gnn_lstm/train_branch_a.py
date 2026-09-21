@@ -103,6 +103,13 @@ def build_or_load_tgne_ta(
     adj_list = [[] for _ in range(n_nodes)]
     ngh_finder = NeighborFinder(adj_list, uniform=True)
 
+    # Placeholder only: HostTrajectoryExtractor.extract_trajectories replaces
+    # node_raw_features with real intrinsic IP features for the hosts actually
+    # present (data_unification/ip_features.py). Left zero here because no IP
+    # map exists yet at construction time -- but if a caller ever runs the
+    # encoder WITHOUT going through the extractor, it would be feeding zeros to
+    # a model trained on IP features, so this stays a documented placeholder
+    # rather than a silent default.
     node_feats = np.zeros((n_nodes, config["node_feat_dim"]), dtype=np.float32)
     edge_feats = np.zeros((10000, config["edge_feat_dim"]), dtype=np.float32)
 

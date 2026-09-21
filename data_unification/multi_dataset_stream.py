@@ -255,7 +255,18 @@ class HostTrajectoryExtractor:
             edge_feats_t = torch.from_numpy(event_stream.edge_features).float().to(self.tgn.device)
             self.tgn.edge_raw_features = edge_feats_t
             self.tgn.embedding_module.edge_features = edge_feats_t
-            node_feats_t = torch.zeros((n_nodes, 12), device=self.tgn.device)
+            # Intrinsic IP node features, matching TRAINING exactly.
+            #
+            # This was torch.zeros(...). The encoder is trained with 12-D
+            # features derived from each host's address (see
+            # data_unification/ip_features.py), and handing it zeros at
+            # inference is a train/serve mismatch that silently destroys the
+            # inductive capability those features exist to provide -- the
+            # difference between inductive AUC 0.83 and 0.50.
+            from data_unification.ip_features import build_node_feature_matrix
+            node_feats_t = torch.from_numpy(
+                build_node_feature_matrix(event_stream.ip_to_id, n_nodes=n_nodes)
+            ).float().to(self.tgn.device)
             self.tgn.node_raw_features = node_feats_t
             self.tgn.embedding_module.node_features = node_feats_t
             self.tgn.n_nodes = n_nodes

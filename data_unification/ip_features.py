@@ -104,16 +104,25 @@ def ip_node_features(ip: str) -> tuple:
     return tuple(f)
 
 
-def build_node_feature_matrix(ip_to_id: Dict[str, int]) -> np.ndarray:
-    """(total_nodes, 12) matrix indexed by node id, row 0 reserved for padding.
+def build_node_feature_matrix(ip_to_id: Dict[str, int], n_nodes: int = None) -> np.ndarray:
+    """(n_nodes, 12) matrix indexed by node id, row 0 reserved for padding.
 
     `ip_to_id` is the 1-based shared namespace built in
-    `bita/train.py::load_and_preprocess_unified_dataset`.
+    `bita/train.py::load_and_preprocess_unified_dataset` at training time, and
+    by `FlowToTemporalEventAdapter` at inference time. Both must produce the
+    SAME features for the same address, or the encoder sees a different input
+    distribution than it was trained on.
+
+    `n_nodes` pads the matrix out to a caller-chosen size (inference allocates
+    slack rows for hosts that have not appeared yet). Unused rows stay zero,
+    which is also what an unknown node should look like.
     """
-    total_nodes = len(ip_to_id) + 1
+    needed = len(ip_to_id) + 1
+    total_nodes = needed if n_nodes is None else max(int(n_nodes), needed)
     m = np.zeros((total_nodes, IP_FEATURE_DIM), dtype=np.float32)
     for ip, node_id in ip_to_id.items():
-        m[node_id] = ip_node_features(ip)
+        if 0 <= node_id < total_nodes:
+            m[node_id] = ip_node_features(ip)
     return m
 
 
