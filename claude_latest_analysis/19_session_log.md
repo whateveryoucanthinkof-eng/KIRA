@@ -84,3 +84,22 @@ Also a missed opportunity for a *forecaster*: a host under reconnaissance that
 is not yet labelled attack gets risk exactly 0.0, so the target carries no
 early-warning gradient. Making risk graded would be a research change to the
 target definition, so I am flagging it rather than changing it unilaterally.
+
+### 16:05 — Checked train/serve config consistency. Clean, but a correction
+`use_memory` is **False** everywhere — training default, loader default, and
+the config JSON written beside the checkpoint all agree. No mismatch.
+Downstream load will also work with the new head: the config records
+`edge_feat_dim: 12`, so both sides build a 12+12+12=36 input. Verified.
+
+**Correction to something I said earlier.** When explaining the chance-level
+inductive AUC I said a new node has "zero memory and zero features". The
+memory half was wrong — the memory module is *disabled* in this
+configuration, so there is no memory for anyone, seen or unseen. The operative
+cause was the all-zero node features alone. The fix was right; my reasoning
+for it was half wrong.
+
+**Candidate experiment (queued):** turn the memory module ON. TGN's per-node
+memory is the paper's central contribution and is exactly the "host state
+accumulating over time" an attack forecaster wants. Running without it makes
+this a temporal graph attention net, not really a TGN. Worth an A/B once the
+current run lands — it is an accuracy lever, so it runs alone.
