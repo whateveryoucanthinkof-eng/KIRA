@@ -235,3 +235,73 @@ def train_branch_b(
 
 if __name__ == "__main__":
     train_branch_b(epochs=3)
+
+
+class LazyHostRolloutDataset(Dataset):
+    """Branch B rollout samples built on demand from a TrajectoryStore.
+
+    `create_rollout_samples` materialises three arrays per sample --
+    h_history [T,12], h_future [K,12], risk_future [K] -- for **1,164 bytes
+    each**. Branch B draws on the same trajectories as Branch A, roughly 42M
+    snapshots at full corpus density:
+
+        10M samples -> 10.8 GiB
+        35M samples -> 37.9 GiB
+
+    That does not fit, and thinning the data is not an option. Same fix as
+    Branch A: keep two int32 columns (~8 bytes per sample) and gather the
+    windows from the store's memmapped feature block on __getitem__.
+
+    Semantics match create_rollout_samples exactly: history is
+    `snaps[i-T:i]`, future is `snaps[i:i+K]` edge-padded when the trajectory
+    ends early, and only hosts with at least T+1 snapshots contribute.
+    """
+
+    def __init__(self, store, T: int = None, K: int = None):
+        _c = get_contract()
+        self.T = _c.history_steps if T is None else T
+        self.K = _c.forecast_steps if K is None else K
+        self.store = store
+
+        hosts, host_idx, pos = [], [], []
+        for h in store:
+            rows = store._rows_by_host[h]
+            n = len(rows)
+            if n < self.T + 1:
+                continue
+            hi = len(hosts)
+            hosts.append(h)
+            host_idx.append(np.full(n - self.T, hi, dtype=np.int32))
+            pos.append(np.arange(self.T, n, dtype=np.int32))
+
+        self.hosts = hosts
+        self._host_idx = np.concatenate(host_idx) if host_idx else np.zeros(0, np.int32)
+        self._pos = np.concatenate(pos) if pos else np.zeros(0, np.int32)
+
+    def __len__(self):
+        return int(len(self._pos))
+
+    def __getitem__(self, idx):
+        host = self.hosts[int(self._host_idx[idx])]
+        i = int(self._pos[idx])
+        rows = self.store._rows_by_host[host]
+
+        # embeddings are the first 12 columns of the 27-D feature block
+        h_hist = self.store.feats[rows[i - self.T:i], :12]
+
+        fut_rows = rows[i:i + self.K]
+        h_fut = self.store.feats[fut_rows, :12]
+        r_fut = np.asarray(
+            [self.store._materialize(int(r)).risk_score for r in fut_rows],
+            dtype=np.float32,
+        )
+        if len(fut_rows) < self.K:
+            pad = self.K - len(fut_rows)
+            h_fut = np.pad(h_fut, ((0, pad), (0, 0)), mode="edge")
+            r_fut = np.pad(r_fut, (0, pad), mode="edge")
+
+        return {
+            "h_history": torch.from_numpy(np.ascontiguousarray(h_hist, dtype=np.float32)),
+            "h_future": torch.from_numpy(np.ascontiguousarray(h_fut, dtype=np.float32)),
+            "risk_future": torch.from_numpy(np.ascontiguousarray(r_fut, dtype=np.float32)),
+        }

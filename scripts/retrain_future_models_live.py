@@ -19,7 +19,9 @@ if str(REPO_ROOT) not in sys.path:
 from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from branch_b_world_model.infiltration_head import InfiltrationRiskHead
 from branch_b_world_model.rollout_encoder_decoder import HostWorldDynamicsTransformer
-from branch_b_world_model.train_branch_b import HostRolloutDataset, create_rollout_samples
+from branch_b_world_model.train_branch_b import (
+    HostRolloutDataset, LazyHostRolloutDataset, create_rollout_samples,
+)
 from data_unification.attack_windows import derive_windows
 from data_unification.cic2018_adapter import CIC2018Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
@@ -193,10 +195,15 @@ def iter_pcap_day_records(pcap_root, csv_label_dir, window_seconds, max_windows_
 
 def train_branch_b_live(train_traj, val_traj, output, epochs, device):
     _c = get_contract()
-    train_samples = create_rollout_samples(train_traj, T=_c.history_steps, K=_c.forecast_steps)
-    val_samples = create_rollout_samples(val_traj, T=_c.history_steps, K=_c.forecast_steps)
-    train_loader = DataLoader(HostRolloutDataset(train_samples), batch_size=128, shuffle=True)
-    val_loader = DataLoader(HostRolloutDataset(val_samples), batch_size=128)
+    # Lazy: create_rollout_samples materialises h_history [15,12],
+    # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
+    # ~38 GiB at the 35M samples full corpus density produces. The store
+    # already holds every embedding in one memmapped block.
+    train_ds = LazyHostRolloutDataset(train_traj, T=_c.history_steps, K=_c.forecast_steps)
+    val_ds = LazyHostRolloutDataset(val_traj, T=_c.history_steps, K=_c.forecast_steps)
+    print(f"Branch B samples: train={len(train_ds)} val={len(val_ds)}", flush=True)
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=128)
     wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64, n_heads=4, n_layers=3).to(device)
     risk = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(device)
     optimizer = torch.optim.Adam(list(wdt.parameters()) + list(risk.parameters()), lr=1e-3, weight_decay=1e-4)
