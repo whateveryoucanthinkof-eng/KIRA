@@ -624,3 +624,19 @@ InitialAccess trending *down* (0.601 → 0.541) while C2 trends up is consistent
 with the earlier finding that InitialAccess is ~half unlearnable
 (Infiltration, tree recall 0.278) — the model may be fitting its learnable
 half and drifting on the rest.
+
+### 19:50 — Dead code in the correlation layer (flagging, not fixing)
+Three functions are defined and **never called anywhere**:
+
+- `correlation/causal_edge_scorer.py::score_candidate_edges` — the scorer's
+  batch entry point
+- `correlation/graph_compaction.py::skip_redundant_semantics`
+- `correlation/graph_compaction.py::prune_non_viable_nodes`
+
+This is dashboard-layer, not model-layer, so it is outside what I have been
+fixing tonight. **Worth knowing if the UI advertises causal-chain or campaign-
+correlation features** — those functions are not providing them, so either a
+different path serves them or the feature is inert.
+
+Not touching it: deleting or wiring up UI behaviour is a product decision,
+not a bug fix, and I would be guessing at the intent.
