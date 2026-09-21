@@ -255,23 +255,49 @@ def load_and_preprocess_unified_dataset(
     from data_unification.cic2018_adapter import CIC2018Adapter
     from data_unification.ctu13_adapter import CTU13Adapter
 
+    # Stride is applied DURING ingestion, per file, not after.
+    #
+    # Two defects this fixes:
+    #
+    # 1. Peak memory. `records[::stride]` after loading everything still holds
+    #    the full corpus in RAM first, so striding saved nothing at the peak --
+    #    exactly the "measure the peak, not the final state" failure that once
+    #    made a builder look like 151 B/snapshot while it hoarded tens of GB.
+    #    Striding as records arrive means peak == the strided size.
+    #
+    # 2. Label bias. `max_rows_per_file` takes a chronological PREFIX, and these
+    #    captures are benign in the morning with attacks later in the day.
+    #    Measured on the frozen val split, a 2000-row prefix per capture gave
+    #    0% attack. Striding within each file spans the whole day instead, so
+    #    `max_rows_per_file` is now a cap on records KEPT after striding rather
+    #    than a cap on rows read.
+    def _take(stream):
+        """Every `stride`-th record of one file, at most `max_rows_per_file`."""
+        kept = 0
+        for n, rec in enumerate(stream):
+            if stride > 1 and (n % stride):
+                continue
+            yield rec
+            kept += 1
+            if max_rows_per_file is not None and kept >= max_rows_per_file:
+                return
+
     records = []
     if cic2017_dir:
-        records.extend(CIC2017Adapter().parse_directory(cic2017_dir, max_rows_per_file=max_rows_per_file))
+        for f in sorted(glob.glob(os.path.join(cic2017_dir, "*.csv"))):
+            records.extend(_take(CIC2017Adapter().parse_file(f, max_rows=None)))
     if cic2018_dir:
-        records.extend(CIC2018Adapter().parse_directory(cic2018_dir, max_rows_per_file=max_rows_per_file))
+        for f in sorted(glob.glob(os.path.join(cic2018_dir, "*.csv"))):
+            records.extend(_take(CIC2018Adapter().parse_file(f, max_rows=None)))
     if ctu13_dir:
         ctu_adapter = CTU13Adapter()
         for f in sorted(glob.glob(os.path.join(ctu13_dir, "*", "*.binetflow"))):
-            records.extend(ctu_adapter.parse_netflow_csv(f, max_rows=max_rows_per_file))
+            records.extend(_take(ctu_adapter.parse_netflow_csv(f, max_rows=None)))
 
     if not records:
         raise FileNotFoundError(
             f"No records loaded (cic2017_dir={cic2017_dir}, cic2018_dir={cic2018_dir}, ctu13_dir={ctu13_dir})"
         )
-
-    if stride > 1:
-        records = records[::stride]
 
     records.sort(key=lambda r: r.start_time)
     logging.info(f"Loaded {len(records)} unified flow records from CIC-2017/CIC-2018/CTU-13")
@@ -799,8 +825,8 @@ if __name__ == '__main__':
     parser.add_argument('--cic2017_dir', type=str, default=None, help='CIC-IDS2017 CSV directory (switches to the unified, non-bipartite loader)')
     parser.add_argument('--cic2018_dir', type=str, default=None, help='CIC-IDS2018 CSV directory (switches to the unified, non-bipartite loader)')
     parser.add_argument('--ctu13_dir', type=str, default=None, help='CTU-13 directory of <scenario>/*.binetflow files (switches to the unified, non-bipartite loader)')
-    parser.add_argument('--rows_per_file', type=int, default=None, help='Max rows read per source file (prefix; use --stride to sample the full file instead)')
-    parser.add_argument('--stride', type=int, default=1, help='Sample every Nth record after loading, to avoid row-prefix label bias')
+    parser.add_argument('--rows_per_file', type=int, default=None, help='Max records KEPT per source file, after striding (not a row prefix)')
+    parser.add_argument('--stride', type=int, default=1, help='Keep every Nth record DURING ingestion: spans the whole capture and bounds peak memory')
     parser.add_argument('--prefix', type=str, default='bita_bigru_transformer', help='Prefix for saved artifacts')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
     parser.add_argument('--n_epoch', type=int, default=30, help='Maximum number of epochs')

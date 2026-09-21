@@ -91,32 +91,52 @@ CIC-2017 has the identical defect.
 
 ## 4. Fix ledger — the actual work
 
-Status: DONE = applied and verified. OPEN = not yet fixed.
+Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 
-| # | Defect | File | Status |
+### Fixed this session
+
+| # | Defect | File | Evidence it was real |
 |---|---|---|---|
-| 1 | `max_context_len` hardcoded 10 vs contract history 15 — Branch B never saw its 5 oldest steps | `branch_b_world_model/rollout_encoder_decoder.py` | **DONE** |
-| 2 | DeepOP checkpoint omitted `history_steps` -> `int(None)` -> would be refused even after a clean retrain | `scripts/retrain_future_models_live.py:241` | **DONE** |
-| 3 | `UNKNOWN` vs `Unknown` case mismatch -> unresolved labels silently graded Benign | `branch_a_gnn_lstm/sequence_dataset.py` | **DONE** |
-| 4 | Nowcast bug — target reused the last *input* window | `branch_a_gnn_lstm/sequence_dataset.py:102` | **DONE** |
-| 5 | Focal loss applied binary alpha to 6 classes -> collapse (macro F1 0.158) | `bita/train.py` | **DONE** |
-| 6 | Timestamps 1000x too small (pandas returns `datetime64[us]`, adapters divided by 1e9) | `data_unification/time_utils.py` | **DONE** |
-| 7 | CIC-2017 tz-aware cast raised; bare `except` zeroed every timestamp | same | **DONE** |
-| 8 | CTU-13 label match `== "benign"` hit 0 of 19,976,700 rows -> reported 100% attack | `ctu13_adapter.py` | **DONE** |
-| 9 | Blank padding rows -> 288,602 records at ts -9.2e9 | `cic2017_adapter.py` | **DONE** |
-| 10 | **12-hour clock** — afternoon sorts before morning, corpus-wide | all three adapters | **OPEN** |
-| 11 | Protocol-0 / port-0 junk rows and 14 rows dated 1970 | adapters | **OPEN** |
-| 12 | `temporal_config.py:24-26` is a **second contract** (history=5, horizon=8) and it seeds the serving adapter | `data_unification/temporal_config.py` | **OPEN** |
-| 13 | T=4 / K=4 defaults contradict the contract | `train_branch_b.py:48,81`; `train_cwa_decoder.py:49,113,332` | **OPEN** |
-| 14 | Contract check writes to a log string; DeepOP never gets `_adopt_contract` | `control_backend/model_adapter.py:184,188-202` | **OPEN** |
-| 15 | `host_attributes.py` — 15 names, **zero** match the computed values; no TCP flag computed anywhere | `host_attributes.py:6-22` | **OPEN** |
-| 16 | `splits.lock.json` has **zero consumers**; five independent splits still exist | all trainers | **OPEN** |
-| 17 | 3 of 6 checkpoints fail `validate_checkpoint` — and they are exactly the three the live adapter serves | `saved_models/` | **OPEN** |
-| 18 | **TGNE inductive AUC 0.5043** (transductive 0.9981) — memorizes seen hosts, chance on unseen | `bita/` | **OPEN** |
+| 1 | `max_context_len` hardcoded 10 vs contract history 15 | `branch_b_world_model/rollout_encoder_decoder.py` | Branch B never saw its 5 oldest history steps |
+| 2 | DeepOP checkpoint omitted `history_steps` -> `int(None)` | `scripts/retrain_future_models_live.py:241` | Would be refused even after a clean retrain |
+| 3 | `UNKNOWN` vs `Unknown` case mismatch | `branch_a_gnn_lstm/sequence_dataset.py` | Unresolved labels silently graded Benign |
+| 4 | Nowcast bug — target reused the last *input* window | `branch_a_gnn_lstm/sequence_dataset.py:102` | Not a forecast at all |
+| 5 | Focal loss applied binary alpha to 6 classes | `bita/train.py` | Collapse, macro F1 0.158 |
+| 6 | Timestamps 1000x too small (`datetime64[us]`) | `data_unification/time_utils.py` | 12h day -> 43s; 21,600 windows -> 22 |
+| 7 | CIC-2017 tz-aware cast raised; bare `except` zeroed all | same | Every CIC-2017 timestamp was 0 |
+| 8 | CTU-13 label match `== "benign"` hit 0 of 19,976,700 rows | `ctu13_adapter.py` | Reported 100% attack; true rate 2.2261% |
+| 9 | Blank padding rows -> 288,602 records at ts -9.2e9 | `cic2017_adapter.py` | Window grid stretched to 1677 AD |
+| 10 | **12-hour clock, corpus-wide** | all three adapters | See §3.1. wed_29: hours {1-5,8-12} -> {8-17}; span 12.00h -> 9.47h |
+| 11 | Protocol-0/port-0 TSO failures and epoch-1970 rows | `data_unification/row_guards.py` (new) | thu_22: exactly 9 rejected, matching the audit's independent count |
+| 12 | `temporal_config.py` declared a **second contract** | `data_unification/temporal_config.py` | history 5 / forecast 8, and it seeded the serving adapter |
+| 13 | T=4 / K=4 literals | `train_branch_b.py`, `train_cwa_decoder.py` | Contradicted the contract |
+| 14 | DeepOP never got `_adopt_contract`; mismatch went to a log string | `control_backend/model_adapter.py` | Now refuses to serve, with an env escape hatch |
+| 15 | `host_attributes.py` — 15 names, **zero** matched | `data_unification/host_attributes.py` | 4 named TCP flags that are never computed |
+| 16 | `splits.lock.json` had **zero consumers** | `data_unification/split_manager.py` | Its own split contradicted the lock (Wednesday train vs test) |
+| 17 | Branch B checkpoint recorded no contract at all | `train_branch_b.py` | `validate_checkpoint` could never accept it |
+| 18 | Assembler defaulted to K=4, 60s windows, history 10/5 | `correlation/trajectory_assembler.py` | Truncated Branch A and B at serving time |
+| 19 | `ScientificSplitManager` returned **ZERO records** for every split | `data_unification/split_manager.py` | Every path wrong, incl. literal `C:\SIH_DATA\...`; guarded by `os.path.exists` so nothing raised. Standalone Branch B/DeepOP trained on nothing |
+| 20 | Prefix sampling was label-biased | `split_manager.py`, `bita/train.py` | Frozen val split measured **0% attack** at 2000 rows/capture |
+| 21 | `stride` applied after loading, so peak memory was the full corpus | `bita/train.py:274` | Striding saved nothing at the peak |
+| 22 | Hits@K / MRR were O(N x P x C) Python loops | `bita/evaluation/eval_edge_prediction_with_categories.py` | Eval took longer than training: 12+ min after a 4 min epoch. 288x / 72x faster |
 
-Items 15 and 18 are the scientifically serious ones. 15 mislabels every feature attribution the
-dashboard shows; 18 means the encoder may not generalize to a host it has not met, which is the
-whole point of a forecasting deployment.
+### Still open
+
+| # | Defect | Why it matters |
+|---|---|---|
+| A | **TGNE inductive AUC 0.5043** (transductive 0.9981) | The encoder is at CHANCE on unseen hosts. A forecasting deployment meets new hosts constantly. **Highest-value open item.** |
+| B | **TGNE category head collapsed** | CatAcc frozen at 0.3327 -> 0.3326 across two epochs, inductive 0.4342 -> 0.4340. Four-decimal-stable accuracy means a constant prediction. |
+| C | 3 served checkpoints fail `validate_checkpoint` | They carry history 5 / forecast 8 — the deleted second contract's values. Tracked by 3 strict-xfail tests. Resolves on retrain. |
+| D | Branch A / B / DeepOP not yet retrained under the fixed pipeline | Everything above changes their inputs. |
+| E | PCAP bridge not wired into the live retrain scripts | `pcap_bridge.py` exists and works; `--pcap-dir` is not plumbed through. |
+| F | 266 corrupt PCAP files (28.8 GB) | User is re-downloading. 262 of 266 come from one capture agent (`capDESKTOP-AN3U28N`). |
+
+### A consequence of #10 worth stating separately
+
+`bita/train.py:357` splits temporally at the 70/85 timestamp quantiles. With the
+12-hour clock unrepaired, afternoon traffic sorted *before* morning, so that
+"temporal" boundary did not separate past from future — **the TGNE train/val
+split was leaking**. Every TGNE run before 2026-09-21 11:02 is affected.
 
 ---
 
@@ -162,13 +182,42 @@ each script invents its own split and the lock is documentation, not enforcement
 
 ---
 
-## 8. The loop
+## 8. Current training run
+
+Launched 2026-09-21 11:02, unit `tgne-retrain`, log `logs/tgne_fixed_retrain.out`.
+
+```
+--stride 4  (no --rows_per_file cap)  --n_epoch 30 --patience 5 --gpu 0
+--data_name unified_clockfixed
+```
+
+This is the first run with the repaired clock, in-ingestion striding and the
+fast evaluation. `--stride 4` over the full corpus (~39M records) keeps ~9.7M
+spanning every capture uniformly — strictly better than the previous run's 8.5M
+chronological-prefix records, and bounded to roughly 5-6 GiB.
+
+The previous run's log is archived at `logs/tgne_retrain_PRE_CLOCKFIX.out`. It
+is not a valid baseline (leaking temporal split, see §4), but its collapse
+signature is the diagnostic record for open items A and B:
+
+| | Epoch 00 | Epoch 01 |
+|---|---|---|
+| Val AUC | 0.9981 | 0.9937 |
+| Val CatAcc | 0.3327 | 0.3326 |
+| Inductive Val AUC | 0.5043 | 0.5026 |
+| Inductive CatAcc | 0.4342 | 0.4340 |
+
+---
+
+## 9. The loop
 
 Repeat until the pipeline is defensible:
 
 1. Pick the highest-severity OPEN item in §4.
 2. Fix it in code. Not a note, not a TODO — an edit.
-3. Run `pytest` (118 tests) plus any targeted check.
+3. Run `pytest` (223 passing, 3 xfailed as of this writing) plus a targeted check.
 4. Update §4 status and append evidence to report 12.
 5. When a fix touches training, retrain the affected stage and read the metrics.
 6. Watch RAM/disk against §1 before launching anything heavy.
+
+Never mark an item DONE without a test or a measurement attached to it.
