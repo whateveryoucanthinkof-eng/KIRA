@@ -56,6 +56,20 @@ pandas' chunk buffers, not your objects. It reported 5,103 B/record for a
 record that actually costs 300 B — a 17x error that would have forced a
 needless stride of 20. Read `/proc/self/statm` after `gc.collect()` instead.
 
+**How the OOM was actually found, after two wrong guesses.** Peak was 13.75 GiB
+while the *final* state was 1.01 GiB — so the consumer was transient, not the
+accumulated data. Measuring each component separately isolated it:
+
+| component | measured |
+|---|---|
+| adapter streaming a full file, all records discarded | 0.22 GiB, flat |
+| final loader state (columns + edge features) | 1.01 GiB |
+| **clock detection on `tue_20` alone** | **13.91 GiB** |
+
+The record list and the triple-copied edge features were real inefficiencies
+and were worth fixing, but neither was the OOM. **Always compare peak against
+final: a large gap means look for something transient, not something big.**
+
 **Never run two data-heavy jobs at once.** A smoke test launched while the
 trainer was loading drove system-available memory to 0.4 GiB and the trainer
 was OOM-killed at 14.3 GiB. The cgroup cap contained it -- the desktop
@@ -146,6 +160,8 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 | 28 | **TGNE trained on the held-out captures** | `bita/train.py` | Its category head uses labels; val/test captures leaked into the encoder, invisible to any branch-level check |
 | 29 | Loader held ~8M record objects -> OOM-killed at 14.3 GiB | `bita/train.py` | Now streams into growable numpy columns; nothing in the output needs the objects |
 | 30 | `NameError: train_records` on every non-credible run | `scripts/retrain_branch_a_live.py:255` | The credibility verdict was replaced by a traceback |
+| 31 | **Clock-detection pre-pass peaked at 13.91 GiB** — the real OOM | `data_unification/time_utils.py` | `low_memory=False` parses the whole file as one block; chunked it is 0.23 GiB. Loader 13.75 -> 1.16 GiB |
+| 32 | Chunking regressed 2 CIC-2017 files to "no repair" | same | pandas `usecols`+`chunksize` IndexError on mixed dtypes, swallowed by a bare `except`. Fixed with `dtype=str` + ERROR log |
 
 ### Still open
 

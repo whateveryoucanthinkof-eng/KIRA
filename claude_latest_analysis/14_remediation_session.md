@@ -265,3 +265,57 @@ a3ca4ba  fix(tgne): give nodes real features; all-zero features made inductive l
 a6d10cf  fix(splits): every trainer now reads the frozen lock; five splits become one
 1b9a6c9  perf(memory): interning never fired for IPs; 479 -> 300 bytes per record
 ```
+
+---
+
+## Addendum — finding the real OOM
+
+The TGNE run was OOM-killed three times. Two fixes were applied before the
+cause was actually located, and it is worth recording that they were not it.
+
+| attempt | hypothesis | outcome |
+|---|---|---|
+| 1 | the ~8M-record Python list | real (479 → 300 B/record via the interning fix) but **not the OOM** |
+| 2 | three copies of the edge-feature block | real (list → `np.stack` → `np.vstack` collapsed to one preallocated array) but **not the OOM** |
+| 3 | the 12-hour-clock detection pre-pass | **this was it** |
+
+What isolated it was comparing **peak against final**: peak 13.75 GiB, final
+1.01 GiB. A large gap means the consumer is transient, so measuring the
+accumulated structures was never going to find it. Measuring each component
+alone:
+
+| component | peak RSS |
+|---|---|
+| adapter streaming a whole file, every record discarded | 0.22 GiB, flat |
+| final loader state (columns + edge features + node features) | 1.01 GiB |
+| **`detect_12h_clock_in_file` on `tue_20` alone** | **13.91 GiB** |
+
+`pd.read_csv(path, usecols=[ts], low_memory=False)` forces pandas to parse the
+whole file as one block; the C tokenizer buffers every column before `usecols`
+is applied. On 7.9M rows × 84 columns that is 13.91 GiB for one column of
+timestamps. Chunked: **0.23 GiB**, identical verdict, same runtime. Full
+CIC-2018 train loader: **13.75 → 1.16 GiB**, byte-identical output.
+
+Chunking then regressed two CIC-2017 files from True to False. Mixed dtypes
+(guaranteed by the blank padding rows) send pandas down its DtypeWarning path,
+where `usecols` + `chunksize` hit a pandas bug — `_concatenate_chunks` indexes
+`column_names` by the original column position while that list holds only the
+selected column — raising IndexError. A bare `except` turned that into "no
+hours" → "not a 12-hour clock" → **file left unrepaired**, the same
+silent-failure shape as the bug the module exists to fix. Now `dtype=str`
+(skipping inference entirely) plus an ERROR log on any detection failure.
+
+All 18 verdicts (10 CIC-2018 + 8 CIC-2017) confirmed True afterwards.
+
+### Also in this addendum
+
+- `~/Downloads/DATA` audited: **byte-identical** to the training copy (MD5 match
+  on all ten, independently spot-checked on three), `sum(wc -l − 1)` =
+  **16,233,002**, the published total exactly. The 2^20 cap is upstream, as
+  report 09 concluded. Its `logs/` holds 1.8 GB of Windows `.evtx` victim-host
+  logs (451 IPs) which cannot restore per-flow IPs — no join key, victim side
+  only, and a strict subset of the 33,176 IPs `tue_20` already has. Full detail
+  in [`15_downloads_csv_audit.md`](15_downloads_csv_audit.md).
+- `scripts/retrain_branch_a_live.py` smoke-tested end to end. The credibility
+  gate fires correctly: it refused a run where model accuracy 0.7221 did not
+  beat the 0.9666 persistence baseline.
