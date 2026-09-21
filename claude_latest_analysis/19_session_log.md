@@ -512,3 +512,29 @@ Consequences:
 host-diversity explanation I gave for it — 10 distinct bot hosts appear to be
 enough to learn transferable structure. Recon (1 host) remains the only class
 that is structurally unable to generalise.
+
+### 18:12 — Branch A validated end to end against the new encoder
+Ran it under a 4 GB cap so it could not disturb training. **Exit 0, peak 2.6 GB,
+72 s.**
+
+| check | result |
+|---|---|
+| new TGNE architecture loads downstream | ✓ |
+| lazy dataset wiring | ✓ 6,644 / 856 / 882 samples |
+| frozen split honoured | ✓ **17 train / 3 val / 3 test** |
+| store-based credibility gate | ✓ **CREDIBLE** |
+| held-out test scored once | ✓ `tech_accuracy 0.756` vs persistence 0.679 |
+| **credibility verdict persisted** | ✓ `{checked: True, credible: True, problems: []}` |
+| **contract persisted** | ✓ `window 2.0s, history 15, forecast 5` — matches v4 |
+
+Both of today's checkpoint-integrity fixes work in practice, and a real
+retrain should flip the three strict-xfail contract tests to passing.
+
+Numbers are from a deliberately tiny config (250 rows/capture, stride 400)
+and are **not results** — the point was to prove the path, not to measure the
+model.
+
+One thing to watch at full density: `val_traj_len_median = 1` and only 6 hosts
+with 16+ snapshots at this stride. Branch B needs T+1 = 16 snapshots per host,
+so at low density it would have almost nothing to train on. Full density
+should fix it, but worth checking when Branch B runs.
