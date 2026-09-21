@@ -86,8 +86,45 @@ class FocalLoss(nn.Module):
         present = counts > 0
         if present.any():
             inv = (counts[present].sum() / counts[present]) ** power
-            w[present] = inv / inv.mean()
+            # Normalise by the GEOMETRIC mean, not the arithmetic mean.
+            #
+            # These are multiplicative weights, so the arithmetic mean is the
+            # wrong centre: one ultra-rare class dominates it and crushes every
+            # other weight to the clip floor. Measured on the full corpus, the
+            # arithmetic version returned
+            #   {Benign: 0.2, C2: 0.2, Impact: 0.2, InitialAccess: 0.2, Recon: 4.911}
+            # -- four of five classes pinned at the floor and therefore
+            # weighted IDENTICALLY, i.e. no class balancing at all among the
+            # four that carry the data. Recon is ~5 orders of magnitude rarer
+            # than Benign, and that single outlier set the scale for everyone.
+            #
+            # The geometric mean centres the weights in log space, which is
+            # where a multiplicative correction belongs, so a single extreme
+            # class shifts the others by a bounded factor instead of collapsing
+            # them.
+            w[present] = inv / float(np.exp(np.mean(np.log(inv))))
+        w_unclipped = w.copy()
         w = np.clip(w, clip[0], clip[1])
+
+        # Report what the weights were actually built from. The class counts
+        # are the single most diagnostic number here: a weight of exactly 1.0
+        # means a class had ZERO training samples, and that is how a broken
+        # split was found (3 of 5 categories were absent because the temporal
+        # cut was splitting by corpus).
+        logging.info(
+            "focal alpha: counts=%s -> weights=%s",
+            {i: int(c) for i, c in enumerate(counts)},
+            {i: round(float(x), 3) for i, x in enumerate(w)},
+        )
+        n_pinned = int(np.sum((w_unclipped < clip[0]) | (w_unclipped > clip[1])))
+        if n_pinned > num_classes // 2:
+            logging.warning(
+                "focal alpha: %d of %d classes are pinned at a clip bound %s. "
+                "Pinned classes are weighted identically, so the loss is doing "
+                "no balancing between them. Class frequencies span %.0fx.",
+                n_pinned, num_classes, clip,
+                float(counts[present].max() / max(1.0, counts[present].min())),
+            )
         return torch.as_tensor(w, dtype=torch.float)
 
     def forward(self, inputs, targets):
