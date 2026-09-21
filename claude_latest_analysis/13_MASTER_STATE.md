@@ -162,13 +162,16 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 | 30 | `NameError: train_records` on every non-credible run | `scripts/retrain_branch_a_live.py:255` | The credibility verdict was replaced by a traceback |
 | 31 | **Clock-detection pre-pass peaked at 13.91 GiB** — the real OOM | `data_unification/time_utils.py` | `low_memory=False` parses the whole file as one block; chunked it is 0.23 GiB. Loader 13.75 -> 1.16 GiB |
 | 32 | Chunking regressed 2 CIC-2017 files to "no repair" | same | pandas `usecols`+`chunksize` IndexError on mixed dtypes, swallowed by a bare `except`. Fixed with `dtype=str` + ERROR log |
+| 33 | **Eleven places silently thinned training data** | 9 files; guard in `data_unification/density.py` | 3 were mine (stride 20, stride 4). `snapshot_flows(max_flows=256)` truncated PCAP flows per window with nothing in any log |
+| 34 | Neighbour finder: a Python tuple per edge per direction | `bita/utils/utils.py` | **293 B/edge = 9.3 GiB** at full density. CSR: 48 B/edge = 1.5 GiB, 1s not minutes |
+| 35 | **Temporal split was a split BY CORPUS** | `bita/train.py::split_data` | Corpora sit in disjoint years; global quantile trained on 2011 CTU-13 and tested on 2018 CIC. Explains the zero-sample classes, chance inductive AUC and frozen CatAcc at once |
 
 ### Still open
 
 | # | Defect | Why it matters |
 |---|---|---|
-| A | **TGNE inductive AUC 0.5043** (transductive 0.9981) | The encoder is at CHANCE on unseen hosts. A forecasting deployment meets new hosts constantly. **Highest-value open item.** |
-| B | **TGNE category head collapsed** | CatAcc frozen at 0.3327 -> 0.3326 across two epochs, inductive 0.4342 -> 0.4340. Four-decimal-stable accuracy means a constant prediction. |
+| A | **TGNE inductive AUC 0.5043** | **Cause found** (item 35): val hosts were a different corpus entirely. Two fixes applied — IP node features and the per-corpus split. Awaiting the full-density run. |
+| B | **TGNE category head collapsed** | **Cause found** (item 35): 3 of 5 classes had ZERO training samples — the focal alpha's exact-1.0 weights were the tell. Awaiting the full-density run. |
 | C | 3 served checkpoints fail `validate_checkpoint` | They carry history 5 / forecast 8 — the deleted second contract's values. Tracked by 3 strict-xfail tests. Resolves on retrain. |
 | D | Branch A / B / DeepOP not yet retrained under the fixed pipeline | Everything above changes their inputs. |
 | E | PCAP bridge not wired into the live retrain scripts | `pcap_bridge.py` exists and works; `--pcap-dir` is not plumbed through. |
@@ -226,44 +229,47 @@ each script invents its own split and the lock is documentation, not enforcement
 
 ---
 
-## 8. Current training run
+## 8. Current training run — FULL DENSITY
 
 Unit `tgne-retrain`, log `logs/tgne_fixed_retrain.out`.
 
 ```
---stride 4 --train_splits train --n_epoch 30 --patience 5 --gpu 0
---data_name unified_v4
+--train_splits train --n_epoch 30 --patience 5 --gpu 0 --data_name unified_full
+(no --stride, no --rows-per-file: require_full_density() refuses otherwise)
 ```
 
-First run with the clock repair, IP node features, working interning, the
-columnar loader, the frozen train-only split and the fast evaluation.
+**Full density is now enforced, not merely intended.** `require_full_density()`
+runs at the top of all three trainers and raises on any active cap or stride.
+`CYBERWORLD_ALLOW_SUBSAMPLING=1` is the only bypass and it logs
+"SUBSAMPLED RUN, NOT A RESULT".
 
-**Launch discipline learned the hard way:** run nothing else heavy while this
-is loading. A concurrent smoke test drove system-available to 0.4 GiB and the
-unit was OOM-killed at 14.3 GiB. The cgroup cap contained it -- the desktop did
-not freeze -- which is exactly what the cap is for.
+### Why the earlier runs could never have worked
 
-Archived logs, in order, none of them valid baselines:
+Every archived log below is invalid for a *different* reason. None is a
+baseline.
 
-| log | why it is not a baseline |
+| log | fatal defect |
 |---|---|
-| `tgne_retrain_PRE_CLOCKFIX.out` | 12-hour clock unrepaired -> leaking temporal split |
-| `tgne_retrain_PRE_NODEFEAT.out` | node features all zero |
+| `tgne_retrain_PRE_CLOCKFIX.out` | 12-hour clock unrepaired → leaking temporal split |
+| `tgne_retrain_PRE_NODEFEAT.out` | node features all zero → inductive learning impossible |
 | `tgne_retrain_PRE_LEAKFIX.out` | trained on val/test captures |
-| `tgne_retrain_OOM_ATTEMPT.out`, `tgne_retrain_OOM2.out` | OOM-killed during load |
+| `tgne_retrain_OOM*.out` | OOM-killed during load |
+| `tgne_retrain_PRE_CORPUSSPLIT.out` | split by corpus, not by time (item 35) |
+| `tgne_retrain_PRE_FULLDENSITY.out` | `--stride 4`, 75% of records discarded |
 
-The collapse signature from the pre-clockfix run is the diagnostic record for
-open items A and B:
+### The diagnostic signature to watch for
 
-| | Epoch 00 | Epoch 01 |
-|---|---|---|
-| Val AUC | 0.9981 | 0.9937 |
-| Val CatAcc | 0.3327 | 0.3326 |
-| Inductive Val AUC | 0.5043 | 0.5026 |
-| Inductive CatAcc | 0.4342 | 0.4340 |
+From the pre-corpus-split run, and what each number meant:
 
-CatAcc stable to four decimals across two epochs is a constant prediction, not
-learning.
+| observation | what it actually indicated |
+|---|---|
+| focal alpha `{Benign: .239, C2: 1.761, Impact: 1.0, InitialAccess: 1.0, Recon: 1.0}` | **exactly 1.0 = zero training samples.** `inverse_frequency_alpha` leaves absent classes at 1.0. 3 of 5 categories were never trained on |
+| Inductive val AUC 0.5043 → 0.5026 | validation hosts were a different corpus (172.31.x / 192.168.10.x vs CTU-13's 147.32.x) |
+| Val CatAcc 0.3327 → 0.3326 | four-decimal stability = a constant prediction |
+| Transductive val AUC 0.9981 | **means nothing on its own** — it was true while the model was a lookup table |
+
+If the alpha still shows exact 1.0 weights, a class has no training data and
+the split is still wrong. Check that before anything else.
 
 ---
 
