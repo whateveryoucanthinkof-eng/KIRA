@@ -348,3 +348,98 @@ if __name__ == "__main__":
     else:
         train_cwa_decoder(epochs=args.epochs, K=args.K)
 
+
+
+class LazyCWADataset(Dataset):
+    """DeepOP samples built on demand from a TrajectoryStore.
+
+    `create_cwa_training_samples` materialises h_future [K,12], h_history
+    [T,12] and two token arrays per sample -- roughly **1,250 bytes each**,
+    and one sample per snapshot plus a duplicate for every attack sequence.
+    At full corpus density (~42M snapshots) that is **~52 GiB**, which does
+    not fit and cannot be solved by using less data.
+
+    Same fix as Branch A and Branch B: keep int32 index columns and gather
+    from the store's memmapped block on __getitem__.
+
+    Semantics match the eager path, including the 2x oversampling of
+    sequences that contain any non-Benign token -- represented here by
+    listing those positions twice in the index rather than by duplicating
+    the arrays.
+    """
+
+    def __init__(self, store, vocab, K: int = None, T: int = None):
+        _c = get_contract()
+        self.K = _c.forecast_steps if K is None else K
+        self.T = _c.history_steps if T is None else T
+        self.store = store
+        self.vocab = vocab
+
+        benign_cat = None
+        for i, name in enumerate(store.categories):
+            if name == "Benign":
+                benign_cat = i
+                break
+
+        hosts, host_idx, pos = [], [], []
+        for h in store:
+            rows = store._rows_by_host[h]
+            n = len(rows)
+            if n < self.K:
+                continue
+            hi = len(hosts)
+            hosts.append(h)
+            starts = np.arange(0, n - self.K + 1, dtype=np.int32)
+            # 2x oversample any window containing a non-Benign step, matching
+            # create_cwa_training_samples' anti-collapse duplication.
+            cats = store.cat_id[rows]
+            active = np.array(
+                [bool((cats[i:i + self.K] != benign_cat).any()) for i in starts],
+                dtype=bool,
+            ) if benign_cat is not None else np.zeros(len(starts), bool)
+            sel = np.concatenate([starts, starts[active]])
+            host_idx.append(np.full(len(sel), hi, dtype=np.int32))
+            pos.append(sel)
+
+        self.hosts = hosts
+        self._host_idx = np.concatenate(host_idx) if host_idx else np.zeros(0, np.int32)
+        self._pos = np.concatenate(pos) if pos else np.zeros(0, np.int32)
+
+    def __len__(self):
+        return int(len(self._pos))
+
+    def _token(self, row: int) -> int:
+        lo, hi = int(self.store.tech_off[row]), int(self.store.tech_off[row + 1])
+        tech = self.store.techniques[int(self.store.tech_flat[lo])] if hi > lo else "None"
+        return self.vocab.encode(self.store.categories[int(self.store.cat_id[row])], tech)
+
+    def __getitem__(self, idx):
+        host = self.hosts[int(self._host_idx[idx])]
+        i = int(self._pos[idx])
+        rows = self.store._rows_by_host[host]
+        fut = rows[i:i + self.K]
+
+        h_fut = np.ascontiguousarray(self.store.feats[fut, :12], dtype=np.float32)
+        token_ids = [self._token(int(r)) for r in fut]
+
+        out = {
+            "h_future": torch.from_numpy(h_fut),
+            "input_tokens": torch.tensor([self.vocab.bos_idx] + token_ids[:-1], dtype=torch.long),
+            "target_tokens": torch.tensor(token_ids, dtype=torch.long),
+            "obs_token": torch.tensor(
+                self._token(int(rows[i - 1])) if i > 0 else self.vocab.bos_idx,
+                dtype=torch.long),
+        }
+        if self.T > 0:
+            lo = max(0, i - self.T)
+            hist_rows = rows[lo:i]
+            if len(hist_rows):
+                hist = self.store.feats[hist_rows, :12]
+                if len(hist) < self.T:            # left-pad by repeating the first
+                    hist = np.concatenate(
+                        [np.repeat(hist[:1], self.T - len(hist), axis=0), hist], axis=0)
+            else:                                  # no history: repeat the first future state
+                hist = np.repeat(h_fut[:1], self.T, axis=0)
+            out["h_history"] = torch.from_numpy(
+                np.ascontiguousarray(hist, dtype=np.float32))
+        return out

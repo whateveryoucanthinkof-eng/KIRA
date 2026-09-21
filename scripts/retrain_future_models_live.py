@@ -50,7 +50,9 @@ def _pcap_day_split(day_dir) -> str:
         )
 from deepop_decoder.forecast_decoder import DeepOPForecastDecoder
 from deepop_decoder.joint_vocab import get_joint_vocab
-from deepop_decoder.train_cwa_decoder import CWASequenceDataset, create_cwa_training_samples
+from deepop_decoder.train_cwa_decoder import (
+    CWASequenceDataset, LazyCWADataset, create_cwa_training_samples,
+)
 from cyberworld_v4.config import get_contract
 
 
@@ -243,11 +245,15 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None):
     # only ever sees WDT output; training it on ground truth is a train/serve
     # mismatch that noise augmentation only approximates.
     _T=_c.history_steps if wdt is not None else 0
-    train_samples=create_cwa_training_samples(train_traj,vocab,K=_c.forecast_steps,T=_T)
-    val_samples=create_cwa_training_samples(val_traj,vocab,K=_c.forecast_steps,T=_T)
+    # Lazy: create_cwa_training_samples materialises h_future, h_history and
+    # two token arrays per sample (~1,250 B), one per snapshot plus a
+    # duplicate per attack window -- ~52 GiB at full corpus density.
+    train_ds=LazyCWADataset(train_traj,vocab,K=_c.forecast_steps,T=_T)
+    val_ds=LazyCWADataset(val_traj,vocab,K=_c.forecast_steps,T=_T)
+    print(f"DeepOP samples: train={len(train_ds)} val={len(val_ds)}",flush=True)
     print(f"DeepOP conditioning: {'Branch-B rollouts (E1 fixed)' if wdt is not None else 'oracle + noise (interim)'}",flush=True)
-    train_loader=DataLoader(CWASequenceDataset(train_samples),batch_size=64,shuffle=True)
-    val_loader=DataLoader(CWASequenceDataset(val_samples),batch_size=64)
+    train_loader=DataLoader(train_ds,batch_size=64,shuffle=True)
+    val_loader=DataLoader(val_ds,batch_size=64)
     decoder=DeepOPForecastDecoder(d_latent=12,d_model=72,vocab_size=vocab.vocab_size,n_heads=6,num_layers=2,window_sizes=[2,4,8],dim_feedforward=144).to(device)
     optimizer=torch.optim.AdamW(decoder.parameters(),lr=5e-4,weight_decay=1e-4)
     best=float("inf")
