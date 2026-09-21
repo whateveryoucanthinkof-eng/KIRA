@@ -596,3 +596,31 @@ Everything for that transition is already staged and verified:
 - epoch checkpoint verified to load (category head 36 → 5)
 - Branch A validated end to end at 2.6 GB
 - all three lazy datasets in place
+
+### 19:15 — Quantified the epoch-to-epoch variance. It qualifies my own selection.
+
+Inductive per-class recall across 8 epochs:
+
+| class | mean | **std** | trend |
+|---|---|---|---|
+| Benign | 0.994 | 0.001 | flat — converged |
+| Impact | 1.000 | 0.000 | flat — converged |
+| **C2** | 0.500 | **0.119** | up (0.387 → 0.563) |
+| InitialAccess | 0.575 | 0.062 | down (0.601 → 0.541) |
+| Recon | 0.000 | 0.000 | structural (1 carrier host) |
+
+**C2's std is 0.119**, so epoch 6 (0.692) vs epoch 3 (0.565) is roughly one
+standard deviation — **within noise**. Epochs 3, 4 and 6 are effectively tied,
+and "epoch 6 is the best" is a weaker statement than it looked.
+
+Two consequences:
+1. Selecting the single best epoch on a noisy minority-class metric is partly
+   luck. A smoothed criterion (mean over a window) would be more honest, and
+   is worth adding before the final selection.
+2. Benign and Impact have **converged** (std ≈ 0). Remaining headroom is
+   entirely in C2 and InitialAccess, which are the two data-limited classes.
+
+InitialAccess trending *down* (0.601 → 0.541) while C2 trends up is consistent
+with the earlier finding that InitialAccess is ~half unlearnable
+(Infiltration, tree recall 0.278) — the model may be fitting its learnable
+half and drifting on the rest.
