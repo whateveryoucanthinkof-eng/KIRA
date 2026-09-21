@@ -896,6 +896,22 @@ def train(args):
                      f"Val AUC: {val_auc:.4f}, AP: {val_ap:.4f}, CatAcc: {val_cat_acc:.4f}, MRR: {val_mrr:.4f} | "
                      f"Inductive Val AUC: {nn_val_auc:.4f}, AP: {nn_val_ap:.4f}, CatAcc: {nn_val_cat_acc:.4f}")
 
+        # Per-class accuracy, every epoch.
+        #
+        # Aggregate CatAcc is dominated by Benign, which is ~80% of the data --
+        # a collapsed head that predicts Benign for everything still scores
+        # ~0.8 there. The minority classes are the whole point of the model,
+        # and they are invisible in the aggregate. This is the number that
+        # actually says whether the class weighting is working.
+        _per_class = val_results[7] or {}
+        _nn_per_class = nn_val_results[7] or {}
+        _nm = {i: category_mapping.get(i, str(i)) for i in _per_class}
+        logging.info(
+            "           per-class val acc: %s | inductive: %s",
+            {_nm[i]: round(float(a), 3) for i, a in sorted(_per_class.items())},
+            {_nm.get(i, i): round(float(a), 3) for i, a in sorted(_nn_per_class.items())},
+        )
+
         # Checkpoint current epoch
         torch.save(tgn.state_dict(), checkpoint_path_fn(epoch))
 
