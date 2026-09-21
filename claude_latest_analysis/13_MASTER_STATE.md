@@ -165,18 +165,41 @@ Status: DONE = applied, verified, and covered by a test. OPEN = not yet fixed.
 | 33 | **Eleven places silently thinned training data** | 9 files; guard in `data_unification/density.py` | 3 were mine (stride 20, stride 4). `snapshot_flows(max_flows=256)` truncated PCAP flows per window with nothing in any log |
 | 34 | Neighbour finder: a Python tuple per edge per direction | `bita/utils/utils.py` | **293 B/edge = 9.3 GiB** at full density. CSR: 48 B/edge = 1.5 GiB, 1s not minutes |
 | 35 | **Temporal split was a split BY CORPUS** | `bita/train.py::split_data` | Corpora sit in disjoint years; global quantile trained on 2011 CTU-13 and tested on 2018 CIC. Explains the zero-sample classes, chance inductive AUC and frozen CatAcc at once |
+| 36 | **Recon had 7 training samples of 11.8M** | `bita/train.py::split_data` | Per-corpus cut at 13:13 vs PortScan at 13:00-15:59. Attack types are organised BY DAY, so a corpus-wide cut segregates whole classes. Now cut per CAPTURE |
+| 37 | Focal alpha pinned 4 of 5 classes to the clip floor | `bita/train.py::inverse_frequency_alpha` | Arithmetic-mean normalisation of multiplicative weights; one ultra-rare class set the scale. Geometric mean fixes it |
+| 38 | Sampler was a per-node Python loop | `bita/utils/utils.py` | 384 iterations/batch, ~35M/epoch, GIL-bound. Vectorised: 4.7x at batch 128, 13.3x at 512 |
+| 39 | Ingest was single-core | `data_unification/parallel_ingest.py` (new) | 12.7 min on 1 of 16 cores. Parallel + bit-identical: 3.14x measured |
 
 ### Still open
 
-| # | Defect | Why it matters |
+| # | item | status |
 |---|---|---|
-| A | **TGNE inductive AUC 0.5043** | **Cause found** (item 35): val hosts were a different corpus entirely. Two fixes applied — IP node features and the per-corpus split. Awaiting the full-density run. |
-| B | **TGNE category head collapsed** | **Cause found** (item 35): 3 of 5 classes had ZERO training samples — the focal alpha's exact-1.0 weights were the tell. Awaiting the full-density run. |
-| C | 3 served checkpoints fail `validate_checkpoint` | They carry history 5 / forecast 8 — the deleted second contract's values. Tracked by 3 strict-xfail tests. Resolves on retrain. |
-| D | Branch A / B / DeepOP not yet retrained under the fixed pipeline | Everything above changes their inputs. |
-| E | PCAP bridge not wired into the live retrain scripts | `pcap_bridge.py` exists and works; `--pcap-dir` is not plumbed through. |
-| F | 266 corrupt PCAP files (28.8 GB) | User is re-downloading. 262 of 266 come from one capture agent (`capDESKTOP-AN3U28N`). |
-| G | `NeighborFinder` is handed an `adj_list` of Python **tuples** | 2 tuples per edge at ~156 B each = ~2.4 GB of transient peak at 7.8M edges, allocated right after loading. Not yet fixed; it is the remaining obstacle to full density. |
+| A | Branch A / B / DeepOP retrain | blocked on the encoder; runbook in `16_downstream_retrain_runbook.md` |
+| B | 3 checkpoints fail `validate_checkpoint` | resolves on retrain; 3 strict-xfail tests track it |
+| C | Perf experiments A/B/C | protocol and results in `17_perf_experiments.md` |
+| D | 266 corrupt PCAP files | user re-downloading; `~/Downloads/DATA` confirmed byte-identical, not an upgrade (report 15) |
+
+### Resolved: the encoder works
+
+First valid full-density epoch, after four fixes that all had to land together
+(clock repair, IP node features, held-out captures excluded, per-corpus split):
+
+| metric | broken | epoch 0 |
+|---|---|---|
+| Inductive Val AUC | 0.5043 *(chance)* | **0.8330** |
+| Inductive CatAcc | 0.4342 | **0.8712** |
+| Val CatAcc | 0.3327 | **0.8351** |
+| Val MRR | 0.5536 | **0.8845** |
+| Val AUC | 0.9981 | 0.9321 |
+
+Transductive AUC **fell**, and that is the healthy signal: 0.9981 was a model
+memorising hosts it had seen. Transductive and inductive now sit close
+together, which is what generalisation looks like.
+
+**Caveat on that epoch:** it ran with the per-CORPUS split, so Recon had 7
+training samples. The aggregate CatAcc of 0.8351 looked fine anyway. Never
+report a headline metric from this pipeline without the per-class counts
+beside it.
 
 ### A consequence of #10 worth stating separately
 
