@@ -569,3 +569,30 @@ hosts (tue_20: 37) or very few sustained ones (CTU-13: 0.6% reach 16).
 
 This confirms the original plan's Phase 2/3 rationale with numbers rather than
 argument.
+
+### 18:56 — Epoch 6 is the new best. Not stopping training.
+
+| epoch | ind_AP | macro recall | selection |
+|---|---|---|---|
+| 3 | 0.9935 | 0.8760 | 0.9347 |
+| 5 | 0.9934 | 0.8488 | 0.9211 |
+| **6** | **0.9945** | **0.8768** | **0.9357** |
+
+C2 inductive: 0.325 → 0.319 → 0.517 → 0.565 → 0.586 → 0.480 → **0.692**.
+More than doubled since epoch 0, and still climbing.
+
+**I had intended to stop after epoch 7 and run the downstream models so there
+would be a complete pipeline tonight. That was the wrong call** — the encoder
+is still gaining materially, and cutting it short would trade real model
+quality for a tidier status report.
+
+Both criteria now agree on epoch 6, so the earlier divergence has resolved as
+well.
+
+**Plan: let it converge on its own (patience 5).** Downstream runs after.
+Everything for that transition is already staged and verified:
+- `select_best_encoder.py` — picks the epoch, no restart needed
+- `write_encoder_config.py` — the config an earlier epoch would otherwise lack
+- epoch checkpoint verified to load (category head 36 → 5)
+- Branch A validated end to end at 2.6 GB
+- all three lazy datasets in place
