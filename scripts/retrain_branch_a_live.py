@@ -57,8 +57,12 @@ def _load_records(cic_dir: Path, ctu_dir: Path, rows_per_file: int, files: List[
     records = []
     for i, path in enumerate(files):
         t0 = time.time()
-        gen = cic.parse_file(str(path), max_rows=rows_per_file * stride) if path.suffix.lower() == ".csv" \
-            else ctu.parse_netflow_csv(str(path), max_rows=rows_per_file * stride)
+        # rows_per_file is None at FULL DENSITY (the default since the
+        # subsampling sweep), so `rows_per_file * stride` raised TypeError.
+        # None must propagate as "no cap" rather than becoming 0.
+        _cap = None if rows_per_file is None else rows_per_file * stride
+        gen = cic.parse_file(str(path), max_rows=_cap) if path.suffix.lower() == ".csv" \
+            else ctu.parse_netflow_csv(str(path), max_rows=_cap)
         got = _strided(gen, stride, rows_per_file)
         records.extend(got)
         print(f"  [{i+1}/{len(files)}] {path.name}: {len(got)} records in {time.time()-t0:.1f}s (cumulative {len(records)})", flush=True)

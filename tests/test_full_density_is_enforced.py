@@ -119,3 +119,43 @@ def test_all_three_trainers_call_the_guard():
                  "scripts/retrain_branch_a_live.py",
                  "scripts/retrain_future_models_live.py"):
         assert "require_full_density(" in open(path).read(), f"{path} is unguarded"
+
+
+# ---------------------------------------------------------------------------
+# Full density (rows_per_file=None) must actually work
+# ---------------------------------------------------------------------------
+
+def test_no_script_multiplies_a_possibly_none_row_cap():
+    """`rows_per_file * stride` raised TypeError the moment full density
+    became the default -- the Branch A retrain died on launch.
+
+    None means "no cap" and must propagate as None, not become 0 (which the
+    adapters would read as "read nothing") and not raise.
+    """
+    import pathlib
+    import re
+    offenders = []
+    for path in (pathlib.Path("scripts/retrain_branch_a_live.py"),
+                 pathlib.Path("scripts/retrain_future_models_live.py")):
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if not re.search(r"rows_per_file\s*\*\s*stride", stripped):
+                continue
+            # The guarded form is correct:
+            #   _cap = None if rows_per_file is None else rows_per_file * stride
+            if "is None else" in stripped:
+                continue
+            offenders.append(f"{path}:{i}")
+    assert not offenders, (
+        "unguarded rows_per_file * stride (None at full density): "
+        + ", ".join(offenders)
+    )
+
+
+def test_the_guard_keeps_none_as_none():
+    """The shape of the fix: None in, None out; a real cap still multiplies."""
+    for rows_per_file, stride, expected in [(None, 20, None), (100, 20, 2000), (50, 1, 50)]:
+        cap = None if rows_per_file is None else rows_per_file * stride
+        assert cap == expected

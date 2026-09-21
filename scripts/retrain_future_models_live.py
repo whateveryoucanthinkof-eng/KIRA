@@ -82,9 +82,11 @@ def load_records(cic_dir, ctu_dir, rows_per_file, stride=1):
     def _read(paths):
         out = []
         for path in paths:
-            gen = (cic.parse_file(str(path), max_rows=rows_per_file * stride)
+            # None at full density; must propagate as "no cap", not become 0.
+            _cap = None if rows_per_file is None else rows_per_file * stride
+            gen = (cic.parse_file(str(path), max_rows=_cap)
                    if path.suffix == ".csv"
-                   else ctu.parse_netflow_csv(str(path), max_rows=rows_per_file * stride))
+                   else ctu.parse_netflow_csv(str(path), max_rows=_cap))
             out.extend(_strided(gen, stride, rows_per_file))
         return out
 
