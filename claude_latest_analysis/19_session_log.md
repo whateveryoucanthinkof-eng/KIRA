@@ -408,3 +408,28 @@ those positions twice in the index, and the index is built from the store's
 
 *22 tests across the three, each asserting equivalence with the eager path
 rather than just "it runs".*
+
+### 17:50 — Early stopping was selecting on a saturated metric
+`val_ap` (link prediction, seen hosts) converges in **one epoch** here and then
+flatlines, while the classification head keeps improving:
+
+| | ep 0 | ep 1 | ep 2 |
+|---|---|---|---|
+| val_ap | 0.9971 | 0.9968 | 0.9968 |
+| inductive AP | 0.9926 | 0.9921 | 0.9918 |
+| C2 inductive | 0.325 | 0.319 | **0.517** |
+
+With patience 5 the run would stop and **restore epoch 0**, discarding the only
+thing still getting better. Confirmed by feeding the real sequence to
+`EarlyStopMonitor`: it picks epoch 0.
+
+**Now selects on `0.5 × inductive AP + 0.5 × val macro-F1`:**
+- *inductive*, because deployment meets unseen hosts and the transductive
+  figure has no discriminative power left at 0.9968;
+- *macro* F1, because Benign is ~90% of val — a head predicting Benign for
+  everything scores 0.90 accuracy and under 0.25 macro-F1. Aggregate accuracy
+  is precisely the metric that hid the collapse all day.
+
+**Deliberately not restarting for this.** The current run will stop around
+epoch 5 and show whether the category head plateaus by itself — that is the
+data needed to know whether the change matters. Applying it to the next run.
