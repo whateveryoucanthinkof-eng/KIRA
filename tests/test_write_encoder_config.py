@@ -56,3 +56,41 @@ def test_config_sits_beside_the_checkpoint(tmp_path):
     """build_or_load_tgne_ta looks for <stem>_config.json next to the file."""
     ckpt, _r = _run(tmp_path, LOG)
     assert (ckpt.parent / (ckpt.stem + "_config.json")).exists()
+
+
+# ---------------------------------------------------------------------------
+# A missing config must not be reported as a stale architecture
+# ---------------------------------------------------------------------------
+
+def test_shape_mismatch_and_name_mismatch_are_distinguished():
+    """Two very different failures both mention category_predictor:
+
+      a) the final layer's SHAPE differs -> num_categories mismatch, i.e. the
+         config JSON is missing or wrong. Fix: write one. NOT a retrain.
+      b) the layer NAMES differ (category_predictor.weight vs
+         category_predictor.0.weight) -> the checkpoint predates the
+         edge-aware head and genuinely needs retraining.
+
+    The original handler said "predates the edge-aware category head" for
+    both, which would send someone to retrain an encoder that needed a
+    400-byte JSON file beside it. Hit exactly that during the Branch B smoke
+    test.
+    """
+    src = Path("branch_a_gnn_lstm/train_branch_a.py").read_text()
+    assert "size mismatch for category_predictor" in src, (
+        "the shape-mismatch case must be detected separately"
+    )
+    assert "write_encoder_config.py" in src, (
+        "the error should name the actual fix"
+    )
+    # and the generic architecture branch must still exist for case (b)
+    assert "predates the edge-aware category head" in src
+
+
+def test_the_shape_branch_is_checked_before_the_generic_one():
+    """Order matters: the generic 'category_predictor in msg' test would
+    swallow the shape case if it came first."""
+    src = Path("branch_a_gnn_lstm/train_branch_a.py").read_text()
+    shape_at = src.index('"size mismatch for category_predictor" in msg')
+    generic_at = src.index('"category_predictor" in msg')
+    assert shape_at < generic_at, "the specific case must be tested first"

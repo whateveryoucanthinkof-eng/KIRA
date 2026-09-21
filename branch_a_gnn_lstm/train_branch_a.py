@@ -149,7 +149,37 @@ def build_or_load_tgne_ta(
         # flow at all, so it collapsed to predicting one class for everything.
         #
         # Say that plainly instead of surfacing a raw state_dict diff.
-        if "category_predictor" in str(exc):
+        msg = str(exc)
+
+        # Distinguish two very different failures that both mention
+        # category_predictor:
+        #
+        #   a) SHAPE of the final layer differs -> num_categories mismatch,
+        #      which means the config JSON is missing or wrong. The fix is to
+        #      write one (scripts/write_encoder_config.py), NOT to retrain.
+        #   b) the layer NAMES differ (category_predictor.weight vs
+        #      category_predictor.0.weight) -> the checkpoint predates the
+        #      edge-aware head and genuinely needs a retrain.
+        #
+        # The original message said "predates the edge-aware category head"
+        # for both, which sends someone to retrain an encoder that only needed
+        # a 400-byte JSON file beside it.
+        if "size mismatch for category_predictor" in msg:
+            import re as _re
+            want = _re.search(r"shape torch\.Size\(\[(\d+)\]\) from checkpoint", msg)
+            got = _re.search(r"current model is torch\.Size\(\[(\d+)\]\)", msg)
+            raise StaleEncoderArchitecture(
+                f"TGNE checkpoint {ckpt_path} was trained with "
+                f"{want.group(1) if want else '?'} categories but this loader built "
+                f"{got.group(1) if got else '?'}.\n\n"
+                f"The architecture is fine -- the config JSON is missing or stale. "
+                f"build_or_load_tgne_ta reads '<checkpoint>_config.json' and falls "
+                f"back to num_categories=4 when it is absent.\n\n"
+                f"Fix:  python scripts/write_encoder_config.py {ckpt_path}\n\n"
+                f"Underlying: {exc}"
+            ) from exc
+
+        if "category_predictor" in msg:
             raise StaleEncoderArchitecture(
                 f"TGNE checkpoint {ckpt_path} predates the edge-aware category "
                 f"head. The old head was a single Linear on summed node "
