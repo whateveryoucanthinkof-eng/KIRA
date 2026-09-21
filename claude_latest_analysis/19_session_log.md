@@ -103,3 +103,31 @@ memory is the paper's central contribution and is exactly the "host state
 accumulating over time" an attack forecaster wants. Running without it makes
 this a temporal graph attention net, not really a TGN. Worth an A/B once the
 current run lands — it is an accuracy lever, so it runs alone.
+
+### 15:58 — Class-starvation guard fired in production and worked
+Log: `Inductive draw removed class(es) [4] from training entirely; re-drawing`
+(class 4 = Recon). After the re-draw:
+
+```
+counts  = {Benign 13,466,285, C2 46,408, Impact 1,300,101,
+           InitialAccess 156,990, Recon 137,877}
+weights = {0.2, 3.099, 0.586, 1.685, 1.798}
+```
+
+**Recon: 0 -> 137,877.** All five weights distinct, none clipped, none at
+exactly 1.0 (the zero-samples signature). First run where all five classes
+have real training data.
+
+The full progression of this one class, each stage a different bug:
+
+| split | Recon train samples |
+|---|---:|
+| global time quantile | 0 (3 of 5 classes absent — split by corpus) |
+| per-corpus quantile | 7 (cut at 13:13, PortScan runs 13:00-15:59) |
+| per-capture quantile | 0 (its single carrier host lost the inductive draw) |
+| per-capture + guard | **137,877** |
+
+**Still true and unchanged:** those 137,877 records all come from ONE host
+(172.16.0.1). The class is now *trainable* but not *generalisable* — a good
+Recon score means the model recognises that host. Do not report Recon as
+detection performance.
