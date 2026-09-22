@@ -226,8 +226,13 @@ def test_both_splits_must_be_swapped_together():
     b = _store({"h2": [0, 1, 0]})
     a.use_hazard_target(10.0)
     assert np.asarray(a.risk_score).max() <= 1.0
-    # b untouched: still the bimodal severity
-    assert set(np.unique(np.round(np.asarray(b.risk_score), 4))) == {0.0, 0.82}
+    # b untouched: still the bimodal severity. Compared with tolerance, not
+    # set equality -- risk_score is float32, so 0.82 round-trips as
+    # 0.81999999284... and an exact set comparison against a Python float
+    # fails on dtype rather than on anything meaningful.
+    vals = np.unique(np.round(np.asarray(b.risk_score), 4))
+    assert len(vals) == 2, f"expected a bimodal target, got {vals}"
+    np.testing.assert_allclose(sorted(vals), [0.0, 0.82], atol=1e-4)
     b.use_hazard_target(10.0)
     assert len(np.unique(np.round(np.asarray(b.risk_score), 4))) > 1
 
