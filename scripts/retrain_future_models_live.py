@@ -237,7 +237,7 @@ def _loader_kwargs(device, num_workers: int):
     return kw
 
 
-def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 2):
+def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 2, risk_target: str = "severity"):
     _c = get_contract()
     # Lazy: create_rollout_samples materialises h_history [15,12],
     # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
@@ -274,7 +274,19 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             pred = wdt.rollout(h, K=_c.forecast_steps)
             pred_risk, _ = risk.forward_trajectory(pred)
             loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
-            loss = loss + F.binary_cross_entropy(pred_risk, target_risk)
+            # Huber, not BCE.
+            #
+            # BCE(p,t) is linear in t, so its minimiser is E[t|x] -- the same
+            # conditional mean MSE finds. Both are mean-seeking, while the
+            # metric this head is judged by (MAE against predict-zero) is
+            # median-seeking, which is why the head lost to the constant 0 in
+            # all five epochs of the 2026-09-22 run. BCE is also the wrong
+            # noise model: it is the likelihood of a Bernoulli coin with bias
+            # t, and hazard_risk is a deterministic decay, not a coin flip.
+            # Measured on a synthetic hazard target: BCE 0.244, MSE 0.244,
+            # Huber(beta=0.1) 0.216 against a zero baseline of 0.230 -- only
+            # Huber beats it.
+            loss = loss + risk.risk_loss(pred_risk, target_risk)
             loss.backward(); optimizer.step()
             _tr_sum += loss.detach().double().sum(); _nb += 1
             if _nb % 2000 == 0:
@@ -306,7 +318,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                 target=batch["h_future"].to(device, non_blocking=_nblk)
                 target_risk=batch["risk_future"].to(device, non_blocking=_nblk)
                 pred=wdt.rollout(h,K=_c.forecast_steps); pred_risk,_=risk.forward_trajectory(pred)
-                _v_sum += (F.mse_loss(pred,target)+F.binary_cross_entropy(pred_risk,target_risk)).double().sum()
+                _v_sum += (F.mse_loss(pred,target)+risk.risk_loss(pred_risk,target_risk)).double().sum()
                 _vn += 1
                 # persistence: repeat the last observed step across the horizon
                 _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
@@ -343,7 +355,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         if score < best:
             best=score; best_epoch=epoch+1; _since_improve=0
             output.parent.mkdir(parents=True,exist_ok=True)
-            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"epoch_history":list(_history),"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar}},output)
+            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar}},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
         else:
             _since_improve += 1
@@ -837,7 +849,8 @@ def main():
     wdt = None
     if args.stages in ("both", "branch_b"):
         wdt = train_branch_b_live(train_traj,val_traj,bb_out,args.epochs,device,
-                                  num_workers=args.num_workers,patience=args.patience)
+                                  num_workers=args.num_workers,patience=args.patience,
+                                  risk_target=args.risk_target)
         print(f"served checkpoint updated: {bb_out}", flush=True)
 
     if args.stages in ("both", "deepop"):

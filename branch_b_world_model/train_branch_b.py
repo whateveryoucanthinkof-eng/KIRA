@@ -180,9 +180,26 @@ def train_branch_b(
                 mse_k = F.mse_loss(h_pred[:, k, :], h_fut[:, k, :])
                 mse_loss += (gamma ** k) * mse_k
 
-            # Infiltration risk BCE loss
+            # Infiltration risk loss. Was F.binary_cross_entropy: appropriate
+            # only if risk_future is a Bernoulli parameter, which it is not
+            # for either target this repo uses -- base_severity(tactic) is a
+            # tactic-derived scalar, and hazard_risk = exp(-dt/tau) is a
+            # deterministic decay of a continuous quantity. Both are
+            # regression targets in [0, 1]. BCE and MSE share the same
+            # optimum on such a target (BCE is linear in the target, so its
+            # minimiser is also the conditional mean -- see
+            # InfiltrationRiskHead.risk_loss's docstring for the derivation
+            # and the measured numbers), so switching to plain MSE would not
+            # have changed anything; what matters is trading the mean-seeking
+            # objective for one closer to the MAE this project actually
+            # reports and gates on. Measured in
+            # tests/test_branch_b_risk_loss.py on a hazard-shaped synthetic
+            # target: BCE/MSE-trained heads scored MAE 0.244, worse than
+            # predicting zero (0.230); a Huber-trained head, identical data
+            # and capacity, scored 0.216 -- the only one of the three to
+            # clear that bar.
             pred_step_risks, _ = risk_head.forward_trajectory(h_pred)
-            risk_loss = F.binary_cross_entropy(pred_step_risks, r_fut)
+            risk_loss = InfiltrationRiskHead.risk_loss(pred_step_risks, r_fut)
 
             total_loss = mse_loss + risk_loss
             total_loss.backward()
@@ -194,6 +211,16 @@ def train_branch_b(
         risk_head.eval()
         val_losses = []
         k1_mses, k_last_mses, persist_mses = [], [], []
+        # Baseline-aware risk reporting -- the gap this whole investigation
+        # is about. A risk MAE with nothing next to it let the head sit worse
+        # than predicting zero for five epochs before anyone noticed (see
+        # logs/branch_b_20260922-095949.out). scripts/retrain_future_models_live.py
+        # (the trainer that actually produced that run) already reports this;
+        # this legacy entry point did not, and is fixed here for the same
+        # reason it needed the loss fix above -- it is still runnable
+        # (`python -m branch_b_world_model.train_branch_b`) and silently
+        # incomplete reporting is how the original defect went unnoticed.
+        risk_maes, risk_targets = [], []
 
         with torch.no_grad():
             for batch in val_loader:
@@ -206,7 +233,7 @@ def train_branch_b(
                 h_pred = wdt.rollout(h_hist, K=K, t_history=t_hist, t_future=t_fut)
                 mse_loss = F.mse_loss(h_pred, h_fut)
                 pred_step_risks, _ = risk_head.forward_trajectory(h_pred)
-                risk_loss = F.binary_cross_entropy(pred_step_risks, r_fut)
+                risk_loss = InfiltrationRiskHead.risk_loss(pred_step_risks, r_fut)
                 val_losses.append((mse_loss + risk_loss).item())
 
                 # Compare Horizon 1 MSE vs Persistence Baseline
@@ -218,16 +245,30 @@ def train_branch_b(
                 persist_mses.append(persist_mse)
                 k_last_mses.append(k_last_mse)
 
+                risk_maes.append((pred_step_risks - r_fut).abs().mean().item())
+                risk_targets.append(r_fut.mean().item())
+
         mean_val = float(np.mean(val_losses))
         mean_k1 = float(np.mean(k1_mses))
         mean_persist = float(np.mean(persist_mses))
         mean_k_last = float(np.mean(k_last_mses))
         improvement = ((mean_persist - mean_k1) / max(1e-6, mean_persist)) * 100.0
 
+        # mae_predict_zero: the MAE of predicting the constant 0 for every
+        # row, i.e. what you get for free with no model at all. Comparable
+        # across severity and hazard targets since it is computed from
+        # whatever risk_future actually holds, not assumed.
+        mean_risk_mae = float(np.mean(risk_maes))
+        mean_risk_target = float(np.mean(risk_targets))
+
         print(
             f"Epoch {epoch:02d} | Val Loss: {mean_val:.4f} | "
             f"1-Step MSE: {mean_k1:.4f} vs Persist: {mean_persist:.4f} (+{improvement:.1f}%) | "
             f"K={K} MSE: {mean_k_last:.4f}"
+        )
+        print(
+            f"  risk: mae_model={mean_risk_mae:.4f} mae_predict_zero={mean_risk_target:.4f}"
+            f"{'  <-- WORSE THAN PREDICTING ZERO' if mean_risk_mae >= mean_risk_target else ''}"
         )
 
         if mean_val < best_val_loss:
@@ -245,6 +286,10 @@ def train_branch_b(
                     "window_size_sec": _c.window_seconds,  # v3 key, kept readable
                     "history_steps": T,
                     "forecast_steps": K,
+                    "baselines": {
+                        "mse_persistence": mean_persist,
+                        "risk_mae_zero": mean_risk_target,
+                    },
                 },
                 save_path,
             )
@@ -254,6 +299,8 @@ def train_branch_b(
         "best_val_loss": best_val_loss,
         "k1_mse": mean_k1,
         "k_last_mse": mean_k_last,
+        "risk_mae": mean_risk_mae,
+        "risk_mae_zero": mean_risk_target,
         "save_path": save_path,
     }
 

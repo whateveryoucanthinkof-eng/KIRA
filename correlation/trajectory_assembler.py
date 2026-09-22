@@ -76,12 +76,21 @@ class AttackTrajectoryAssembler:
         risk_head,
         deepop_decoder,
         device: str = "cpu",
+        risk_target: str = "severity",
     ):
         self.branch_a = branch_a_model.to(device)
         self.wdt = wdt_model.to(device)
         self.risk_head = risk_head.to(device)
         self.deepop = deepop_decoder.to(device)
         self.device = device
+        #: Which target Branch B's risk head was trained against. Decides how
+        #: per-step risks are reduced to one number -- see the comment at the
+        #: reduction site. Defaults to "severity", the current training
+        #: default, so behaviour is unchanged unless a hazard-trained
+        #: checkpoint says otherwise.
+        if risk_target not in ("severity", "hazard"):
+            raise ValueError(f"risk_target must be 'severity' or 'hazard', got {risk_target!r}")
+        self.risk_target = risk_target
 
         self.branch_a.eval()
         self.wdt.eval()
@@ -180,7 +189,23 @@ class AttackTrajectoryAssembler:
                 h_future = self.wdt.rollout(h_hist_tensor, K=K, delta_t_step=window_size_sec)  # [B, K, d_latent]
                 step_risks, cumul_risks = self.risk_head.forward_trajectory(h_future)  # [B, K], [B]
                 step_risks_np = step_risks.cpu().numpy()  # [B, K]
-                cumul_risks_np = cumul_risks.cpu().numpy()  # [B]
+                # Which aggregation is correct depends on what the head was
+                # trained against, so it is read from the checkpoint rather
+                # than assumed.
+                #
+                # `1 - prod(1-r)` is the discrete-survival identity, exact
+                # when each step is an INDEPENDENT conditional hazard -- true
+                # of the severity target. Under the hazard target it is wrong:
+                # exp(-dt/tau) at k=1..K are K correlated restatements of one
+                # event's proximity, not K independent draws, so the product
+                # compounds the same evidence K times. Measured with exact
+                # ground-truth hazards and a perfect predictor: an attack four
+                # windows PAST the horizon yields cumulative 0.854 when the
+                # truth is 0. peak() is the right reduction there.
+                if getattr(self, "risk_target", "severity") == "hazard":
+                    cumul_risks_np = step_risks_np.max(axis=1)  # [B]
+                else:
+                    cumul_risks_np = cumul_risks.cpu().numpy()  # [B]
 
                 pred_tokens, decoded_names = self.deepop.forecast_sequence(
                     h_future, max_steps=K, observed_token=obs_t_tensor
