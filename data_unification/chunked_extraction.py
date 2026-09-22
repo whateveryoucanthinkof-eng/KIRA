@@ -57,8 +57,12 @@ def extract_trajectories_chunked(
         # values -- so it just has to stay monotonic in time across chunks.
         # Deriving the next base from what was actually emitted is exact,
         # unlike estimating it from the chunk's time span.
-        if builder._window_idx:
-            window_idx_base = int(max(builder._window_idx[-len(batch) * 4:])) + 1
+        # `_Col` defines neither __len__ nor __getitem__: the old form
+        # `if builder._window_idx:` was always True (default object truthiness)
+        # and the slice that followed raised TypeError on the first chunk.
+        col = builder._window_idx
+        if col.n:
+            window_idx_base = int(col.buf[: col.n].max()) + 1
         if progress:
             progress(f"  chunk {chunk_no}: {len(batch)} records "
                      f"(cumulative {total}), store now {builder._n} snapshots")

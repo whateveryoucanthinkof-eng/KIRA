@@ -193,7 +193,11 @@ class ScientificSplitManager:
     def get_heldout_test_records(self, max_per_source: Optional[int] = None, stride: int = 1) -> List[UnifiedFlowRecord]:
         """The held-out test split. Score it ONCE, at the end, on the restored
         best checkpoint -- never for model selection."""
-        return self.records_for("test", max_per_source)
+        # `stride` was dropped here while the two sibling accessors forward it.
+        # With max_per_source set that silently turned the test split back into
+        # a chronological PREFIX -- the exact prefix bias `_parse` exists to
+        # avoid, and which measured 0% attack on the frozen val split.
+        return self.records_for("test", max_per_source, stride)
 
 
 _GLOBAL_SPLIT_MANAGER: Optional[ScientificSplitManager] = None

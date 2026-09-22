@@ -18,10 +18,27 @@ PY=/var/home/samito/.pyenv/versions/3.12.14/bin/python3
 A_LOG="$REPO/logs/clean_branch_a.out"
 RID="$(date +%Y%m%d-%H%M%S)"
 
+# Require several CONSECUTIVE misses before concluding Branch A is done.
+#
+# The first version exited the moment one `systemctl list-units` call did not
+# list the unit, then hit its own ABORT path because the log had no "saved="
+# line yet -- Branch A was still training at epoch 5. A single transient query
+# was enough to tear down the chain. Requiring N consecutive misses makes a
+# hiccup cost 3 minutes of waiting instead of the whole handoff, and `|| true`
+# stops a failed query from killing the loop under `set -o pipefail`.
 echo "[chain-b] waiting for Branch A ($(date -Is))"
-while systemctl --user list-units --state=running --no-legend 2>/dev/null \
-      | grep -q 'clean-branch-a-'; do sleep 60; done
-echo "[chain-b] Branch A idle ($(date -Is))"
+misses=0
+while [ "$misses" -lt 3 ]; do
+    if systemctl --user list-units --all --no-legend 2>/dev/null \
+         | grep -E 'clean-branch-a-.*\.service' | grep -qE 'running|activating' || true; then
+        alive=1
+    else
+        alive=0
+    fi
+    if [ "$alive" -eq 1 ]; then misses=0; else misses=$((misses + 1)); fi
+    [ "$misses" -lt 3 ] && sleep 60
+done
+echo "[chain-b] Branch A idle after 3 consecutive checks ($(date -Is))"
 
 # Only the most recent run: StandardOutput=append accumulates across runs.
 START=$(grep -n "^train_records=" "$A_LOG" | tail -1 | cut -d: -f1)

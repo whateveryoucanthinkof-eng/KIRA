@@ -328,7 +328,15 @@ def _resident_or_random_advised(feats, n_rows):
     if n_rows == 0 or not isinstance(feats, np.memmap):
         return feats
     if feats.nbytes <= RESIDENT_FEATS_MAX_BYTES:
-        resident = np.ascontiguousarray(feats)   # one sequential read
+        # np.ascontiguousarray on an ALREADY C-contiguous memmap returns a
+        # VIEW, not a copy, so this branch used to return something still
+        # backed by the spill file and the whole fix was inert -- the block
+        # got neither the resident copy NOR the MADV_RANDOM fallback below.
+        # Verified: the result had OWNDATA False and a .base chain of
+        # memmap -> mmap, and overwriting the backing file on disk changed
+        # the array's contents.
+        resident = np.empty(feats.shape, dtype=feats.dtype)
+        np.copyto(resident, feats)               # one sequential read
         del feats                                # drop the mapping
         return resident
     try:
