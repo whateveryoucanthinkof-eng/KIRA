@@ -4,6 +4,7 @@ import argparse
 import gc
 import math
 import shutil
+import tempfile
 import time
 import os
 import random
@@ -358,6 +359,77 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     return wdt
 
 
+class _WithRollout(torch.utils.data.Dataset):
+    """Serves a precomputed Branch-B rollout alongside each sample.
+
+    Wrapping rather than changing LazyCWADataset keeps the cache out of the
+    dataset's own contract, and the lookup happens in the DataLoader workers
+    rather than the main process.
+    """
+
+    def __init__(self, base, cache):
+        self.base, self.cache = base, cache
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        d = self.base[i]
+        d["h_rollout"] = torch.from_numpy(np.ascontiguousarray(self.cache[i]))
+        return d
+
+
+def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_workers=3):
+    """Run the frozen Branch-B rollout once and memmap the result.
+
+    DeepOP conditions every batch on `wdt.rollout(h_history)`. The WDT is
+    frozen and in eval mode there, so that call is a pure function of
+    h_history: profiling the 2026-09-21 run put **25.4% of DeepOP's wall
+    clock** in a rollout whose output is identical on every epoch. Verified
+    bit-identical across repeated calls and invariant to batch order (max abs
+    diff exactly 0.0), and *not* identical in train mode, where dropout is
+    live -- which is why this asserts eval below rather than trusting it.
+
+    Computing it once costs one inference pass; a 6-epoch run pays for it six
+    times. The pass itself has no gradients, so its batch size carries no
+    optimisation semantics and can be wide.
+    """
+    if wdt.training:
+        raise RuntimeError(
+            "refusing to cache rollouts from a WDT in train mode: dropout is "
+            "live, so the rollout is not a function of its input and every "
+            "epoch would otherwise see a different conditioning signal")
+
+    n = len(ds)
+    path = os.path.join(spill_dir or tempfile.gettempdir(),
+                        f"rollout_{label}_{os.getpid()}.f32")
+    cache = np.memmap(path, dtype=np.float32, mode="w+", shape=(n, K, 12))
+    try:
+        os.unlink(path)          # reclaimed when the mapping is dropped
+    except OSError:
+        pass
+
+    loader = DataLoader(ds, batch_size=batch, shuffle=False,
+                        num_workers=num_workers, pin_memory=(str(device) == "cuda"))
+    t0, done = time.time(), 0
+    with torch.no_grad():
+        for b in loader:
+            h = b["h_history"].to(device, non_blocking=(str(device) == "cuda"))
+            out = wdt.rollout(h, K=K).detach().float().cpu().numpy()
+            cache[done:done + len(out)] = out
+            done += len(out)
+            if done % (batch * 200) == 0:
+                r = done / max(time.time() - t0, 1e-9)
+                print(f"  rollout cache [{label}] {done:,}/{n:,} "
+                      f"({100.0*done/n:.1f}%) {r:,.0f} samples/s "
+                      f"eta={(n-done)/max(r,1e-9)/60:.1f}m", flush=True)
+    cache.flush()
+    print(f"  rollout cache [{label}]: {n:,} samples in "
+          f"{(time.time()-t0)/60:.1f}m ({cache.nbytes/2**30:.2f} GiB, unlinked)",
+          flush=True)
+    return cache
+
+
 def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4, patience: int = 2):
     vocab=get_joint_vocab(network_observable_only=True)
     _c=get_contract()
@@ -373,6 +445,16 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
     val_ds=LazyCWADataset(val_traj,vocab,K=_c.forecast_steps,T=_T)
     print(f"DeepOP samples: train={len(train_ds)} val={len(val_ds)}",flush=True)
     print(f"DeepOP conditioning: {'Branch-B rollouts (E1 fixed)' if wdt is not None else 'oracle + noise (interim)'}",flush=True)
+    # Precompute the frozen rollout once instead of recomputing it every epoch.
+    if wdt is not None and _T > 0:
+        _sp = os.environ.get("CYBERWORLD_SPILL_DIR")
+        train_ds = _WithRollout(train_ds, _precompute_rollouts(
+            wdt, train_ds, device, _sp, "train", _c.forecast_steps,
+            num_workers=max(1, num_workers)))
+        val_ds = _WithRollout(val_ds, _precompute_rollouts(
+            wdt, val_ds, device, _sp, "val", _c.forecast_steps,
+            num_workers=max(1, num_workers)))
+
     _lk=_loader_kwargs(device,num_workers)
     train_loader=DataLoader(train_ds,batch_size=64,shuffle=True,**_lk)
     val_loader=DataLoader(val_ds,batch_size=64,**_lk)
@@ -390,7 +472,9 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             h=batch["h_future"].to(device,non_blocking=_nblk)
             inp=batch["input_tokens"].to(device,non_blocking=_nblk)
             tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
-            if wdt is not None and "h_history" in batch:
+            if "h_rollout" in batch:
+                h_aug=batch["h_rollout"].to(device,non_blocking=_nblk)
+            elif wdt is not None and "h_history" in batch:
                 # Condition on what Branch B actually predicts, which is what
                 # DeepOP receives in production.
                 with torch.no_grad():
@@ -425,7 +509,9 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         with torch.no_grad():
             for batch in val_loader:
                 hv=batch["h_future"].to(device,non_blocking=_nblk)
-                if wdt is not None and "h_history" in batch:
+                if "h_rollout" in batch:
+                    hv=batch["h_rollout"].to(device,non_blocking=_nblk)
+                elif wdt is not None and "h_history" in batch:
                     hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1]).detach()
                 tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
                 logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk))
@@ -641,6 +727,8 @@ def main():
         print(f"credibility check skipped: {_e}", flush=True)
 
     device="cuda" if torch.cuda.is_available() else "cpu"
+    if args.spill_dir:
+        os.environ["CYBERWORLD_SPILL_DIR"] = str(args.spill_dir)
 
     # Write where the adapter actually loads from.
     #

@@ -313,6 +313,51 @@ class AntigravityModelAdapter:
                 )
             self.checkpoint_contract[k] = v
 
+        if name == "branch_a":
+            self._adopt_risk_semantics(ckpt)
+
+    def _adopt_risk_semantics(self, ckpt):
+        """What `risk_score` means, and where to alert on it.
+
+        Branch A's risk head has two objectives. Under "smooth_l1" the output
+        is a severity magnitude (benign 0.0, attack 0.50-0.96 by tactic), and
+        the historical 0.65 alerting cut was chosen against that scale. Under
+        "bce" -- the default since the head was shown to be worse than
+        predicting zero -- the output is P(next window is an attack window).
+
+        Those are different quantities on the same [0, 1] axis. A calibrated
+        probability against a 17.5% base rate rarely exceeds 0.65, so keeping
+        the old cut would quietly stop the system alerting at all. That is the
+        worst possible failure for a detector: silent, and it looks like
+        "no attacks today".
+
+        So the threshold is taken from the checkpoint when the training run
+        fitted one. If the objective is bce and no threshold was fitted, the
+        default is not silently reused -- it is reported.
+        """
+        tc = ckpt.get("training_contract") or {}
+        objective = tc.get("risk_objective") or ckpt.get("risk_objective")
+        self.risk_objective = objective or "smooth_l1"
+
+        fitted = (ckpt.get("operating_point") or {}).get("alert_threshold")
+        if fitted is not None:
+            self.alert_threshold = float(fitted)
+            op = ckpt.get("operating_point") or {}
+            logger.info(
+                "branch_a: alert threshold %.4f fitted on validation "
+                "(precision %.3f, recall %.3f, alert rate %.4f)",
+                self.alert_threshold, op.get("precision", float("nan")),
+                op.get("recall", float("nan")), op.get("alert_rate", float("nan")))
+        elif self.risk_objective == "bce":
+            logger.warning(
+                "branch_a was trained with the bce risk objective, so risk_score "
+                "is P(attack next window), but the checkpoint carries no fitted "
+                "operating point. Falling back to the %.2f cut that was chosen "
+                "for the old severity scale -- on a %s base rate a calibrated "
+                "probability will seldom reach it, so alerting may be far too "
+                "quiet. Re-run Branch A so it fits and stores a threshold.",
+                self.alert_threshold, "low")
+
         self.window_seconds = self.checkpoint_contract.get("window_seconds", self.window_seconds)
         self.history_steps = self.checkpoint_contract.get("history_steps", self.history_steps)
         self.forecast_steps = self.checkpoint_contract.get("forecast_steps", self.forecast_steps)
@@ -418,11 +463,21 @@ class AntigravityModelAdapter:
         )
 
     def _alert_level(self, risk: float) -> str:
-        if risk >= 0.85:
+        """Band a risk score.
+
+        The ELEVATED cut used to be the literal 0.65, which is also the default
+        `alert_threshold`, so the WARNING band below it was unreachable: every
+        score that could have been WARNING had already returned ELEVATED. The
+        bands are now derived from the operating threshold, so WARNING means
+        "over the alerting threshold", ELEVATED "clearly over" and CRITICAL
+        "far over", whatever that threshold has been fitted to.
+        """
+        t = self.alert_threshold
+        if risk >= t + (1.0 - t) * 0.60:
             return "CRITICAL"
-        if risk >= 0.65:
+        if risk >= t + (1.0 - t) * 0.25:
             return "ELEVATED"
-        if risk >= self.alert_threshold:
+        if risk >= t:
             return "WARNING"
         return "NOMINAL"
 
