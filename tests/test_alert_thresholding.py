@@ -86,3 +86,79 @@ def test_adapter_exposes_the_risk_objective():
     src = inspect.getsource(ma.AntigravityModelAdapter._adopt_risk_semantics)
     assert "risk_objective" in src
     assert "operating_point" in src, "must read a fitted threshold when present"
+
+
+# --- the rule layer must not make alerting arithmetically impossible -------
+
+def test_internal_only_traffic_cannot_alert_under_the_shipped_settings():
+    """The defect, stated as arithmetic.
+
+    Internal-only windows are scored max(0.05, raw_risk * 0.4). raw_risk is
+    bounded at 1.0, so the displayed value cannot exceed 0.40 -- while the
+    alert threshold is 0.65. No internal-only window can raise an alert at ANY
+    model confidence: a model output of 0.9965 displays as 0.3986, and you
+    would need raw_risk = 1.625 to clear the cut.
+
+    Lateral movement is internal-only traffic by definition, so this silently
+    makes the system unable to alert on the behaviour the pipeline exists to
+    forecast.
+    """
+    factor, threshold = 0.4, 0.65
+    ceiling = max(0.05, 1.0 * factor)
+    assert ceiling < threshold
+    assert threshold / factor > 1.0, "would need a risk above 1.0 to alert"
+    for ml in (0.30, 0.50, 0.70, 0.90, 0.9965, 1.00):
+        assert max(0.05, ml * factor) < threshold
+
+
+def test_the_adapter_warns_when_alerting_is_unreachable(caplog):
+    """It must be impossible to ship this combination unnoticed."""
+    pytest.importorskip("torch")
+    import logging
+    from control_backend.model_adapter import AntigravityModelAdapter
+    a = AntigravityModelAdapter.__new__(AntigravityModelAdapter)
+    a.rules_enabled = True
+    a.alert_threshold = 0.65
+    a.INTERNAL_SUPPRESSION_FACTOR = 0.4
+    with caplog.at_level(logging.WARNING, logger="antigravity.model_adapter"):
+        ceiling = AntigravityModelAdapter._check_alerting_is_reachable(a)
+    assert ceiling == pytest.approx(0.40)
+    assert "ALERTING UNREACHABLE" in caplog.text
+    assert "Lateral movement is internal by definition" in caplog.text
+
+
+def test_no_warning_once_the_settings_are_consistent():
+    pytest.importorskip("torch")
+    import logging
+    from control_backend.model_adapter import AntigravityModelAdapter
+    a = AntigravityModelAdapter.__new__(AntigravityModelAdapter)
+    a.rules_enabled = True
+    a.alert_threshold = 0.30          # below the 0.40 ceiling
+    a.INTERNAL_SUPPRESSION_FACTOR = 0.4
+    import io as _io, contextlib
+    logger = logging.getLogger("antigravity.model_adapter")
+    buf = _io.StringIO()
+    h = logging.StreamHandler(buf); logger.addHandler(h)
+    try:
+        AntigravityModelAdapter._check_alerting_is_reachable(a)
+    finally:
+        logger.removeHandler(h)
+    assert "UNREACHABLE" not in buf.getvalue()
+
+
+def test_disabling_rules_removes_the_ceiling():
+    pytest.importorskip("torch")
+    import logging
+    from control_backend.model_adapter import AntigravityModelAdapter
+    a = AntigravityModelAdapter.__new__(AntigravityModelAdapter)
+    a.rules_enabled = False
+    a.alert_threshold = 0.65
+    a.INTERNAL_SUPPRESSION_FACTOR = 0.4
+    import io as _io
+    logger = logging.getLogger("antigravity.model_adapter")
+    buf = _io.StringIO(); h = logging.StreamHandler(buf); logger.addHandler(h)
+    try:
+        AntigravityModelAdapter._check_alerting_is_reachable(a)
+    finally:
+        logger.removeHandler(h)
+    assert "UNREACHABLE" not in buf.getvalue()

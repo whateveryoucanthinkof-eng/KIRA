@@ -132,6 +132,7 @@ class AntigravityModelAdapter:
         self.checkpoint_contract: Dict[str, Any] = {}
         self.fingerprinter = BehavioralFlowFingerprinter()
         self._load_models()
+        self._check_alerting_is_reachable()
 
     def _load_models(self):
         import sys
@@ -462,6 +463,42 @@ class AntigravityModelAdapter:
             top_features=top_features,
         )
 
+    #: Ceiling the internal-only suppression imposes: rule_risk is
+    #: max(0.05, raw_risk * 0.4) and raw_risk is bounded by 1.0.
+    INTERNAL_SUPPRESSION_FACTOR = 0.4
+
+    def _check_alerting_is_reachable(self):
+        """Refuse to pretend the detector can fire when it arithmetically cannot.
+
+        Internal-only traffic is scored `max(0.05, raw_risk * 0.4)`. With
+        raw_risk bounded at 1.0 the displayed value cannot exceed 0.40, so
+        against the historical 0.65 threshold **no internal-only window can
+        ever raise an alert, whatever the model says** -- a model output of
+        0.9965 is displayed as 0.3986. You would need raw_risk = 1.625.
+
+        That matters far more than it looks. Lateral movement is by definition
+        internal-only traffic, so the one rule silently makes the system unable
+        to alert on the behaviour this pipeline exists to forecast. It is not a
+        tuning choice; it is a ceiling below the floor.
+
+        This does not change the policy -- suppressing internal chatter is a
+        defensible thing to want -- it refuses to let the combination stay
+        invisible.
+        """
+        ceiling = max(0.05, 1.0 * self.INTERNAL_SUPPRESSION_FACTOR)
+        if self.rules_enabled and ceiling < self.alert_threshold:
+            logger.warning(
+                "ALERTING UNREACHABLE for internal-only traffic: the rule layer "
+                "caps displayed risk at %.2f (raw_risk * %.2f) while the alert "
+                "threshold is %.2f, so no internal-only window can raise an "
+                "alert at any model confidence. Lateral movement is internal by "
+                "definition. Either lower the threshold below %.2f, raise the "
+                "suppression factor above %.2f, or run with "
+                "CYBERWORLD_DISABLE_RULES=1.",
+                ceiling, self.INTERNAL_SUPPRESSION_FACTOR, self.alert_threshold,
+                ceiling, self.alert_threshold / 1.0)
+        return ceiling
+
     def _alert_level(self, risk: float) -> str:
         """Band a risk score.
 
@@ -646,7 +683,11 @@ class AntigravityModelAdapter:
                     obs_technique = "Exploit"
                 rules_applied = True
             else:
-                rule_risk = float(max(0.05, raw_risk * 0.4))
+                # See _check_alerting_is_reachable: this caps displayed
+                # risk at 0.40, below the 0.65 alert threshold, so an
+                # internal-only window can never alert. Lateral movement
+                # is internal by definition.
+                rule_risk = float(max(0.05, raw_risk * self.INTERNAL_SUPPRESSION_FACTOR))
                 obs_risk = rule_risk
                 rules_applied = True
         else:
