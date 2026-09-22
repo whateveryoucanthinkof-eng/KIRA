@@ -115,11 +115,28 @@ class FlowToTemporalEventAdapter:
                 else:
                     raise ValueError(f"Out-of-order timestamp at index {i} ({timestamps[i]} < {timestamps[i-1]}); pass sort_by_time=True or pre-sort telemetry.")
 
-        # Compute 60s window boundaries: (win_start, win_end, start_idx, end_idx)
+        # Window boundaries on a fixed grid anchored at the first timestamp:
+        # (win_start, win_end, start_idx, end_idx). Empty windows are simply
+        # not emitted.
+        #
+        # The advance below used to be `current_win_start += window_size_sec`,
+        # i.e. exactly ONE window per boundary-crossing record. Any gap wider
+        # than one window therefore left the clock permanently behind the data,
+        # and it never caught up: every later window carried a nominal
+        # [start, start+window) that did not contain its own records.
+        #
+        # Measured at full density with the contract's 2 s window:
+        #   CIC-2017 Wednesday (the held-out TEST split) -- 14,676 of 15,183
+        #     emitted windows (96.66%) held a record outside their own
+        #     interval, the worst 116 s away, and the final window spanned 116 s
+        #     instead of 2 s.
+        #   CIC-2017 Monday -- 659 windows (4.52%), worst 29 s.
+        # window_start/window_end are what TrajectoryStore.time_to_next_attack
+        # and hazard_risk() are computed from, and what get_host_embeddings is
+        # given as `timestamp`, so those were fiction for the rest of a capture.
         window_boundaries = []
         if n > 0:
             first_t = timestamps[0]
-            last_t = timestamps[-1]
             current_win_start = first_t
             start_idx = 0
 
@@ -128,10 +145,14 @@ class FlowToTemporalEventAdapter:
                     window_boundaries.append(
                         (current_win_start, current_win_start + self.window_size_sec, start_idx, i)
                     )
-                    current_win_start = current_win_start + self.window_size_sec
+                    k = math.floor((timestamps[i] - first_t) / self.window_size_sec)
+                    current_win_start = first_t + k * self.window_size_sec
                     start_idx = i
+            # The last window ends one window after its start, like every other
+            # one. `max(..., last_t)` stretched it to the final timestamp, which
+            # only ever mattered because the clock was already behind.
             window_boundaries.append(
-                (current_win_start, max(current_win_start + self.window_size_sec, last_t), start_idx, n)
+                (current_win_start, current_win_start + self.window_size_sec, start_idx, n)
             )
 
         return TemporalEventStream(

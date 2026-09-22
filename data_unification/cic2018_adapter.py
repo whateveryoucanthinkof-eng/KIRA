@@ -18,6 +18,7 @@ from data_unification.time_utils import (
     detect_12h_clock_in_file,
     repair_12h_clock,
     to_epoch_seconds,
+    warn_if_resolution_too_coarse,
 )
 
 
@@ -45,6 +46,7 @@ def _file_needs_clock_repair(filepath: str) -> bool:
     return _CLOCK_REPAIR_CACHE[key]
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
+from cyberworld_v4.config import get_contract
 
 
 class CIC2018Adapter:
@@ -136,6 +138,10 @@ class CIC2018Adapter:
                 start_timestamps = to_epoch_seconds(ts_series)
                 if needs_clock_repair:
                     start_timestamps = repair_12h_clock(start_timestamps)
+                warn_if_resolution_too_coarse(
+                    start_timestamps, get_contract().window_seconds,
+                    source=os.path.basename(filepath),
+                )
             else:
                 start_timestamps = np.zeros(len(chunk), dtype=float)
 

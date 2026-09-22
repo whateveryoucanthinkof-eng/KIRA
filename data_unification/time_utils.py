@@ -132,6 +132,75 @@ def repair_12h_clock(epoch_seconds: np.ndarray) -> np.ndarray:
     return e
 
 
+# ---------------------------------------------------------------------------
+# Effective timestamp resolution
+# ---------------------------------------------------------------------------
+#
+# A capture whose Timestamp column is written to the MINUTE cannot support a
+# 2-second window contract, and nothing in the pipeline noticed. Measured over
+# the corpora in this repository (400k-row sample per file):
+#
+#   CIC-2017: 7 of 8 captures carry `d/m/Y H:M` with no seconds --
+#     Friday-DDos, Friday-PortScan, Friday-Morning, Thursday-Infilteration,
+#     Thursday-WebAttacks, Tuesday (the val split) and Wednesday (the TEST
+#     split). Wednesday's 692,703 rows hold just 509 distinct stamps. Only
+#     Monday (the all-benign capture) has seconds.
+#   CIC-2018: all 10 days have seconds.
+#
+# The consequence is not merely coarse: every flow in a minute is pinned to the
+# top of that minute, so one 2 s window holds a minute of traffic and the other
+# 29 are empty. A host's consecutive windows are then 60 real seconds apart,
+# "15 steps of history" is 15 minutes rather than 30 s, and
+# `TrajectoryStore.hazard_risk(tau=10)` degenerates: measured on
+# Friday-PortScan the smallest non-zero seconds-to-next-attack is 60.0 s, so
+# the target takes exactly two values -- 1.0 on attack windows and <= 0.0025
+# elsewhere, with ZERO of 20,401 host-windows in (0.01, 0.99). On CIC-2018,
+# whose stamps have seconds, 8.4% land in that informative band.
+#
+# So the continuous hazard target collapses back to the binary label it exists
+# to replace, on exactly the captures that carry CIC-2017's attacks.
+
+
+#: Sources already warned about, so the message appears once per capture.
+_RESOLUTION_WARNED: set = set()
+
+
+def timestamp_resolution_seconds(epoch_seconds) -> float:
+    """Smallest positive spacing between distinct stamps, i.e. the real grid.
+
+    0.0 when fewer than two distinct valid stamps are present.
+    """
+    e = np.asarray(epoch_seconds, dtype=np.float64)
+    e = np.unique(e[np.isfinite(e) & (e > 0)])
+    if e.size < 2:
+        return 0.0
+    return float(np.min(np.diff(e)))
+
+
+def warn_if_resolution_too_coarse(
+    epoch_seconds, window_seconds: float, *, source: str
+) -> float:
+    """Log once per source when the stamps cannot resolve `window_seconds`.
+
+    Returns the measured resolution. Reporting it is the point: a capture on a
+    60 s grid trained under a 2 s contract produces windows, histories,
+    horizons and hazard targets that are all fiction, and nothing else in the
+    pipeline can see it.
+    """
+    res = timestamp_resolution_seconds(epoch_seconds)
+    if res > window_seconds and source not in _RESOLUTION_WARNED:
+        _RESOLUTION_WARNED.add(source)
+        logging.getLogger(__name__).warning(
+            "%s: timestamps resolve to %.0f s but the contract window is %.0f s. "
+            "Every flow in a %.0f s interval collapses onto one window, so window "
+            "membership, inter-window deltas, history length, forecast horizon and "
+            "any hazard target computed from them are quantised to %.0f s on this "
+            "capture. Do not read its per-window numbers as %.0f s numbers.",
+            source, res, window_seconds, res, res, window_seconds,
+        )
+    return res
+
+
 def hours_present_in_file(
     filepath: str,
     ts_col: str,

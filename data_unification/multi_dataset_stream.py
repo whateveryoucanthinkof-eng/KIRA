@@ -25,6 +25,53 @@ from data_unification.trajectory_store import TrajectoryStore, TrajectoryStoreBu
 from dataclasses import field
 
 
+# ---------------------------------------------------------------------------
+# Heuristic label OVERRIDE -- off by default
+# ---------------------------------------------------------------------------
+#
+# Two blocks in extract_trajectories could set `is_attack = True`, rewrite
+# `coarse_category`, prepend a technique id and raise `risk_score` AFTER the
+# dataset's own label had been read:
+#
+#   auth:       is_brute_force_flag == 1.0  or  auth_failed_count >= 5
+#   behaviour:  is_shell_detected  == 1.0  or  port_mismatch_count >= 2
+#
+# They are not a small correction. Measured at full density, replaying the
+# exact label path of extract_trajectories on real captures with the
+# contract's 2 s window:
+#
+#   CIC-2017 Monday  (train, 529,601 flows, ZERO attack rows in the corpus)
+#       203,760 host-windows, 28,748 (14.11%) relabelled attack/Execution,
+#       every one of them a fabricated positive.
+#   CIC-2017 Wednesday (the held-out TEST split, 692,373 flows)
+#       ground truth 178 attack host-windows (0.19%); after the override
+#       9,659 (10.11%). 9,481 of 9,659 -- 98.2% of the split's positives --
+#       are the heuristic, not the data.
+#   CIC-2018 wed_29 (val, stride 4)   11.93% -> 17.45%
+#   CTU-13 scenario 11 (val, stride 4) 0.57% ->  9.47%
+#
+# The dominant driver is a bug in the detector itself: fingerprint_flow marks
+# `is_port_mismatch = dst_port not in STANDARD_WEB_PORTS` for its C2Beaconing
+# profile, and that profile is any flow with 1-3 packets each way, <=1200
+# bytes and a mean packet under 180 B -- i.e. essentially every DNS, NTP or
+# short service exchange. On Monday 166,598 of the mismatches came from that
+# one profile.
+#
+# A detector that labels 14% of a capture with no attacks in it is a source of
+# systematic label noise, and any metric computed over these labels is partly
+# measuring the heuristic rather than the model. The override is therefore
+# OFF unless explicitly requested; the dataset's own label stands.
+#
+# The auth block is additionally dead in every offline path: no caller in this
+# repository ever supplies auth_events, so `all_auth_events` is always empty.
+_LABEL_OVERRIDE_ENV = "CYBERWORLD_HEURISTIC_LABEL_OVERRIDE"
+
+
+def heuristic_label_override_enabled() -> bool:
+    """True when the auth/behavioural heuristics may overwrite a dataset label."""
+    return os.environ.get(_LABEL_OVERRIDE_ENV, "") in ("1", "true", "True", "yes")
+
+
 @dataclass(slots=True)
 class HostWindowSnapshot:
     """Per-host state snapshot for a single time window t.
@@ -238,6 +285,8 @@ class HostTrajectoryExtractor:
         event_stream = adapter.process_records(records, sort_by_time=True)
 
         all_auth_events: List[AuthEventRecord] = self.auth_events + (list(auth_events) if auth_events else [])
+        # Read once, not once per host-window.
+        label_override = heuristic_label_override_enabled()
 
         if hasattr(self.tgn, "embedding_module") and len(event_stream.sources) > 0:
             from utils.utils import NeighborFinder
@@ -346,9 +395,10 @@ class HostTrajectoryExtractor:
                 else:
                     risk = 0.0
 
-                # Extract and correlate multimodal authentication metrics
+                # Extract and correlate multimodal authentication metrics.
+                # Gated: this OVERRIDES the dataset's own label (module note).
                 auth_metrics = {}
-                if all_auth_events:
+                if label_override and all_auth_events:
                     auth_metrics = AuthLogAdapter.extract_window_auth_metrics(
                         all_auth_events, ip, win_start, win_end
                     )
@@ -361,15 +411,22 @@ class HostTrajectoryExtractor:
                         brute_score = auth_metrics.get("auth_brute_force_score", 0.5)
                         risk = max(risk, min(1.0, 0.75 + 0.25 * brute_score))
 
-                # Compute behavioral flow size & protocol profile metrics (independent of static ports)
-                behavioral_metrics = BehavioralFlowFingerprinter.compute_host_behavioral_metrics(ip, host_recs)
-                if behavioral_metrics.get("is_shell_detected", 0.0) == 1.0 or behavioral_metrics.get("port_mismatch_count", 0.0) >= 2:
-                    is_atk = True
-                    if coarse == "Benign":
-                        coarse = "Execution"
-                    if "T1059" not in techs:
-                        techs = ["T1059"] + techs
-                    risk = max(risk, min(1.0, 0.65 + 0.35 * behavioral_metrics.get("behavioral_threat_score", 0.5)))
+                # Compute behavioral flow size & protocol profile metrics
+                # (independent of static ports). Gated: this OVERRIDES the
+                # dataset's own label, and relabelled 14.11% of a capture with
+                # no attacks in it -- see the module note for the measurement.
+                # The metrics are computed only when the override is on: they
+                # are not read anywhere else, and fingerprinting every flow of
+                # every host-window is not free at corpus density.
+                if label_override:
+                    behavioral_metrics = BehavioralFlowFingerprinter.compute_host_behavioral_metrics(ip, host_recs)
+                    if behavioral_metrics.get("is_shell_detected", 0.0) == 1.0 or behavioral_metrics.get("port_mismatch_count", 0.0) >= 2:
+                        is_atk = True
+                        if coarse == "Benign":
+                            coarse = "Execution"
+                        if "T1059" not in techs:
+                            techs = ["T1059"] + techs
+                        risk = max(risk, min(1.0, 0.65 + 0.35 * behavioral_metrics.get("behavioral_threat_score", 0.5)))
 
                 if sliding_buffer is not None:
                     sliding_buffer.append(HostWindowSnapshot(
