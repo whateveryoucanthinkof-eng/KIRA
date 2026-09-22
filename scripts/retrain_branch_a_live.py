@@ -106,9 +106,12 @@ def _selection_score(metrics, mode):
     A selection metric has to mean the same thing at every epoch. Macro F1 and
     risk MAE do; the weighted loss does not.
 
-    - ``composite`` (default): ``0.5 * macro_f1 + 0.5 * (1 - min(risk_mae, 1))``
-      -- balances the two heads that carry the task, both bounded in [0, 1] and
-      both independent of the loss weighting.
+    - ``composite`` (default): ``0.5 * macro_f1 + 0.5 * risk_auc`` -- balances
+      the two heads that carry the task, both bounded in [0, 1] and both
+      independent of the loss weighting. AUC replaces the risk MAE that was
+      here first: MAE is median-seeking, so on a target that is 0 for 82.5% of
+      samples it rewards a head for predicting nothing, which is the opposite
+      of what selection should reward.
     - ``macro_f1``: technique head only.
     - ``val_loss``: the previous behaviour, kept so a run can be reproduced.
       Negated here because this function is maximised.
@@ -118,8 +121,10 @@ def _selection_score(metrics, mode):
     if mode == "macro_f1":
         return float(metrics.get("tech_macro_f1", 0.0))
     f1 = float(metrics.get("tech_macro_f1", 0.0))
-    mae = min(float(metrics.get("risk_mae", 1.0)), 1.0)
-    return 0.5 * f1 + 0.5 * (1.0 - mae)
+    auc = float(metrics.get("risk_auc", float("nan")))
+    if auc != auc:                      # NaN: one class only in this split
+        auc = 0.5                       # chance -- contributes nothing either way
+    return 0.5 * f1 + 0.5 * auc
 
 
 def _flag_outlier_selection(history, best):
@@ -158,6 +163,11 @@ def _flag_outlier_selection(history, best):
             flush=True)
 
 
+#: score bins for the risk histogram. 2000 gives AUC to ~5e-4 and a
+#: 0.05%-wide calibration bin, at 16 KB of device memory.
+RISK_BINS = 2000
+
+
 def _print_per_class(per_class, where):
     """Per-class precision/recall/f1/support, largest class first."""
     if not per_class:
@@ -170,6 +180,28 @@ def _print_per_class(per_class, where):
         print(f"    {inv.get(c, f'class_{c}'):<28} {m['precision']:>6.3f} "
               f"{m['recall']:>7.3f} {m['f1']:>6.3f} {m['support']:>9,} "
               f"{m['predicted']:>10,}", flush=True)
+
+
+def _warn_if_risk_head_useless(metrics, where):
+    """Say so when the risk head is not beating its own base rate.
+
+    The 2026-09-21 head scored MAE 0.2268 where the smooth-L1-optimal constant
+    scores 0.2279 -- it had learned the unconditional mean and nothing else,
+    and no reported number said so. AUC at 0.5 is chance; a Brier score at or
+    above base_rate*(1-base_rate) means predicting the base rate for every
+    host would do as well.
+    """
+    auc = float(metrics.get("risk_auc", float("nan")))
+    brier = float(metrics.get("risk_brier", float("nan")))
+    base = float(metrics.get("risk_brier_baseline", float("nan")))
+    if auc == auc and auc < 0.55:
+        print(f"  WARNING [{where}]: risk AUC {auc:.4f} is at or near chance -- "
+              f"the head is not ranking attack windows above benign ones.",
+              flush=True)
+    if brier == brier and base == base and brier >= base:
+        print(f"  WARNING [{where}]: risk Brier {brier:.4f} is no better than "
+              f"predicting the base rate {metrics.get('risk_base_rate', 0):.4f} "
+              f"for every host ({base:.4f}).", flush=True)
 
 
 def _warn_if_head_collapsed(metrics, where):
@@ -235,6 +267,11 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
     n_risk = 0
     correct_tech_t = torch.zeros((), device=device, dtype=torch.long)
 
+    pos_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
+    neg_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
+    brier_sum = torch.zeros((), device=device, dtype=torch.float64)
+    prob_sum = torch.zeros((), device=device, dtype=torch.float64)
+
     task_sums = {k: torch.zeros((), device=device, dtype=torch.float64)
                  for k in ("loss_risk", "loss_tech", "loss_grad",
                            "weight_risk", "weight_tech", "weight_grad")}
@@ -270,6 +307,19 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
             err = (predictions["risk_score"] - targets["risk"]).abs()
             abs_err_sum += err.double().sum()
             n_risk += int(err.numel())
+
+            # Risk as a probability: AUC, Brier and calibration, accumulated
+            # from a fixed histogram so 1.02M samples cost O(bins) memory and
+            # no host-device sync. MAE alone cannot judge this head -- on a
+            # target that is 0 for 82.5% of samples the MAE-optimal constant
+            # is 0, so a well-fit head can still "lose" to predicting nothing.
+            _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
+            _y = (targets["risk"] > 0).reshape(-1)
+            brier_sum += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
+            _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
+            pos_hist += torch.bincount(_b[_y], minlength=RISK_BINS)
+            neg_hist += torch.bincount(_b[~_y], minlength=RISK_BINS)
+            prob_sum += _p.double().sum()
 
             pred_t = predictions["technique_logits"].argmax(dim=-1)
             true_t = targets["technique"]
@@ -312,11 +362,35 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
         for c in range(C) if support[c] > 0 or predicted[c] > 0
     }
 
+    # AUC exactly from the histogram: for each score bin, every negative in a
+    # strictly lower bin is a win and every negative in the same bin is a tie.
+    ph = pos_hist.double().cpu().numpy()
+    nh = neg_hist.double().cpu().numpy()
+    P, N = float(ph.sum()), float(nh.sum())
+    if P > 0 and N > 0:
+        neg_below = np.concatenate([[0.0], np.cumsum(nh)[:-1]])
+        risk_auc = float((ph * (neg_below + 0.5 * nh)).sum() / (P * N))
+        conf = (np.arange(RISK_BINS) + 0.5) / RISK_BINS      # bin centre
+        cnt = ph + nh
+        with np.errstate(divide="ignore", invalid="ignore"):
+            acc_in_bin = np.where(cnt > 0, ph / np.maximum(cnt, 1), 0.0)
+        risk_ece = float((cnt * np.abs(acc_in_bin - conf)).sum() / max(cnt.sum(), 1))
+        base_rate = P / (P + N)
+    else:
+        risk_auc, risk_ece, base_rate = float("nan"), float("nan"), 0.0
+    n_prob = max(int(P + N), 1)
     out_tasks = {k: (float((v / nb).item()) if nb else 0.0) for k, v in task_sums.items()}
     return {
         "loss": float((loss_sum / nb).item()) if nb else 0.0,
         "risk_mae": float((abs_err_sum / n_risk).item()) if n_risk else 0.0,
         "tech_accuracy": accuracy,
+        # -- risk as a probability, judged the way a probability must be --
+        "risk_auc": risk_auc,
+        "risk_brier": float((brier_sum / n_prob).item()),
+        "risk_brier_baseline": base_rate * (1 - base_rate),   # always predict the base rate
+        "risk_ece": risk_ece,
+        "risk_base_rate": base_rate,
+        "risk_mean_prediction": float((prob_sum / n_prob).item()),
         **out_tasks,
         # -- the metrics that can tell a working head from a collapsed one --
         "tech_macro_f1": macro_f1,
@@ -340,6 +414,18 @@ def main():
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--risk-objective", choices=("bce", "smooth_l1"),
+                        default="bce",
+                        help="How the risk head is trained. 'bce' predicts "
+                             "P(next window is an attack window) -- calibrated, "
+                             "and judged by AUC/Brier which match the loss. "
+                             "'smooth_l1' is the original scalar regression, "
+                             "kept to reproduce the 2026-09-21 run; it cannot "
+                             "beat a constant on MAE by construction.")
+    parser.add_argument("--patience", type=int, default=3,
+                        help="Stop after N epochs without improving --select-on. "
+                             "The best checkpoint is already written, so this "
+                             "cannot cost quality. 0 disables.")
     parser.add_argument("--select-on", choices=("composite", "macro_f1", "val_loss"),
                         default="composite",
                         help="Which validation metric picks the kept checkpoint. "
@@ -539,9 +625,11 @@ def main():
         num_layers=2,
         num_techniques=len(TECHNIQUE_VOCAB),
         num_gradations=4,
+        risk_objective=args.risk_objective,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     best_loss = float("-inf")       # _selection_score is maximised
+    _since_improve = 0
     _history: List[Dict[str, float]] = []
     best_metrics: Dict[str, float] = {}
 
@@ -647,9 +735,12 @@ def main():
             f"grad={metrics['loss_grad']:.4f} "
             f"| weight risk={metrics['weight_risk']:.2f} tech={metrics['weight_tech']:.2f} "
             f"grad={metrics['weight_grad']:.2f} "
+            f"| risk auc={metrics['risk_auc']:.4f} brier={metrics['risk_brier']:.4f} "
+            f"(base {metrics['risk_brier_baseline']:.4f}) ece={metrics['risk_ece']:.4f} "
             f"wall={metrics['epoch_seconds'] / 60:.1f}m"
         )
         _warn_if_head_collapsed(metrics, f"epoch {epoch}")
+        _warn_if_risk_head_useless(metrics, f"epoch {epoch}")
         # Keep every epoch's validation metrics. Only the best-scoring weights
         # are written, so without this the other epochs are unrecoverable and
         # a selection decision cannot be revisited without a full retrain.
@@ -660,6 +751,7 @@ def main():
         if _score > best_loss:
             best_loss = _score
             best_metrics = metrics
+            _since_improve = 0
             args.output.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
@@ -685,6 +777,16 @@ def main():
                 },
                 args.output,
             )
+        else:
+            _since_improve += 1
+            # The best weights are already written, so stopping here cannot
+            # cost quality -- it only stops paying for epochs that do nothing.
+            if args.patience and _since_improve >= args.patience:
+                print(f"early stop at epoch {epoch}: no improvement in "
+                      f"{_since_improve} epochs (best epoch "
+                      f"{best_metrics.get('epoch')}, "
+                      f"{args.select_on}={best_loss:.4f})", flush=True)
+                break
 
     # Held-out test: scored once, on the restored best checkpoint, after
     # training is finished. This is the only number that is a generalisation

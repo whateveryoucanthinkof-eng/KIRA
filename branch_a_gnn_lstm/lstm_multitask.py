@@ -179,8 +179,17 @@ class MultiTaskLSTM(nn.Module):
         num_techniques: int = len(TECHNIQUE_VOCAB),
         num_gradations: int = 4,
         dropout: float = 0.2,
+        risk_objective: str = "bce",
     ):
         super(MultiTaskLSTM, self).__init__()
+        if risk_objective not in ("bce", "smooth_l1"):
+            raise ValueError(f"risk_objective must be 'bce' or 'smooth_l1', got {risk_objective!r}")
+        #: "bce"       -- predict P(next window is an attack window). Calibrated,
+        #:                and the metric that judges it (AUC/Brier) matches the
+        #:                loss that trains it.
+        #: "smooth_l1" -- the original scalar regression. Kept to reproduce the
+        #:                2026-09-21 run; it cannot beat a constant on MAE.
+        self.risk_objective = risk_objective
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -266,8 +275,33 @@ class MultiTaskLSTM(nn.Module):
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes multi-task loss with calibrated focal loss and uncertainty weighting."""
-        # Risk regression loss (smooth L1)
-        risk_loss = F.smooth_l1_loss(predictions["risk_score"], batch["risk"])
+        # Risk loss.
+        #
+        # `risk_score` is bimodal by construction: exactly 0.0 for a benign
+        # window, and base_sev + small terms (0.50..0.96 by tactic) for an
+        # attack one. On validation 82.5% of targets are exactly 0.
+        #
+        # Regressing that with smooth L1 is the wrong formulation twice over.
+        # smooth L1 is mean-seeking while MAE -- the metric we report -- is
+        # median-seeking, and for a target that is 0 in 82.5% of cases the
+        # median is 0. So a smooth-L1-trained head is *guaranteed* to score
+        # worse on MAE than the constant 0, however well it fits. Measured:
+        # the smooth-L1-optimal constant is 0.1400, whose MAE is 0.2279, and
+        # the trained head scored 0.2268 -- it had learned the unconditional
+        # mean and nothing else.
+        #
+        # "bce" reformulates the head as what it can actually be held to: a
+        # calibrated probability that the next window is an attack window.
+        # The magnitude it used to regress is nearly a function of the
+        # category, which the category head already predicts, so nothing is
+        # lost by separating them. Output stays in [0, 1], so serving is
+        # unchanged.
+        if self.risk_objective == "bce":
+            risk_target = (batch["risk"] > 0).to(predictions["risk_score"].dtype)
+            risk_loss = F.binary_cross_entropy(
+                predictions["risk_score"].clamp(1e-6, 1 - 1e-6), risk_target)
+        else:
+            risk_loss = F.smooth_l1_loss(predictions["risk_score"], batch["risk"])
 
         # Temperature-scaled Extreme-Value Focal Loss
         temp = self.temperature.clamp(min=0.2, max=5.0)
