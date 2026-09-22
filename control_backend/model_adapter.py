@@ -6,7 +6,7 @@ Consumes UnifiedFlowRecord windows from Containerlab SPAN,
 runs TGNE-TA → Branch A / Branch B (WDT) / DeepOP CWA, and emits PredictionEvent.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 import time
@@ -499,19 +499,37 @@ class AntigravityModelAdapter:
         if is_mitigated:
             flows = []
 
-        host_flows = [
-            record
-            for record in flows
-            if record.src_ip == target_ip or record.dst_ip == target_ip
-        ]
-        if host_flows:
-            window_end = max(record.end_time for record in host_flows)
+        # One window, defined once, and used by BOTH halves of the feature
+        # vector. `flows` as handed over by the sensor is NOT one window: the
+        # live flow table retains a flow until it has been silent for 30 s
+        # (telemetry/flow/flow_table.py), so a snapshot routinely carries flows
+        # last seen many windows ago. Training builds a window's features from
+        # `win_recs` -- the records of that window, for every host -- and takes
+        # the attributes and the TGNE embedding from that same slice
+        # (data_unification/multi_dataset_stream.py:extract_trajectories).
+        #
+        # This used to clip only the host-scoped list, then hand the FULL,
+        # unclipped snapshot to TGNE. The 15 attributes were therefore computed
+        # over one time window and the 12 embedding dimensions over another,
+        # which training never does. Measured on a snapshot mixing flows aged
+        # 0.2-18 s: the embedding moved by up to 3.3e-2 per dimension between
+        # the two slices (mean 1.1e-2) -- the same magnitude as the
+        # full-graph-vs-subgraph mismatch this block already guards against.
+        window_flows = flows
+        if flows:
+            window_end = max(record.end_time for record in flows)
             window_start = window_end - self.window_seconds
-            host_flows = [
+            window_flows = [
                 record
-                for record in host_flows
+                for record in flows
                 if record.end_time >= window_start or record.start_time >= window_start
             ]
+
+        host_flows = [
+            record
+            for record in window_flows
+            if record.src_ip == target_ip or record.dst_ip == target_ip
+        ]
 
         # Host-scoped flows are correct for the temporal ATTRIBUTES: those are
         # per-host aggregates (this host's byte counts, peers, ports).
@@ -531,10 +549,10 @@ class AntigravityModelAdapter:
         # cross-host traffic. That is a train/serve mismatch: the model was
         # fitted on full-graph embeddings and served subgraph ones.
         #
-        # The full window is passed here so live matches training. Verified by
-        # scripts/verify_offline_live_parity.py.
-        window_flows = flows if flows else host_flows
-        h_emb = self._build_embedding(target_ip, window_flows)
+        # The full window is passed here -- every host's flows, clipped to the
+        # same window the attributes were computed over -- so live matches
+        # training on both axes: the whole graph, one window.
+        h_emb = self._build_embedding(target_ip, window_flows or host_flows)
         
         import model_contract
         model_contract.assert_shape(h_emb, (model_contract.TGNE_LATENT_DIM,), "TGNE Embedding")
@@ -600,8 +618,18 @@ class AntigravityModelAdapter:
         rule_risk: Optional[float] = None
         rules_applied = False
 
+        # `rule_risk` must be set in EVERY branch that moves the number, not
+        # only in the branch that raises it. Two of the three rule branches
+        # left it None while setting rules_applied=True, so the payload said
+        # "a rule adjusted this" and then offered nothing to compare against --
+        # the provenance contract in schema.PredictionData ("the three numbers
+        # must be separable") was satisfied only when the rule INCREASED risk.
+        # The suppressing branches are the ones an operator most needs to see:
+        # measured on an internal-only window, ml_risk 0.2228 was displayed as
+        # 0.0891, with rule_risk reported as null.
         if is_mitigated:
-            obs_risk = max(0.02, raw_risk * 0.15)
+            rule_risk = float(max(0.02, raw_risk * 0.15))
+            obs_risk = rule_risk
             obs_technique = "Benign"
             rules_applied = True
         elif self.rules_enabled:
@@ -618,7 +646,8 @@ class AntigravityModelAdapter:
                     obs_technique = "Exploit"
                 rules_applied = True
             else:
-                obs_risk = max(0.05, raw_risk * 0.4)
+                rule_risk = float(max(0.05, raw_risk * 0.4))
+                obs_risk = rule_risk
                 rules_applied = True
         else:
             # Research mode: the displayed number IS the model output.
@@ -631,21 +660,40 @@ class AntigravityModelAdapter:
         if len(h_state_history) > self.history_steps:
             h_state_history.pop(0)
         self.h_state_history = h_state_history
-        while len(h_state_history) < self.history_steps:
-            h_state_history.insert(0, torch.zeros_like(curr_h))
-        h_seq = torch.stack(h_state_history, dim=1)
+        # Pad a COPY. `h_state_history` is the list held in
+        # h_state_history_by_target, so padding it in place wrote the zero
+        # placeholders into the retained history -- which made
+        # `len(self.h_state_history)` equal history_steps from the very first
+        # window. `state.sequence_ready` and `state.buffer_length` are derived
+        # from that length, so the payload reported a full 15-step buffer while
+        # 14 of the 15 slots were padding. Measured on window 0 of a fresh
+        # adapter: sequence_ready=True, buffer_length=15, non-zero entries=1.
+        # The Branch A feature history two blocks above already takes a copy;
+        # this one did not, and that was the whole difference.
+        padded_h = list(h_state_history)
+        while len(padded_h) < self.history_steps:
+            padded_h.insert(0, torch.zeros_like(curr_h))
+        h_seq = torch.stack(padded_h, dim=1)
 
         with torch.no_grad():
+            # delta_t_step is the served window, not the module default. The
+            # adapter takes its contract from the checkpoints
+            # (_adopt_contract), so passing nothing here would silently encode
+            # positions at LIVE_WINDOW_SIZE_SEC whenever a checkpoint is served
+            # under a different window -- exactly the case the
+            # CYBERWORLD_ALLOW_CONTRACT_MISMATCH escape hatch permits.
             if hasattr(self.wdt, "rollout_with_uncertainty"):
                 # NOTE: _radii holds per-step confidence bands. They are computed but
                 # not yet carried in the prediction payload; wire them into the
                 # PredictionEvent schema to draw confidence bands on the forecast.
                 h_future, _radii = self.wdt.rollout_with_uncertainty(
-                    h_seq, K=self.forecast_steps, stabilize_horizon=True
+                    h_seq, K=self.forecast_steps,
+                    delta_t_step=self.window_seconds, stabilize_horizon=True
                 )
             else:
                 h_future = self.wdt.rollout(
-                    h_seq, K=self.forecast_steps, stabilize_horizon=True
+                    h_seq, K=self.forecast_steps,
+                    delta_t_step=self.window_seconds, stabilize_horizon=True
                 )
 
             step_risks, _ = self.risk_head.forward_trajectory(h_future)
@@ -701,6 +749,16 @@ class AntigravityModelAdapter:
             obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
         )
 
+        _lead_time: Optional[float] = None
+        if alert:
+            if obs_risk >= self.alert_threshold:
+                _lead_time = 0.0          # the current window already crosses
+            else:
+                for _i, _r in enumerate(fut_risks):
+                    if _r >= self.alert_threshold:
+                        _lead_time = (_i + 1) * self.window_seconds
+                        break
+
         explain = self._explain(x_tensor)
         inf_ms = (time.perf_counter() - t0) * 1000.0
         now_ts = time.time()
@@ -730,7 +788,14 @@ class AntigravityModelAdapter:
         return PredictionEvent(
             type="prediction",
             mode="LIVE",
-            timestamp=datetime.fromtimestamp(now_ts).isoformat() + "Z",
+            # datetime.fromtimestamp() with no tz is LOCAL time; suffixing "Z"
+            # then asserts it is UTC. On an IST (+0530) host the payload read
+            # 2026-09-22T18:19:46Z when UTC was 12:49:46Z -- every alert
+            # timestamp 5h30m in the future, and disagreeing with every other
+            # event on the bus, which all use schema.utc_now_iso().
+            timestamp=datetime.fromtimestamp(now_ts, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
             wall_clock=time.strftime("%H:%M:%S", time.localtime(now_ts)),
             model=ModelMetadata(
                 name="Antigravity-DualBranch-DeepOP",
@@ -788,7 +853,14 @@ class AntigravityModelAdapter:
             early_warning=EarlyWarningData(
                 is_alert=alert,
                 alert_timestamp=now_ts if alert else None,
-                lead_time_seconds=self.forecast_steps * self.window_seconds if alert else None,
+                # Lead time is how far AHEAD the alert fires, so it is the
+                # horizon of the first threshold crossing -- not the length of
+                # the forecast. This reported the full horizon (10 s) for every
+                # alert, including one raised by the CURRENT window, where the
+                # true lead time is zero. Overstating warning time on an
+                # already-in-progress attack is the wrong direction to be wrong
+                # in.
+                lead_time_seconds=_lead_time,
                 target_milestone_desc=forecast_techniques[0] if alert else None,
             ),
             attack_active=attack_active,

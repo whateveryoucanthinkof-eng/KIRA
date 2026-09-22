@@ -50,7 +50,7 @@ class UnifiedExplanation:
     current_risk_score: float
     predicted_technique: str
     top_feature_attributions: List[Tuple[str, float]]  # List of (feature_name, attribution_score)
-    temporal_attention_weights: List[float]           # Attention over past windows [t-4, ..., t]
+    temporal_attention_weights: List[float]           # Attention over the history window, oldest -> newest
     campaign_id: Optional[int]
     causal_chain_summary: List[Dict[str, Any]]
     operator_narrative: str
@@ -94,16 +94,51 @@ class UnifiedExplainer:
         campaign: Optional[AttackCampaign] = None,
         fast_mode: bool = False,
         use_cache: bool = True,
+        feature_sequence: Optional[np.ndarray] = None,
     ) -> UnifiedExplanation:
         """
         Generates a unified explanation object for a host's current attack trajectory.
-        
+
         Args:
             trajectory: Target host trajectory
             campaign: Optional associated campaign
             fast_mode: If True, uses forward-only attention-weighted activation attribution (<0.5ms)
                        If False, performs single-pass gradient-input backpropagation.
             use_cache: If True, checks and updates LRU cache.
+            feature_sequence: the [T, 27] window that was actually scored. REQUIRED
+                for feature attribution -- see below.
+
+        ## Why `feature_sequence` is a parameter and not reconstructed here
+
+        This method used to build its own input:
+
+            for e in obs_entries[-5:]:
+                emb = np.zeros(12, dtype=np.float32)
+                attrs = np.zeros(15, dtype=np.float32)
+                seq_features.append(np.concatenate([emb, attrs]))
+
+        `e` is never read. Every timestep was the zero vector, so
+        `attributions = |grad * input|` was identically zero, the normalisation
+        was skipped by its `if total_attr > 0` guard, and the top-5 fell out of
+        `sorted()` as whatever FEATURE_NAMES happens to list first. Measured on
+        both paths, fast and exact:
+
+            top_feature_attributions = [('H_emb_0', 0.0), ('H_emb_1', 0.0),
+                                        ('H_emb_2', 0.0), ('H_emb_3', 0.0),
+                                        ('H_emb_4', 0.0)]
+            narrative: "Primary driving indicators: H_emb_0 (0.0%),
+                        H_emb_1 (0.0%), H_emb_2 (0.0%)."
+
+        An operator was told which features drove an alert, in a fixed order
+        that had nothing to do with the host, the model, or the alert. That is
+        worse than no explanation, which is why the absent case now says so
+        instead of ranking zeros.
+
+        `TrajectoryEntry` carries no embedding or temporal_attrs -- the
+        explainer genuinely cannot recover the scored window from a trajectory,
+        which is presumably how the zeros got here. The caller holds it
+        (`control_backend/model_adapter.py` has it as `x_tensor`), so it is
+        passed in.
         """
         obs_entries = trajectory.observed_entries
         if not obs_entries:
@@ -128,53 +163,77 @@ class UnifiedExplainer:
             if cached is not None:
                 return cached
 
-        # Reconstruct sequence input for feature attribution (L=5)
-        seq_features = []
-        for e in obs_entries[-5:]:
-            emb = np.zeros(12, dtype=np.float32)
-            attrs = np.zeros(15, dtype=np.float32)
-            seq_features.append(np.concatenate([emb, attrs]))
-
-        while len(seq_features) < 5:
-            seq_features.insert(0, np.zeros(27, dtype=np.float32))
-        
-        x = torch.from_numpy(np.array([seq_features[-5:]], dtype=np.float32)).to(self.device)
-
-        if fast_mode:
-            # Fast-path: Single forward pass with attention-proxy readout without gradient tracking
-            with torch.no_grad():
-                out = self.branch_a(x)
-                attn_weights = [float(w) for w in out["attention_weights"][0].cpu().numpy()]
-                # Proxy feature attribution using input magnitude scaled by final attention weight
-                inputs = np.abs(x[0, -1, :].cpu().numpy())
-                attributions = inputs * (attn_weights[-1] if attn_weights else 1.0)
+        if feature_sequence is None:
+            # No scored window, so no attribution. Say nothing rather than
+            # rank zeros; see the docstring.
+            attn_weights: List[float] = []
+            feat_ranks: List[Tuple[str, float]] = []
         else:
-            # High-precision path: Gradient * Input attribution
-            x.requires_grad_(True)
-            was_training = self.branch_a.training
-            self.branch_a.train()
-            try:
-                out = self.branch_a(x)
-                risk = out["risk_score"]
-                risk.backward()
-            finally:
-                if not was_training:
-                    self.branch_a.eval()
+            seq = np.asarray(feature_sequence, dtype=np.float32)
+            if seq.ndim == 3 and seq.shape[0] == 1:
+                seq = seq[0]
+            if seq.ndim != 2 or seq.shape[-1] != len(FEATURE_NAMES):
+                raise ValueError(
+                    f"feature_sequence must be [T, {len(FEATURE_NAMES)}] (the window that "
+                    f"was scored); got {np.asarray(feature_sequence).shape}"
+                )
+            # The sequence length is the model's, not a literal: this was
+            # hardcoded to 5 in four places while the contract is 15, so even a
+            # correctly-populated window would have been truncated to its last
+            # third before being explained.
+            x = torch.from_numpy(seq[None, ...]).to(self.device)
 
-            grads = x.grad[0, -1, :].cpu().numpy() if x.grad is not None else np.zeros(27, dtype=np.float32)
-            inputs = x[0, -1, :].detach().cpu().numpy()
-            attributions = np.abs(grads * inputs)
-            attn_weights = [float(w) for w in out["attention_weights"][0].detach().cpu().numpy()]
+            if fast_mode:
+                # Fast-path: Single forward pass with attention-proxy readout without gradient tracking
+                with torch.no_grad():
+                    out = self.branch_a(x)
+                    attn_weights = [float(w) for w in out["attention_weights"][0].cpu().numpy()]
+                    # Proxy feature attribution using input magnitude scaled by final attention weight
+                    inputs = np.abs(x[0, -1, :].cpu().numpy())
+                    attributions = inputs * (attn_weights[-1] if attn_weights else 1.0)
+            else:
+                # High-precision path: Gradient * Input attribution.
+                #
+                # The module stays in eval(). This called self.branch_a.train()
+                # as a cuDNN-RNN-backward workaround, which also switched
+                # dropout=0.2 back on across the LSTM and every head, so the
+                # attributions an operator saw were a fresh random draw each
+                # time the same alert was explained. Disabling cuDNN achieves
+                # the same thing without perturbing the model, and is what
+                # control_backend/model_adapter.py::_explain already does.
+                x.requires_grad_(True)
+                was_training = self.branch_a.training
+                self.branch_a.eval()
+                try:
+                    with torch.backends.cudnn.flags(enabled=False):
+                        out = self.branch_a(x)
+                        risk = out["risk_score"]
+                        if risk.ndim > 0:
+                            risk = risk.reshape(-1)[0]
+                        self.branch_a.zero_grad(set_to_none=True)
+                        risk.backward()
+                finally:
+                    if was_training:
+                        self.branch_a.train()
 
-        # Normalize and sort feature attributions
-        total_attr = float(attributions.sum())
-        if total_attr > 0:
-            attributions = attributions / total_attr
-        feat_ranks = sorted(
-            zip(FEATURE_NAMES, [float(v) for v in attributions]),
-            key=lambda item: item[1],
-            reverse=True,
-        )[:5]
+                grads = (
+                    x.grad[0, -1, :].cpu().numpy()
+                    if x.grad is not None
+                    else np.zeros(len(FEATURE_NAMES), dtype=np.float32)
+                )
+                inputs = x[0, -1, :].detach().cpu().numpy()
+                attributions = np.abs(grads * inputs)
+                attn_weights = [float(w) for w in out["attention_weights"][0].detach().cpu().numpy()]
+
+            # Normalize and sort feature attributions
+            total_attr = float(attributions.sum())
+            if total_attr > 0:
+                attributions = attributions / total_attr
+            feat_ranks = sorted(
+                zip(FEATURE_NAMES, [float(v) for v in attributions]),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:5]
 
         # Extract local causal chain from campaign if available
         causal_chain = []
@@ -197,10 +256,22 @@ class UnifiedExplainer:
         if fc_entries:
             forecast_str = f" Predicted next stages: {', '.join([f'{f.technique_id} ({f.coarse_category})' for f in fc_entries[:2]])}."
 
+        if feat_ranks:
+            drivers = (
+                "Primary driving indicators: "
+                + ", ".join(f"{name} ({val * 100:.1f}%)" for name, val in feat_ranks[:3])
+                + "."
+            )
+        else:
+            drivers = (
+                "Feature attribution unavailable: the scored feature window was not "
+                "supplied to the explainer."
+            )
+
         narrative = (
             f"Host {host_ip} exhibits an active compromise risk of {last_entry.risk_score:.2f} "
             f"classified under {last_entry.coarse_category} (Technique {last_entry.technique_id}). "
-            f"Primary driving indicators: {', '.join([f'{name} ({val*100:.1f}%)' for name, val in feat_ranks[:3]])}."
+            f"{drivers}"
             f"{forecast_str}"
         )
 
@@ -226,6 +297,7 @@ class UnifiedExplainer:
         trajectories: Dict[str, HostAttackTrajectory],
         campaigns: Optional[List[AttackCampaign]] = None,
         fast_mode: bool = True,
+        feature_sequences: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, UnifiedExplanation]:
         """
         Explains a batch of host trajectories efficiently.
@@ -240,7 +312,10 @@ class UnifiedExplainer:
         results: Dict[str, UnifiedExplanation] = {}
         for hip, traj in trajectories.items():
             camp = host_to_camp.get(hip)
-            results[hip] = self.explain_host_trajectory(traj, campaign=camp, fast_mode=fast_mode)
+            results[hip] = self.explain_host_trajectory(
+                traj, campaign=camp, fast_mode=fast_mode,
+                feature_sequence=(feature_sequences or {}).get(hip),
+            )
         return results
 
 
@@ -266,6 +341,7 @@ class AsyncExplainabilityQueue:
         trajectory: HostAttackTrajectory,
         campaign: Optional[AttackCampaign] = None,
         fast_mode: bool = False,
+        feature_sequence: Optional[np.ndarray] = None,
     ) -> concurrent.futures.Future[UnifiedExplanation]:
         """Submits an explanation task asynchronously without blocking."""
         host_ip = trajectory.host_ip
@@ -274,6 +350,8 @@ class AsyncExplainabilityQueue:
             trajectory,
             campaign,
             fast_mode,
+            True,
+            feature_sequence,
         )
 
         def _on_done(f: concurrent.futures.Future[UnifiedExplanation]):
@@ -294,6 +372,7 @@ class AsyncExplainabilityQueue:
         trajectories: Dict[str, HostAttackTrajectory],
         campaigns: Optional[List[AttackCampaign]] = None,
         fast_mode: bool = False,
+        feature_sequences: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, concurrent.futures.Future[UnifiedExplanation]]:
         """Submits a batch of trajectories asynchronously."""
         host_to_camp: Dict[str, AttackCampaign] = {}
@@ -305,7 +384,10 @@ class AsyncExplainabilityQueue:
         future_map: Dict[str, concurrent.futures.Future[UnifiedExplanation]] = {}
         for hip, traj in trajectories.items():
             camp = host_to_camp.get(hip)
-            future_map[hip] = self.submit(traj, campaign=camp, fast_mode=fast_mode)
+            future_map[hip] = self.submit(
+                traj, campaign=camp, fast_mode=fast_mode,
+                feature_sequence=(feature_sequences or {}).get(hip),
+            )
         return future_map
 
     def get_explanation(self, host_ip: str, timeout: Optional[float] = None) -> Optional[UnifiedExplanation]:
