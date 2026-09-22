@@ -844,6 +844,7 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     abs_err_sum = torch.zeros((), device=device, dtype=torch.float64)
     n_risk = 0
+    conf_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.float64)
     pos_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     neg_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     brier_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -919,6 +920,9 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
             pos_hist += torch.bincount(_b[_y], minlength=RISK_BINS)
             neg_hist += torch.bincount(_b[~_y], minlength=RISK_BINS)
+            # Sum of the predicted probabilities per bin, so ECE can use each
+            # bin's ACTUAL mean confidence rather than its nominal centre.
+            conf_hist += torch.bincount(_b, weights=_p.double(), minlength=RISK_BINS)
             prob_sum += _p.double().sum()
 
             pred_t = predictions["technique_logits"].argmax(dim=-1)
@@ -960,14 +964,28 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     # strictly lower bin is a win and every negative in the same bin is a tie.
     ph = pos_hist.double().cpu().numpy()
     nh = neg_hist.double().cpu().numpy()
+    ch = conf_hist.cpu().numpy()
     P, N = float(ph.sum()), float(nh.sum())
     if P > 0 and N > 0:
         neg_below = np.concatenate([[0.0], np.cumsum(nh)[:-1]])
         risk_auc = float((ph * (neg_below + 0.5 * nh)).sum() / (P * N))
-        conf = (np.arange(RISK_BINS) + 0.5) / RISK_BINS      # bin centre
+        # ECE with each bin's MEASURED mean confidence.
+        #
+        # This used the nominal bin centre `(i + 0.5) / RISK_BINS`, which
+        # disagreed with how scores are binned everywhere else in this file:
+        # a score lands in `floor(p * (RISK_BINS - 1))`, so bin i spans
+        # [i/(B-1), (i+1)/(B-1)) and its centre is (i+0.5)/(B-1), not
+        # (i+0.5)/B. The mismatch reached 5.0e-4 at the top of the range --
+        # negligible against an ECE of 0.07, but up to 25% of one at 0.002,
+        # and ECE at that scale is exactly where a calibration claim is made.
+        #
+        # Summing the probabilities per bin removes the approximation rather
+        # than correcting it: this is the textbook definition, and it is exact
+        # whatever the binning.
         cnt = ph + nh
         with np.errstate(divide="ignore", invalid="ignore"):
             acc_in_bin = np.where(cnt > 0, ph / np.maximum(cnt, 1), 0.0)
+            conf = np.where(cnt > 0, ch / np.maximum(cnt, 1), 0.0)
         risk_ece = float((cnt * np.abs(acc_in_bin - conf)).sum() / max(cnt.sum(), 1))
     else:
         # AUC and ECE need both classes; the BASE RATE does not, and reporting
