@@ -38,11 +38,15 @@ class HostRolloutDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        return {
+        out = {
             "h_history": torch.from_numpy(s["h_history"]).float(),
             "h_future": torch.from_numpy(s["h_future"]).float(),
             "risk_future": torch.from_numpy(s["risk_future"]).float(),
         }
+        for k in ("t_history", "t_future"):
+            if k in s:
+                out[k] = torch.from_numpy(s[k]).float()
+        return out
 
 
 def create_rollout_samples(trajectories, T: int = None, K: int = None):
@@ -68,15 +72,28 @@ def create_rollout_samples(trajectories, T: int = None, K: int = None):
             h_fut = np.array([s.embedding for s in future_snaps], dtype=np.float32)
             r_fut = np.array([s.risk_score for s in future_snaps], dtype=np.float32)
 
+            # Real elapsed seconds, origin at the last observed step. See the
+            # note in LazyHostRolloutDataset: the gap between a host's
+            # consecutive snapshots has median 7 windows on wed_29_csv.csv,
+            # not 1, so step index is not time.
+            w0 = float(snaps[i - 1].window_idx)
+            t_hist = np.array([(s.window_idx - w0) * _c.window_seconds
+                               for s in snaps[i - T:i]], dtype=np.float32)
+            t_fut = np.array([(s.window_idx - w0) * _c.window_seconds
+                              for s in future_snaps], dtype=np.float32)
+
             if k_avail < K:
                 pad_k = K - k_avail
                 h_fut = np.pad(h_fut, ((0, pad_k), (0, 0)), mode="edge")
                 r_fut = np.pad(r_fut, (0, pad_k), mode="edge")
+                t_fut = np.pad(t_fut, (0, pad_k), mode="edge")
 
             samples.append({
                 "h_history": h_hist,
                 "h_future": h_fut,
                 "risk_future": r_fut,
+                "t_history": t_hist,
+                "t_future": t_fut,
             })
     return samples
 
@@ -145,11 +162,17 @@ def train_branch_b(
             h_hist = batch["h_history"].to(device)
             h_fut = batch["h_future"].to(device)
             r_fut = batch["risk_future"].to(device)
+            # REFERENCE USAGE. scripts/retrain_future_models_live.py still
+            # calls `wdt.rollout(h, K=...)` with no times, so its model is
+            # told every step is 2 s apart when the measured median is 14 s.
+            # Passing these two tensors is the whole change it needs.
+            t_hist = batch["t_history"].to(device) if "t_history" in batch else None
+            t_fut = batch["t_future"].to(device) if "t_future" in batch else None
 
             optimizer.zero_grad()
 
             # Autoregressive rollout across K steps
-            h_pred = wdt.rollout(h_hist, K=K)  # [B, K, d_latent]
+            h_pred = wdt.rollout(h_hist, K=K, t_history=t_hist, t_future=t_fut)
 
             # Discounted multi-horizon MSE loss
             mse_loss = 0.0
@@ -177,8 +200,10 @@ def train_branch_b(
                 h_hist = batch["h_history"].to(device)
                 h_fut = batch["h_future"].to(device)
                 r_fut = batch["risk_future"].to(device)
+                t_hist = batch["t_history"].to(device) if "t_history" in batch else None
+                t_fut = batch["t_future"].to(device) if "t_future" in batch else None
 
-                h_pred = wdt.rollout(h_hist, K=K)
+                h_pred = wdt.rollout(h_hist, K=K, t_history=t_hist, t_future=t_fut)
                 mse_loss = F.mse_loss(h_pred, h_fut)
                 pred_step_risks, _ = risk_head.forward_trajectory(h_pred)
                 risk_loss = F.binary_cross_entropy(pred_step_risks, r_fut)
@@ -257,11 +282,36 @@ class LazyHostRolloutDataset(Dataset):
     ends early, and only hosts with at least T+1 snapshots contribute.
     """
 
-    def __init__(self, store, T: int = None, K: int = None):
+    def __init__(self, store, T: int = None, K: int = None,
+                 emit_times: bool = True, window_seconds: float = None):
         _c = get_contract()
         self.T = _c.history_steps if T is None else T
         self.K = _c.forecast_steps if K is None else K
         self.store = store
+        # Emit the REAL elapsed time of each step, not just its ordinal.
+        #
+        # This dataset indexes a host's snapshots by POSITION in its own
+        # trajectory, so `snaps[i:i+K]` is "the next 5 snapshots of this host",
+        # which the model and the contract both read as "the next 5 windows =
+        # +10 s". Those are not the same thing. Measured on wed_29_csv.csv
+        # (the validation capture; 295,483 records, 488,284 snapshots over 350
+        # hosts), the window_idx gap between a host's consecutive snapshots is:
+        #
+        #     median 7   mean 12.06   p90 29   fraction equal to 1: 0.159
+        #
+        # so the median "10 second" forecast is really 5*7*2 = 70 s, the p90 is
+        # 290 s, and the spacing varies by more than an order of magnitude
+        # between samples. A host is only present in a window it had traffic
+        # in, and most hosts are not busy every 2 seconds.
+        #
+        # There are two ways to handle that: drop samples whose steps are not
+        # contiguous, which throws away data, or tell the model how far apart
+        # the steps actually are, which does not. This does the second: 20
+        # extra float32 per sample (80 bytes on ~1.2 kB) and the model can
+        # condition on real elapsed seconds through ContinuousTimeEncoding.
+        self.emit_times = emit_times
+        self.window_seconds = (_c.window_seconds if window_seconds is None
+                               else float(window_seconds))
 
         hosts, host_idx, pos = [], [], []
         for h in store:
@@ -295,13 +345,32 @@ class LazyHostRolloutDataset(Dataset):
         # builds. `_materialize` would construct K full HostWindowSnapshots
         # per sample and read one float off each.
         r_fut = np.asarray(self.store.risk_score[fut_rows], dtype=np.float32)
-        if len(fut_rows) < self.K:
-            pad = self.K - len(fut_rows)
+        n_fut = len(fut_rows)
+        if n_fut < self.K:
+            pad = self.K - n_fut
             h_fut = np.pad(h_fut, ((0, pad), (0, 0)), mode="edge")
             r_fut = np.pad(r_fut, (0, pad), mode="edge")
 
-        return {
+        out = {
             "h_history": torch.from_numpy(np.ascontiguousarray(h_hist, dtype=np.float32)),
             "h_future": torch.from_numpy(np.ascontiguousarray(h_fut, dtype=np.float32)),
             "risk_future": torch.from_numpy(np.ascontiguousarray(r_fut, dtype=np.float32)),
         }
+        if self.emit_times:
+            # Seconds relative to the last OBSERVED step (rows[i-1]), which is
+            # the origin HostWorldDynamicsTransformer._elapsed_times uses:
+            # history <= 0 with its last entry exactly 0, future > 0.
+            w = self.store.window_idx
+            w0 = float(w[rows[i - 1]])
+            t_hist = (np.asarray(w[rows[i - self.T:i]], dtype=np.float64) - w0)
+            t_fut = (np.asarray(w[fut_rows], dtype=np.float64) - w0)
+            if n_fut < self.K:
+                # Edge-padded future states repeat the last real one, so they
+                # repeat its timestamp too -- a padded step is not a step
+                # further into the future.
+                t_fut = np.pad(t_fut, (0, self.K - n_fut), mode="edge")
+            out["t_history"] = torch.from_numpy(
+                np.ascontiguousarray(t_hist * self.window_seconds, dtype=np.float32))
+            out["t_future"] = torch.from_numpy(
+                np.ascontiguousarray(t_fut * self.window_seconds, dtype=np.float32))
+        return out

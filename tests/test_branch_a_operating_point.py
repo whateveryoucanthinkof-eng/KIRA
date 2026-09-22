@@ -207,6 +207,23 @@ def test_precision_is_one_where_nothing_is_predicted_positive():
 
 # --- the conformal half-width ----------------------------------------------
 
+def test_the_operating_point_is_json_clean_and_matches_what_serving_reads():
+    """`control_backend/model_adapter.py::_adopt_risk_semantics` reads
+    `ckpt["operating_point"]["alert_threshold"]` and logs `precision`,
+    `recall` and `alert_rate`. A numpy scalar in there is not an error today,
+    but it makes the checkpoint awkward to dump and compare, and one missing
+    key sends serving silently back to the 0.65 severity cut."""
+    import json
+    y, pq, pos, neg = _synthetic()
+    op = bra.fit_operating_point(pos, neg)
+    for k in ("alert_threshold", "precision", "recall", "f1", "alert_rate",
+              "base_rate", "criterion", "curve"):
+        assert k in op, k
+    for k in ("alert_threshold", "precision", "recall", "f1", "alert_rate"):
+        assert type(op[k]) is float, (k, type(op[k]))
+    json.dumps(op)          # raises on a numpy scalar
+
+
 def test_conformal_from_histogram_matches_the_exact_order_statistic():
     """The binned quantile must equal the exact one to within one bin, and must
     never be SMALLER -- rounding a conformal interval down over-states

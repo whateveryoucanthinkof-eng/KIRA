@@ -576,6 +576,20 @@ def fit_operating_point(pos_hist, neg_hist, *, criterion="budgeted_f1",
     base_rate = curve["base_rate"]
     budget = float(alert_budget) * base_rate
     usable = (curve["alert_rate"] > 0.0) & (curve["alert_rate"] < 1.0)
+    if not usable.any():
+        # Every threshold alerts on everything or on nothing. That happens
+        # when the head emits one score for every window -- the collapsed
+        # case -- and there is then no operating point to choose. Returning
+        # the least-bad degenerate one would put "alert on everything" into
+        # serving under the name of a fitted threshold.
+        return {
+            "fitted": False,
+            "reason": ("every threshold is degenerate: the risk head's scores "
+                       "do not separate the two classes at any cut, which "
+                       "means the head is emitting a constant"),
+            "base_rate": base_rate,
+            "n_positive": int(P), "n_negative": int(N),
+        }
     within = usable & (curve["alert_rate"] <= budget)
 
     b_max_f1 = int(np.argmax(np.where(usable, curve["f1"], -1.0)))
@@ -826,13 +840,10 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     """
     model.eval()
     nb = 0
-    total = 0
     non_blocking = (device == "cuda")
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     abs_err_sum = torch.zeros((), device=device, dtype=torch.float64)
     n_risk = 0
-    correct_tech_t = torch.zeros((), device=device, dtype=torch.long)
-
     pos_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     neg_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     brier_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -912,8 +923,9 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
 
             pred_t = predictions["technique_logits"].argmax(dim=-1)
             true_t = targets["technique"]
-            correct_tech_t += (pred_t == true_t).sum()
-            total += int(true_t.numel())
+            # No separate hit counter: the confusion matrix's trace IS the
+            # number correct, so accumulating it twice bought one more
+            # device tensor and an extra `.item()` sync at the end.
             confusion += torch.bincount(true_t * C + pred_t, minlength=C * C)
 
             if "gradation_logits" in predictions:
@@ -931,14 +943,12 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
                 keep_logits.append(_raw.detach().float().cpu())
                 keep_labels.append(true_t.detach().cpu())
 
-    correct_tech = int(correct_tech_t.item())
     cm = confusion.reshape(C, C).cpu().numpy()
     tech = _metrics_from_confusion(cm)
     macro_f1 = tech["macro_f1"]
     baseline = tech["majority_baseline"]
     accuracy = tech["accuracy"]
     per_class = tech["per_class"]
-    present = np.asarray(cm).sum(axis=1) > 0
 
     # The gradation head, scored the same way. Until 2026-09-22 nothing
     # measured it at all; then it got aggregate accuracy, which on a ladder
@@ -959,9 +969,13 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         with np.errstate(divide="ignore", invalid="ignore"):
             acc_in_bin = np.where(cnt > 0, ph / np.maximum(cnt, 1), 0.0)
         risk_ece = float((cnt * np.abs(acc_in_bin - conf)).sum() / max(cnt.sum(), 1))
-        base_rate = P / (P + N)
     else:
-        risk_auc, risk_ece, base_rate = float("nan"), float("nan"), 0.0
+        # AUC and ECE need both classes; the BASE RATE does not, and reporting
+        # it as 0.0 on an all-attack split (every CTU-13 scenario is one) said
+        # the opposite of the truth and drove `risk_brier_baseline` to 0, which
+        # made the "no better than the base rate" warning fire unconditionally.
+        risk_auc, risk_ece = float("nan"), float("nan")
+    base_rate = P / (P + N) if (P + N) > 0 else 0.0
     n_prob = max(int(P + N), 1)
     out_tasks = {k: (float((v / nb).item()) if nb else 0.0) for k, v in task_sums.items()}
     return {
@@ -980,8 +994,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         "tech_macro_f1": macro_f1,
         "tech_majority_baseline": baseline,
         "tech_lift_over_baseline": accuracy - baseline,
-        "tech_classes_present": int(present.sum()),
-        "tech_classes_predicted": int((predicted > 0).sum()),
+        "tech_classes_present": tech["classes_present"],
+        "tech_classes_predicted": tech["classes_predicted"],
         "tech_per_class": per_class,
         # -- the gradation head, judged the same way as the technique head --
         "gradation_accuracy": (float(grad_correct.item()) / grad_total) if grad_total else None,
@@ -1485,8 +1499,33 @@ def main():
             _ck["risk_conformal"] = _fits.get("risk_conformal")
             _ck["model_state_dict"] = model.state_dict()
             _tc = dict(_ck.get("training_contract") or {})
-            _tc["risk_objective"] = args.risk_objective
-            _tc["risk_target"] = args.risk_target
+            # Never re-stamp an objective onto weights that were trained with
+            # a different one.
+            #
+            # `--eval-only` does not train, so `args.risk_objective` describes
+            # THIS invocation, not the run that produced the checkpoint. The
+            # checkpoint on disk from 2026-09-21 predates the flag entirely
+            # and was trained with smooth_l1, so writing the current default
+            # (bce) into its contract would tell serving that its severity
+            # magnitude is a probability -- and serving bands alerts on
+            # exactly that distinction. An existing value wins; an absent one
+            # is recorded with a warning that it came from the command line.
+            _existing = _tc.get("risk_objective")
+            if _existing and _existing != args.risk_objective:
+                print(f"\nNOTE: {_src} records risk_objective="
+                      f"{_existing!r}; --risk-objective {args.risk_objective!r} "
+                      f"describes this scoring run only and is NOT written "
+                      f"into the contract. The stored value is what the "
+                      f"weights were trained with.", flush=True)
+            elif not _existing:
+                print(f"\nWARNING: {_src} carries no risk_objective, so it "
+                      f"predates the flag. Recording {args.risk_objective!r} "
+                      f"from the command line -- if these weights were NOT "
+                      f"trained that way, re-run --eval-only with the right "
+                      f"--risk-objective, because serving bands alerts on "
+                      f"this field.", flush=True)
+                _tc["risk_objective"] = args.risk_objective
+            _tc.setdefault("risk_target", args.risk_target)
             _ck["training_contract"] = _tc
             torch.save(_ck, _src)
             print(f"\nwrote fitted operating point / calibration back to {_src}",
