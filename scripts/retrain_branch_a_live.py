@@ -730,11 +730,30 @@ def _metrics_from_confusion(cm):
     total = int(support.sum())
     accuracy = float(tp.sum() / max(total, 1))
     baseline = float(support.max() / max(total, 1)) if total else 0.0
+
+    # The macro F1 a majority-class predictor would score, exactly from the
+    # support: it gets recall 1.0 and precision equal to that class's share on
+    # the majority class, and F1 = 0 on every other present class.
+    #
+    # Comparing macro F1 against the ACCURACY baseline is a category error,
+    # and it made this file's own warning misleading. On epoch 1 of the
+    # 2026-09-22 run the technique head scored accuracy 0.791 against a 0.900
+    # majority share, so the warning called it "adding almost nothing" --
+    # while its macro F1 of 0.397 beat the majority predictor's 0.316 by
+    # +0.081. Giving up majority-class accuracy to gain minority recall is
+    # exactly what focal loss is for, so judging these heads on accuracy
+    # punishes them for working as intended.
+    n_present = int(present.sum())
+    macro_f1 = float(f1[present].mean()) if present.any() else 0.0
+    macro_baseline = (float((2 * baseline / (baseline + 1.0)) / n_present)
+                      if n_present and total else 0.0)
     return {
         "accuracy": accuracy,
-        "macro_f1": float(f1[present].mean()) if present.any() else 0.0,
+        "macro_f1": macro_f1,
         "majority_baseline": baseline,
         "lift_over_baseline": accuracy - baseline,
+        "macro_f1_baseline": macro_baseline,
+        "macro_f1_lift": macro_f1 - macro_baseline,
         "classes_present": int(present.sum()),
         "classes_predicted": int((predicted > 0).sum()),
         "per_class": {
@@ -771,11 +790,13 @@ def _warn_if_gradation_collapsed(metrics, where):
         print(f"  WARNING [{where}]: gradation head predicts a SINGLE level for "
               f"every input ({present} levels present). Its accuracy {acc:.3f} "
               f"is the class prior, not a result.", flush=True)
-    elif lift < 0.01:
-        print(f"  WARNING [{where}]: gradation accuracy {acc:.3f} is within 1 "
-              f"point of the majority-level baseline "
-              f"{metrics.get('gradation_majority_baseline', 0):.3f} -- the head "
-              f"is adding almost nothing.", flush=True)
+    elif metrics.get("gradation_macro_f1_lift") is not None and \
+            metrics["gradation_macro_f1_lift"] <= 0.0:
+        # Macro F1, not accuracy -- see the technique warning for why.
+        print(f"  WARNING [{where}]: gradation macro F1 {f1:.3f} is at or below "
+              f"what a majority-level predictor scores "
+              f"({metrics.get('gradation_macro_f1_baseline', 0):.3f}) -- the head "
+              f"is adding nothing over a constant.", flush=True)
     elif f1 < 0.2 and present > 2:
         print(f"  WARNING [{where}]: gradation macro F1 {f1:.3f} over {present} "
               f"levels -- accuracy {acc:.3f} is carried by level 0 while the "
@@ -802,12 +823,17 @@ def _warn_if_head_collapsed(metrics, where):
               f"every input ({present} classes present in the data). Its "
               f"accuracy {metrics.get('tech_accuracy', 0):.3f} is the class "
               f"prior, not a result.", flush=True)
-    elif lift < 0.01 and present > 1:
-        print(f"  WARNING [{where}]: technique accuracy "
-              f"{metrics.get('tech_accuracy', 0):.3f} is within 1 point of the "
-              f"majority-class baseline "
-              f"{metrics.get('tech_majority_baseline', 0):.3f} -- the head is "
-              f"adding almost nothing.", flush=True)
+    elif metrics.get("tech_macro_f1_lift") is not None and \
+            metrics["tech_macro_f1_lift"] <= 0.0 and present > 1:
+        # Judged on macro F1, never on accuracy. A focal-loss head trades
+        # majority-class accuracy for minority recall by design, so accuracy
+        # below the majority share is expected and is not evidence of
+        # failure -- macro F1 at or below what a constant predictor scores is.
+        print(f"  WARNING [{where}]: technique macro F1 "
+              f"{metrics.get('tech_macro_f1', 0):.3f} is at or below what a "
+              f"majority-class predictor scores "
+              f"({metrics.get('tech_macro_f1_baseline', 0):.3f}) -- the head is "
+              f"adding nothing over a constant.", flush=True)
     elif f1 < 0.2 and present > 2:
         print(f"  WARNING [{where}]: macro F1 {f1:.3f} over {present} classes -- "
               f"accuracy {metrics.get('tech_accuracy', 0):.3f} is carried by the "
@@ -1010,6 +1036,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         **out_tasks,
         # -- the metrics that can tell a working head from a collapsed one --
         "tech_macro_f1": macro_f1,
+        "tech_macro_f1_baseline": tech["macro_f1_baseline"],
+        "tech_macro_f1_lift": tech["macro_f1_lift"],
         "tech_majority_baseline": baseline,
         "tech_lift_over_baseline": accuracy - baseline,
         "tech_classes_present": tech["classes_present"],
@@ -1018,6 +1046,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         # -- the gradation head, judged the same way as the technique head --
         "gradation_accuracy": (float(grad_correct.item()) / grad_total) if grad_total else None,
         "gradation_macro_f1": grad["macro_f1"],
+        "gradation_macro_f1_baseline": grad["macro_f1_baseline"],
+        "gradation_macro_f1_lift": grad["macro_f1_lift"],
         "gradation_majority_baseline": grad["majority_baseline"],
         "gradation_lift_over_baseline": grad["lift_over_baseline"],
         "gradation_classes_present": grad["classes_present"],
@@ -1600,7 +1630,8 @@ def main():
             f"val_loss={metrics['loss']:.4f} risk_mae={metrics['risk_mae']:.4f} "
             f"tech_accuracy={metrics['tech_accuracy']:.3f} "
             f"tech_macro_f1={metrics['tech_macro_f1']:.3f} "
-            f"lift={metrics['tech_lift_over_baseline']:+.3f} "
+            f"lift_acc={metrics['tech_lift_over_baseline']:+.3f} "
+            f"lift_f1={metrics['tech_macro_f1_lift']:+.3f} "
             f"classes_pred={metrics['tech_classes_predicted']}/{metrics['tech_classes_present']} "
             f"sel[{args.select_on}]={_selection_score(metrics, args.select_on):.4f} "
             f"| task_loss risk={metrics['loss_risk']:.4f} tech={metrics['loss_tech']:.4f} "

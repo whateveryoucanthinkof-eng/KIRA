@@ -174,3 +174,50 @@ def test_flagging_never_changes_the_selection():
     bra._flag_outlier_selection(hist, best)
     assert best == before
     assert len(hist) == len(REAL_RUN_LOSSES)
+
+
+# --- the warning must judge macro F1, not accuracy -------------------------
+
+def test_a_focal_loss_head_is_not_warned_about_for_losing_accuracy():
+    """Branch A epoch 1 (2026-09-22): accuracy 0.791 against a 0.900 majority
+    share, but macro F1 0.397 against a majority predictor's 0.316. Trading
+    majority accuracy for minority recall is what focal loss is for, so the
+    accuracy-based warning was punishing the head for working as designed."""
+    m = {"tech_accuracy": 0.791, "tech_majority_baseline": 0.900,
+         "tech_lift_over_baseline": -0.109,
+         "tech_macro_f1": 0.397, "tech_macro_f1_baseline": 0.316,
+         "tech_macro_f1_lift": 0.081,
+         "tech_classes_present": 3, "tech_classes_predicted": 6}
+    import io as _io, contextlib
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        bra._warn_if_head_collapsed(m, "unit")
+    assert "WARNING" not in buf.getvalue(), buf.getvalue()
+
+
+def test_a_head_below_the_macro_f1_baseline_is_warned_about(capsys):
+    m = {"tech_accuracy": 0.95, "tech_majority_baseline": 0.900,
+         "tech_lift_over_baseline": 0.05,
+         "tech_macro_f1": 0.30, "tech_macro_f1_baseline": 0.316,
+         "tech_macro_f1_lift": -0.016,
+         "tech_classes_present": 3, "tech_classes_predicted": 3}
+    bra._warn_if_head_collapsed(m, "unit")
+    out = capsys.readouterr().out
+    assert "macro F1" in out and "adding nothing over a constant" in out
+
+
+def test_the_macro_f1_baseline_matches_a_hand_computed_majority_predictor():
+    """A constant predictor gets recall 1.0 on the majority class and
+    precision equal to its share, and F1 = 0 elsewhere."""
+    import numpy as np
+    C = 3
+    support = np.array([900, 60, 40])          # majority share 0.90
+    cm = np.zeros((C, C), dtype=np.int64)
+    cm[:, 0] = support                          # predict class 0 for everything
+    got = bra._metrics_from_confusion(cm)
+    p_maj, r_maj = 0.90, 1.0
+    expected = (2 * p_maj * r_maj / (p_maj + r_maj)) / 3
+    assert got["macro_f1_baseline"] == pytest.approx(expected, abs=1e-9)
+    # and a constant predictor's own macro F1 must equal that baseline
+    assert got["macro_f1"] == pytest.approx(expected, abs=1e-9)
+    assert got["macro_f1_lift"] == pytest.approx(0.0, abs=1e-9)
