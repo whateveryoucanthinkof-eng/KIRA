@@ -160,6 +160,119 @@ class TrajectoryStore(Mapping):
             int(self.window_idx[row]),
         )
 
+    def time_to_next_attack(self, never: float = np.inf) -> np.ndarray:
+        """Seconds from each window until that host's NEXT attack window.
+
+        0.0 where the window is itself an attack; `never` where the host has
+        no later attack window in this split. One reverse scan per host over
+        columns that already exist, so this costs a pass over the store and
+        no extra memory beyond the output.
+
+        Rows within a host are in encounter order, which is time order --
+        `window_idx` is assigned per window as captures are read, and the
+        builder appends per host per window. A host's row slice is therefore
+        already sorted by `window_start`; this asserts that rather than
+        assuming it, because a hazard computed on out-of-order rows would be
+        silently wrong rather than raising.
+        """
+        n = self.n_snapshots
+        out = np.full(n, float(never), dtype=np.float64)
+        atk = np.asarray(self.is_attack).astype(bool)
+        start = np.asarray(self.window_start, dtype=np.float64)
+
+        for rows in self._rows_by_host.values():
+            r = np.asarray(rows)
+            if r.size == 0:
+                continue
+            ts = start[r]
+            if r.size > 1 and not np.all(np.diff(ts) >= 0):
+                order = np.argsort(ts, kind="stable")
+                r, ts = r[order], ts[order]
+            a = atk[r]
+            # Reverse running minimum of the attack timestamps: for each row,
+            # the earliest attack at or after it. A Python loop here costs one
+            # interpreter step per row -- 22.8M of them at full density -- so
+            # it is done with an accumulate instead.
+            masked = np.where(a, ts, np.inf)
+            next_atk = np.minimum.accumulate(masked[::-1])[::-1]
+            res = next_atk - ts
+            res[a] = 0.0
+            res[~np.isfinite(next_atk)] = float(never)
+            out[r] = res
+        return out
+
+    def hazard_risk(self, tau_seconds: float, never: float = np.inf) -> np.ndarray:
+        """A forward-looking risk target: exp(-dt / tau).
+
+        ## Why this exists
+
+        The `risk_score` written during extraction is
+        `base_severity(tactic) + 0.04*density + 0.04*volume` for an attack
+        window and exactly 0.0 otherwise. Three things follow, and all three
+        were measured on the 2026-09-21 run:
+
+        1. It is **not a forecast**. It describes whether THIS window contains
+           attack traffic. A model asked to predict it is doing detection with
+           a one-step delay, not forecasting -- which is the stated purpose of
+           the system.
+        2. It is **nearly a function of the coarse category**, which a
+           different head already predicts. The two heads were being trained
+           to carry the same information.
+        3. It is **bimodal** -- 0.0 for 82.5% of validation windows, ~0.76 for
+           the rest -- so regressing it with a mean-seeking loss produces a
+           head that cannot beat predicting zero on MAE. Branch A's did not:
+           0.2268 against 0.1334 for the constant 0.
+
+        The hazard form answers the question a SOC actually asks -- *how soon
+        is this host going to be in trouble* -- and is continuous, monotone in
+        time, and independent of the tactic label. It is 1.0 during an attack,
+        decays smoothly beforehand, and reaches 0 for a host that is never
+        attacked.
+
+        `tau_seconds` sets the decay scale; the forecast horizon
+        (forecast_steps * window_seconds) is the natural choice, so a host one
+        full horizon away from an attack scores exp(-1) = 0.368.
+        """
+        if not (tau_seconds > 0):
+            raise ValueError(f"tau_seconds must be positive, got {tau_seconds}")
+        dt = self.time_to_next_attack(never=never)
+        with np.errstate(over="ignore"):
+            out = np.exp(-dt / float(tau_seconds))
+        out[~np.isfinite(dt)] = 0.0
+        return out.astype(np.float32)
+
+    def use_hazard_target(self, tau_seconds: float) -> dict:
+        """Replace `risk_score` with the hazard target, in place.
+
+        Every consumer -- Branch A's sequence dataset, Branch B's rollout
+        dataset, DeepOP -- reads `store.risk_score`, so swapping the column
+        here reaches all of them without each one growing a flag. The original
+        severity values stay available as `risk_score_severity` for reporting
+        and for reproducing an earlier run.
+
+        Returns a summary worth printing: a target that is 82.5% zeros is the
+        thing that broke the old risk head, so the zero fraction is the number
+        to look at when deciding whether the swap did what it was meant to.
+        """
+        if getattr(self, "_hazard_tau", None) is not None:
+            raise RuntimeError(
+                f"hazard target already applied with tau={self._hazard_tau}; "
+                f"applying it twice would decay an already-decayed target")
+        sev = np.asarray(self.risk_score)
+        haz = self.hazard_risk(tau_seconds)
+        self.risk_score_severity = sev
+        self.risk_score = haz
+        self._hazard_tau = float(tau_seconds)
+        return {
+            "tau_seconds": float(tau_seconds),
+            "zero_fraction_before": float((sev == 0).mean()),
+            "zero_fraction_after": float((haz == 0).mean()),
+            "distinct_before": int(len(np.unique(np.round(sev, 4)))),
+            "distinct_after": int(len(np.unique(np.round(haz, 4)))),
+            "mean_before": float(sev.mean()),
+            "mean_after": float(haz.mean()),
+        }
+
     @property
     def n_snapshots(self) -> int:
         return int(self.feats.shape[0])

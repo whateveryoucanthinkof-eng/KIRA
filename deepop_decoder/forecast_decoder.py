@@ -16,6 +16,28 @@ from deepop_decoder.joint_vocab import JointAttackVocab, get_joint_vocab, BOS_TO
 from deepop_decoder.cwa import CausalWindowAttention
 
 
+# ---------------------------------------------------------------------------
+# The step-0 "continuity prior": a hand-set logit bonus, applied at inference
+# only, that pushes the first forecast step towards the last OBSERVED token.
+#
+# It is not learned and it is not in the training objective, so anything
+# measured through `forecast_sequence` with it enabled is partly this constant
+# and not the model. Measured on an untrained decoder over 4,000 samples with
+# an 82.5% Benign observed-token mix (the corpus rate): the bonus changes
+# 71.9% of step-0 decisions, and drives agreement between the step-0 output
+# and the observed token from 0.177 to 0.896. In other words, with the bonus
+# on, step 0 *is* substantially the persistence baseline -- so "free-running
+# accuracy beats persistence" cannot be concluded from a run that leaves it on.
+#
+# Serving (control_backend/model_adapter.py, correlation/trajectory_assembler.py)
+# calls `forecast_sequence` without overriding it, so the default must stay 1.0
+# or serving behaviour changes silently. Evaluation passes
+# `continuity_bonus=0.0` to measure the model alone; `evaluate_forecast_rigor`
+# reports both.
+CONTINUITY_BONUS_ATTACK = 1.2   # x3.32 odds on the observed attack token
+CONTINUITY_BONUS_BENIGN = 1.8   # x6.05 odds on Benign
+
+
 class CWADecoderLayer(nn.Module):
     """
     Decoder layer combining:
@@ -146,8 +168,27 @@ class DeepOPForecastDecoder(nn.Module):
         self.future_gate = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         # Direct prediction head from future latent embedding H_hat
         self.direct_head = nn.Linear(d_latent, self.vocab_size)
-        # Prototypical Metric Head: class prototype centroids in d_latent embedding space
-        self.prototypes = nn.Parameter(torch.zeros(self.vocab_size, d_latent))
+        # Prototypical Metric Head: class prototype centroids in d_latent embedding space.
+        #
+        # This used to be `torch.zeros(...)`, which made the whole head a
+        # permanent no-op for any trainer that does not seed it from class
+        # centroids -- i.e. for `train_deepop_live`, which is the trainer that
+        # produced every shipped checkpoint. The mechanism: all-zero
+        # prototypes -> `active_proto_mask.sum() == 0` -> `forward` takes the
+        # `torch.zeros(...)` branch, which is a *fresh constant*, so
+        # `self.prototypes` is not in the autograd graph at all. Measured:
+        # after 50 AdamW steps `prototypes.grad is None` and
+        # `prototypes.abs().max() == 0.0` -- exactly zero, not merely small.
+        # A zero parameter whose only gradient path is gated off by its own
+        # zero-ness can never leave zero.
+        #
+        # trunc_normal_ std=0.02 gives ||p|| ~ 0.02*sqrt(12) = 0.069, an order
+        # of magnitude above the 1e-4 activation threshold, so the head starts
+        # alive and receives gradient. Loading an older all-zero checkpoint
+        # restores the old (inert) behaviour exactly, so this is not a
+        # silent change to anything already on disk.
+        self.prototypes = nn.Parameter(torch.empty(self.vocab_size, d_latent))
+        nn.init.trunc_normal_(self.prototypes, std=0.02)
         self.proto_scale = nn.Parameter(torch.tensor(2.5, dtype=torch.float32))
         # Prediction projection from autoregressive decoder
         self.fc_out = nn.Linear(d_model, self.vocab_size)
@@ -196,7 +237,20 @@ class DeepOPForecastDecoder(nn.Module):
                 h_norm = F.normalize(h_future, p=2, dim=-1)
                 p_norm = F.normalize(self.prototypes + 1e-8, p=2, dim=-1)
                 proto_logits = self.proto_scale * torch.einsum("bkd,vd->bkv", h_norm, p_norm)
-                proto_logits = proto_logits * active_proto_mask.unsqueeze(0).unsqueeze(0)
+                # An unseeded class used to be masked to logit 0. A seeded
+                # class gets proto_scale * cos in [-2.5, +2.5] with mean ~0, so
+                # a literal 0 sits at the MIDDLE of that range: masking to zero
+                # *promotes* a class the prototype head knows nothing about
+                # above every class it actively dislikes. With 6 of the 10
+                # tokens absent from this corpus (measured: only Benign.None,
+                # C2.T1071, Impact.T1498, InitialAccess.T1190 occur in train)
+                # that is six free votes per step. Floor them at -proto_scale,
+                # the least a cosine can ever award, so "no prototype" is the
+                # worst evidence rather than average evidence.
+                floor = -self.proto_scale.abs().expand_as(proto_logits)
+                proto_logits = torch.where(
+                    active_proto_mask.bool().unsqueeze(0).unsqueeze(0), proto_logits, floor
+                )
             else:
                 proto_logits = torch.zeros(B, K, self.vocab_size, device=h_future.device)
         else:
@@ -224,6 +278,7 @@ class DeepOPForecastDecoder(nn.Module):
         repetition_penalty: float = 1.0,
         temperature: float = 0.8,
         return_probs: bool = False,
+        continuity_bonus: float = 1.0,
     ) -> Any:
         """
         Autoregressive sequence generation conditioned on h_future and optional observed_token.
@@ -232,8 +287,16 @@ class DeepOPForecastDecoder(nn.Module):
             max_steps: maximum number of tokens to forecast
             observed_token: [batch_size] or [batch_size, 1] observed technique at t=0
             repetition_penalty: penalty discount applied to previously generated tokens (breaks mode collapse)
-            temperature: softmax temperature scaling
+            temperature: INERT for the emitted tokens. Decoding is greedy, and
+                argmax(x / T) == argmax(x) for every T > 0, so this cannot
+                change a single output token; verified by
+                `test_temperature_cannot_change_the_output`. It is kept only
+                because callers pass it. Do not read it as "the model samples".
             return_probs: if True, additionally returns per-step attack and top token probabilities
+            continuity_bonus: scale on the un-learned step-0 bonus towards
+                `observed_token` (see CONTINUITY_BONUS_* above). 1.0 is the
+                shipped serving behaviour; pass 0.0 to measure the model
+                without the hard-coded persistence prior mixed in.
         Returns:
             If return_probs is False:
                 pred_tokens: [batch_size, max_steps] integer token IDs
@@ -261,20 +324,22 @@ class DeepOPForecastDecoder(nn.Module):
                 next_logits[:, self.vocab.bos_idx] = -1e9
                 next_logits[:, self.vocab.pad_idx] = -1e9
 
-                # If step==0 and observed_token is provided, lightly bias toward observed state
-                if step == 0 and observed_token is not None:
-                    if observed_token.dim() == 2:
-                        obs_t_flat = observed_token.squeeze(1)
-                    else:
-                        obs_t_flat = observed_token
+                # If step==0 and observed_token is provided, bias toward the
+                # observed state. Vectorised: the old per-sample Python loop
+                # ran B iterations per call, which is 1.46M per validation
+                # epoch at the live val size.
+                if step == 0 and observed_token is not None and continuity_bonus != 0.0:
+                    obs_t_flat = observed_token.squeeze(1) if observed_token.dim() == 2 else observed_token
                     benign_idx = self.vocab.encode("Benign", None)
-                    for b in range(B):
-                        ot = int(obs_t_flat[b].item())
-                        if ot != self.vocab.bos_idx and ot != self.vocab.pad_idx:
-                            if ot != benign_idx:
-                                next_logits[b, ot] += 1.2  # Calibrated continuity prior for ongoing active attacks
-                            else:
-                                next_logits[b, benign_idx] += 1.8  # Calibrated continuity prior for ongoing benign activity
+                    usable = (obs_t_flat != self.vocab.bos_idx) & (obs_t_flat != self.vocab.pad_idx)
+                    bonus = torch.where(
+                        obs_t_flat == benign_idx,
+                        torch.full_like(next_logits[:, 0], CONTINUITY_BONUS_BENIGN),
+                        torch.full_like(next_logits[:, 0], CONTINUITY_BONUS_ATTACK),
+                    ) * usable.to(next_logits.dtype) * continuity_bonus
+                    next_logits.scatter_add_(
+                        1, obs_t_flat.clamp(min=0).unsqueeze(1), bonus.unsqueeze(1)
+                    )
 
                 # Apply repetition penalty to active attack tokens generated so far
                 if repetition_penalty > 1.0 and curr_tokens.shape[1] > prefix_len:
@@ -300,13 +365,16 @@ class DeepOPForecastDecoder(nn.Module):
                 else:
                     next_token = next_logits.argmax(dim=-1, keepdim=True)
 
-                for b in range(B):
-                    p_ben = float(step_probs[b, benign_idx].item())
-                    p_atk = float(torch.clamp(1.0 - step_probs[b, benign_idx], 0.0, 1.0).item())
-                    t_idx = int(next_token[b].item())
-                    p_tok = float(step_probs[b, t_idx].item())
-                    all_attack_probs[b].append(p_atk)
-                    all_token_probs[b].append(p_tok)
+                # Vectorised bookkeeping. The old form did B `.item()` calls
+                # per step -- 5 * B GPU syncs, which is what made
+                # `train_cwa_decoder`'s whole-val-set `forecast_sequence` call
+                # unrunnable at the live val size (1.46M samples).
+                if return_probs:
+                    p_atk = torch.clamp(1.0 - step_probs[:, benign_idx], 0.0, 1.0).cpu().tolist()
+                    p_tok = step_probs.gather(1, next_token).squeeze(1).cpu().tolist()
+                    for b in range(B):
+                        all_attack_probs[b].append(p_atk[b])
+                        all_token_probs[b].append(p_tok[b])
 
                 curr_tokens = torch.cat([curr_tokens, next_token], dim=1)
 

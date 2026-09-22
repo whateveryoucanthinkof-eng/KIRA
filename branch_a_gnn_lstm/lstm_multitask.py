@@ -10,6 +10,8 @@ and jointly predicts:
 
 import math
 from typing import Dict, Tuple, Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,6 +26,16 @@ class MultiClassFocalLoss(nn.Module):
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
     Down-weights easy well-classified negative/benign examples (p_t -> 1)
     and concentrates gradient updates on rare/hard attack classes.
+
+    ## alpha is NOT a registered buffer, deliberately
+
+    `self.tech_focal_loss` is a submodule of `MultiTaskLSTM`, so anything
+    registered here lands in the model's `state_dict`. Serving builds the model
+    with `MultiTaskLSTM(input_dim=27, hidden_dim=64)` -- i.e. alpha=None -- and
+    then calls `load_state_dict(..., strict=True)`. A checkpoint carrying
+    `tech_focal_loss.alpha` would be an *unexpected key* there and would break
+    serving outright. alpha is a training-time quantity; it is recorded in the
+    checkpoint dict (`ckpt["focal_alpha"]`) for the audit trail instead.
     """
 
     def __init__(
@@ -37,12 +49,97 @@ class MultiClassFocalLoss(nn.Module):
         self.alpha = alpha
         self.label_smoothing = label_smoothing
 
+    @staticmethod
+    def inverse_frequency_alpha(
+        labels,
+        num_classes: int,
+        *,
+        power: float = 0.5,
+        clip: Tuple[float, float] = (0.2, 5.0),
+    ) -> torch.Tensor:
+        """Damped, clipped, geometric-mean-centred inverse-frequency weights.
+
+        This is the same construction as `bita.train.FocalLoss` (the TGNE
+        encoder's loss), reproduced here because Branch A must not import a
+        sibling branch's training module to compute a weight vector.
+        `tests/test_branch_a_focal_loss.py` pins the two to agree numerically,
+        so they cannot drift apart silently.
+
+        The form is not arbitrary; it is the third attempt, and the first two
+        each failed on this corpus in opposite directions:
+
+        1. Plain 1/frequency -- a class absent from a split gets an
+           astronomical raw weight, and normalising by it collapses every
+           present class to ~0. Measured {Benign: 0.0, C2: 0.0, Impact: 2.0,
+           ...}: the majority classes contributed no loss at all.
+        2. Arithmetic-mean normalisation -- one ultra-rare class sets the
+           scale and crushes everyone else onto the clip floor. Measured
+           {Benign: 0.2, C2: 0.2, Impact: 0.2, InitialAccess: 0.2,
+           Recon: 4.911}: four of five classes weighted IDENTICALLY, i.e. no
+           balancing at all among the four carrying the data.
+
+        These are multiplicative weights, so the geometric mean is the right
+        centre: it centres them in log space, where a multiplicative
+        correction belongs, so one extreme class shifts the others by a
+        bounded factor instead of collapsing them.
+
+        A class absent from `labels` keeps weight exactly 1.0 and is excluded
+        from the normalisation. That exact 1.0 is a diagnostic, not a default:
+        it is how a broken split was found.
+        """
+        counts = np.bincount(
+            np.asarray(labels, dtype=np.int64), minlength=num_classes
+        ).astype(np.float64)
+        w = np.ones(num_classes, dtype=np.float64)
+        present = counts > 0
+        if present.any():
+            inv = (counts[present].sum() / counts[present]) ** power
+            w[present] = inv / float(np.exp(np.mean(np.log(inv))))
+        return torch.as_tensor(np.clip(w, clip[0], clip[1]), dtype=torch.float)
+
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # The modulating factor must use the TRUE p_t, not exp(-ce_loss).
+        #
+        # With label smoothing, `ce_loss` is not -log(p_t): PyTorch returns
+        #     (1 - eps) * nll  +  eps * mean_j(-log p_j)
+        # and the second term diverges exactly when the model becomes
+        # confident. So `pt = exp(-ce_loss)` is bounded well away from 1 no
+        # matter how well the example is classified, and `(1 - pt)^gamma`
+        # -- the whole mechanism focal loss exists for -- stops shrinking.
+        #
+        # Measured at this head's own settings (14 classes, eps=0.04,
+        # gamma=2). Columns are the focal term each definition produces:
+        #
+        #     true p_t     exp(-ce)   focal from exp(-ce)   focal from p_t
+        #       0.9         0.7541          6.05e-02          1.00e-02
+        #       0.99        0.7588          5.82e-02          1.00e-04
+        #       0.999       0.7027          8.84e-02          1.00e-06
+        #       0.99999     0.5928          1.66e-01          1.00e-10
+        #       1 - 1e-9    0.4211          3.35e-01          1.00e-18
+        #
+        # Two things are wrong, and the second is worse than the first.
+        # At p_t = 0.999 the modulating factor is ~88,000x too large. And
+        # past p_t ~ 0.99 the old factor turns around and *grows*: the more
+        # confidently correct the model is, the more weight focal loss gave
+        # the example. The mechanism was not merely weakened, it was
+        # inverted, because the smoothing term -eps*mean_j(log p_j) grows
+        # without bound exactly as the non-target probabilities shrink.
+        #
+        # Easy Benign windows are 82.5% of the corpus, so this is not a
+        # corner case: it is most of the gradient, and it is precisely the
+        # mass focal loss was added to remove.
+        #
+        # Keeping label smoothing in the MAGNITUDE term is correct -- it
+        # regularises the target distribution, which is what it is for. Only
+        # the modulating factor has to come from the unsmoothed p_t.
+        log_probs = F.log_softmax(logits, dim=-1)
+        logpt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = logpt.exp()
+        focal_term = (1.0 - pt) ** self.gamma
+
         ce_loss = F.cross_entropy(
             logits, targets, reduction="none", label_smoothing=self.label_smoothing
         )
-        pt = torch.exp(-ce_loss)
-        focal_term = (1.0 - pt) ** self.gamma
         if self.alpha is not None:
             if self.alpha.device != logits.device:
                 self.alpha = self.alpha.to(logits.device)
@@ -180,6 +277,8 @@ class MultiTaskLSTM(nn.Module):
         num_gradations: int = 4,
         dropout: float = 0.2,
         risk_objective: str = "bce",
+        focal_gamma: float = 2.0,
+        gradation_class_weights: Optional[torch.Tensor] = None,
     ):
         super(MultiTaskLSTM, self).__init__()
         if risk_objective not in ("bce", "smooth_l1"):
@@ -195,6 +294,10 @@ class MultiTaskLSTM(nn.Module):
         self.num_layers = num_layers
         self.num_techniques = num_techniques
         self.num_gradations = num_gradations
+        # Plain attribute, not a buffer: see MultiClassFocalLoss's docstring --
+        # anything registered here enters state_dict and an unexpected key
+        # breaks the serving load. Training-time only.
+        self.gradation_class_weights = gradation_class_weights
 
         # Core recurrent backbone
         self.lstm = nn.LSTM(
@@ -234,8 +337,51 @@ class MultiTaskLSTM(nn.Module):
         )
 
         self.uncertainty_loss = MultiTaskUncertaintyLoss()
-        self.temperature = nn.Parameter(torch.ones(1))
-        self.tech_focal_loss = MultiClassFocalLoss(gamma=2.0)
+        self.tech_focal_loss = MultiClassFocalLoss(gamma=focal_gamma)
+
+        # Temperature scaling, done the way temperature scaling is defined.
+        #
+        # This used to be `nn.Parameter(torch.ones(1))`, trained jointly with
+        # everything else by the same Adam step, and applied ONLY inside
+        # `compute_loss`. Three things were wrong with that, and they compound:
+        #
+        # 1. It is not temperature scaling. Guo et al. (2017) fit a single T by
+        #    minimising NLL on held-out data with the model FROZEN, precisely
+        #    because a network is overconfident on data it was fitted to.
+        #    Training T on the training objective moves it toward whatever
+        #    sharpness minimises the training loss -- the opposite correction.
+        #    The 2026-09-21 checkpoint settled at T = 0.9169, i.e. it learned
+        #    to SHARPEN, which is what an overconfident model does when you let
+        #    it choose.
+        # 2. During training it is redundant. `technique_head`'s final Linear
+        #    can absorb any constant 1/T into its own weights, so the parameter
+        #    adds no capacity -- only the illusion of calibration.
+        # 3. It was applied in the loss and dropped at inference. `forward`
+        #    returned raw logits, and the serving path
+        #    (correlation/trajectory_assembler.py:163) softmaxes those and
+        #    reports `max()` as the operator-facing confidence. So the model
+        #    was trained under logits/0.9169 and served under logits: a
+        #    train/serve mismatch on exactly the number a human reads.
+        #
+        # Now: a non-trainable buffer, fixed at 1.0 during training, fitted
+        # post-hoc by `fit_temperature()` on held-out data with the model
+        # frozen, and applied in `forward` so that every downstream softmax --
+        # including serving's, which this repo cannot reach from here -- gets
+        # the calibrated logits without any change at the call site.
+        #
+        # `temperature_fitted` is a separate buffer rather than "T != 1.0"
+        # because a legacy checkpoint carries a jointly-trained T that must NOT
+        # be applied: it was never fitted to anything. Loading such a
+        # checkpoint leaves the flag at 0 (see `_load_from_state_dict`), so
+        # serving behaviour for the weights on disk today is unchanged.
+        self.register_buffer("temperature", torch.ones(1))
+        self.register_buffer("temperature_fitted", torch.zeros(1))
+
+        # Half-width of the fitted split-conformal interval on the risk head.
+        # NaN means "never fitted", and `predict_calibrated_risk` raises rather
+        # than inventing one. See that method for why the old hardcoded 0.05
+        # was not a 95% interval.
+        self.register_buffer("risk_conformal_halfwidth", torch.full((1,), float("nan")))
 
     def forward(
         self,
@@ -258,16 +404,64 @@ class MultiTaskLSTM(nn.Module):
         context, attn_weights = self.attention(lstm_out, mask=mask)
 
         risk_score = self.risk_head(context)
-        tech_logits = self.technique_head(context)
+        tech_logits_raw = self.technique_head(context)
         grad_logits = self.gradation_head(context)
+
+        # `technique_logits` is the SERVED quantity, so the fitted temperature
+        # is applied here rather than at the call site. The serving path
+        # softmaxes this key and reports the max as an operator-facing
+        # confidence; it cannot be asked to divide by a temperature it does not
+        # know about. `technique_logits_raw` is what the loss must use, because
+        # T is fitted post-hoc against a frozen model -- training it through
+        # the loss is the defect this replaces.
+        #
+        # T divides monotonically, so argmax and therefore accuracy, macro F1
+        # and the confusion matrix are all unchanged. Only the probabilities
+        # move, which is the entire point.
+        tech_logits = tech_logits_raw / self.effective_temperature
 
         return {
             "risk_score": risk_score.squeeze(-1),
             "technique_logits": tech_logits,
+            "technique_logits_raw": tech_logits_raw,
             "gradation_logits": grad_logits,
             "attention_weights": attn_weights,
             "context": context,
         }
+
+    @property
+    def effective_temperature(self) -> torch.Tensor:
+        """T when it has been fitted post-hoc, otherwise exactly 1.0.
+
+        An unfitted temperature must be inert. A legacy checkpoint stores
+        T = 0.9169 left over from joint training; that number was fitted to
+        nothing and applying it would be a silent change to what the currently
+        served model outputs.
+        """
+        if float(self.temperature_fitted) <= 0.0:
+            return torch.ones((), device=self.temperature.device,
+                              dtype=self.temperature.dtype)
+        return self.temperature.clamp(min=1e-3)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Let checkpoints written before these buffers existed load strictly.
+
+        `control_backend/model_adapter.py` calls `load_state_dict` with the
+        default `strict=True`, so a buffer added here would make every
+        checkpoint already on disk unloadable -- i.e. it would take serving
+        down. Supplying the constructor default for any absent new buffer
+        keeps old checkpoints loading and, importantly, keeps their behaviour
+        identical: `temperature_fitted` defaults to 0, so the jointly-trained
+        temperature they carry stays inert.
+        """
+        for name in ("temperature", "temperature_fitted", "risk_conformal_halfwidth"):
+            key = prefix + name
+            if key not in state_dict:
+                state_dict[key] = getattr(self, name).clone()
+        return super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
 
     def compute_loss(
         self,
@@ -303,36 +497,259 @@ class MultiTaskLSTM(nn.Module):
         else:
             risk_loss = F.smooth_l1_loss(predictions["risk_score"], batch["risk"])
 
-        # Temperature-scaled Extreme-Value Focal Loss
-        temp = self.temperature.clamp(min=0.2, max=5.0)
-        scaled_logits = predictions["technique_logits"] / temp
-        tech_loss = self.tech_focal_loss(scaled_logits, batch["technique"])
+        # Focal loss on the RAW logits.
+        #
+        # Temperature scaling is a post-hoc correction fitted against a frozen
+        # model (see __init__). Dividing by it inside the training objective is
+        # not calibration -- it is an extra, redundant scale parameter on the
+        # head, and gradient descent moves it toward the sharpness that
+        # minimises the TRAINING loss, which is the direction that makes
+        # miscalibration worse. `technique_logits_raw` is preferred so that
+        # training is unaffected by a temperature fitted later; the fallback
+        # keeps callers that build a predictions dict by hand working.
+        tech_logits = predictions.get("technique_logits_raw")
+        if tech_logits is None:
+            tech_logits = predictions["technique_logits"]
+        tech_loss = self.tech_focal_loss(tech_logits, batch["technique"])
 
-        # Gradation cross entropy loss
-        grad_loss = F.cross_entropy(predictions["gradation_logits"], batch["gradation"])
+        # Gradation cross entropy loss.
+        #
+        # `gradation_class_weights` is None by default. The gradation head had
+        # never been evaluated at all before 2026-09-22, so there is no measured
+        # evidence yet that it needs re-weighting -- and weighting a head before
+        # measuring it is guessing. `--gradation-class-weights` turns it on once
+        # a run's per-class table shows it collapsing onto level 0.
+        _gw = self.gradation_class_weights
+        if _gw is not None and _gw.device != predictions["gradation_logits"].device:
+            _gw = _gw.to(predictions["gradation_logits"].device)
+            self.gradation_class_weights = _gw
+        grad_loss = F.cross_entropy(
+            predictions["gradation_logits"], batch["gradation"], weight=_gw)
 
         total_loss, metrics = self.uncertainty_loss(risk_loss, tech_loss, grad_loss)
-        metrics["temperature"] = temp.detach()      # see MultiTaskUncertaintyLoss
+        # Reported so a run can see whether a temperature has been fitted yet;
+        # it is 1.0 (inert) for the whole of training by construction.
+        metrics["temperature"] = self.effective_temperature.detach()
         return total_loss, metrics
+
+    # ---------------------------------------------------------------- #
+    # Post-hoc calibration. Fitted after training, on held-out data,    #
+    # with the model frozen -- which is what makes it calibration.      #
+    # ---------------------------------------------------------------- #
+
+    #: Same grid and boundary convention as cyberworld_v4.metrics.calibration
+    #: .TemperatureScaler, so the two cannot disagree about what "T hit the
+    #: boundary" means. A 1-D grid is exact enough on a near-flat objective
+    #: and, unlike an unconstrained optimiser, cannot diverge.
+    _TEMP_GRID = (0.05, 10.0, 96, 181)
+
+    @staticmethod
+    def top_label_ece(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+        """Expected calibration error of the predicted class's confidence.
+
+        The standard multi-class ECE (Guo et al.): bin samples by
+        max_j p_j, and compare each bin's mean confidence with the fraction
+        of that bin the model got right. Reported before and after a fit,
+        because "we scaled the logits" is not evidence that anything improved.
+        """
+        conf, pred = probs.max(dim=-1)
+        correct = (pred == labels).to(conf.dtype)
+        edges = torch.linspace(0.0, 1.0, n_bins + 1, device=conf.device, dtype=conf.dtype)
+        ece = torch.zeros((), device=conf.device, dtype=torch.float64)
+        n = max(int(conf.numel()), 1)
+        for i in range(n_bins):
+            lo, hi = edges[i], edges[i + 1]
+            sel = (conf > lo) & (conf <= hi) if i > 0 else (conf >= lo) & (conf <= hi)
+            k = int(sel.sum())
+            if k == 0:
+                continue
+            ece += (k / n) * (correct[sel].mean() - conf[sel].mean()).abs().double()
+        return float(ece)
+
+    @torch.no_grad()
+    def fit_temperature(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        n_bins: int = 15,
+    ) -> Dict[str, object]:
+        """Fit T by minimising NLL on held-out logits, model frozen.
+
+        `logits` must be the RAW technique logits (`technique_logits_raw`)
+        collected in a no-grad pass over a split the model's *parameters* were
+        not fitted on. This method changes no weight; it sets one scalar.
+
+        Returns the evidence, not just the number: NLL and top-label ECE
+        before and after, whether T landed on a grid boundary, and how many
+        samples it was fitted on. A temperature is only worth the word
+        "calibrated" if the after-numbers are better than the before-numbers,
+        and this is what lets a caller check that instead of assuming it.
+        """
+        lo, hi, n_lo, n_hi = self._TEMP_GRID
+        grid = torch.cat([
+            torch.linspace(lo, 1.0, n_lo)[:-1],
+            torch.linspace(1.0, hi, n_hi),
+        ]).to(logits.device)
+
+        logits = logits.detach().float()
+        labels = labels.detach().long()
+        n = int(labels.numel())
+        if n == 0 or int(labels.unique().numel()) < 2:
+            return {
+                "fitted": False,
+                "reason": (f"calibration split has {n} samples across "
+                           f"{int(labels.unique().numel()) if n else 0} classes; "
+                           f"a temperature fitted on one class is meaningless"),
+                "temperature": 1.0,
+            }
+
+        before_nll = float(F.cross_entropy(logits, labels))
+        before_ece = self.top_label_ece(logits.softmax(-1), labels, n_bins)
+
+        best_t, best_nll = 1.0, float("inf")
+        for t in grid.tolist():
+            nll = float(F.cross_entropy(logits / t, labels))
+            if nll < best_nll:
+                best_nll, best_t = nll, float(t)
+
+        at_boundary = bool(best_t <= lo * 1.001 or best_t >= hi * 0.999)
+        after_ece = self.top_label_ece((logits / best_t).softmax(-1), labels, n_bins)
+
+        # A temperature on the end of the grid is not a fit, it is the
+        # objective asking to go further and being stopped. Recording it as
+        # fitted would put an arbitrary boundary value into serving.
+        if at_boundary:
+            return {
+                "fitted": False,
+                "reason": (f"temperature hit the search boundary ({best_t:.4g}); "
+                           f"the calibration split is unrepresentative of what "
+                           f"the model was trained on"),
+                "temperature": best_t, "at_grid_boundary": True,
+                "n_calibration": n,
+                "nll_before": before_nll, "nll_after": best_nll,
+                "ece_before": before_ece, "ece_after": after_ece,
+            }
+
+        self.temperature.fill_(best_t)
+        self.temperature_fitted.fill_(1.0)
+        return {
+            "fitted": True,
+            "temperature": best_t,
+            "at_grid_boundary": False,
+            "n_calibration": n,
+            "nll_before": before_nll, "nll_after": best_nll,
+            "ece_before": before_ece, "ece_after": after_ece,
+            "ece_improvement": before_ece - after_ece,
+            "split": "held-out, model frozen",
+        }
+
+    @torch.no_grad()
+    def fit_risk_conformal(
+        self,
+        risk_pred: torch.Tensor,
+        risk_true: torch.Tensor,
+        alpha: float = 0.05,
+    ) -> Dict[str, float]:
+        """Split-conformal half-width for the risk head, from held-out residuals.
+
+        Uses the finite-sample-corrected quantile ceil((n+1)(1-alpha))/n, the
+        same one as `cyberworld_v4.conformal.conformal_quantile`; the plain
+        empirical quantile makes the coverage guarantee approximate rather
+        than exact.
+
+        ## What this will honestly return, and why that is the point
+
+        Under `--risk-objective bce` the target is Bernoulli: `risk_true > 0`
+        is 1 for an attack window and 0 otherwise, and the residual is
+        |p - y|. For a well-calibrated head on a ~17.5% base rate, ~17.5% of
+        residuals are near 1 - p, so the 95% quantile is large -- the interval
+        will be wide, possibly close to vacuous. That is not a defect in this
+        function; it is what a 95% *prediction interval on a coin flip* means.
+        The previous hardcoded +/-0.05 was not a narrower version of this
+        answer, it was a different and false one.
+        """
+        s = (risk_pred.detach().float().reshape(-1)
+             - risk_true.detach().float().reshape(-1)).abs()
+        n = int(s.numel())
+        if n == 0:
+            return {"fitted": False, "reason": "no calibration residuals", "n": 0}
+        k = int(math.ceil((n + 1) * (1.0 - alpha)))
+        if k > n:
+            return {
+                "fitted": False,
+                "n": n,
+                "reason": (f"{n} calibration points cannot support "
+                           f"{(1 - alpha) * 100:.1f}% coverage; need at least "
+                           f"{int(math.ceil(1 / alpha)) - 1}"),
+            }
+        q = float(torch.sort(s).values[k - 1])
+        covered = float(((s <= q).to(torch.float64)).mean())
+        self.risk_conformal_halfwidth.fill_(q)
+        return {
+            "fitted": True,
+            "alpha": alpha,
+            "target_coverage": 1.0 - alpha,
+            "half_width": q,
+            "empirical_coverage_on_calibration": covered,
+            "n": n,
+        }
 
     def predict_calibrated_risk(
         self,
         x: torch.Tensor,
-        threshold: float = 0.35,
-        conformal_error: float = 0.05,
+        threshold: Optional[float] = None,
+        conformal_error: Optional[float] = None,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Inference method with extreme-value calibrated gating and conformal confidence intervals.
-        Suppresses background benign tail noise when risk < threshold.
-        Returns bounds [risk_lower, risk_upper] guaranteeing (1 - alpha) = 95% coverage for SOAR.
+        """Risk with a conformal interval -- or a loud failure.
+
+        ## What was here, and why it had to go
+
+        The previous body was three magic numbers presented as calibration:
+
+            calibrated_risk = where(raw < 0.35, raw * 0.5, raw)
+            lower, upper    = calibrated +/- 0.05        # "95% coverage"
+
+        1. `raw * 0.5` below 0.35. Nothing fitted this. Under the bce
+           objective `raw_risk` IS a probability, and halving a probability
+           does not suppress noise -- it destroys the calibration the head was
+           trained to have and makes every low-risk host report a number that
+           is not the probability of anything. Suppression is a *decision*,
+           and a decision belongs at a fitted operating point (see
+           `ckpt["operating_point"]` written by
+           scripts/retrain_branch_a_live.py), not inside the model's estimate.
+        2. `+/- 0.05` described as "guaranteeing 95% coverage". It guarantees
+           nothing: it is a constant, fitted on no data. For the interval to
+           contain a binary outcome it needs |p - y| <= 0.05, i.e. p >= 0.95
+           on an attack window or p <= 0.05 on a benign one. Its real coverage
+           is whatever fraction of windows happen to be that confident and
+           correct -- on the 2026-09-21 head, nowhere near 95%.
+        3. It claimed both to an operator, in a field named
+           `risk_lower_bound`/`risk_upper_bound`.
+
+        So: `fit_risk_conformal()` on held-out data, or this raises. A
+        fabricated interval is worse than no interval, because a SOAR rule can
+        act on it.
         """
         out = self.forward(x)
         raw_risk = out["risk_score"]
-        calibrated_risk = torch.where(raw_risk < threshold, raw_risk * 0.5, raw_risk)
-        risk_lower = torch.clamp(calibrated_risk - conformal_error, 0.0, 1.0)
-        risk_upper = torch.clamp(calibrated_risk + conformal_error, 0.0, 1.0)
 
-        out["calibrated_risk"] = calibrated_risk
-        out["risk_lower_bound"] = risk_lower
-        out["risk_upper_bound"] = risk_upper
+        if conformal_error is None:
+            hw = float(self.risk_conformal_halfwidth)
+            if hw != hw:        # NaN -- never fitted
+                raise RuntimeError(
+                    "predict_calibrated_risk needs a conformal half-width fitted "
+                    "on held-out data. Call fit_risk_conformal(risk_pred, "
+                    "risk_true) after training -- or pass conformal_error "
+                    "explicitly and take responsibility for the number. It is "
+                    "not defaulted, because the previous default (0.05) was "
+                    "presented as a 95% interval and was fitted to nothing.")
+        else:
+            hw = float(conformal_error)
+
+        out["calibrated_risk"] = raw_risk
+        out["risk_lower_bound"] = torch.clamp(raw_risk - hw, 0.0, 1.0)
+        out["risk_upper_bound"] = torch.clamp(raw_risk + hw, 0.0, 1.0)
+        out["conformal_half_width"] = torch.full_like(raw_risk, hw)
+        if threshold is not None:
+            out["alert"] = raw_risk >= threshold
         return out
