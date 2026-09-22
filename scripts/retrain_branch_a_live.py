@@ -1,6 +1,7 @@
 """Retrain Branch A on supplied 2-second SIH/CTU live-telemetry data."""
 
 import argparse
+import math
 import os
 import random
 import sys
@@ -20,6 +21,7 @@ from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
 from branch_a_gnn_lstm.sequence_dataset import (
     TECHNIQUE_VOCAB,
     TECH_TO_IDX,
+    GRADATION_LEVELS,
     HostSequenceDataset,
     create_host_sequence_samples,
     LazyHostSequenceDataset,
@@ -168,13 +170,501 @@ def _flag_outlier_selection(history, best):
 RISK_BINS = 2000
 
 
-def _print_per_class(per_class, where):
+def _label_columns(store):
+    """Per-row (technique index, gradation level) for a whole store, vectorised.
+
+    Both are derived from interned columns the store already holds, via a
+    lookup table per distinct string -- so this is two fancy-index gathers
+    over `n_snapshots`, not 20.7M dict lookups. The defaults match
+    `LazyHostSequenceDataset.__getitem__` exactly: no technique recorded means
+    Benign, an unknown coarse category means level 0.
+    """
+    tech_map = np.array(
+        [TECH_TO_IDX.get(t, TECH_TO_IDX["Benign"]) for t in store.techniques],
+        dtype=np.int64)
+    cat_map = np.array(
+        [GRADATION_LEVELS.get(c, 0) for c in store.categories], dtype=np.int64)
+    tech_off = np.asarray(store.tech_off)
+    lo = tech_off[:-1]
+    has = tech_off[1:] > lo
+    tech = np.full(store.n_snapshots, TECH_TO_IDX["Benign"], dtype=np.int64)
+    if has.any() and tech_map.size:
+        tech[has] = tech_map[np.asarray(store.tech_flat)[lo[has]]]
+    grad = cat_map[np.asarray(store.cat_id)] if cat_map.size else \
+        np.zeros(store.n_snapshots, dtype=np.int64)
+    return tech, grad
+
+
+def target_label_counts(dataset):
+    """(technique_counts, gradation_counts) over a LazyHostSequenceDataset.
+
+    The focal alpha needs the class histogram of all 20.7M training targets
+    before the first batch, so how this is computed matters.
+
+    Not through `__getitem__`: that gathers a [15, 27] feature window from the
+    memmap and builds four tensors per sample, none of which a label count
+    uses. Not by materialising the target-row indices either -- that is a
+    166 MB int64 array in a process that is already holding three stores.
+
+    Instead, by complement. A sample's target is row `rows[end]` with `end`
+    running 1..n-1 per host, so the multiset of target rows is *every row in
+    the store except each host's first*. Counting all rows and subtracting the
+    per-host first rows is two bincounts and one gather of `len(hosts)`
+    indices, and it is exact rather than approximate.
+
+    The identity only holds when every store row belongs to a host the dataset
+    kept (true at `min_trajectory_len <= 1`, which is what Branch A uses), so
+    it is checked against the dataset's own sample count rather than assumed;
+    a mismatch falls back to the direct per-host count.
+    """
+    store = dataset.store
+    tech, grad = _label_columns(store)
+    n_hosts = len(dataset._rows)
+    complement_ok = (len(dataset._pos) == store.n_snapshots - n_hosts)
+
+    if complement_ok:
+        first = np.fromiter((int(r[0]) for r in dataset._rows),
+                            dtype=np.int64, count=n_hosts)
+        t_counts = (np.bincount(tech, minlength=len(TECHNIQUE_VOCAB))
+                    - np.bincount(tech[first], minlength=len(TECHNIQUE_VOCAB)))
+        g_counts = (np.bincount(grad, minlength=4)
+                    - np.bincount(grad[first], minlength=4))
+        return t_counts, g_counts
+
+    t_counts = np.zeros(len(TECHNIQUE_VOCAB), dtype=np.int64)
+    g_counts = np.zeros(4, dtype=np.int64)
+    for rows in dataset._rows:
+        r = np.asarray(rows)[1:]
+        if r.size:
+            t_counts += np.bincount(tech[r], minlength=len(TECHNIQUE_VOCAB))
+            g_counts += np.bincount(grad[r], minlength=4)
+    return t_counts, g_counts
+
+
+#: Metric keys that must never reach the checkpoint or `epoch_history`.
+#: `_evaluate` returns the raw score histograms and (optionally) the collected
+#: technique logits so a caller can fit an operating point and a temperature
+#: without a second pass over the split. Those are working data, not results:
+#: the logits alone are 57 MB at the validation split's size, and a
+#: checkpoint that carried them per epoch would be gigabytes.
+BULKY_METRIC_KEYS = (
+    "risk_pos_hist", "risk_neg_hist", "risk_resid_hist",
+    "technique_logits", "technique_labels",
+)
+
+
+def slim(metrics, drop_per_class=False):
+    """A copy of a metrics dict safe to store, print or log."""
+    drop = set(BULKY_METRIC_KEYS)
+    if drop_per_class:
+        drop |= {"tech_per_class", "gradation_per_class"}
+    return {k: v for k, v in metrics.items() if k not in drop}
+
+
+def conformal_halfwidth_from_histogram(resid_hist, alpha=0.05, bins=RISK_BINS):
+    """Split-conformal half-width from a binned residual distribution.
+
+    The same finite-sample correction as
+    `cyberworld_v4.conformal.conformal_quantile`: the k-th smallest residual
+    with k = ceil((n+1)(1-alpha)), not the plain empirical quantile -- that
+    correction is what makes the coverage guarantee exact rather than
+    approximate.
+
+    Binning rounds the quantile UP to the bin's upper edge, so the interval is
+    at worst one bin (1/(bins-1) = 5e-4) wider than the exact one. That
+    direction is deliberate: a conformal interval rounded up over-covers,
+    which is a weaker claim, while rounding down would over-state coverage.
+    `empirical_coverage` is computed from the same histogram so the reported
+    number is the one the width actually achieves, never the target alone.
+    """
+    h = np.asarray(resid_hist, dtype=np.int64)
+    n = int(h.sum())
+    if n == 0:
+        return {"fitted": False, "n": 0, "reason": "no residuals"}
+    k = int(np.ceil((n + 1) * (1.0 - alpha)))
+    if k > n:
+        return {"fitted": False, "n": n,
+                "reason": (f"{n} calibration points cannot support "
+                           f"{(1 - alpha) * 100:.1f}% coverage")}
+    cum = np.cumsum(h)
+    b = int(np.searchsorted(cum, k, side="left"))
+    q = min(float(b + 1) / (bins - 1), 1.0)
+    covered = float(cum[b] / n)
+    return {
+        "fitted": True, "alpha": float(alpha),
+        "target_coverage": 1.0 - float(alpha),
+        "half_width": q,
+        "empirical_coverage": covered,
+        "n": n,
+        "bin_width": 1.0 / (bins - 1),
+        "method": "split conformal, ceil((n+1)(1-alpha)) order statistic, "
+                  "binned and rounded up",
+    }
+
+
+def _print_conformal(c, where):
+    if not c.get("fitted"):
+        print(f"  conformal [{where}]: NOT FITTED -- {c.get('reason')}", flush=True)
+        return
+    print(f"  conformal [{where}]: half-width {c['half_width']:.4f} for "
+          f"{c['target_coverage'] * 100:.0f}% target coverage "
+          f"(empirical {c['empirical_coverage'] * 100:.2f}% on n={c['n']:,})",
+          flush=True)
+    if c["half_width"] > 0.4:
+        # Not a failure -- the honest answer for a near-binary target. Said
+        # out loud because the number it replaces (a hardcoded 0.05 described
+        # as "guaranteeing 95% coverage") was small enough to look useful.
+        print(f"    NOTE: a {c['target_coverage'] * 100:.0f}% prediction "
+              f"interval on a near-binary outcome is wide by construction -- "
+              f"to contain y in {{0,1}} it needs |p - y| <= half-width, so "
+              f"anything short of a near-certain prediction fails. This is "
+              f"the measured answer; the +/-0.05 it replaces was fitted to "
+              f"nothing and its real coverage was whatever it happened to be.",
+              flush=True)
+
+
+def calibrate_and_fit_operating_point(model, metrics, args, where="validation"):
+    """Everything that must happen AFTER training, on held-out data, frozen.
+
+    Three post-hoc fits, all from one already-completed evaluation pass:
+
+    * the technique temperature, by NLL on the collected raw logits;
+    * the risk head's conformal half-width, from the residuals;
+    * the served alert threshold, from the risk score histograms.
+
+    They are grouped because they share a precondition that is easy to lose:
+    the model's parameters must already be final. A temperature fitted while
+    training continues is not a temperature scaling, which is exactly the
+    defect this replaces.
+
+    ## What this inherits, and what it would take to not inherit it
+
+    These are fitted on VALIDATION, the same split that chose the checkpoint,
+    so they carry that selection's optimism. The honest remedy is a fourth
+    split -- `cyberworld_v4.splits` already defines CALIBRATION as disjoint
+    from VALIDATION for precisely this reason -- but `splits.lock.json` is
+    frozen three-way and is not Branch A's file to change. Carving a
+    calibration split out of the three validation captures by hand would be
+    worse than the optimism it removes: the captures are one CIC-2018 day and
+    two CTU-13 scenarios, and CTU-13 scenarios are ~100% attack, so any
+    capture-disjoint carve-out gives a calibration set whose base rate is
+    nothing like the one serving will see. A temperature or a threshold fitted
+    on an unrepresentative split is a worse number than a mildly optimistic
+    one. Recorded in the checkpoint as `split: "validation"` so the claim is
+    never stronger than the evidence.
+    """
+    out = {}
+
+    if not args.no_fit_temperature:
+        logits = metrics.get("technique_logits")
+        labels = metrics.get("technique_labels")
+        if logits is None or labels is None:
+            out["temperature"] = {"fitted": False,
+                                  "reason": "no logits collected"}
+        else:
+            rep = model.fit_temperature(logits, labels)
+            rep["split"] = where
+            out["temperature"] = rep
+            if rep.get("fitted"):
+                print(f"  temperature [{where}]: T={rep['temperature']:.4f} "
+                      f"NLL {rep['nll_before']:.4f} -> {rep['nll_after']:.4f}, "
+                      f"top-label ECE {rep['ece_before']:.4f} -> "
+                      f"{rep['ece_after']:.4f} (n={rep['n_calibration']:,})",
+                      flush=True)
+                if rep["ece_after"] > rep["ece_before"]:
+                    print(f"  WARNING [{where}]: temperature scaling lowered NLL "
+                          f"but RAISED top-label ECE "
+                          f"({rep['ece_before']:.4f} -> {rep['ece_after']:.4f}). "
+                          f"NLL and ECE disagree when the errors are not a pure "
+                          f"confidence miscalibration; the fit is recorded, and "
+                          f"it should not be described as improving calibration.",
+                          flush=True)
+            else:
+                print(f"  temperature [{where}]: NOT FITTED -- {rep.get('reason')}",
+                      flush=True)
+
+    conf = conformal_halfwidth_from_histogram(
+        metrics["risk_resid_hist"], alpha=args.conformal_alpha)
+    _print_conformal(conf, where)
+    if conf.get("fitted"):
+        model.set_risk_conformal_halfwidth(conf["half_width"])
+    out["risk_conformal"] = conf
+
+    op = fit_operating_point(
+        metrics["risk_pos_hist"], metrics["risk_neg_hist"],
+        criterion=args.operating_point_criterion,
+        alert_budget=args.alert_budget,
+    )
+    if op.get("fitted"):
+        # What the historical 0.65 cut does to this same head. It is the
+        # number that decides whether carrying it across would be silent.
+        curve = _pr_curve_from_histograms(metrics["risk_pos_hist"],
+                                          metrics["risk_neg_hist"])
+        b65 = int(round(0.65 * (RISK_BINS - 1)))
+        op["legacy_0_65"] = _point(curve, b65)
+        op["risk_objective"] = args.risk_objective
+        op["risk_target"] = args.risk_target
+        op["positive_event"] = (
+            "risk_score > 0 (this window contains attack traffic)"
+            if args.risk_target == "severity" else
+            f"hazard >= exp(-1) (an attack within one forecast horizon, "
+            f"tau={metrics.get('risk_positive_above', 0):.4f} cut)")
+    _print_operating_point(op, where)
+    out["operating_point"] = op
+    return out
+
+
+def _print_class_counts(counts, names, label):
+    """The counts the weights were built from.
+
+    A weight of exactly 1.0 means a class had ZERO training samples, and that
+    is how a broken split was found before (3 of 5 encoder categories absent
+    because the temporal cut was splitting by corpus). Printing the histogram
+    next to the weights is what makes that visible.
+    """
+    total = max(int(np.sum(counts)), 1)
+    print(f"  {label} class counts (train):", flush=True)
+    for i, c in enumerate(counts):
+        if c == 0:
+            continue
+        print(f"    {names.get(i, f'class_{i}'):<28} {int(c):>12,} "
+              f"({100.0 * c / total:5.2f}%)", flush=True)
+    absent = [names.get(i, f"class_{i}") for i, c in enumerate(counts) if c == 0]
+    if absent:
+        print(f"    ABSENT from train ({len(absent)}): {', '.join(absent)}",
+              flush=True)
+
+
+def _pr_curve_from_histograms(pos_hist, neg_hist, bins=RISK_BINS):
+    """Exact TP/FP/FN/precision/recall/F1/alert-rate at every bin boundary.
+
+    `_evaluate` already accumulates the risk scores into `pos_hist`/`neg_hist`
+    on the device, so the whole precision-recall curve is two reversed cumulative
+    sums away -- no second pass over 1.02M validation windows and no 1.02M-float
+    score array on the host.
+
+    The binning is exact, not approximate. A score lands in bin
+    `floor(p * (bins - 1))`, and `floor(p * (bins-1)) >= b` iff `p >= b/(bins-1)`,
+    so the threshold that bin boundary `b` represents is exactly `b/(bins-1)` and
+    the counts above it are exactly the tail sums. Verified against
+    `sklearn.metrics.precision_recall_curve` on 200k scores quantised onto this
+    grid: maximum precision and recall difference **0.0**, and TP/FP/alert-rate
+    reproduced exactly by brute force at eight thresholds
+    (tests/test_branch_a_operating_point.py).
+
+    Precision where nothing is predicted positive is defined as 1.0, which is
+    sklearn's convention; `alert_rate` is 0 there, so such a point can never be
+    selected by a criterion that requires alerting.
+    """
+    ph = np.asarray(pos_hist, dtype=np.float64)
+    nh = np.asarray(neg_hist, dtype=np.float64)
+    P, N = float(ph.sum()), float(nh.sum())
+    tp = np.cumsum(ph[::-1])[::-1]          # tp[b] = positives in bins >= b
+    fp = np.cumsum(nh[::-1])[::-1]
+    pred_pos = tp + fp
+    with np.errstate(divide="ignore", invalid="ignore"):
+        precision = np.where(pred_pos > 0, tp / np.maximum(pred_pos, 1.0), 1.0)
+        recall = (tp / P) if P > 0 else np.zeros_like(tp)
+        denom = precision + recall
+        f1 = np.where(denom > 0, 2 * precision * recall / np.maximum(denom, 1e-12), 0.0)
+    return {
+        "threshold": np.arange(bins, dtype=np.float64) / (bins - 1),
+        "tp": tp, "fp": fp, "fn": P - tp, "tn": N - fp,
+        "precision": precision, "recall": recall, "f1": f1,
+        "alert_rate": pred_pos / max(P + N, 1.0),
+        "n_positive": P, "n_negative": N,
+        "base_rate": P / max(P + N, 1.0),
+    }
+
+
+def _point(curve, b):
+    """One operating point off the curve, as plain floats."""
+    return {
+        "alert_threshold": float(curve["threshold"][b]),
+        "precision": float(curve["precision"][b]),
+        "recall": float(curve["recall"][b]),
+        "f1": float(curve["f1"][b]),
+        "alert_rate": float(curve["alert_rate"][b]),
+        "tp": int(curve["tp"][b]), "fp": int(curve["fp"][b]),
+        "fn": int(curve["fn"][b]), "tn": int(curve["tn"][b]),
+    }
+
+
+def _downsample_pr_curve(curve, n_points=101):
+    """~100 points along the recall axis, for the report.
+
+    Sampled by recall rather than by threshold: recall is the axis an operator
+    reasons about ("what fraction of attacks do I see?"), and threshold-uniform
+    sampling wastes most of its points on the flat high-threshold tail where
+    almost nothing changes. Recall is non-increasing in threshold, so for each
+    target recall the highest threshold that still reaches it is also the
+    highest-precision way to reach it.
+    """
+    rec = curve["recall"]
+    out, seen = [], set()
+    for target in np.linspace(0.0, 1.0, n_points):
+        ok = np.nonzero(rec >= target)[0]
+        if ok.size == 0:
+            continue
+        b = int(ok[-1])
+        if b in seen:
+            continue
+        seen.add(b)
+        out.append(_point(curve, b))
+    return sorted(out, key=lambda d: d["alert_threshold"])
+
+
+def fit_operating_point(pos_hist, neg_hist, *, criterion="budgeted_f1",
+                        alert_budget=2.0, bins=RISK_BINS):
+    """Choose the threshold Branch A's risk head alerts at, on VALIDATION.
+
+    ## Why this has to be fitted at all
+
+    `--risk-objective bce` changed what `risk_score` means: it is now
+    P(next window is an attack window), not the old severity magnitude
+    (0.0 benign, 0.50-0.96 by tactic). Serving's historical cut was 0.65,
+    chosen against the severity scale. A calibrated probability on a ~17.5%
+    base rate almost never reaches 0.65 -- measured on a synthetic head with
+    this corpus's base rate, it fires on 0.9% of windows and recalls 5.4% of
+    attacks. Carrying the old cut across would turn the detector off, and the
+    failure presents to an operator as "no attacks today".
+
+    ## Why the default is not max-F1
+
+    Max-F1 is the obvious criterion and it is the wrong default alone, because
+    it prices a false positive and a false negative the same and is blind to
+    volume. A SOC has a finite alert budget; a threshold that produces 10,000
+    alerts a shift produces zero read alerts. F1 cannot see that -- it has no
+    term for how many windows fire.
+
+    So the default is **max F1 subject to an alert-rate budget**:
+
+        alert_rate <= alert_budget * base_rate      (default 2x)
+
+    A budget expressed as a multiple of the base rate rather than an absolute
+    number is scale-free: at perfect precision the alert rate IS the base rate,
+    so 2x is "at most one false alert for every true one, at full recall", and
+    the constraint keeps its meaning on a corpus with a different attack
+    density. It is a guard rail rather than a thumb on the scale -- on the
+    synthetic check in tests/test_branch_a_operating_point.py the unconstrained
+    max-F1 point (alert rate 0.172) sits inside a 0.348 budget and the budget
+    does not bind at all.
+
+    `max_f1` (unconstrained) and `max_recall_at_budget` (highest recall inside
+    the budget, for a deployment that would rather chase false positives than
+    miss an intrusion) are both available. Whichever is used, the unconstrained
+    max-F1 point is also recorded, so the cost of the budget is visible rather
+    than implied.
+
+    Degenerate points are excluded: a threshold that alerts on everything, or
+    on nothing, is not an operating point. Same rule as
+    `cyberworld_v4.benchmark.choose_threshold`.
+
+    Returns None when the split cannot support a threshold (one class only),
+    because a fabricated threshold would be silently served.
+    """
+    curve = _pr_curve_from_histograms(pos_hist, neg_hist, bins=bins)
+    P, N = curve["n_positive"], curve["n_negative"]
+    if P <= 0 or N <= 0:
+        return {
+            "fitted": False,
+            "reason": (f"validation split has {int(P)} attack and {int(N)} benign "
+                       f"windows; a threshold needs both classes"),
+            "base_rate": curve["base_rate"],
+        }
+
+    base_rate = curve["base_rate"]
+    budget = float(alert_budget) * base_rate
+    usable = (curve["alert_rate"] > 0.0) & (curve["alert_rate"] < 1.0)
+    within = usable & (curve["alert_rate"] <= budget)
+
+    b_max_f1 = int(np.argmax(np.where(usable, curve["f1"], -1.0)))
+    max_f1_point = _point(curve, b_max_f1)
+
+    if criterion == "max_f1":
+        b, why = b_max_f1, "max F1 over all non-degenerate thresholds"
+    elif criterion in ("budgeted_f1", "max_recall_at_budget"):
+        if not within.any():
+            # Every usable threshold is over budget. Say so and fall back to
+            # max-F1 rather than returning the most extreme in-budget point,
+            # which would be no point at all.
+            b, why = b_max_f1, (
+                f"max F1; NO threshold met the alert budget "
+                f"{budget:.4f} ({alert_budget}x base rate {base_rate:.4f}), "
+                f"so the budget was reported and not applied")
+        elif criterion == "budgeted_f1":
+            b = int(np.argmax(np.where(within, curve["f1"], -1.0)))
+            why = (f"max F1 subject to alert_rate <= {budget:.4f} "
+                   f"({alert_budget}x the {base_rate:.4f} validation base rate)")
+        else:
+            b = int(np.argmax(np.where(within, curve["recall"], -1.0)))
+            why = (f"max recall subject to alert_rate <= {budget:.4f} "
+                   f"({alert_budget}x the {base_rate:.4f} validation base rate)")
+    else:
+        raise ValueError(f"unknown operating-point criterion {criterion!r}")
+
+    op = _point(curve, b)
+    op.update({
+        "fitted": True,
+        "criterion": why,
+        "criterion_name": criterion,
+        "alert_budget_multiple": float(alert_budget),
+        "alert_budget": budget,
+        "base_rate": base_rate,
+        "n_positive": int(P), "n_negative": int(N),
+        "split": "validation",
+        "score_bins": int(bins),
+        "unconstrained_max_f1": max_f1_point,
+        "curve": _downsample_pr_curve(curve),
+    })
+    return op
+
+
+def _print_operating_point(op, where):
+    if not op:
+        return
+    if not op.get("fitted"):
+        print(f"  operating point [{where}]: NOT FITTED -- {op.get('reason')}",
+              flush=True)
+        return
+    m = op["unconstrained_max_f1"]
+    print(f"  operating point [{where}]: threshold={op['alert_threshold']:.4f} "
+          f"precision={op['precision']:.4f} recall={op['recall']:.4f} "
+          f"f1={op['f1']:.4f} alert_rate={op['alert_rate']:.4f} "
+          f"(base rate {op['base_rate']:.4f})", flush=True)
+    print(f"    criterion: {op['criterion']}", flush=True)
+    print(f"    unconstrained max-F1 would be threshold={m['alert_threshold']:.4f} "
+          f"f1={m['f1']:.4f} recall={m['recall']:.4f} "
+          f"alert_rate={m['alert_rate']:.4f}", flush=True)
+    # What the historical cut would have done to the SAME head. This is the
+    # number that says whether carrying 0.65 across would have been silent.
+    legacy = op.get("legacy_0_65")
+    if legacy:
+        print(f"    the legacy 0.65 cut on this head: recall={legacy['recall']:.4f} "
+              f"alert_rate={legacy['alert_rate']:.4f} f1={legacy['f1']:.4f}",
+              flush=True)
+
+
+#: Gradation is a 4-level severity ladder, not a technique. GRADATION_LEVELS
+#: maps several coarse categories onto the same level (InitialAccess and
+#: Execution both -> 2; C2, LateralMovement, Exfiltration and Impact all -> 3),
+#: so a level's name has to say which categories it covers or a per-class table
+#: is unreadable.
+GRADATION_NAMES = {
+    0: "0 Benign",
+    1: "1 Recon/Unknown",
+    2: "2 InitialAccess/Exec",
+    3: "3 C2/Lateral/Exfil/Impact",
+}
+
+
+def _print_per_class(per_class, where, names=None, label="technique"):
     """Per-class precision/recall/f1/support, largest class first."""
     if not per_class:
         return
-    inv = {v: k for k, v in TECH_TO_IDX.items()}
-    print(f"  per-class ({where}):", flush=True)
-    print(f"    {'technique':<28} {'prec':>6} {'recall':>7} {'f1':>6} "
+    inv = names if names is not None else {v: k for k, v in TECH_TO_IDX.items()}
+    print(f"  per-class {label} ({where}):", flush=True)
+    print(f"    {label:<28} {'prec':>6} {'recall':>7} {'f1':>6} "
           f"{'support':>9} {'predicted':>10}", flush=True)
     for c, m in sorted(per_class.items(), key=lambda kv: -kv[1]["support"]):
         print(f"    {inv.get(c, f'class_{c}'):<28} {m['precision']:>6.3f} "
@@ -202,6 +692,81 @@ def _warn_if_risk_head_useless(metrics, where):
         print(f"  WARNING [{where}]: risk Brier {brier:.4f} is no better than "
               f"predicting the base rate {metrics.get('risk_base_rate', 0):.4f} "
               f"for every host ({base:.4f}).", flush=True)
+
+
+def _metrics_from_confusion(cm):
+    """Accuracy, macro F1, majority baseline, lift and per-class, from one cm.
+
+    Shared by the technique and gradation heads. It was written once for
+    technique; the gradation head had **no evaluation at all** before
+    2026-09-22 beyond aggregate accuracy, which on a ladder whose level 0 is
+    82.5% of the corpus is the same metric that could not fail for technique.
+    Two heads with the same class-prior problem get the same instrument.
+    """
+    cm = np.asarray(cm)
+    support = cm.sum(axis=1)             # true count per class
+    predicted = cm.sum(axis=0)           # predicted count per class
+    tp = np.diag(cm)
+    present = support > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        precision = np.where(predicted > 0, tp / np.maximum(predicted, 1), 0.0)
+        recall = np.where(support > 0, tp / np.maximum(support, 1), 0.0)
+        denom = precision + recall
+        f1 = np.where(denom > 0, 2 * precision * recall / np.maximum(denom, 1e-12), 0.0)
+    total = int(support.sum())
+    accuracy = float(tp.sum() / max(total, 1))
+    baseline = float(support.max() / max(total, 1)) if total else 0.0
+    return {
+        "accuracy": accuracy,
+        "macro_f1": float(f1[present].mean()) if present.any() else 0.0,
+        "majority_baseline": baseline,
+        "lift_over_baseline": accuracy - baseline,
+        "classes_present": int(present.sum()),
+        "classes_predicted": int((predicted > 0).sum()),
+        "per_class": {
+            int(c): {
+                "precision": float(precision[c]),
+                "recall": float(recall[c]),
+                "f1": float(f1[c]),
+                "support": int(support[c]),
+                "predicted": int(predicted[c]),
+            }
+            for c in range(cm.shape[0]) if support[c] > 0 or predicted[c] > 0
+        },
+        "n": total,
+    }
+
+
+def _warn_if_gradation_collapsed(metrics, where):
+    """The gradation head gets the same scrutiny as the technique head.
+
+    It had never been scored beyond `gradation_accuracy`, which was added on
+    2026-09-22. That single number cannot fail on this corpus for exactly the
+    reason the technique accuracy could not: GRADATION_LEVELS sends every
+    benign window to level 0, so a head that emits 0 for everything scores
+    ~0.825 and looks like it works.
+    """
+    pred = metrics.get("gradation_classes_predicted", 0)
+    present = metrics.get("gradation_classes_present", 0)
+    lift = metrics.get("gradation_lift_over_baseline", 0.0)
+    f1 = metrics.get("gradation_macro_f1", 0.0)
+    acc = metrics.get("gradation_accuracy") or 0.0
+    if present <= 1:
+        return
+    if pred <= 1:
+        print(f"  WARNING [{where}]: gradation head predicts a SINGLE level for "
+              f"every input ({present} levels present). Its accuracy {acc:.3f} "
+              f"is the class prior, not a result.", flush=True)
+    elif lift < 0.01:
+        print(f"  WARNING [{where}]: gradation accuracy {acc:.3f} is within 1 "
+              f"point of the majority-level baseline "
+              f"{metrics.get('gradation_majority_baseline', 0):.3f} -- the head "
+              f"is adding almost nothing.", flush=True)
+    elif f1 < 0.2 and present > 2:
+        print(f"  WARNING [{where}]: gradation macro F1 {f1:.3f} over {present} "
+              f"levels -- accuracy {acc:.3f} is carried by level 0 while the "
+              f"escalation levels are largely missed. Consider "
+              f"--gradation-class-weights.", flush=True)
 
 
 def _warn_if_head_collapsed(metrics, where):
@@ -236,7 +801,8 @@ def _warn_if_head_collapsed(metrics, where):
               flush=True)
 
 
-def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
+def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
+              risk_positive_above=0.0, collect_logits=False):
     """Validation pass.
 
     Accumulators live on the device and are read once at the end. An earlier
@@ -271,6 +837,11 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
     neg_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     brier_sum = torch.zeros((), device=device, dtype=torch.float64)
     prob_sum = torch.zeros((), device=device, dtype=torch.float64)
+    # |prediction - target|, binned. The conformal half-width is a quantile of
+    # this, and a quantile needs the distribution, not a running mean. A fixed
+    # histogram gives it to within one bin (5e-4) for 16 KB, where the exact
+    # route would either hold 1.02M floats or cost a second pass.
+    resid_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
 
     task_sums = {k: torch.zeros((), device=device, dtype=torch.float64)
                  for k in ("loss_risk", "loss_tech", "loss_grad",
@@ -282,6 +853,14 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
 
     grad_correct = torch.zeros((), device=device, dtype=torch.long)
     grad_total = 0
+    G = int(num_gradations) if num_gradations else 4
+    grad_confusion = torch.zeros(G * G, device=device, dtype=torch.long)
+
+    # Raw technique logits + labels, for post-hoc temperature scaling. Held on
+    # the host because the device copy would be [N, C] float32 -- 57 MB at the
+    # 1.02M-sample validation split, which is fine, but a calibration pass is
+    # the only caller and it runs once.
+    keep_logits, keep_labels = [], []
 
     with torch.no_grad():
         for batch in loader:
@@ -307,14 +886,24 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
             err = (predictions["risk_score"] - targets["risk"]).abs()
             abs_err_sum += err.double().sum()
             n_risk += int(err.numel())
+            _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
+            resid_hist += torch.bincount(_rb.reshape(-1), minlength=RISK_BINS)
 
             # Risk as a probability: AUC, Brier and calibration, accumulated
             # from a fixed histogram so 1.02M samples cost O(bins) memory and
             # no host-device sync. MAE alone cannot judge this head -- on a
             # target that is 0 for 82.5% of samples the MAE-optimal constant
             # is 0, so a well-fit head can still "lose" to predicting nothing.
+            # Which windows count as positive for AUC / Brier / ECE / the
+            # operating point. With the severity target the event is "this is
+            # an attack window", i.e. risk > 0. With the hazard target
+            # (exp(-dt/tau)) risk > 0 degenerates to "this host is attacked at
+            # SOME later point", which discards the timing the hazard exists
+            # to carry; the operationally meaningful event there is "an attack
+            # occurs within one forecast horizon", i.e. hazard >= exp(-1).
+            # `risk_positive_above` carries whichever the caller means.
             _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
-            _y = (targets["risk"] > 0).reshape(-1)
+            _y = (targets["risk"] > risk_positive_above).reshape(-1)
             brier_sum += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
             _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
             pos_hist += torch.bincount(_b[_y], minlength=RISK_BINS)
@@ -329,38 +918,33 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
 
             if "gradation_logits" in predictions:
                 pred_g = predictions["gradation_logits"].argmax(dim=-1)
-                grad_correct += (pred_g == targets["gradation"]).sum()
-                grad_total += int(targets["gradation"].numel())
+                true_g = targets["gradation"]
+                grad_correct += (pred_g == true_g).sum()
+                grad_total += int(true_g.numel())
+                grad_confusion += torch.bincount(true_g * G + pred_g,
+                                                 minlength=G * G)
+
+            if collect_logits:
+                _raw = predictions.get("technique_logits_raw")
+                if _raw is None:
+                    _raw = predictions["technique_logits"]
+                keep_logits.append(_raw.detach().float().cpu())
+                keep_labels.append(true_t.detach().cpu())
 
     correct_tech = int(correct_tech_t.item())
     cm = confusion.reshape(C, C).cpu().numpy()
+    tech = _metrics_from_confusion(cm)
+    macro_f1 = tech["macro_f1"]
+    baseline = tech["majority_baseline"]
+    accuracy = tech["accuracy"]
+    per_class = tech["per_class"]
+    present = np.asarray(cm).sum(axis=1) > 0
 
-    support = cm.sum(axis=1)             # true count per class
-    predicted = cm.sum(axis=0)           # predicted count per class
-    tp = np.diag(cm)
-
-    present = support > 0                # classes that actually occur
-    with np.errstate(divide="ignore", invalid="ignore"):
-        precision = np.where(predicted > 0, tp / np.maximum(predicted, 1), 0.0)
-        recall = np.where(support > 0, tp / np.maximum(support, 1), 0.0)
-        denom = precision + recall
-        f1 = np.where(denom > 0, 2 * precision * recall / np.maximum(denom, 1e-12), 0.0)
-
-    macro_f1 = float(f1[present].mean()) if present.any() else 0.0
-    # What "always predict the most common class" would score.
-    baseline = float(support.max() / max(support.sum(), 1)) if support.sum() else 0.0
-    accuracy = correct_tech / max(1, total)
-
-    per_class = {
-        int(c): {
-            "precision": float(precision[c]),
-            "recall": float(recall[c]),
-            "f1": float(f1[c]),
-            "support": int(support[c]),
-            "predicted": int(predicted[c]),
-        }
-        for c in range(C) if support[c] > 0 or predicted[c] > 0
-    }
+    # The gradation head, scored the same way. Until 2026-09-22 nothing
+    # measured it at all; then it got aggregate accuracy, which on a ladder
+    # that is 82.5% level 0 is the metric that already failed to fail for
+    # technique.
+    grad = _metrics_from_confusion(grad_confusion.reshape(G, G).cpu().numpy())
 
     # AUC exactly from the histogram: for each score bin, every negative in a
     # strictly lower bin is a win and every negative in the same bin is a tie.
@@ -399,7 +983,22 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4):
         "tech_classes_present": int(present.sum()),
         "tech_classes_predicted": int((predicted > 0).sum()),
         "tech_per_class": per_class,
+        # -- the gradation head, judged the same way as the technique head --
         "gradation_accuracy": (float(grad_correct.item()) / grad_total) if grad_total else None,
+        "gradation_macro_f1": grad["macro_f1"],
+        "gradation_majority_baseline": grad["majority_baseline"],
+        "gradation_lift_over_baseline": grad["lift_over_baseline"],
+        "gradation_classes_present": grad["classes_present"],
+        "gradation_classes_predicted": grad["classes_predicted"],
+        "gradation_per_class": grad["per_class"],
+        # Raw histograms, so a caller can fit an operating point without a
+        # second pass over the split. 2 x 2000 int64 -- 32 KB.
+        "risk_pos_hist": pos_hist.cpu().numpy(),
+        "risk_neg_hist": neg_hist.cpu().numpy(),
+        "risk_resid_hist": resid_hist.cpu().numpy(),
+        "risk_positive_above": float(risk_positive_above),
+        "technique_logits": (torch.cat(keep_logits) if keep_logits else None),
+        "technique_labels": (torch.cat(keep_labels) if keep_labels else None),
     }
 
 
@@ -414,14 +1013,83 @@ def main():
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--risk-objective", choices=("bce", "smooth_l1"),
+    parser.add_argument("--risk-objective", choices=("bce", "soft_bce", "smooth_l1"),
                         default="bce",
                         help="How the risk head is trained. 'bce' predicts "
                              "P(next window is an attack window) -- calibrated, "
                              "and judged by AUC/Brier which match the loss. "
+                             "'soft_bce' is the same proper scoring rule "
+                             "against a CONTINUOUS target in [0,1]; it is the "
+                             "right pairing for --risk-target hazard, which "
+                             "'bce' would binarise and throw away. "
                              "'smooth_l1' is the original scalar regression, "
-                             "kept to reproduce the 2026-09-21 run; it cannot "
-                             "beat a constant on MAE by construction.")
+                             "kept to reproduce the 2026-09-21 run; against "
+                             "the severity target it cannot beat a constant on "
+                             "MAE by construction.")
+    parser.add_argument("--risk-target", choices=("severity", "hazard"),
+                        default="severity",
+                        help="What the risk head is asked to predict. "
+                             "'severity' (default, unchanged) is the "
+                             "base_severity(tactic)+density+volume score "
+                             "written during extraction -- it describes THIS "
+                             "window, so predicting it is detection with a "
+                             "one-step delay rather than forecasting. "
+                             "'hazard' is exp(-dt/tau), seconds until the "
+                             "host's next attack window: continuous, monotone "
+                             "in time and independent of the tactic label. The "
+                             "default is deliberately unchanged -- swapping the "
+                             "target changes what the model learns and deserves "
+                             "a measured A/B, not a silent default.")
+    parser.add_argument("--hazard-tau", type=float, default=None,
+                        help="Decay scale for --risk-target hazard, in seconds. "
+                             "Default forecast_steps * window_seconds (= 10.0s "
+                             "under v4), so a host exactly one forecast horizon "
+                             "from an attack scores exp(-1) = 0.368 -- which is "
+                             "also the cut that defines the positive class for "
+                             "AUC/Brier/the operating point under this target.")
+    parser.add_argument("--focal-gamma", type=float, default=2.0,
+                        help="Focusing exponent of the technique focal loss. "
+                             "2.0 is Lin et al.'s value and the one this head "
+                             "has always used; exposed because gamma and the "
+                             "per-class alpha both correct imbalance and their "
+                             "combination has never been swept on this corpus.")
+    parser.add_argument("--no-focal-alpha", action="store_true",
+                        help="Train the technique head with a FLAT focal alpha. "
+                             "The default is the damped, clipped, geometric-mean "
+                             "centred inverse-frequency weighting computed from "
+                             "the training split -- the class balancing the "
+                             "loss's own docstring has always claimed and, "
+                             "before 2026-09-22, never did (alpha was None).")
+    parser.add_argument("--gradation-class-weights", action="store_true",
+                        help="Weight the gradation cross-entropy by inverse "
+                             "class frequency. OFF by default: the head had "
+                             "never been evaluated at all until 2026-09-22, and "
+                             "re-weighting a head before measuring it is "
+                             "guessing. Turn it on when the per-class table "
+                             "shows it collapsing onto level 0.")
+    parser.add_argument("--operating-point-criterion",
+                        choices=("budgeted_f1", "max_f1", "max_recall_at_budget"),
+                        default="budgeted_f1",
+                        help="How the served alert threshold is chosen from the "
+                             "validation precision-recall curve. See "
+                             "fit_operating_point for why max-F1 is not the "
+                             "default.")
+    parser.add_argument("--alert-budget", type=float, default=2.0,
+                        help="Alert-rate budget as a MULTIPLE of the validation "
+                             "base rate. 2.0 means at most one false alert per "
+                             "true one at full recall. Scale-free, so it keeps "
+                             "its meaning on a corpus with a different attack "
+                             "density.")
+    parser.add_argument("--no-fit-temperature", action="store_true",
+                        help="Skip post-hoc temperature scaling of the technique "
+                             "logits. Fitting is on by default and happens after "
+                             "training, on validation, with the model frozen.")
+    parser.add_argument("--conformal-alpha", type=float, default=0.05,
+                        help="Miscoverage rate for the risk head's split-conformal "
+                             "interval, fitted on validation residuals. On a "
+                             "binary target a 95%% interval is wide by "
+                             "construction; that is the honest answer, and the "
+                             "reason the hardcoded +/-0.05 was not one.")
     parser.add_argument("--patience", type=int, default=3,
                         help="Stop after N epochs without improving --select-on. "
                              "The best checkpoint is already written, so this "
@@ -429,7 +1097,12 @@ def main():
     parser.add_argument("--select-on", choices=("composite", "macro_f1", "val_loss"),
                         default="composite",
                         help="Which validation metric picks the kept checkpoint. "
-                             "Default 'composite' = 0.5*macro_f1 + 0.5*(1-risk_mae). "
+                             "Default 'composite' = 0.5*macro_f1 + 0.5*risk_auc. "
+                             "(It read '0.5*(1-risk_mae)' until 2026-09-22; that "
+                             "was the first version and the help text outlived "
+                             "it. MAE is median-seeking, so on a target that is "
+                             "0 for 82.5%% of samples it rewards predicting "
+                             "nothing -- which is why it was replaced by AUC.) "
                              "'val_loss' was the previous default but is not "
                              "comparable across epochs: the uncertainty-weighted "
                              "loss contains learned log-variance terms that drift "
@@ -439,8 +1112,14 @@ def main():
     parser.add_argument("--eval-only", type=str, default=None,
                         metavar="CKPT",
                         help="Score an existing checkpoint and exit; no "
-                             "training, no checkpoint is written. '-' means "
-                             "the path given by --output.")
+                             "training. The post-hoc fits ARE written back "
+                             "into it -- the operating point, the technique "
+                             "temperature and the conformal half-width -- "
+                             "because those need only a frozen model and a "
+                             "validation pass, and a finished checkpoint "
+                             "should not need a retrain to acquire them. "
+                             "Weights are never modified. '-' means the path "
+                             "given by --output.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader worker processes. 0 loads in the main "
                              "process, which serialises data loading with GPU "
@@ -570,19 +1249,68 @@ def main():
         # produce identical samples.
         return store
 
+    # tau defaults to the horizon the model is actually asked about, so a host
+    # exactly one forecast horizon from an attack scores exp(-1) = 0.368.
+    hazard_tau = (args.hazard_tau if args.hazard_tau is not None
+                  else _c.forecast_steps * _c.window_seconds)
+    #: The cut that makes a window "positive" for AUC / Brier / ECE / the
+    #: operating point. For the severity target, any non-zero score means the
+    #: window contains attack traffic. For the hazard target, `> 0` would mean
+    #: "this host is attacked at some later point in this split" -- nearly
+    #: constant, and it discards exactly the timing the hazard encodes. The
+    #: meaningful event is "an attack within one forecast horizon", which is
+    #: hazard >= exp(-tau/tau) = exp(-1). The epsilon makes the comparison
+    #: inclusive of a host sitting exactly on the horizon.
+    risk_positive_above = (0.0 if args.risk_target == "severity"
+                           else math.exp(-1.0) - 1e-6)
+
+    def _apply_risk_target(store, label):
+        """Swap in the hazard target, on every split or on none.
+
+        Applying it to some splits and not others would train against one
+        distribution and score against another, and the metrics would look
+        fine while meaning nothing -- so this is called from one place for all
+        three stores rather than at each call site.
+        """
+        if args.risk_target != "hazard":
+            return
+        summary = store.use_hazard_target(hazard_tau)
+        print(f"  [{label}] risk target -> hazard(tau={hazard_tau:.1f}s): "
+              f"zero fraction {summary['zero_fraction_before']:.4f} -> "
+              f"{summary['zero_fraction_after']:.4f} | {summary}", flush=True)
+
     import gc
     t0 = time.time()
     train_store = _store_per_capture(train_files, "train")
+    _apply_risk_target(train_store, "train")
     train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1)
     print(f"train done in {time.time()-t0:.1f}s ({len(train_ds)} samples)", flush=True)
     t0 = time.time()
     val_store = _store_per_capture(val_files, "val")
+    _apply_risk_target(val_store, "val")
     val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1)
     print(f"val done in {time.time()-t0:.1f}s ({len(val_ds)} samples)", flush=True)
     t0 = time.time()
     test_store = _store_per_capture(test_files, "test")
+    _apply_risk_target(test_store, "test")
     test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1)
     print(f"test done in {time.time()-t0:.1f}s ({len(test_ds)} samples)", flush=True)
+
+    # Pairing guard. `bce` binarises at risk > 0; under the hazard target that
+    # question is "is this host ever attacked later", which is not what the
+    # target encodes and is nearly constant on this corpus. Loud, not fatal --
+    # it is a legitimate ablation, just not a sensible default.
+    if args.risk_target == "hazard" and args.risk_objective == "bce":
+        print("\nWARNING: --risk-target hazard with --risk-objective bce "
+              "binarises exp(-dt/tau) at > 0, which discards the timing the "
+              "hazard target exists to carry and leaves a near-constant label. "
+              "--risk-objective soft_bce is the proper scoring rule for a "
+              "continuous target in [0, 1].\n", flush=True)
+    if args.risk_target == "severity" and args.risk_objective == "soft_bce":
+        print("\nWARNING: --risk-objective soft_bce against the severity "
+              "target regresses a bimodal variable (82.5% exactly 0, the rest "
+              "0.50-0.96) with a mean-seeking loss -- the same failure mode as "
+              "smooth_l1.\n", flush=True)
 
     # Gate the data before training on it.
     try:
@@ -619,6 +1347,47 @@ def main():
         **_loader_kw,
     )
 
+    # Per-class focal alpha, computed from the TRAINING split only.
+    #
+    # Before 2026-09-22 this head was constructed as
+    # `MultiClassFocalLoss(gamma=2.0)` -- alpha=None -- so it did no class
+    # balancing whatsoever, while its own docstring described per-class
+    # weighting as the reason it existed. The geometric-mean-normalised
+    # weighting that the TGNE encoder's loss already used
+    # (bita/train.py::FocalLoss) had never been carried across to Branch A.
+    #
+    # Counted from the store's columns, not by iterating the dataset: 20.7M
+    # targets, and a label count needs none of the feature windows.
+    from branch_a_gnn_lstm.lstm_multitask import MultiClassFocalLoss
+    _t_counts, _g_counts = target_label_counts(train_ds)
+    _inv_tech = {v: k for k, v in TECH_TO_IDX.items()}
+    _print_class_counts(_t_counts, _inv_tech, "technique")
+    _print_class_counts(_g_counts, GRADATION_NAMES, "gradation")
+
+    focal_alpha = None
+    if not args.no_focal_alpha:
+        focal_alpha = MultiClassFocalLoss.alpha_from_counts(
+            _t_counts, len(TECHNIQUE_VOCAB))
+        print(f"  focal alpha: "
+              f"{ {_inv_tech.get(i, i): round(float(w), 3) for i, w in enumerate(focal_alpha) if _t_counts[i] > 0} }",
+              flush=True)
+        _pinned = int(((focal_alpha <= 0.2 + 1e-9) | (focal_alpha >= 5.0 - 1e-9))
+                      .logical_and(torch.as_tensor(_t_counts > 0)).sum())
+        _present = int((_t_counts > 0).sum())
+        if _pinned > _present // 2:
+            print(f"  WARNING: {_pinned} of {_present} present classes are "
+                  f"pinned at a clip bound, so the loss does no balancing "
+                  f"between them. Class frequencies span "
+                  f"{_t_counts[_t_counts > 0].max() / max(_t_counts[_t_counts > 0].min(), 1):.0f}x.",
+                  flush=True)
+
+    grad_weights = None
+    if args.gradation_class_weights:
+        grad_weights = MultiClassFocalLoss.alpha_from_counts(_g_counts, 4)
+        print(f"  gradation class weights: "
+              f"{ {GRADATION_NAMES.get(i, i): round(float(w), 3) for i, w in enumerate(grad_weights)} }",
+              flush=True)
+
     model = MultiTaskLSTM(
         input_dim=27,
         hidden_dim=64,
@@ -626,7 +1395,12 @@ def main():
         num_techniques=len(TECHNIQUE_VOCAB),
         num_gradations=4,
         risk_objective=args.risk_objective,
+        focal_gamma=args.focal_gamma,
+        gradation_class_weights=(grad_weights.to(device)
+                                 if grad_weights is not None else None),
     ).to(device)
+    if focal_alpha is not None:
+        model.tech_focal_loss.alpha = focal_alpha.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     best_loss = float("-inf")       # _selection_score is maximised
     _since_improve = 0
@@ -664,9 +1438,17 @@ def main():
         # side with the same metric set.
         _tl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                          **_loader_kw)
+        _fits = None
         for _name, _ldr in (("validation", val_loader), ("held-out test", _tl)):
-            _m = _evaluate(model, _ldr, device, num_techniques=len(TECHNIQUE_VOCAB))
+            # Logits are collected on validation only: that is the split a
+            # temperature may honestly be fitted on, and collecting them on
+            # test would invite exactly the mistake.
+            _m = _evaluate(model, _ldr, device, num_techniques=len(TECHNIQUE_VOCAB),
+                           risk_positive_above=risk_positive_above,
+                           collect_logits=(_name == "validation"
+                                           and not args.no_fit_temperature))
             _pc = _m.pop("tech_per_class", {})
+            _gpc = _m.pop("gradation_per_class", {})
             print(f"\n{_name.upper()}: "
                   f"loss={_m['loss']:.4f} risk_mae={_m['risk_mae']:.4f} "
                   f"acc={_m['tech_accuracy']:.4f} "
@@ -675,9 +1457,40 @@ def main():
                   f"lift={_m['tech_lift_over_baseline']:+.4f} "
                   f"classes_pred={_m['tech_classes_predicted']}"
                   f"/{_m['tech_classes_present']} "
-                  f"gradation_acc={_m['gradation_accuracy']}", flush=True)
+                  f"| gradation acc={_m['gradation_accuracy']} "
+                  f"macro_f1={_m['gradation_macro_f1']:.4f} "
+                  f"baseline={_m['gradation_majority_baseline']:.4f} "
+                  f"lift={_m['gradation_lift_over_baseline']:+.4f} "
+                  f"levels_pred={_m['gradation_classes_predicted']}"
+                  f"/{_m['gradation_classes_present']} "
+                  f"| risk auc={_m['risk_auc']:.4f} "
+                  f"brier={_m['risk_brier']:.4f} ece={_m['risk_ece']:.4f}",
+                  flush=True)
             _warn_if_head_collapsed(_m, _name)
+            _warn_if_gradation_collapsed(_m, _name)
+            _warn_if_risk_head_useless(_m, _name)
             _print_per_class(_pc, _name)
+            _print_per_class(_gpc, _name, names=GRADATION_NAMES, label="gradation")
+            if _name == "validation":
+                # Fit the post-hoc parameters on validation and write them
+                # back into the checkpoint that was just scored. This is the
+                # whole reason --eval-only exists for a finished run: a
+                # trained Branch A on disk can get an operating point without
+                # paying for another retrain, and extraction (the expensive
+                # part, ~37 min) is identical either way.
+                _fits = calibrate_and_fit_operating_point(model, _m, args)
+        if _fits is not None:
+            _ck["operating_point"] = _fits["operating_point"]
+            _ck["technique_calibration"] = _fits.get("temperature")
+            _ck["risk_conformal"] = _fits.get("risk_conformal")
+            _ck["model_state_dict"] = model.state_dict()
+            _tc = dict(_ck.get("training_contract") or {})
+            _tc["risk_objective"] = args.risk_objective
+            _tc["risk_target"] = args.risk_target
+            _ck["training_contract"] = _tc
+            torch.save(_ck, _src)
+            print(f"\nwrote fitted operating point / calibration back to {_src}",
+                  flush=True)
         return
 
     for epoch in range(1, args.epochs + 1):
@@ -719,7 +1532,9 @@ def main():
                       f"{_rate:.1f} batch/s elapsed={_el / 60:.1f}m "
                       f"eta={_eta / 60:.1f}m", flush=True)
 
-        metrics = _evaluate(model, val_loader, device)
+        metrics = _evaluate(model, val_loader, device,
+                            num_techniques=len(TECHNIQUE_VOCAB),
+                            risk_positive_above=risk_positive_above)
         metrics["epoch"] = epoch
         metrics["train_loss"] = float((_loss_sum / max(_nb, 1)).item())
         metrics["epoch_seconds"] = float(time.time() - _t_epoch)
@@ -737,20 +1552,29 @@ def main():
             f"grad={metrics['weight_grad']:.2f} "
             f"| risk auc={metrics['risk_auc']:.4f} brier={metrics['risk_brier']:.4f} "
             f"(base {metrics['risk_brier_baseline']:.4f}) ece={metrics['risk_ece']:.4f} "
+            f"| gradation acc={metrics['gradation_accuracy']} "
+            f"macro_f1={metrics['gradation_macro_f1']:.3f} "
+            f"lift={metrics['gradation_lift_over_baseline']:+.3f} "
+            f"levels_pred={metrics['gradation_classes_predicted']}"
+            f"/{metrics['gradation_classes_present']} "
             f"wall={metrics['epoch_seconds'] / 60:.1f}m"
         )
         _warn_if_head_collapsed(metrics, f"epoch {epoch}")
+        _warn_if_gradation_collapsed(metrics, f"epoch {epoch}")
         _warn_if_risk_head_useless(metrics, f"epoch {epoch}")
         # Keep every epoch's validation metrics. Only the best-scoring weights
         # are written, so without this the other epochs are unrecoverable and
         # a selection decision cannot be revisited without a full retrain.
-        _history.append({k: v for k, v in metrics.items() if k != "tech_per_class"})
+        _history.append(slim(metrics, drop_per_class=True))
         _score = _selection_score(metrics, args.select_on)
         metrics["selection_score"] = _score
         metrics["selection_metric"] = args.select_on
         if _score > best_loss:
             best_loss = _score
-            best_metrics = metrics
+            # `slim` strips the score histograms and the collected logits.
+            # They are working data for the post-hoc fits, not results, and a
+            # checkpoint that carried them per epoch would be gigabytes.
+            best_metrics = slim(metrics)
             _since_improve = 0
             args.output.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -770,6 +1594,26 @@ def main():
                         "forecast_steps": _c.forecast_steps,
                         "feature_dim": _cfg.state_dim,
                         "sources": [str(args.cic_dir), str(args.ctu_dir)],
+                        # What `risk_score` MEANS. Serving reads this to decide
+                        # whether the number it is thresholding is a severity
+                        # magnitude or a probability -- and to say so loudly
+                        # when it is a probability with no fitted threshold.
+                        # It was not written before, so the adapter could only
+                        # guess, and its guess was the old severity scale.
+                        "risk_objective": args.risk_objective,
+                        "risk_target": args.risk_target,
+                        "hazard_tau_seconds": (hazard_tau
+                                               if args.risk_target == "hazard"
+                                               else None),
+                        "focal_gamma": args.focal_gamma,
+                    },
+                    "focal_alpha": (focal_alpha.detach().cpu().tolist()
+                                    if focal_alpha is not None else None),
+                    "train_class_counts": {
+                        "technique": {_inv_tech.get(i, i): int(c)
+                                      for i, c in enumerate(_t_counts)},
+                        "gradation": {GRADATION_NAMES.get(i, i): int(c)
+                                      for i, c in enumerate(_g_counts)},
                     },
                     "config": _cfg.to_dict(),
                     "manifest": _manifest.to_dict(),
@@ -795,14 +1639,73 @@ def main():
     # estimate rather than a selection artefact.
     ckpt = torch.load(args.output, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
+
+    # Post-hoc calibration, and the served operating point.
+    #
+    # Order matters and is the point of doing it here: the weights are the
+    # FINAL selected ones, restored above, and nothing after this line trains.
+    # A temperature fitted before or during training is not temperature
+    # scaling; the previous implementation trained one jointly with the loss
+    # and then dropped it at inference.
+    #
+    # Validation is re-scored rather than reusing the best epoch's metrics,
+    # because those came from whatever the weights were at the end of that
+    # epoch and the technique logits were not kept. One extra pass over
+    # validation buys the fits for all three post-hoc parameters.
+    print("\nfitting post-hoc calibration and the operating point on "
+          "validation, model frozen", flush=True)
+    _val_metrics = _evaluate(model, val_loader, device,
+                             num_techniques=len(TECHNIQUE_VOCAB),
+                             risk_positive_above=risk_positive_above,
+                             collect_logits=not args.no_fit_temperature)
+    fits = calibrate_and_fit_operating_point(model, _val_metrics, args)
+    # The temperature and the conformal width are buffers, so the state_dict
+    # written below has to be re-taken AFTER the fit -- otherwise serving
+    # loads a calibrated checkpoint whose weights say it was never calibrated.
+    ckpt["model_state_dict"] = model.state_dict()
+    ckpt["operating_point"] = fits["operating_point"]
+    ckpt["technique_calibration"] = fits.get("temperature")
+    ckpt["risk_conformal"] = fits.get("risk_conformal")
+    ckpt["validation_metrics_at_fit"] = slim(_val_metrics)
+
     test_loader = DataLoader(test_ds,
                              batch_size=args.batch_size, shuffle=False, **_loader_kw)
-    test_metrics = _evaluate(model, test_loader, device)
+    test_metrics = _evaluate(model, test_loader, device,
+                             num_techniques=len(TECHNIQUE_VOCAB),
+                             risk_positive_above=risk_positive_above)
     _per_class = test_metrics.pop("tech_per_class", {})
-    print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): {test_metrics}", flush=True)
+    _grad_per_class = test_metrics.pop("gradation_per_class", {})
+    # `slim` keeps the histograms out of the printed line and out of the
+    # checkpoint; they are 2 x 2000 arrays of working data.
+    print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): "
+          f"{slim(test_metrics)}", flush=True)
     _warn_if_head_collapsed(test_metrics, "held-out test")
+    _warn_if_gradation_collapsed(test_metrics, "held-out test")
+    _warn_if_risk_head_useless(test_metrics, "held-out test")
     _print_per_class(_per_class, "held-out test")
+    _print_per_class(_grad_per_class, "held-out test", names=GRADATION_NAMES,
+                     label="gradation")
+    # What the fitted threshold actually delivers on data it was not chosen
+    # on. The operating point is fitted on validation and must never be
+    # re-fitted here -- that would make it a test-set artefact -- but scoring
+    # the SAME threshold on test is the only honest statement of what an
+    # operator will see.
+    _op = fits["operating_point"]
+    if _op.get("fitted"):
+        _tcurve = _pr_curve_from_histograms(test_metrics["risk_pos_hist"],
+                                            test_metrics["risk_neg_hist"])
+        _tb = int(round(_op["alert_threshold"] * (RISK_BINS - 1)))
+        _op["held_out_test"] = _point(_tcurve, _tb)
+        _t = _op["held_out_test"]
+        print(f"  operating point on HELD-OUT TEST (threshold "
+              f"{_op['alert_threshold']:.4f}, fitted on validation, not "
+              f"re-fitted): precision={_t['precision']:.4f} "
+              f"recall={_t['recall']:.4f} f1={_t['f1']:.4f} "
+              f"alert_rate={_t['alert_rate']:.4f} "
+              f"(test base rate {_tcurve['base_rate']:.4f})", flush=True)
+    test_metrics = slim(test_metrics)
     test_metrics["tech_per_class"] = _per_class
+    test_metrics["gradation_per_class"] = _grad_per_class
     # The credibility verdict travels WITH the checkpoint.
     #
     # It used to be computed, printed to stdout, and thrown away. The
@@ -835,7 +1738,8 @@ def main():
         print("WARNING: checkpoint saved but marked NOT CREDIBLE -- "
               "its metrics must not be reported as results.", flush=True)
 
-    print(f"saved={args.output} best_metrics={best_metrics} test_metrics={test_metrics}")
+    print(f"saved={args.output} best_metrics={slim(best_metrics, True)} "
+          f"test_metrics={slim(test_metrics, True)}")
 
 
 if __name__ == "__main__":

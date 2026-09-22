@@ -89,11 +89,38 @@ class MultiClassFocalLoss(nn.Module):
         """
         counts = np.bincount(
             np.asarray(labels, dtype=np.int64), minlength=num_classes
-        ).astype(np.float64)
+        )
+        return MultiClassFocalLoss.alpha_from_counts(
+            counts, num_classes, power=power, clip=clip)
+
+    @staticmethod
+    def alpha_from_counts(
+        counts,
+        num_classes: int,
+        *,
+        power: float = 0.5,
+        clip: Tuple[float, float] = (0.2, 5.0),
+    ) -> torch.Tensor:
+        """The weights, from a class histogram rather than from labels.
+
+        The single implementation; `inverse_frequency_alpha` bincounts and
+        delegates here. Branch A's training split is 20.7M samples and its
+        class histogram is read straight off the trajectory store's columns,
+        so materialising 20.7M labels purely to bincount them again would be
+        the expensive way to compute a 14-element vector.
+
+        The result depends only on the ratios between counts -- `total/count`
+        normalised by its own geometric mean is invariant to a common scale
+        factor -- so a histogram carries everything the weights need.
+        """
+        counts = np.asarray(counts, dtype=np.float64)
+        if counts.size < num_classes:
+            counts = np.pad(counts, (0, num_classes - counts.size))
         w = np.ones(num_classes, dtype=np.float64)
-        present = counts > 0
+        present = counts[:num_classes] > 0
         if present.any():
-            inv = (counts[present].sum() / counts[present]) ** power
+            c = counts[:num_classes][present]
+            inv = (c.sum() / c) ** power
             w[present] = inv / float(np.exp(np.mean(np.log(inv))))
         return torch.as_tensor(np.clip(w, clip[0], clip[1]), dtype=torch.float)
 
@@ -281,13 +308,23 @@ class MultiTaskLSTM(nn.Module):
         gradation_class_weights: Optional[torch.Tensor] = None,
     ):
         super(MultiTaskLSTM, self).__init__()
-        if risk_objective not in ("bce", "smooth_l1"):
-            raise ValueError(f"risk_objective must be 'bce' or 'smooth_l1', got {risk_objective!r}")
+        if risk_objective not in ("bce", "soft_bce", "smooth_l1"):
+            raise ValueError(
+                f"risk_objective must be 'bce', 'soft_bce' or 'smooth_l1', "
+                f"got {risk_objective!r}")
         #: "bce"       -- predict P(next window is an attack window). Calibrated,
         #:                and the metric that judges it (AUC/Brier) matches the
         #:                loss that trains it.
+        #: "soft_bce"  -- the same proper scoring rule against a CONTINUOUS
+        #:                target in [0, 1]. Cross-entropy between two Bernoullis
+        #:                is minimised at p == y for any y in [0, 1], so this
+        #:                stays a proper scoring rule without binarising. It
+        #:                exists for the hazard target (exp(-dt/tau)), which is
+        #:                already a survival probability and which "bce" would
+        #:                collapse to "is this host ever attacked".
         #: "smooth_l1" -- the original scalar regression. Kept to reproduce the
-        #:                2026-09-21 run; it cannot beat a constant on MAE.
+        #:                2026-09-21 run; against the severity target it cannot
+        #:                beat a constant on MAE.
         self.risk_objective = risk_objective
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -490,8 +527,21 @@ class MultiTaskLSTM(nn.Module):
         # category, which the category head already predicts, so nothing is
         # lost by separating them. Output stays in [0, 1], so serving is
         # unchanged.
+        #
+        # "soft_bce" keeps the same proper scoring rule but does NOT binarise.
+        # Against the hazard target exp(-dt/tau) the binarisation is actively
+        # destructive: `risk > 0` there means "this host is attacked at some
+        # later point in this split", which is nearly constant and carries
+        # none of the timing the hazard target was built to express. BCE with
+        # a real-valued y in [0, 1] is the cross-entropy between two
+        # Bernoullis; it is minimised at p == y, so it stays proper and the
+        # sigmoid head stays calibrated against a continuous target.
         if self.risk_objective == "bce":
             risk_target = (batch["risk"] > 0).to(predictions["risk_score"].dtype)
+            risk_loss = F.binary_cross_entropy(
+                predictions["risk_score"].clamp(1e-6, 1 - 1e-6), risk_target)
+        elif self.risk_objective == "soft_bce":
+            risk_target = batch["risk"].to(predictions["risk_score"].dtype).clamp(0.0, 1.0)
             risk_loss = F.binary_cross_entropy(
                 predictions["risk_score"].clamp(1e-6, 1 - 1e-6), risk_target)
         else:
@@ -693,6 +743,22 @@ class MultiTaskLSTM(nn.Module):
             "empirical_coverage_on_calibration": covered,
             "n": n,
         }
+
+    @torch.no_grad()
+    def set_risk_conformal_halfwidth(self, half_width: float) -> None:
+        """Install a half-width computed outside the model.
+
+        `fit_risk_conformal` needs every residual in memory. The training
+        script instead accumulates them into a fixed histogram during the
+        validation pass it is already running, which is exact to the bin
+        width and costs one bincount per batch instead of a second pass over
+        1.02M windows. Both routes end here, so there is one place that
+        decides what "fitted" means.
+        """
+        if not (half_width == half_width) or half_width < 0:
+            raise ValueError(f"conformal half-width must be finite and >= 0, "
+                             f"got {half_width!r}")
+        self.risk_conformal_halfwidth.fill_(float(half_width))
 
     def predict_calibrated_risk(
         self,

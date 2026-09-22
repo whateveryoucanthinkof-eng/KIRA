@@ -8,6 +8,7 @@ and autoregressively decodes upcoming MITRE ATT&CK technique tokens.
 
 import math
 from typing import List, Dict, Tuple, Optional, Any
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -393,95 +394,320 @@ class DeepOPForecastDecoder(nn.Module):
         return pred_tokens, decoded_names
 
 
+class DeepOPTokenScorer:
+    """Streaming DeepOP token metrics with information-matched baselines.
+
+    ## Why this exists
+
+    The validation block in `scripts/retrain_future_models_live.py` scores a
+    **teacher-forced** model against a **free-running** baseline:
+
+        logits = decoder(h, batch["input_tokens"])   # position s is GIVEN y_{s-1}
+        pred   = logits.argmax(-1)
+        acc_persist = (obs.unsqueeze(1).expand_as(tgt) == tgt)   # obs = y_{-1}, repeated
+
+    The model is handed the previous *true* token at every step; the baseline
+    is handed one token and must hold it for the whole horizon. That is not a
+    baseline, it is a handicap.
+
+    Measured, on 200k synthetic 5-step sequences generated at the corpus's own
+    statistics (val_label_churn 0.0524, val_positive_rate 0.175, so that
+    free-running persistence reproduces the logged val_persistence_accuracy of
+    0.8248 to within 0.0003):
+
+        a model with ZERO parameters that simply echoes its own input token
+            acc = 0.9165   macro_f1 = 0.8829
+            persistence (as printed) = 0.8251   majority = 0.7366
+            reported lift            = +0.0914      <-- "beats both baselines"
+
+        the same-information baseline (repeat the token the model was given)
+            acc = 0.9382
+
+    So the printed lift is +0.0914 for a model that has no parameters and
+    never looks at `h_future`, and the honest baseline is 0.9382, which that
+    model does *not* reach. Per step the gap is entirely in the tail:
+
+        step    persistence(obs)   persistence(previous target)
+        0           0.9000              0.9000
+        1           0.8583              0.9473
+        2           0.8210              0.9479
+        3           0.7881              0.9476
+        4           0.7579              0.9480
+
+    `acc_persistence_free` is the right baseline for `acc_free`; it is the
+    wrong one for `acc_teacher_forced`, whose partner is
+    `acc_persistence_fed`. This class reports all four so the pairing cannot
+    be got wrong by accident.
+
+    Deployment runs free-running (`forecast_sequence`, via
+    control_backend/model_adapter.py), so `acc_free` is the number that
+    describes production and `acc_teacher_forced` is a training diagnostic.
+
+    Accumulates on-device; no per-sample Python and no host sync per batch.
+    """
+
+    def __init__(self, vocab_size: int, device="cpu"):
+        self.V = int(vocab_size)
+        self.device = device
+        V = self.V
+        self._conf_tf = torch.zeros(V * V, device=device, dtype=torch.long)
+        self._conf_free = torch.zeros(V * V, device=device, dtype=torch.long)
+        self._hit_tf = torch.zeros((), device=device, dtype=torch.long)
+        self._hit_free = torch.zeros((), device=device, dtype=torch.long)
+        self._hit_persist_free = torch.zeros((), device=device, dtype=torch.long)
+        self._hit_persist_fed = torch.zeros((), device=device, dtype=torch.long)
+        self._tgt_hist = torch.zeros(V, device=device, dtype=torch.long)
+        self._n = 0
+        self._have_free = False
+
+    def update(self, target, input_tokens, obs_token, pred_tf=None, pred_free=None):
+        """
+        target:       [B, K] ground-truth tokens
+        input_tokens: [B, K] what teacher forcing feeds -- [<BOS>, y_0 .. y_{K-2}]
+        obs_token:    [B]    the last token observed BEFORE the horizon
+        pred_tf:      [B, K] teacher-forced argmax, or None
+        pred_free:    [B, K] free-running generation, or None
+        """
+        V = self.V
+        t = target.reshape(-1)
+        self._n += int(t.numel())
+        self._tgt_hist += torch.bincount(t, minlength=V)
+
+        if pred_tf is not None:
+            pf = pred_tf.reshape(-1)
+            self._hit_tf += (pf == t).sum()
+            self._conf_tf += torch.bincount(t * V + pf, minlength=V * V)
+        if pred_free is not None:
+            self._have_free = True
+            pr = pred_free.reshape(-1)
+            self._hit_free += (pr == t).sum()
+            self._conf_free += torch.bincount(t * V + pr, minlength=V * V)
+
+        obs = obs_token.reshape(-1)
+        # free-running persistence: one observation, held for the whole horizon
+        self._hit_persist_free += (obs.unsqueeze(1).expand_as(target) == target).sum()
+        # information-matched persistence: repeat whatever teacher forcing fed.
+        # Slot 0 of input_tokens is <BOS>, which is not a legal output, so the
+        # observed token stands in there -- that is exactly the information the
+        # model has at step 0.
+        fed = input_tokens.clone()
+        fed[:, 0] = obs
+        self._hit_persist_fed += (fed == target).sum()
+
+    @staticmethod
+    def _macro_f1(conf, V):
+        cm = conf.reshape(V, V).cpu().numpy()
+        sup, pred_n, tp = cm.sum(axis=1), cm.sum(axis=0), np.diag(cm)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pr = np.where(pred_n > 0, tp / np.maximum(pred_n, 1), 0.0)
+            rc = np.where(sup > 0, tp / np.maximum(sup, 1), 0.0)
+            dn = pr + rc
+            f1 = np.where(dn > 0, 2 * pr * rc / np.maximum(dn, 1e-12), 0.0)
+        present = sup > 0
+        # Macro-F1 is averaged over classes with SUPPORT only. Averaging over
+        # the union of true and predicted classes -- what
+        # sklearn's average="macro" does by default -- lets a single spurious
+        # prediction into an absent class add a hard 0.0 to the mean. Of the
+        # 10 joint tokens, only 4 occur anywhere in train (Benign.None,
+        # C2.T1071, Impact.T1498, InitialAccess.T1190) and only 3 in val, so
+        # that is 6-7 potential free zeros.
+        return (float(f1[present].mean()) if present.any() else 0.0,
+                f1, sup, pred_n, present)
+
+    def result(self):
+        n = max(self._n, 1)
+        mf1_tf, f1_tf, sup, pred_tf_n, present = self._macro_f1(self._conf_tf, self.V)
+        out = {
+            "n_tokens": self._n,
+            "acc_teacher_forced": float(self._hit_tf.item()) / n,
+            "macro_f1_teacher_forced": mf1_tf,
+            "acc_persistence_fed": float(self._hit_persist_fed.item()) / n,
+            "acc_persistence_free": float(self._hit_persist_free.item()) / n,
+            "acc_majority": float(self._tgt_hist.max().item()) / n,
+            "classes_present": int(present.sum()),
+            "classes_predicted_tf": int((pred_tf_n > 0).sum()),
+            "target_histogram": self._tgt_hist.cpu().tolist(),
+        }
+        if self._have_free:
+            mf1_free, _, _, pred_free_n, _ = self._macro_f1(self._conf_free, self.V)
+            out["acc_free"] = float(self._hit_free.item()) / n
+            out["macro_f1_free"] = mf1_free
+            out["classes_predicted_free"] = int((pred_free_n > 0).sum())
+        # The two comparisons that are actually like-for-like.
+        out["lift_teacher_forced"] = out["acc_teacher_forced"] - max(
+            out["acc_persistence_fed"], out["acc_majority"])
+        if self._have_free:
+            out["lift_free"] = out["acc_free"] - max(
+                out["acc_persistence_free"], out["acc_majority"])
+        return out
+
+    @staticmethod
+    def format(r):
+        lines = [
+            f"  tokens n={r['n_tokens']} classes_present={r['classes_present']}"
+            f"/{len(r['target_histogram'])}",
+            f"  TEACHER-FORCED  acc={r['acc_teacher_forced']:.4f} "
+            f"macro_f1={r['macro_f1_teacher_forced']:.4f} "
+            f"| matched baseline persistence_fed={r['acc_persistence_fed']:.4f} "
+            f"majority={r['acc_majority']:.4f} | lift={r['lift_teacher_forced']:+.4f}"
+            f"{'  <-- NO BETTER THAN A CONSTANT' if r['lift_teacher_forced'] <= 0 else ''}",
+        ]
+        if "acc_free" in r:
+            lines.append(
+                f"  FREE-RUNNING    acc={r['acc_free']:.4f} "
+                f"macro_f1={r['macro_f1_free']:.4f} "
+                f"| matched baseline persistence_free={r['acc_persistence_free']:.4f} "
+                f"majority={r['acc_majority']:.4f} | lift={r['lift_free']:+.4f}"
+                f"{'  <-- NO BETTER THAN A CONSTANT' if r['lift_free'] <= 0 else ''}")
+        else:
+            lines.append("  FREE-RUNNING    not measured -- this is the mode deployment uses")
+        return "\n".join(lines)
+
+
+def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=None):
+    """Both losses from one forward pass, because only one of them is comparable.
+
+    `train_deepop_live` optimises `cross_entropy(..., label_smoothing=0.04)`
+    and validates with plain `cross_entropy(...)`, then prints the two side by
+    side as `train_loss=` and `val_loss=`. They are different functions of the
+    same predictions.
+
+    PyTorch's smoothed loss is an exact identity, not an approximation:
+
+        L_smooth = (1 - eps) * plain_CE + eps * U,    U = mean_c NLL(c)
+
+    U is the mean negative log-probability over ALL classes, bounded below by
+    ln(V) = ln(10) = 2.3026 and larger for any non-uniform prediction.
+    Two consequences, both measured:
+
+    1. Rigorous, assumption-free: eps*U >= 0.04 * 2.3026 = 0.0921, so the
+       comparable plain CE behind the reported train 0.6644 is at most
+       (0.6644 - 0.0921) / 0.96 = **0.5961**. The train-to-val degradation is
+       therefore **at least 0.2087 nats**, not the 0.8048 - 0.6644 = 0.1404
+       the printed pair shows.
+
+    2. Empirical: sweeping logit distributions shaped like this problem
+       (4 classes with support, 6 without, peak 1.0-4.0, confidence
+       0.80-0.95) and keeping those whose SMOOTHED loss lands on 0.6644 +-0.03,
+       the plain CE lies in **0.4092 .. 0.5567** and eps*U in 0.1502 .. 0.2614.
+       The comparable degradation is then **0.248 .. 0.396 nats** -- 1.8x to
+       2.8x the printed 0.1404.
+
+    Note the sign: smoothing makes the TRAIN number larger, so correcting for
+    it makes the gap WORSE, not better. "val is only 0.14 above train" was the
+    flattering reading.
+
+    Returns (loss_to_backprop, plain_ce_detached).
+    """
+    V = logits.shape[-1]
+    flat, tgt = logits.reshape(-1, V), target.reshape(-1)
+    smoothed = F.cross_entropy(flat, tgt, weight=weight, label_smoothing=label_smoothing)
+    with torch.no_grad():
+        plain = F.cross_entropy(flat, tgt, weight=weight)
+    return smoothed, plain
+
+
 def evaluate_forecast_rigor(
-    decoder: DeepOPForecastDecoder,
+    decoder: "DeepOPForecastDecoder",
     h_future: torch.Tensor,
     target_tokens: torch.Tensor,
     observed_tokens: Optional[torch.Tensor] = None,
     repetition_penalty: float = 1.0,
+    batch_size: int = 4096,
 ) -> Dict[str, Any]:
+    """Evaluate DeepOP with baselines matched to the decoding mode.
+
+    Changes from the previous version, each for a stated reason:
+
+    1. The persistence baseline is reported twice -- free-running (one
+       observation held across the horizon) and information-matched (repeat
+       the token teacher forcing supplied). The old code compared
+       `teacher_forced_accuracy` against the free-running baseline only, which
+       a zero-parameter echo model beats by +0.09 (see `DeepOPTokenScorer`).
+    2. Free-running accuracy is reported with AND without the hard-coded
+       step-0 continuity bonus. With it on, 71.9% of step-0 decisions are the
+       bonus's rather than the model's (measured, untrained decoder, 4k
+       samples), so the pair is the only honest way to present it.
+    3. Macro-F1 averages over classes with support, not over the union of true
+       and predicted classes; 6 of the 10 joint tokens never occur in this
+       corpus and used to contribute free zeros the moment the model emitted
+       one of them.
+    4. Generation is batched. The old path ran `forecast_sequence` over the
+       whole set at once with a per-sample Python loop inside; at the live val
+       size (1.46M sequences x 5 steps) that is 7.3M Python iterations plus
+       the whole set resident on the GPU.
+    5. `observed_tokens` may be [B] or [B, 1]; the old `unsqueeze(1).repeat(1, K)`
+       silently produced a [B, 1, K] tensor for the [B, 1] form that
+       `forecast_sequence` documents as accepted.
     """
-    Rigorously evaluates DeepOP decoder comparing:
-    1. Free-running Autoregressive Token Accuracy (no ground truth during rollout)
-    2. Teacher-Forced Token Accuracy
-    3. Macro-F1 across all vocabulary classes
-    4. Active-Technique Macro-F1 (excluding PAD and Benign)
-    5. Comparison against Persistence Baseline (assuming no change from last observed token)
-    6. Per-Technique Precision, Recall, and F1 metrics
-    """
-    from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
     decoder.eval()
     B, K = target_tokens.shape
     device = h_future.device
+    V = decoder.vocab_size
 
-    # 1. Free-running generation conditioned on observed token at t=0
-    with torch.no_grad():
-        free_pred, _ = decoder.forecast_sequence(
-            h_future, max_steps=K, observed_token=observed_tokens, repetition_penalty=repetition_penalty
-        )
+    if observed_tokens is None:
+        observed_tokens = torch.full((B,), decoder.vocab.bos_idx, dtype=torch.long, device=device)
+    observed_tokens = observed_tokens.reshape(-1)
 
-    y_true = target_tokens.cpu().numpy().reshape(-1)
-    y_pred_free = free_pred.cpu().numpy().reshape(-1)
-
-    free_acc = float(accuracy_score(y_true, y_pred_free))
-    macro_f1 = float(f1_score(y_true, y_pred_free, average="macro", zero_division=0))
-
-    # Active technique classes: exclude PAD (0) and Benign
-    pad_idx = decoder.vocab.pad_idx
-    benign_idx = decoder.vocab.encode("Benign", None)
-    active_mask = (y_true != pad_idx) & (y_true != benign_idx)
-
-    if active_mask.sum() > 0:
-        active_f1 = float(
-            f1_score(
-                y_true[active_mask],
-                y_pred_free[active_mask],
-                average="macro",
-                zero_division=0,
-            )
-        )
-    else:
-        active_f1 = macro_f1
-
-    # 2. Teacher-forced generation
     bos = torch.full((B, 1), decoder.vocab.bos_idx, dtype=torch.long, device=device)
     teacher_input = torch.cat([bos, target_tokens[:, :-1]], dim=1)
+
+    scorer = DeepOPTokenScorer(V, device=device)
+    scorer_nobonus = DeepOPTokenScorer(V, device=device)
+
     with torch.no_grad():
-        logits_tf = decoder.forward(h_future, teacher_input)
-        preds_tf = logits_tf.argmax(dim=-1).cpu().numpy().reshape(-1)
-    tf_acc = float(accuracy_score(y_true, preds_tf))
+        for lo in range(0, B, batch_size):
+            hi = min(lo + batch_size, B)
+            h_b = h_future[lo:hi]
+            tgt_b = target_tokens[lo:hi]
+            inp_b = teacher_input[lo:hi]
+            obs_b = observed_tokens[lo:hi]
 
-    # 3. Persistence baseline
-    if observed_tokens is not None:
-        persist_pred = observed_tokens.unsqueeze(1).repeat(1, K).cpu().numpy().reshape(-1)
-        persist_acc = float(accuracy_score(y_true, persist_pred))
-    else:
-        persist_acc = 0.0
+            pred_tf = decoder.forward(h_b, inp_b).argmax(dim=-1)
+            free_b, _ = decoder.forecast_sequence(
+                h_b, max_steps=K, observed_token=obs_b,
+                repetition_penalty=repetition_penalty, continuity_bonus=1.0)
+            free_nb, _ = decoder.forecast_sequence(
+                h_b, max_steps=K, observed_token=obs_b,
+                repetition_penalty=repetition_penalty, continuity_bonus=0.0)
+            scorer.update(tgt_b, inp_b, obs_b, pred_tf=pred_tf, pred_free=free_b)
+            scorer_nobonus.update(tgt_b, inp_b, obs_b, pred_tf=pred_tf, pred_free=free_nb)
 
-    # 4. Per-class metrics
-    all_classes = sorted(list(set(y_true) | set(y_pred_free)))
-    p, r, f1, supp = precision_recall_fscore_support(
-        y_true, y_pred_free, labels=all_classes, zero_division=0
-    )
+    res = scorer.result()
+    nb = scorer_nobonus.result()
+    res["acc_free_no_continuity_bonus"] = nb["acc_free"]
+    res["macro_f1_free_no_continuity_bonus"] = nb["macro_f1_free"]
+    res["lift_free_no_continuity_bonus"] = nb["lift_free"]
+
+    # Per-class breakdown over the classes that have support, plus any the
+    # model emitted; each row says whether the class can occur at all.
+    cm = scorer._conf_free.reshape(V, V).cpu().numpy()
+    sup, pred_n, tp = cm.sum(axis=1), cm.sum(axis=0), np.diag(cm)
+    pad_idx = decoder.vocab.pad_idx
+    benign_idx = decoder.vocab.encode("Benign", None)
     per_technique = {}
-    for cls_idx, p_val, r_val, f1_val, s_val in zip(all_classes, p, r, f1, supp):
-        coarse, tech = decoder.vocab.decode(cls_idx)
-        token_name = f"{coarse}.{tech}" if tech else coarse
-        per_technique[token_name] = {
-            "token_id": int(cls_idx),
-            "precision": float(p_val),
-            "recall": float(r_val),
-            "f1": float(f1_val),
-            "support": int(s_val),
-            "is_active": bool(cls_idx != pad_idx and cls_idx != benign_idx),
+    active_f1s = []
+    for c in range(V):
+        if sup[c] == 0 and pred_n[c] == 0:
+            continue
+        pr = tp[c] / pred_n[c] if pred_n[c] else 0.0
+        rc = tp[c] / sup[c] if sup[c] else 0.0
+        f1 = 2 * pr * rc / (pr + rc) if (pr + rc) else 0.0
+        coarse, tech = decoder.vocab.decode(c)
+        per_technique[f"{coarse}.{tech}" if tech else coarse] = {
+            "token_id": c, "precision": float(pr), "recall": float(rc),
+            "f1": float(f1), "support": int(sup[c]),
+            "occurs_in_targets": bool(sup[c] > 0),
+            "is_active": bool(c != pad_idx and c != benign_idx),
         }
+        if sup[c] > 0 and c != pad_idx and c != benign_idx:
+            active_f1s.append(f1)
 
-    return {
-        "free_running_accuracy": free_acc,
-        "teacher_forced_accuracy": tf_acc,
-        "free_running_macro_f1": macro_f1,
-        "active_technique_macro_f1": active_f1,
-        "persistence_baseline_accuracy": persist_acc,
-        "per_technique": per_technique,
-    }
-
+    res["active_technique_macro_f1"] = float(np.mean(active_f1s)) if active_f1s else 0.0
+    res["per_technique"] = per_technique
+    # Backwards-compatible aliases for existing callers.
+    res["free_running_accuracy"] = res["acc_free"]
+    res["teacher_forced_accuracy"] = res["acc_teacher_forced"]
+    res["free_running_macro_f1"] = res["macro_f1_free"]
+    res["persistence_baseline_accuracy"] = res["acc_persistence_free"]
+    return res
