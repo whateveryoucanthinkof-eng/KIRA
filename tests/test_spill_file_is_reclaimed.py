@@ -86,13 +86,40 @@ def test_spilled_and_in_memory_stores_agree_exactly(tmp_path):
 
 
 def test_the_block_really_went_to_disk(tmp_path):
-    """Guard the guard: if it never spilled, the cleanup test is vacuous."""
+    """Guard the guard: if it never spilled, the cleanup test is vacuous.
+
+    `feats_on_disk` is deliberately NOT asserted here any more. finalize()
+    reads a block at or under RESIDENT_FEATS_MAX_BYTES back into RAM, because
+    training gathers it in random order and a memmap page fault pulls 128 KiB
+    of readahead per 108-byte row -- measured at 41.8 TiB of disk reads from a
+    2.30 GiB block. What this test guards is that the spill path was genuinely
+    exercised during building and cleaned up afterwards; whether the finished
+    store keeps the mapping is covered by the two tests below.
+    """
     b = _build(tmp_path)
     assert b._spill_path is not None
     assert os.path.exists(b._spill_path), "nothing was written to disk"
+    # NOT asserting a non-zero size here: the builder buffers a 262,144-row
+    # block and only flushes when it fills, so a store smaller than that has
+    # a legitimately empty file until finalize() flushes it.
     store = b.finalize()
-    assert store.memory_report()["feats_on_disk"] is True
+    assert store.n_snapshots > 0
     assert not os.path.exists(b._spill_path), "file survived finalize()"
+
+
+def test_a_small_block_is_resident_after_finalize(tmp_path):
+    """The read-back: holding 2.30 GiB costs less than the page cache was
+    already spending on it, and removes the random-access amplification."""
+    store = _build(tmp_path).finalize()
+    assert store.memory_report()["feats_on_disk"] is False
+
+
+def test_a_block_over_the_threshold_keeps_the_mapping(tmp_path, monkeypatch):
+    """The escape hatch: a block too large to hold stays memmapped."""
+    import data_unification.trajectory_store as ts
+    monkeypatch.setattr(ts, "RESIDENT_FEATS_MAX_BYTES", 1)
+    store = _build(tmp_path).finalize()
+    assert store.memory_report()["feats_on_disk"] is True
 
 
 def test_an_empty_store_spills_nothing_and_leaves_nothing(tmp_path):
