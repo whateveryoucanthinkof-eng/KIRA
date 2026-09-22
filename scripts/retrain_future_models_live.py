@@ -657,6 +657,16 @@ def main():
     parser.add_argument("--stride",type=int,default=1)
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=3)
+    parser.add_argument("--risk-target",choices=("severity","hazard"),default="severity",
+                        help="Which risk target to train against. 'severity' is "
+                             "base_severity(tactic) for an attack window and 0.0 "
+                             "otherwise -- bimodal, not a forecast, and close to a "
+                             "function of the category another head predicts; "
+                             "Branch B's risk head was worse than predicting zero "
+                             "against it in every epoch. 'hazard' is "
+                             "exp(-seconds_to_next_attack / horizon): continuous, "
+                             "forward-looking, tactic-independent. Default stays "
+                             "severity so the change is measured, not silent.")
     parser.add_argument("--stages",choices=("both","branch_b","deepop"),default="both",
                         help="Which models to train. DeepOP trains on Branch B's "
                              "rollouts and cannot be better than it, so "
@@ -797,6 +807,27 @@ def main():
             _bak = _p.with_name(f"{_p.stem}.superseded-{stamp}{_p.suffix}")
             shutil.copy2(_p, _bak)
             print(f"backed up {_p} -> {_bak}", flush=True)
+
+    # Optionally replace the risk target before any dataset is built.
+    #
+    # Branch B's risk head was worse than predicting zero in all five epochs
+    # of the 2026-09-22 run -- MAE 0.2412-0.2548 against 0.1401 -- the same
+    # defect Branch A's had, from the same cause. `risk_score` as written
+    # during extraction is base_severity(tactic) for an attack window and
+    # exactly 0.0 otherwise: bimodal, not a forecast, and close to a function
+    # of the coarse category. The hazard form is continuous and forward
+    # looking. Both stores are swapped together, or the train and validation
+    # targets would be on different scales.
+    if args.risk_target == "hazard":
+        _tau = _c.forecast_steps * _c.window_seconds
+        for _nm, _st in (("train", train_traj), ("val", val_traj)):
+            _info = _st.use_hazard_target(_tau)
+            print(f"risk target [{_nm}]: severity -> hazard(tau={_tau}s) | "
+                  f"zeros {_info['zero_fraction_before']:.3f} -> "
+                  f"{_info['zero_fraction_after']:.3f} | "
+                  f"distinct {_info['distinct_before']} -> {_info['distinct_after']} | "
+                  f"mean {_info['mean_before']:.4f} -> {_info['mean_after']:.4f}",
+                  flush=True)
 
     # DeepOP is trained on Branch B's rollouts, so it cannot be better than
     # Branch B: if the world model does not beat persistence, DeepOP is

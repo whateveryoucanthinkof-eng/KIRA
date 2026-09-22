@@ -217,3 +217,25 @@ def test_resident_block_still_reads_back_the_right_values(tmp_path):
     st = b.finalize()
     expect = np.concatenate([np.stack(embs), np.stack(attrs)], axis=1)
     np.testing.assert_allclose(np.asarray(st.feats), expect, rtol=0, atol=0)
+
+
+def test_both_splits_must_be_swapped_together():
+    """Swapping only one leaves train and validation on different scales,
+    which would look like a generalisation gap and is really a unit mismatch."""
+    a = _store({"h": [0, 0, 1]})
+    b = _store({"h2": [0, 1, 0]})
+    a.use_hazard_target(10.0)
+    assert np.asarray(a.risk_score).max() <= 1.0
+    # b untouched: still the bimodal severity
+    assert set(np.unique(np.round(np.asarray(b.risk_score), 4))) == {0.0, 0.82}
+    b.use_hazard_target(10.0)
+    assert len(np.unique(np.round(np.asarray(b.risk_score), 4))) > 1
+
+
+def test_the_downstream_trainer_exposes_the_flag():
+    """Pins that Branch B / DeepOP can actually reach the hazard target."""
+    src = open("scripts/retrain_future_models_live.py").read()
+    assert '"--risk-target"' in src
+    assert "use_hazard_target" in src
+    # applied to BOTH stores
+    assert 'for _nm, _st in (("train", train_traj), ("val", val_traj))' in src
