@@ -166,3 +166,54 @@ def test_the_lazy_dataset_picks_up_the_swapped_target():
     assert r_before != r_after
     assert all(0.0 <= v <= 1.0 for v in r_after)
     assert r_after == sorted(r_after), "risk must rise as the attack approaches"
+
+
+# --- the spill block must not become a disk-thrashing memmap ---------------
+
+def test_a_small_feature_block_is_held_in_ram_not_memmapped(tmp_path):
+    """Why: training reads the block in random order, 20.66M gathers an epoch,
+    and a memmap page fault pulls the kernel's default 128 KiB readahead for a
+    108-byte row. On 2026-09-22 four workers each read 10.4 TiB from a 2.30 GiB
+    block and throughput fell 52.5 -> 8.1 batch/s."""
+    b = TrajectoryStoreBuilder(spill_dir=str(tmp_path))
+    for w in range(200):
+        b.append(host_ip="h", host_id=0, window_idx=w,
+                 window_start=float(w * 2), window_end=float(w * 2 + 2),
+                 embedding=EMB, temporal_attrs=ATTRS, is_attack=False,
+                 coarse_category="Benign", technique_ids=[], risk_score=0.0)
+    st = b.finalize()
+    assert not isinstance(st.feats, np.memmap), "small block should be resident"
+    assert st.feats.shape == (200, 27)
+    assert st.n_snapshots == 200
+
+
+def test_a_block_over_the_threshold_stays_memmapped(tmp_path, monkeypatch):
+    """The escape hatch still works: a block too large to hold stays mapped."""
+    import data_unification.trajectory_store as ts
+    monkeypatch.setattr(ts, "RESIDENT_FEATS_MAX_BYTES", 1)   # force the mapped path
+    b = ts.TrajectoryStoreBuilder(spill_dir=str(tmp_path))
+    for w in range(50):
+        b.append(host_ip="h", host_id=0, window_idx=w,
+                 window_start=float(w * 2), window_end=float(w * 2 + 2),
+                 embedding=EMB, temporal_attrs=ATTRS, is_attack=False,
+                 coarse_category="Benign", technique_ids=[], risk_score=0.0)
+    st = b.finalize()
+    assert isinstance(st.feats, np.memmap)
+    assert st.feats.shape == (50, 27)
+
+
+def test_resident_block_still_reads_back_the_right_values(tmp_path):
+    """Correctness of the copy, not just its type."""
+    rng = np.random.default_rng(4)
+    embs, attrs = [], []
+    b = TrajectoryStoreBuilder(spill_dir=str(tmp_path))
+    for w in range(120):
+        e = rng.random(12).astype(np.float32); a = rng.random(15).astype(np.float32)
+        embs.append(e); attrs.append(a)
+        b.append(host_ip="h", host_id=0, window_idx=w,
+                 window_start=float(w * 2), window_end=float(w * 2 + 2),
+                 embedding=e, temporal_attrs=a, is_attack=False,
+                 coarse_category="Benign", technique_ids=[], risk_score=0.0)
+    st = b.finalize()
+    expect = np.concatenate([np.stack(embs), np.stack(attrs)], axis=1)
+    np.testing.assert_allclose(np.asarray(st.feats), expect, rtol=0, atol=0)

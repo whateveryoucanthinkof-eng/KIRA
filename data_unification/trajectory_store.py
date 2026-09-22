@@ -291,6 +291,54 @@ class TrajectoryStore(Mapping):
         }
 
 
+#: A feature block at or under this size is read back into RAM instead of
+#: being left as a memmap. 2.30 GiB is the full-density Branch A block, so
+#: the default covers it with room to spare.
+RESIDENT_FEATS_MAX_BYTES = int(os.environ.get(
+    "CYBERWORLD_RESIDENT_FEATS_MAX_BYTES", 6 * 1024 ** 3))
+
+
+def _resident_or_random_advised(feats, n_rows):
+    """Keep a small feature block in RAM; tell the kernel not to read ahead.
+
+    ## What this fixes
+
+    Spilling exists so the feature block does not have to be resident. But
+    training reads it in a *random* order -- every sample gathers `seq_len`
+    scattered rows, 20.66M times an epoch -- and a memmap page fault triggers
+    the kernel's default 128 KiB readahead for a 108-byte row. When the page
+    cache cannot hold the block, essentially every access goes to disk and is
+    amplified ~1000x.
+
+    Measured on the 2026-09-22 run, with two trainers sharing a 22 GiB box:
+    four DataLoader workers had each read **10.4 TiB** (41.8 TiB total) from a
+    block of **2.30 GiB**, and throughput fell from 52.5 batch/s to 8.1 --
+    6.5x slower, putting an 8-epoch run at ~44 hours.
+
+    The block is 2.30 GiB. Spilling it was never worth it: holding it resident
+    costs less memory than the page cache was trying to use for it anyway.
+    So a block at or under RESIDENT_FEATS_MAX_BYTES is read back into RAM and
+    the mapping dropped.
+
+    A block genuinely too large to hold stays memmapped, but gets
+    MADV_RANDOM, which turns off readahead: the kernel then fetches the 4 KiB
+    page actually touched instead of 128 KiB around it -- a 32x reduction in
+    the amplification for exactly this access pattern.
+    """
+    if n_rows == 0 or not isinstance(feats, np.memmap):
+        return feats
+    if feats.nbytes <= RESIDENT_FEATS_MAX_BYTES:
+        resident = np.ascontiguousarray(feats)   # one sequential read
+        del feats                                # drop the mapping
+        return resident
+    try:
+        import mmap as _mmap
+        feats._mmap.madvise(_mmap.MADV_RANDOM)
+    except (AttributeError, OSError, ValueError):
+        pass          # advisory only; correctness does not depend on it
+    return feats
+
+
 class TrajectoryStoreBuilder:
     """Accumulates snapshots columnar-side, spilling the bulk array to disk."""
 
@@ -376,6 +424,7 @@ class TrajectoryStoreBuilder:
             feats = (np.memmap(self._spill_path, dtype=np.float32, mode="r",
                                shape=(self._n, FEAT_DIM))
                      if self._n else np.zeros((0, FEAT_DIM), dtype=np.float32))
+            feats = _resident_or_random_advised(feats, self._n)
             # Unlink the backing file NOW, while the mapping holds it open.
             #
             # On POSIX the inode survives until every reference is dropped, so
