@@ -17,6 +17,7 @@ ground-truth labels (`is_attack`, `coarse_category`, `attck_technique_ids`).
 """
 
 from dataclasses import dataclass, field
+import os
 from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 
@@ -65,6 +66,64 @@ class TGNEFeatureSchema:
 SCHEMA: TGNEFeatureSchema = TGNEFeatureSchema()
 
 
+#: Edge features to zero out, by name, for ablation studies. Set via
+#: CYBERWORLD_ABLATE_EDGE_FEATURES as a comma-separated list of names from
+#: EDGE_FEATURE_NAMES. Empty (the default) changes nothing.
+#:
+#: ## Why this exists
+#:
+#: A reviewer asked how these twelve features were chosen and what makes them
+#: the right ones. The honest answer was that nothing in the repository
+#: justified them -- they are conventional NetFlow summaries, with no ablation
+#: and no importance analysis behind them.
+#:
+#: `dst_port_norm_65535` is the sharp end of that question. Several CIC-2018
+#: attack classes sit on fixed destination ports, so a model can learn
+#: "port => class" and score well without learning behaviour at all -- and
+#: that collapses the moment an attacker changes port. Zeroing one feature and
+#: re-measuring inductive AUC turns the question into a number.
+#:
+#: Zeroing rather than removing keeps the 12-D contract intact, so an ablated
+#: encoder still loads everywhere a normal one does and the comparison is not
+#: confounded by an architecture change.
+def _ablation_mask() -> "np.ndarray | None":
+    raw = os.environ.get("CYBERWORLD_ABLATE_EDGE_FEATURES", "").strip()
+    if not raw:
+        return None
+    wanted = [n.strip() for n in raw.split(",") if n.strip()]
+    unknown = [n for n in wanted if n not in EDGE_FEATURE_NAMES]
+    if unknown:
+        raise ValueError(
+            f"unknown edge feature(s) to ablate: {unknown}. "
+            f"Valid names: {EDGE_FEATURE_NAMES}")
+    mask = np.ones(len(EDGE_FEATURE_NAMES), dtype=np.float32)
+    for n in wanted:
+        mask[EDGE_FEATURE_NAMES.index(n)] = 0.0
+    return mask
+
+
+_ABLATION_MASK = None
+_ABLATION_READ = False
+
+
+def ablation_mask():
+    """Cached so the env var is read once, not once per flow record."""
+    global _ABLATION_MASK, _ABLATION_READ
+    if not _ABLATION_READ:
+        _ABLATION_MASK = _ablation_mask()
+        _ABLATION_READ = True
+        if _ABLATION_MASK is not None:
+            dropped = [n for n, m in zip(EDGE_FEATURE_NAMES, _ABLATION_MASK) if m == 0.0]
+            print(f"EDGE FEATURE ABLATION ACTIVE: zeroing {dropped}", flush=True)
+    return _ABLATION_MASK
+
+
+def reset_ablation_cache():
+    """For tests, which change the env var between cases."""
+    global _ABLATION_MASK, _ABLATION_READ
+    _ABLATION_MASK, _ABLATION_READ = None, False
+
+
 def extract_canonical_edge_features(
     fwd_bytes: float,
     bwd_bytes: float,
@@ -96,6 +155,10 @@ def extract_canonical_edge_features(
     # Feature 11: Directional flow asymmetry in [-1.0, 1.0]
     tot_bytes = max(0.0, float(fwd_bytes)) + max(0.0, float(bwd_bytes))
     feat[11] = np.float32((float(fwd_bytes) - float(bwd_bytes)) / (tot_bytes + 1e-5))
+
+    _m = ablation_mask()
+    if _m is not None:
+        feat *= _m
     return feat
 
 

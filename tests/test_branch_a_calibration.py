@@ -225,6 +225,63 @@ def test_a_fitted_checkpoint_round_trips_through_the_serving_constructor():
     assert torch.allclose(served(x)["technique_logits"], m(x)["technique_logits"])
 
 
+@pytest.mark.parametrize("name", [
+    "branch_a_lstm.pt", "branch_a_lstm.full_corpus.pt", "branch_a_lstm.ctu13_only.pt",
+])
+def test_a_checkpoint_on_disk_applies_a_temperature_only_if_it_earned_one(name):
+    """The real artifacts, through the real serving constructor.
+
+    `control_backend/model_adapter.py:175` builds
+    `MultiTaskLSTM(input_dim=27, hidden_dim=64)` and calls `load_state_dict`
+    with the default `strict=True`. Every checkpoint written before
+    `temperature_fitted` and `risk_conformal_halfwidth` existed lacks those
+    keys, so without `_load_from_state_dict` supplying them this load raises
+    and serving is down. The synthetic version of this test cannot catch a
+    checkpoint whose real key set differs, which is the case that would
+    actually page someone.
+
+    The assertion is the biconditional, not today's state: a temperature
+    reaches the served logits **iff** it was fitted post-hoc. Asserting
+    "T is inert" outright would start failing the moment a retrain lands a
+    correctly fitted one, which is the outcome this whole change is for.
+
+    As of 2026-09-22 all three carry a jointly-trained T (0.9169 / 0.6896 /
+    0.7353 -- every one below 1.0, i.e. each learned to *sharpen* an already
+    overconfident head) and none records a fit, so all three take the inert
+    branch.
+    """
+    import os
+    path = os.path.join("saved_models", "branch_a", name)
+    if not os.path.exists(path):
+        pytest.skip(f"{name} not present")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    state = ckpt.get("model_state_dict", ckpt)
+
+    served = MultiTaskLSTM(input_dim=27, hidden_dim=64).eval()
+    served.load_state_dict(state, strict=True)      # strict: the serving contract
+
+    out = served(torch.randn(2, 15, 27))
+    fitted = float(served.temperature_fitted) > 0.0
+
+    if not fitted:
+        assert float(served.effective_temperature) == 1.0
+        assert torch.equal(out["technique_logits"], out["technique_logits_raw"]), (
+            f"{name}: a temperature that was fitted to nothing reached the "
+            f"served logits")
+    else:
+        rep = ckpt.get("technique_calibration") or {}
+        assert rep.get("fitted") is True, (
+            f"{name} claims temperature_fitted=1 but carries no record of the "
+            f"fit; a T nobody can audit is the defect this replaced")
+        assert rep.get("at_grid_boundary") is False, (
+            f"{name} recorded a boundary temperature as a fit")
+        assert rep["ece_after"] <= rep["ece_before"] + 1e-9, (
+            f"{name}: the fitted T made top-label ECE worse "
+            f"({rep['ece_before']:.5f} -> {rep['ece_after']:.5f})")
+        assert float(served.effective_temperature) == pytest.approx(
+            rep["temperature"], rel=1e-5)
+
+
 # --- predict_calibrated_risk -----------------------------------------------
 
 def test_an_unfitted_interval_raises_instead_of_inventing_one():
@@ -282,6 +339,68 @@ def test_the_conformal_fit_uses_the_finite_sample_correction():
     rep = m.fit_risk_conformal(resid, torch.zeros(n), alpha=alpha)
     k = int(math.ceil((n + 1) * (1 - alpha)))
     assert rep["half_width"] == pytest.approx(float(resid[k - 1]), abs=1e-6)
+
+
+def test_the_conformal_quantile_agrees_with_the_canonical_implementation():
+    """`fit_risk_conformal`'s docstring claims it uses the same corrected
+    quantile as `cyberworld_v4.conformal.conformal_quantile`. Two copies of a
+    finite-sample correction are two chances to get the off-by-one wrong, so
+    the claim is pinned rather than trusted. `conformal_quantile` returns inf
+    where there are too few points; the model refuses instead, which is the
+    same decision reported differently.
+    """
+    conformal_quantile = pytest.importorskip(
+        "cyberworld_v4.conformal").conformal_quantile
+    g = torch.Generator().manual_seed(1)
+    for _ in range(40):
+        n = int(torch.randint(20, 4000, (1,), generator=g))
+        alpha = float(torch.rand(1, generator=g)) * 0.3 + 0.01
+        pred = torch.rand(n, generator=g)
+        true = torch.rand(n, generator=g)
+        rep = _model().fit_risk_conformal(pred, true, alpha=alpha)
+        ref = conformal_quantile((pred - true).abs().numpy(), alpha)
+        if not rep["fitted"]:
+            assert not math.isfinite(ref), (
+                f"model refused n={n} alpha={alpha:.4f} but the canonical "
+                f"implementation returned a finite {ref}")
+            continue
+        assert rep["half_width"] == pytest.approx(ref, abs=1e-6), (
+            f"n={n} alpha={alpha:.4f}: {rep['half_width']} vs {ref}")
+
+
+def test_conformal_coverage_holds_on_fresh_data_not_just_the_calibration_set():
+    """The coverage that matters is on data the quantile was NOT fitted to.
+
+    `empirical_coverage_on_calibration` is >= 1-alpha by construction -- it is
+    the definition of the order statistic, so asserting it proves only that
+    sorting works. The guarantee split conformal actually makes is about
+    exchangeable *future* points. Known noise, so the answer is checkable:
+    for residuals |N(0, sigma)| the exact 95% half-width is
+    sigma * 1.959964, and coverage on a fresh draw must land at ~95%.
+    """
+    g = torch.Generator().manual_seed(11)
+    sigma = 0.3
+    f_cal = torch.rand(5000, generator=g)
+    y_cal = f_cal + torch.randn(5000, generator=g) * sigma
+    f_te = torch.rand(20_000, generator=g)
+    y_te = f_te + torch.randn(20_000, generator=g) * sigma
+
+    m = _model()
+    rep = m.fit_risk_conformal(f_cal, y_cal, alpha=0.05)
+    assert rep["fitted"]
+    hw = rep["half_width"]
+    assert hw == pytest.approx(sigma * 1.959964, abs=0.05), (
+        f"half-width {hw:.4f} is not the 95% quantile of |N(0,{sigma})|")
+
+    coverage = float(((y_te - f_te).abs() <= hw).float().mean())
+    assert 0.93 <= coverage <= 0.97, (
+        f"held-out coverage {coverage:.4f} is not the 95% that was promised")
+
+    # And the number the old code hardcoded, on the same data, for contrast.
+    fake = float(((y_te - f_te).abs() <= 0.05).float().mean())
+    assert fake < 0.30, (
+        f"sanity: a hardcoded +/-0.05 should cover far less than 95% here, "
+        f"got {fake:.4f}")
 
 
 def test_too_few_calibration_points_refuses_rather_than_returning_infinity():
