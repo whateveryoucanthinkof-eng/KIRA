@@ -55,6 +55,7 @@ def _pcap_day_split(day_dir) -> str:
         )
 from deepop_decoder.forecast_decoder import DeepOPForecastDecoder
 from deepop_decoder.joint_vocab import get_joint_vocab
+from deepop_decoder.forecast_decoder import DeepOPTokenScorer, smoothed_and_plain_ce
 from deepop_decoder.train_cwa_decoder import (
     CWASequenceDataset, LazyCWADataset, create_cwa_training_samples,
 )
@@ -442,7 +443,13 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
     # two token arrays per sample (~1,250 B), one per snapshot plus a
     # duplicate per attack window -- ~52 GiB at full corpus density.
     train_ds=LazyCWADataset(train_traj,vocab,K=_c.forecast_steps,T=_T)
-    val_ds=LazyCWADataset(val_traj,vocab,K=_c.forecast_steps,T=_T)
+    # Validation is NOT oversampled. LazyCWADataset duplicates every window
+    # containing a non-Benign token, which is a training-time class-balance
+    # device; applying it to the eval split inflates the attack rate there
+    # (measured Benign share 0.8571 -> 0.7692) so every DeepOP validation
+    # number reported before this was read against a distribution that does
+    # not exist. It moved the printed lift by +0.024 on its own.
+    val_ds=LazyCWADataset(val_traj,vocab,K=_c.forecast_steps,T=_T,oversample=False)
     print(f"DeepOP samples: train={len(train_ds)} val={len(val_ds)}",flush=True)
     print(f"DeepOP conditioning: {'Branch-B rollouts (E1 fixed)' if wdt is not None else 'oracle + noise (interim)'}",flush=True)
     # Precompute the frozen rollout once instead of recomputing it every epoch.
@@ -466,7 +473,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         decoder.train()
         # On-device accumulation: `loss.item()` per batch synced the host to
         # the GPU on every step and defeated the worker prefetch queue.
-        _tr_sum=torch.zeros((),device=device,dtype=torch.float64); _nb=0
+        _tr_sum=torch.zeros((),device=device,dtype=torch.float64)
+        _tr_plain=torch.zeros((),device=device,dtype=torch.float64); _nb=0
         _t0=time.time()
         for batch in train_loader:
             h=batch["h_future"].to(device,non_blocking=_nblk)
@@ -482,8 +490,15 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             else:
                 step_sigma=torch.linspace(0.015,0.055,steps=h.shape[1],device=device).unsqueeze(0).unsqueeze(-1)
                 h_aug=h+torch.randn_like(h)*step_sigma
-            optimizer.zero_grad(set_to_none=True); logits=decoder(h_aug,inp); loss=F.cross_entropy(logits.reshape(-1,vocab.vocab_size),tgt.reshape(-1),label_smoothing=0.04); loss.backward(); torch.nn.utils.clip_grad_norm_(decoder.parameters(),1.0); optimizer.step()
-            _tr_sum+=loss.detach().double().sum(); _nb+=1
+            optimizer.zero_grad(set_to_none=True); logits=decoder(h_aug,inp)
+            # Train used smoothed CE while validation used plain CE, so the two
+            # printed numbers were different functions and their gap was not a
+            # generalisation gap. Identity: L_smooth = 0.96*plain + 0.04*U with
+            # U >= ln(10), which put the real degradation at >= 0.2087 nats
+            # against a printed 0.1404. Both are now reported.
+            loss, _plain = smoothed_and_plain_ce(logits, tgt, label_smoothing=0.04)
+            loss.backward(); torch.nn.utils.clip_grad_norm_(decoder.parameters(),1.0); optimizer.step()
+            _tr_sum+=loss.detach().double().sum(); _tr_plain+=_plain.detach().double().sum(); _nb+=1
             if _nb % 2000 == 0:
                 _el=time.time()-_t0; _r=_nb/max(_el,1e-9)
                 print(f"  DeepOP epoch={epoch+1} batch={_nb}/{_nb_total} "
@@ -505,6 +520,10 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _hit_persist = torch.zeros((), device=device, dtype=torch.long)
         _tok_total = 0
         _conf = torch.zeros(V * V, device=device, dtype=torch.long)
+        try:
+            _scorer = DeepOPTokenScorer(V, device=device)
+        except Exception as _e:
+            print(f"  token scorer unavailable: {_e}", flush=True); _scorer = None
         _tgt_hist = torch.zeros(V, device=device, dtype=torch.long)
         with torch.no_grad():
             for batch in val_loader:
@@ -518,6 +537,16 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                 _v_sum+=F.cross_entropy(logits.reshape(-1,V),tgt.reshape(-1)).double().sum()
                 _vn+=1
                 pred = logits.argmax(dim=-1)
+                if _scorer is not None:
+                    _obs = batch.get("obs_token")
+                    if _obs is not None:
+                        _free, _ = decoder.forecast_sequence(
+                            hv, max_steps=hv.shape[1],
+                            observed_token=_obs.to(device, non_blocking=_nblk),
+                            continuity_bonus=0.0)
+                        _scorer.update(tgt, batch["input_tokens"].to(device, non_blocking=_nblk),
+                                       _obs.to(device, non_blocking=_nblk),
+                                       pred_tf=pred, pred_free=_free)
                 flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
                 _hit_model += (flat_p == flat_t).sum()
                 _tok_total += int(flat_t.numel())
@@ -551,6 +580,18 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
               f"| lift={acc - _best_base:+.4f} "
               f"| classes_pred={int((_pred_n > 0).sum())}/{int(_present.sum())}"
               f"{'  <-- NO BETTER THAN A CONSTANT' if acc <= _best_base else ''}", flush=True)
+        # The line above compares a TEACHER-FORCED model (handed y_{s-1} at
+        # every step) against a FREE-RUNNING baseline (handed y_{-1} and held
+        # for 5 steps). Those see different information, so the comparison
+        # flatters the model: a zero-parameter model that echoes its input
+        # token scores +0.0914 by it. Deployment is free-running
+        # (model_adapter calls forecast_sequence), so the free-running row is
+        # the one that describes what is actually served.
+        if _scorer is not None:
+            print(DeepOPTokenScorer.format(_scorer.result()), flush=True)
+        _plain_tr = float((_tr_plain/max(_nb,1)).item())
+        print(f"  train CE plain={_plain_tr:.4f} (smoothed={float((_tr_sum/max(_nb,1)).item()):.4f}) "
+              f"vs val CE {score:.4f} -> comparable gap {score - _plain_tr:+.4f}", flush=True)
         _history.append({"epoch": epoch + 1, "val_loss": score, "token_acc": acc,
                          "macro_f1": macro_f1, "acc_persistence": acc_persist,
                          "acc_majority": acc_majority, "lift": acc - _best_base})
