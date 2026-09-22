@@ -244,3 +244,20 @@ def test_the_downstream_trainer_exposes_the_flag():
     assert "use_hazard_target" in src
     # applied to BOTH stores
     assert 'for _nm, _st in (("train", train_traj), ("val", val_traj))' in src
+
+
+def test_main_does_not_reference_a_trainer_local_name():
+    """The hazard branch in main() used `_c`, which is local to the trainer
+    functions. It raised NameError only AFTER a 40-minute extraction had been
+    paid for -- the most expensive place for a typo to hide. This pins that
+    main() resolves the contract itself."""
+    import ast
+    src = open("scripts/retrain_future_models_live.py").read()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == "main")
+    attr_bases = {n.value.id for n in ast.walk(fn)
+                  if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+    assert "_c" not in attr_bases, (
+        "main() reads an attribute off `_c`, which is only defined inside the "
+        "trainer functions")
+    assert "get_contract" in src

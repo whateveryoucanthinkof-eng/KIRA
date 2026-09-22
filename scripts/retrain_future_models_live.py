@@ -831,7 +831,11 @@ def main():
     # looking. Both stores are swapped together, or the train and validation
     # targets would be on different scales.
     if args.risk_target == "hazard":
-        _tau = _c.forecast_steps * _c.window_seconds
+        # get_contract() here, not _c: that name is local to the trainer
+        # functions, and using it in main() raised NameError after a 40-minute
+        # extraction had already been paid for.
+        _hc = get_contract()
+        _tau = _hc.forecast_steps * _hc.window_seconds
         for _nm, _st in (("train", train_traj), ("val", val_traj)):
             _info = _st.use_hazard_target(_tau)
             print(f"risk target [{_nm}]: severity -> hazard(tau={_tau}s) | "
