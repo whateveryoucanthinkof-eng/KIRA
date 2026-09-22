@@ -530,6 +530,12 @@ def main():
     parser.add_argument("--stride",type=int,default=1)
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=3)
+    parser.add_argument("--stages",choices=("both","branch_b","deepop"),default="both",
+                        help="Which models to train. DeepOP trains on Branch B's "
+                             "rollouts and cannot be better than it, so "
+                             "'branch_b' lets you check Branch B against its "
+                             "persistence baseline before committing hours to "
+                             "DeepOP. 'deepop' loads the Branch B already on disk.")
     parser.add_argument("--patience",type=int,default=2,
                         help="Stop a model after N epochs without a validation "
                              "improvement. The best checkpoint is written every "
@@ -663,9 +669,35 @@ def main():
             shutil.copy2(_p, _bak)
             print(f"backed up {_p} -> {_bak}", flush=True)
 
-    wdt = train_branch_b_live(train_traj,val_traj,bb_out,args.epochs,device,num_workers=args.num_workers,patience=args.patience)
-    train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,num_workers=args.num_workers,patience=args.patience)
-    print(f"served checkpoints updated: {bb_out}, {dp_out}", flush=True)
+    # DeepOP is trained on Branch B's rollouts, so it cannot be better than
+    # Branch B: if the world model does not beat persistence, DeepOP is
+    # conditioning on a near-constant signal and can only learn the label
+    # prior. Splitting the stages means Branch B can be validated against its
+    # baseline first, and DeepOP run only once that is worth doing.
+    wdt = None
+    if args.stages in ("both", "branch_b"):
+        wdt = train_branch_b_live(train_traj,val_traj,bb_out,args.epochs,device,
+                                  num_workers=args.num_workers,patience=args.patience)
+        print(f"served checkpoint updated: {bb_out}", flush=True)
+
+    if args.stages in ("both", "deepop"):
+        if wdt is None:
+            # deepop-only: condition on the Branch B already on disk rather
+            # than retraining it. eval() matters -- the rollout has dropout,
+            # and a WDT left in train mode would feed DeepOP a different
+            # (randomly perturbed) conditioning signal every epoch.
+            if not bb_out.exists():
+                parser.error(f"--stages deepop needs a trained Branch B at {bb_out}")
+            _bb = torch.load(bb_out, map_location=device, weights_only=False)
+            wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64, n_heads=4,
+                                               n_layers=3).to(device)
+            wdt.load_state_dict(_bb["wdt_state_dict"])
+            wdt.eval()
+            print(f"loaded Branch B from {bb_out} (epoch {_bb.get('epoch')}) for "
+                  f"DeepOP conditioning", flush=True)
+        train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,
+                          num_workers=args.num_workers,patience=args.patience)
+        print(f"served checkpoint updated: {dp_out}", flush=True)
 
 
 if __name__ == "__main__":
