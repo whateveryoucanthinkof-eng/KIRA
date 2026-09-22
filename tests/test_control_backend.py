@@ -14,6 +14,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "bita"))
 
 from control_backend.main import app
+from cyberworld_v4.config import get_contract
 from control_backend.model_adapter import (
     AntigravityModelAdapter,
     flows_from_span_dicts,
@@ -37,10 +38,14 @@ def test_01_api_status_endpoint(client):
     assert data["mode"] in ["STANDBY", "LIVE"]
     assert data["ml_status"] in ["standby", "live"]
     assert data["model_meta"]["name"] == "Antigravity-DualBranch-DeepOP"
+    # Assert against the contract in force, not v3 literals. These read 5 and
+    # 8 (v3 history/forecast) and went stale the moment the v4 retrain landed;
+    # the adapter was right and the test was wrong.
+    _c = get_contract()
     assert data["model_meta"]["feature_count"] == 27
-    assert data["model_meta"]["history_steps"] == 5
-    assert data["model_meta"]["window_seconds"] == 2.0
-    assert data["model_meta"]["forecast_steps"] == 8
+    assert data["model_meta"]["history_steps"] == _c.history_steps
+    assert data["model_meta"]["window_seconds"] == _c.window_seconds
+    assert data["model_meta"]["forecast_steps"] == _c.forecast_steps
 
 
 def test_02_dual_branch_adapter_smoke():
@@ -67,10 +72,11 @@ def test_02_dual_branch_adapter_smoke():
     event = adapter.predict_window(target, flows)
     assert event.type == "prediction"
     assert event.model.feature_count == 27
-    assert event.model.forecast_steps == 8
+    assert event.model.forecast_steps == get_contract().forecast_steps
+    assert event.model.history_steps == get_contract().history_steps
     assert event.prediction.risk is not None
     assert 0.0 <= float(event.prediction.risk) <= 1.0
-    assert len(event.forecast) == 8
+    assert len(event.forecast) == get_contract().forecast_steps
     assert "10.0.3.10" in event.focus_ips
     assert event.target_ip == "10.0.3.10"
     assert len(adapter.feature_history) == 1

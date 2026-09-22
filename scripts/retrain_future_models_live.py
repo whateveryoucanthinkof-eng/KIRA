@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import math
 import shutil
 import time
 import os
@@ -234,7 +235,7 @@ def _loader_kwargs(device, num_workers: int):
     return kw
 
 
-def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4):
+def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 2):
     _c = get_contract()
     # Lazy: create_rollout_samples materialises h_history [15,12],
     # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
@@ -250,6 +251,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     risk = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(device)
     optimizer = torch.optim.Adam(list(wdt.parameters()) + list(risk.parameters()), lr=1e-3, weight_decay=1e-4)
     best = float("inf")
+    best_epoch, _since_improve = 0, 0
+    _history = []
     best_state = {k: v.detach().clone() for k, v in wdt.state_dict().items()}
     _nb_total = len(train_loader)
     _nblk = (str(device) == "cuda")
@@ -278,7 +281,23 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                       f"({100.0*_nb/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
                       f"eta={(_nb_total-_nb)/max(_r,1e-9)/60:.1f}m", flush=True)
         wdt.eval(); risk.eval()
+        # Validation, measured against baselines that cost nothing to beat.
+        #
+        # A world model that predicts the next 5 host embeddings has an obvious
+        # null hypothesis: copy the last observed embedding forward ("nothing
+        # changes in 10 seconds"). On 2-second windows that is a strong
+        # baseline, and a loss value on its own cannot say whether the model
+        # beats it. Branch B's first run moved train loss 1.9% across 6 epochs
+        # with its best validation at epoch 1 -- consistent either with a model
+        # that converged instantly or with one that never learned anything, and
+        # nothing reported could tell those apart.
         _v_sum = torch.zeros((), device=device, dtype=torch.float64); _vn = 0
+        _mse_model = torch.zeros((), device=device, dtype=torch.float64)
+        _mse_persist = torch.zeros((), device=device, dtype=torch.float64)
+        _bce_model = torch.zeros((), device=device, dtype=torch.float64)
+        _risk_mae_model = torch.zeros((), device=device, dtype=torch.float64)
+        _risk_sum = torch.zeros((), device=device, dtype=torch.float64)
+        _risk_n = 0
         with torch.no_grad():
             for batch in val_loader:
                 h=batch["h_history"].to(device, non_blocking=_nblk)
@@ -287,20 +306,59 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                 pred=wdt.rollout(h,K=_c.forecast_steps); pred_risk,_=risk.forward_trajectory(pred)
                 _v_sum += (F.mse_loss(pred,target)+F.binary_cross_entropy(pred_risk,target_risk)).double().sum()
                 _vn += 1
+                # persistence: repeat the last observed step across the horizon
+                _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
+                _mse_model += F.mse_loss(pred, target).double()
+                _mse_persist += F.mse_loss(_last, target).double()
+                _bce_model += F.binary_cross_entropy(pred_risk, target_risk).double()
+                _risk_mae_model += (pred_risk - target_risk).abs().double().mean()
+                _risk_sum += target_risk.double().mean()
+                _risk_n += 1
         score=float((_v_sum/max(_vn,1)).item())
         _trl=float((_tr_sum/max(_nb,1)).item())
+        _n = max(_risk_n, 1)
+        _mm, _mp = float((_mse_model/_n).item()), float((_mse_persist/_n).item())
+        _bm = float((_bce_model/_n).item())
+        _rmae = float((_risk_mae_model/_n).item())
+        _rbar = float((_risk_sum/_n).item())
+        # BCE of predicting the empirical mean risk for everything, and the MAE
+        # of predicting 0.0 -- the two trivial risk predictors.
+        _p = min(max(_rbar, 1e-7), 1 - 1e-7)
+        _bce_base = -(_rbar * math.log(_p) + (1 - _rbar) * math.log(1 - _p))
+        _skill = (1.0 - _mm / _mp) if _mp > 0 else float("nan")
         print(f"Branch B epoch={epoch+1} train_loss={_trl:.4f} val_loss={score:.4f} "
               f"wall={(time.time()-_t0)/60:.1f}m", flush=True)
+        print(f"  embeddings: mse_model={_mm:.6f} mse_persistence={_mp:.6f} "
+              f"skill={_skill:+.3f}"
+              f"{'  <-- WORSE THAN COPYING THE LAST STEP' if _mm >= _mp else ''}", flush=True)
+        print(f"  risk: bce_model={_bm:.4f} bce_constant={_bce_base:.4f} "
+              f"mae_model={_rmae:.4f} mae_predict_zero={_rbar:.4f}"
+              f"{'  <-- WORSE THAN PREDICTING ZERO' if _rmae >= _rbar else ''}", flush=True)
+        _history.append({"epoch": epoch + 1, "train_loss": _trl, "val_loss": score,
+                         "mse_model": _mm, "mse_persistence": _mp, "skill": _skill,
+                         "bce_model": _bm, "bce_constant": _bce_base,
+                         "risk_mae_model": _rmae, "risk_mae_zero": _rbar})
         if score < best:
-            best=score; output.parent.mkdir(parents=True,exist_ok=True)
-            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds},output)
+            best=score; best_epoch=epoch+1; _since_improve=0
+            output.parent.mkdir(parents=True,exist_ok=True)
+            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"epoch_history":list(_history),"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar}},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
+        else:
+            _since_improve += 1
+            # The best weights are already saved, so stopping here cannot cost
+            # quality -- it only stops spending hours on epochs that do not
+            # improve validation. Run 1 went 6 epochs and its best was epoch 1.
+            if patience and _since_improve >= patience:
+                print(f"Branch B: early stop at epoch {epoch+1}; no improvement "
+                      f"in {_since_improve} epochs, best was epoch {best_epoch} "
+                      f"(val_loss {best:.4f})", flush=True)
+                break
     wdt.load_state_dict(best_state)
     wdt.eval()
     return wdt
 
 
-def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4):
+def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4, patience: int = 2):
     vocab=get_joint_vocab(network_observable_only=True)
     _c=get_contract()
     # T>0 makes samples carry h_history so we can condition on Branch B's own
@@ -320,7 +378,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
     val_loader=DataLoader(val_ds,batch_size=64,**_lk)
     decoder=DeepOPForecastDecoder(d_latent=12,d_model=72,vocab_size=vocab.vocab_size,n_heads=6,num_layers=2,window_sizes=[2,4,8],dim_feedforward=144).to(device)
     optimizer=torch.optim.AdamW(decoder.parameters(),lr=5e-4,weight_decay=1e-4)
-    best=float("inf")
+    best=float("inf"); best_epoch=0; _since_improve=0; _history=[]
     _nb_total=len(train_loader); _nblk=(str(device)=="cuda")
     for epoch in range(epochs):
         decoder.train()
@@ -348,20 +406,79 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                       f"({100.0*_nb/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
                       f"eta={(_nb_total-_nb)/max(_r,1e-9)/60:.1f}m",flush=True)
         decoder.eval()
+        # Validation against the two predictors that require no model at all.
+        #
+        # DeepOP emits a sequence of (category, technique) tokens. The corpus
+        # is ~90% Benign and a host's label rarely changes inside a 10-second
+        # horizon, so both "repeat the last observed token" and "always emit
+        # the most common token" score well. Cross-entropy alone cannot show
+        # that, exactly as Branch A's 0.88 accuracy could not show a head
+        # sitting on the class prior. Token accuracy, macro F1 over the tokens
+        # actually present, and both baselines are reported together.
+        V = vocab.vocab_size
         _v_sum=torch.zeros((),device=device,dtype=torch.float64); _vn=0
+        _hit_model = torch.zeros((), device=device, dtype=torch.long)
+        _hit_persist = torch.zeros((), device=device, dtype=torch.long)
+        _tok_total = 0
+        _conf = torch.zeros(V * V, device=device, dtype=torch.long)
+        _tgt_hist = torch.zeros(V, device=device, dtype=torch.long)
         with torch.no_grad():
             for batch in val_loader:
                 hv=batch["h_future"].to(device,non_blocking=_nblk)
                 if wdt is not None and "h_history" in batch:
                     hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1]).detach()
+                tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
                 logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk))
-                _v_sum+=F.cross_entropy(logits.reshape(-1,vocab.vocab_size),batch["target_tokens"].to(device,non_blocking=_nblk).reshape(-1)).double().sum()
+                _v_sum+=F.cross_entropy(logits.reshape(-1,V),tgt.reshape(-1)).double().sum()
                 _vn+=1
+                pred = logits.argmax(dim=-1)
+                flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
+                _hit_model += (flat_p == flat_t).sum()
+                _tok_total += int(flat_t.numel())
+                _conf += torch.bincount(flat_t * V + flat_p, minlength=V * V)
+                _tgt_hist += torch.bincount(flat_t, minlength=V)
+                # persistence: the last token actually observed, repeated
+                obs = batch.get("obs_token")
+                if obs is not None:
+                    obs = obs.to(device, non_blocking=_nblk)
+                    _hit_persist += (obs.unsqueeze(1).expand_as(tgt) == tgt).sum()
         score=float((_v_sum/max(_vn,1)).item())
+        _tt = max(_tok_total, 1)
+        acc = float(_hit_model.item()) / _tt
+        acc_persist = float(_hit_persist.item()) / _tt
+        _hist_np = _tgt_hist.cpu().numpy()
+        acc_majority = float(_hist_np.max()) / _tt if _hist_np.sum() else 0.0
+        cm = _conf.reshape(V, V).cpu().numpy()
+        _sup, _pred_n, _tp = cm.sum(axis=1), cm.sum(axis=0), np.diag(cm)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            _pr = np.where(_pred_n > 0, _tp / np.maximum(_pred_n, 1), 0.0)
+            _rc = np.where(_sup > 0, _tp / np.maximum(_sup, 1), 0.0)
+            _dn = _pr + _rc
+            _f1 = np.where(_dn > 0, 2 * _pr * _rc / np.maximum(_dn, 1e-12), 0.0)
+        _present = _sup > 0
+        macro_f1 = float(_f1[_present].mean()) if _present.any() else 0.0
+        _best_base = max(acc_persist, acc_majority)
         print(f"DeepOP epoch={epoch+1} train_loss={float((_tr_sum/max(_nb,1)).item()):.4f} "
               f"val_loss={score:.4f} wall={(time.time()-_t0)/60:.1f}m",flush=True)
+        print(f"  tokens: acc={acc:.4f} macro_f1={macro_f1:.4f} "
+              f"| baselines persistence={acc_persist:.4f} majority={acc_majority:.4f} "
+              f"| lift={acc - _best_base:+.4f} "
+              f"| classes_pred={int((_pred_n > 0).sum())}/{int(_present.sum())}"
+              f"{'  <-- NO BETTER THAN A CONSTANT' if acc <= _best_base else ''}", flush=True)
+        _history.append({"epoch": epoch + 1, "val_loss": score, "token_acc": acc,
+                         "macro_f1": macro_f1, "acc_persistence": acc_persist,
+                         "acc_majority": acc_majority, "lift": acc - _best_base})
         if score < best:
-            best=score; output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size},output)
+            best=score; best_epoch=epoch+1; _since_improve=0
+            output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"epoch_history":list(_history),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
+        else:
+            _since_improve += 1
+            # Best weights are already on disk; stopping cannot cost quality.
+            if patience and _since_improve >= patience:
+                print(f"DeepOP: early stop at epoch {epoch+1}; no improvement in "
+                      f"{_since_improve} epochs, best was epoch {best_epoch} "
+                      f"(val_loss {best:.4f})", flush=True)
+                break
 
 
 def _pcap_trajectories_per_day(args, extractor):
@@ -413,6 +530,13 @@ def main():
     parser.add_argument("--stride",type=int,default=1)
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=3)
+    parser.add_argument("--patience",type=int,default=2,
+                        help="Stop a model after N epochs without a validation "
+                             "improvement. The best checkpoint is written every "
+                             "time it improves, so this cannot cost quality -- it "
+                             "only stops paying for epochs that do nothing. Run 1 "
+                             "took 6 Branch B epochs and its best was epoch 1. "
+                             "0 disables.")
     parser.add_argument("--num-workers",type=int,default=4,
                         help="DataLoader worker processes; 0 loads in the main "
                              "process and serialises loading with GPU compute.")
@@ -539,8 +663,8 @@ def main():
             shutil.copy2(_p, _bak)
             print(f"backed up {_p} -> {_bak}", flush=True)
 
-    wdt = train_branch_b_live(train_traj,val_traj,bb_out,args.epochs,device,num_workers=args.num_workers)
-    train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,num_workers=args.num_workers)
+    wdt = train_branch_b_live(train_traj,val_traj,bb_out,args.epochs,device,num_workers=args.num_workers,patience=args.patience)
+    train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,num_workers=args.num_workers,patience=args.patience)
     print(f"served checkpoints updated: {bb_out}, {dp_out}", flush=True)
 
 

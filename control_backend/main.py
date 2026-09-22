@@ -143,15 +143,25 @@ async def get_system_status():
         ml_state = "stopped"
 
     ml_live = ml_state == "running"
+    # Report the contract the loaded checkpoints actually carry.
+    #
+    # These were literals -- history_steps=5, forecast_steps=8 -- which were
+    # the v3 values. After the v4 retrain the served models use history 15 /
+    # forecast 5, so /api/status was telling an operator the wrong temporal
+    # contract for the model that was answering their queries. The adapter
+    # already adopts the real values from the checkpoints in _adopt_contract
+    # and refuses to load if they disagree with each other, so it is the one
+    # source worth reporting.
+    from control_backend.model_adapter import model_adapter as _served
     model_meta = ModelMetadata(
         name="Antigravity-DualBranch-DeepOP",
         version="3.3-SOC",
         feature_count=model_contract.BRANCH_A_INPUT_DIM,
-        history_steps=5,
-        window_seconds=2.0,
-        forecast_steps=8,
+        history_steps=_served.history_steps,
+        window_seconds=_served.window_seconds,
+        forecast_steps=_served.forecast_steps,
         checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
-        threshold=0.65,
+        threshold=_served.alert_threshold,
     )
 
     now_iso = utc_now_iso()
