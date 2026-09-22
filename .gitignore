@@ -153,3 +153,7 @@ Desktop.ini
 *.webm
 *.mov
 *.mkv
+
+# Transient training spill: memmapped feature blocks, 500MB+ each,
+# rewritten continuously by a live run. Never an artefact worth versioning.
+.spill/
