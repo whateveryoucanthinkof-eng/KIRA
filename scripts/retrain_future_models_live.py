@@ -642,6 +642,7 @@ def _pcap_trajectories_per_day(args, extractor):
             args.pcap_max_windows_per_day, window_stride=args.pcap_window_stride):
         b = builders[split]
         t = time.time()
+        b.set_namespace(f"pcap/{day}")   # one trajectory per (host, capture day)
         extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
         if b._window_idx.n:
             wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
@@ -749,7 +750,7 @@ def main():
         print(f"frozen split: {len(_train_files)} train / {len(_val_files)} val captures",
               flush=True)
 
-        from data_unification.trajectory_store import TrajectoryStoreBuilder
+        from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
         _cic, _ctu = CIC2018Adapter(), CTU13Adapter()
         _spill = str(args.spill_dir) if args.spill_dir else None
 
@@ -760,6 +761,7 @@ def main():
                 t = time.time()
                 recs = read_one_capture(f, _cic, _ctu, args.rows_per_file, args.stride)
                 total += len(recs)
+                shared.set_namespace(capture_namespace(f))   # one trajectory per (host, capture)
                 extractor.extract_trajectories(recs, builder=shared,
                                                window_idx_base=widx_base)
                 if shared._window_idx.n:

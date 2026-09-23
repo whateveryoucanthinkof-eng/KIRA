@@ -1273,7 +1273,7 @@ def main():
         networks, and a merged graph would make hosts from different captures
         each other's temporal neighbours, which they never were.
         """
-        from data_unification.trajectory_store import TrajectoryStoreBuilder
+        from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
         shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
         widx_base = 0
         total_recs = 0
@@ -1281,6 +1281,11 @@ def main():
             t = time.time()
             recs = _load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, [f], args.stride)
             total_recs += len(recs)
+            # One trajectory per (host, capture): see TrajectoryStoreBuilder.
+            # set_namespace. Without it, the fabricated CIC-2018 days merged
+            # all 350 of their hosts across days, and 2018 rows preceded 2011
+            # rows in merged CTU-13 hosts.
+            shared.set_namespace(capture_namespace(f))
             extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
             if shared._window_idx.n:
                 widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
