@@ -53,31 +53,55 @@ launch() {
         "$@"
 }
 
-# The measured peaks were ~6.7 GiB (A) and ~7.0 GiB (B). 10 GiB each keeps
-# their combined hard caps below the machine's 22 GiB physical memory.
-launch branch-a-retrain 10G 9G "$A_LOG" \
+# SEQUENTIAL, not concurrent.
+#
+# This script used to start Branch A and Branch B together at 10G/9G each,
+# citing measured peaks of ~6.7 GiB (A) and ~7.0 GiB (B). Those peaks were
+# taken while TrajectoryStoreBuilder.finalize's "resident" copy was silently a
+# view of the memmap (np.ascontiguousarray on an already-contiguous array),
+# so they undercount. With the block genuinely resident Branch A ran at
+# 10.7 GiB -- past a 9G MemoryHigh and at a 10G MemoryMax. Measured
+# 2026-09-22 with both running: Branch B throttled 3,775,949 times and fell to
+# 10.5 batch/s, Branch A throttled 1,500,062 times; stopping B took A to
+# 128.7 batch/s with 0.00% stall. Two full-density jobs plus a desktop do not
+# fit in 22 GiB, and running them together is slower than one after the other.
+#
+# They are independent (both only consume TGNE), so order does not matter.
+A_STATUS=0
+B_STATUS=0
+launch branch-a-retrain 15G 13G "$A_LOG" \
     "$PY" -u scripts/retrain_branch_a_live.py \
     --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
     --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
     --output "$REPO/saved_models/branch_a/branch_a_lstm.pt" \
     --epochs 8 --patience 3 --risk-objective bce --risk-target severity \
-    --spill-dir "$RUN_ROOT/branch-a" --num-workers 4 &
-A_PID=$!
+    --spill-dir "$RUN_ROOT/branch-a" --num-workers 4 \
+    || A_STATUS=$?
+# `|| X=$?` rather than a bare `X=$?` on the next line: this script runs under
+# `set -e`, which would abort on a failed Branch A before its status was ever
+# read -- and Branch B, which does not depend on A, would never start.
 
-launch branch-b-retrain 10G 9G "$B_LOG" \
+launch branch-b-retrain 15G 13G "$B_LOG" \
     "$PY" -u scripts/retrain_future_models_live.py \
     --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
     --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
     --tgne "$REPO/saved_models/bita_bigru_transformer-unified_final.pth" \
     --out-dir "$REPO/saved_models" \
-    --stages branch_b --epochs 6 --patience 2 \
-    --spill-dir "$RUN_ROOT/branch-b" --num-workers 4 &
-B_PID=$!
+    --stages branch_b --risk-target hazard --epochs 6 --patience 2 \
+    --spill-dir "$RUN_ROOT/branch-b" --num-workers 4 \
+    || B_STATUS=$?
+
+# --risk-target hazard for Branch B: its risk head is trained with a Huber
+# (median-seeking) loss, which was chosen for the continuous hazard target. On
+# the bimodal severity target (82.5% exactly zero) a median-seeking loss just
+# converges to predicting zero. Branch A stays on severity: with --risk-objective
+# bce it predicts P(next window is an attack), for which the binary label is
+# exactly right.
 
 A_OK=0
 B_OK=0
-if wait "$A_PID"; then A_OK=1; else echo "Branch A failed; see $A_LOG" >&2; fi
-if wait "$B_PID"; then B_OK=1; else echo "Branch B failed; see $B_LOG" >&2; fi
+if (( A_STATUS == 0 )); then A_OK=1; else echo "Branch A failed; see $A_LOG" >&2; fi
+if (( B_STATUS == 0 )); then B_OK=1; else echo "Branch B failed; see $B_LOG" >&2; fi
 
 if (( ! B_OK )); then
     echo "Not starting DeepOP because Branch B, its prerequisite, failed." >&2
@@ -89,7 +113,7 @@ if (( ! A_OK )); then
 fi
 
 # DeepOP reads saved_models/branch_b/host_wdt.pt, so it must follow Branch B.
-launch deepop-retrain 13G 11G "$D_LOG" \
+launch deepop-retrain 15G 13G "$D_LOG" \
     "$PY" -u scripts/retrain_future_models_live.py \
     --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
     --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
