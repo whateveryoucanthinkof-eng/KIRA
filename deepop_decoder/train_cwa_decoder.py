@@ -461,6 +461,7 @@ class LazyCWADataset(Dataset):
         self.T = _c.history_steps if T is None else T
         self.store = store
         self.vocab = vocab
+        self._window_seconds = float(_c.window_seconds)
         self.oversample = oversample
 
         benign_cat = None
@@ -600,4 +601,25 @@ class LazyCWADataset(Dataset):
                     f"guard in __init__ was bypassed")
             out["h_history"] = torch.from_numpy(
                 np.ascontiguousarray(hist, dtype=np.float32))
+
+            # Real elapsed times for the Branch-B rollout DeepOP conditions on,
+            # in exactly LazyHostRolloutDataset's convention: seconds relative
+            # to the last OBSERVED step rows[i-1], history <= 0 ending at 0,
+            # future > 0.
+            #
+            # Branch B is now trained with these, so the rollouts DeepOP is
+            # conditioned on must be produced the same way -- otherwise DeepOP
+            # trains on rollouts from a uniform 2 s grid while Branch B's own
+            # training and serving use real spacing, a skew between the two
+            # models rather than inside one.
+            w = self.store.window_idx
+            w0 = float(w[rows[i - 1]])
+            t_h = np.asarray(w[hist_rows], dtype=np.float64) - w0
+            if len(t_h) < self.T:        # padded steps repeat the first real one's time
+                t_h = np.concatenate([np.repeat(t_h[:1], self.T - len(t_h)), t_h])
+            t_f = np.asarray(w[fut], dtype=np.float64) - w0
+            out["t_history"] = torch.from_numpy(
+                np.ascontiguousarray(t_h * self._window_seconds, dtype=np.float32))
+            out["t_future"] = torch.from_numpy(
+                np.ascontiguousarray(t_f * self._window_seconds, dtype=np.float32))
         return out

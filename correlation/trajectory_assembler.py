@@ -150,6 +150,7 @@ class AttackTrajectoryAssembler:
             # Pre-allocate numpy batch buffers
             x_batch = np.zeros((B, max_la, 27), dtype=np.float32)
             h_hist_batch = np.zeros((B, max_lw, 12), dtype=np.float32)
+            t_hist_batch = np.zeros((B, max_lw), dtype=np.float32)
 
             # LEFT-pad, because that is what training does.
             #
@@ -178,9 +179,18 @@ class AttackTrajectoryAssembler:
                     x_batch[i, off_a + j] = np.concatenate([s.embedding, s.temporal_attrs])
                 for j, s in enumerate(recent_w):
                     h_hist_batch[i, off_w + j] = s.embedding
+                # Real elapsed seconds relative to the latest snapshot, in the
+                # convention Branch B is trained with (<= 0, last entry 0).
+                # Left-padded slots repeat the earliest real time.
+                if recent_w:
+                    _t0 = float(recent_w[-1].window_start)
+                    _ts = [float(s.window_start) - _t0 for s in recent_w]
+                    t_hist_batch[i, off_w:] = _ts
+                    t_hist_batch[i, :off_w] = _ts[0]
 
             x_tensor = torch.from_numpy(x_batch).to(self.device)
             h_hist_tensor = torch.from_numpy(h_hist_batch).to(self.device)
+            t_hist_tensor = torch.from_numpy(t_hist_batch).to(self.device)
 
             with torch.no_grad():
                 # 1. Branch A: Batched forward pass.
@@ -207,7 +217,11 @@ class AttackTrajectoryAssembler:
                 ]
                 obs_t_tensor = torch.tensor(obs_token_ids, dtype=torch.long, device=self.device)
 
-                h_future = self.wdt.rollout(h_hist_tensor, K=K, delta_t_step=window_size_sec)  # [B, K, d_latent]
+                # Real history spacing -- Branch B is trained on it (median gap
+                # 14 s, not the 2 s grid). t_future stays None: the uniform grid
+                # IS the question being asked, "+2, +4, ... +10 s from now".
+                h_future = self.wdt.rollout(h_hist_tensor, K=K, delta_t_step=window_size_sec,
+                                            t_history=t_hist_tensor)  # [B, K, d_latent]
                 step_risks, cumul_risks = self.risk_head.forward_trajectory(h_future)  # [B, K], [B]
                 step_risks_np = step_risks.cpu().numpy()  # [B, K]
                 # Which aggregation is correct depends on what the head was

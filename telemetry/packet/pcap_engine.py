@@ -7,8 +7,10 @@ Zero intermediate disk I/O.
 """
 
 import math
-from typing import List, Dict, Set, Tuple, Any
+from typing import List, Dict, Set, Tuple, Any, Optional
 import numpy as np
+
+from cyberworld_v4.config import get_contract
 
 PCAP_BEHAVIORAL_COLUMNS = [
     'ttl_mean',
@@ -88,7 +90,11 @@ class LivePCAPEngine:
     def __init__(self):
         self.causal_seen_internal_edges: Set[Tuple[str, str]] = set()
 
-    def extract_features(self, packets: List[Dict[str, Any]], window_sec: float = 2.0) -> Dict[str, float]:
+    def extract_features(
+        self, packets: List[Dict[str, Any]], window_sec: Optional[float] = None
+    ) -> Dict[str, float]:
+        if window_sec is None:
+            window_sec = get_contract().window_seconds
         if not packets:
             return {col: 0.0 for col in PCAP_BEHAVIORAL_COLUMNS}
 

@@ -117,6 +117,11 @@ class AntigravityModelAdapter:
         self.h_state_history: List[torch.Tensor] = []
         self.feature_history: List[torch.Tensor] = []
         self.h_state_history_by_target: Dict[str, List[torch.Tensor]] = {}
+        #: Window end time of each entry in h_state_history_by_target, kept in
+        #: lockstep with it. Branch B is trained on REAL elapsed times between
+        #: a host's steps (median 14 s, not the 2 s grid), so serving must pass
+        #: them too or it forecasts from a spacing the model never saw.
+        self.h_time_history_by_target: Dict[str, List[float]] = {}
         self.feature_history_by_target: Dict[str, List[torch.Tensor]] = {}
         self.alert_threshold = 0.65
         # Rules on by default so the operator console is unchanged; off for any
@@ -368,6 +373,7 @@ class AntigravityModelAdapter:
         self.feature_history.clear()
         self.h_state_history_by_target.clear()
         self.feature_history_by_target.clear()
+        self.h_time_history_by_target.clear()
 
     def _build_embedding(
         self, target_ip: str, flows: List[UnifiedFlowRecord]
@@ -697,9 +703,13 @@ class AntigravityModelAdapter:
 
         curr_h = torch.from_numpy(h_emb).float().unsqueeze(0).to(self.device)
         h_state_history = self.h_state_history_by_target.setdefault(target_ip, [])
+        h_time_history = self.h_time_history_by_target.setdefault(target_ip, [])
         h_state_history.append(curr_h)
+        h_time_history.append(
+            float(max(r.end_time for r in flows)) if flows else float(time.time()))
         if len(h_state_history) > self.history_steps:
             h_state_history.pop(0)
+            h_time_history.pop(0)
         self.h_state_history = h_state_history
         # Pad a COPY. `h_state_history` is the list held in
         # h_state_history_by_target, so padding it in place wrote the zero
@@ -716,6 +726,20 @@ class AntigravityModelAdapter:
             padded_h.insert(0, torch.zeros_like(curr_h))
         h_seq = torch.stack(padded_h, dim=1)
 
+        # Real elapsed seconds of each history step, relative to the latest
+        # (the convention HostWorldDynamicsTransformer._elapsed_times and both
+        # training datasets use: <= 0, last entry exactly 0). Padded slots
+        # repeat the earliest real time, as the DeepOP dataset does.
+        _t_last = h_time_history[-1]
+        _t_rel = [t - _t_last for t in h_time_history]
+        while len(_t_rel) < self.history_steps:
+            _t_rel.insert(0, _t_rel[0])
+        t_history = torch.tensor([_t_rel], dtype=torch.float32, device=self.device)
+        # t_future is deliberately None: it falls back to the uniform
+        # window_seconds grid, i.e. "forecast at +2, +4, ... +10 s" -- exactly
+        # the contract's question. Training teaches h(t + dt) over real dt;
+        # serving chooses which dt to ask about.
+
         with torch.no_grad():
             # delta_t_step is the served window, not the module default. The
             # adapter takes its contract from the checkpoints
@@ -729,12 +753,14 @@ class AntigravityModelAdapter:
                 # PredictionEvent schema to draw confidence bands on the forecast.
                 h_future, _radii = self.wdt.rollout_with_uncertainty(
                     h_seq, K=self.forecast_steps,
-                    delta_t_step=self.window_seconds, stabilize_horizon=True
+                    delta_t_step=self.window_seconds, stabilize_horizon=True,
+                    t_history=t_history,
                 )
             else:
                 h_future = self.wdt.rollout(
                     h_seq, K=self.forecast_steps,
-                    delta_t_step=self.window_seconds, stabilize_horizon=True
+                    delta_t_step=self.window_seconds, stabilize_horizon=True,
+                    t_history=t_history,
                 )
 
             step_risks, _ = self.risk_head.forward_trajectory(h_future)

@@ -234,6 +234,45 @@ async def get_topology():
     return evt.dict() if hasattr(evt, "dict") else evt.model_dump()
 
 
+# A private adapter instance dedicated to /api/replay -- see
+# _get_replay_adapter() below for why replay must never score on the live
+# `model_adapter` singleton. Built lazily (once) on first use, not at import
+# time, so importing this module never pays the model-loading cost and test
+# collection doesn't require checkpoints on disk unless /api/replay actually
+# runs.
+_replay_adapter: Optional[Any] = None
+
+
+def _get_replay_adapter():
+    """Return the adapter /api/replay scores against -- never the live singleton.
+
+    Replay used to call `predict_window()` directly on `model_adapter`, the
+    SAME instance the live tail worker scores on concurrently, and mutated
+    its shared state: `rules_enabled` (restored in `finally`) and
+    `reset_history()` -- NOT restored, and not scoped to any one target
+    either: `AntigravityModelAdapter.reset_history()` clears
+    `h_state_history_by_target` and `feature_history_by_target` in full, so
+    one `/api/replay` call wiped the rolling window for every host the live
+    tail worker was tracking, not just whatever the upload analysed. Past
+    that, for the rest of the replay run any window whose target IP
+    coincides with a live host's IP (likely -- both draw from the same
+    site's asset IPs) would splice replayed windows into that host's real
+    rolling history as it rebuilds.
+
+    A private `AntigravityModelAdapter` instance starts with its own, empty
+    `feature_history_by_target`/`h_state_history_by_target` dicts and its own
+    `rules_enabled`, so replay can never read or clear a live host's history
+    or toggle rules out from under the tail worker, no matter what IPs appear
+    in the uploaded capture and no matter how the two overlap in time. Live
+    history is therefore untouched by a replay, always.
+    """
+    global _replay_adapter
+    if _replay_adapter is None:
+        from control_backend.model_adapter import AntigravityModelAdapter
+        _replay_adapter = AntigravityModelAdapter()
+    return _replay_adapter
+
+
 @app.post("/api/replay")
 async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     """Offline analysis of an uploaded capture or flow CSV.
@@ -246,13 +285,19 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     Runs entirely locally: no network egress, no cloud dependency. The upload is
     written to a temp file, parsed, scored window by window, and deleted.
 
+    Scored on a private adapter instance (see _get_replay_adapter()), never on
+    the live serving singleton, so a replay can run concurrently with the live
+    tail worker without corrupting its state.
+
     Rules are disabled for this path regardless of the server's setting: an
     offline analysis is an evaluation, and a heuristic that floors risk at 0.40
     would make every uploaded file look alarming.
     """
     import tempfile
 
-    from control_backend.model_adapter import model_adapter, select_primary_target
+    from control_backend.model_adapter import select_primary_target
+
+    replay_adapter = _get_replay_adapter()
 
     name = (file.filename or "upload").lower()
     suffix = Path(name).suffix
@@ -266,16 +311,18 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     tmp = Path(tempfile.mkstemp(suffix=suffix or ".bin")[1])
     tmp.write_bytes(data)
 
-    prev_rules = getattr(model_adapter, "rules_enabled", False)
     try:
-        model_adapter.rules_enabled = False
-        model_adapter.reset_history()
+        # replay_adapter is private to this endpoint (see _get_replay_adapter),
+        # so forcing rules off and clearing history here can never affect the
+        # live tail worker's adapter or its state.
+        replay_adapter.rules_enabled = False
+        replay_adapter.reset_history()
 
         if suffix in (".csv", ".binetflow"):
             records = _parse_flow_file(tmp, suffix)
-            windows = _group_records_into_windows(records, model_adapter.window_seconds)
+            windows = _group_records_into_windows(records, replay_adapter.window_seconds)
         else:
-            windows = _replay_pcap_windows(tmp, max_windows)
+            windows = _replay_pcap_windows(tmp, max_windows, replay_adapter.window_seconds)
 
         results = []
         for widx, flows in enumerate(windows[:max_windows]):
@@ -284,7 +331,7 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
             target = select_primary_target(flows)
             if not target:
                 continue
-            ev = model_adapter.predict_window(target_ip=target, flows=flows, window_id=widx)
+            ev = replay_adapter.predict_window(target_ip=target, flows=flows, window_id=widx)
             results.append({
                 "window": widx,
                 "target": target,
@@ -313,7 +360,6 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
             "results": results,
         }
     finally:
-        model_adapter.rules_enabled = prev_rules
         tmp.unlink(missing_ok=True)
 
 
@@ -339,15 +385,20 @@ def _group_records_into_windows(records, window_seconds: float):
     return [buckets[k] for k in sorted(buckets)]
 
 
-def _replay_pcap_windows(path: Path, max_windows: int):
-    """Reuse the sensor's own window builder so replay matches live exactly."""
+def _replay_pcap_windows(path: Path, max_windows: int, window_seconds: float):
+    """Reuse the sensor's own window builder so replay matches live exactly.
+
+    `window_seconds` is passed in by the caller (the replay adapter's own
+    served contract) rather than read from the live `model_adapter` singleton
+    here, so this function never touches live serving state.
+    """
     import struct
 
     from telemetry.capture.sniffer import StreamingPacketSniffer
     from telemetry.state.state_builder import LiveStateBuilder
-    from control_backend.model_adapter import flows_from_span_dicts, model_adapter
+    from control_backend.model_adapter import flows_from_span_dicts
 
-    sb = LiveStateBuilder(window_sec=model_adapter.window_seconds)
+    sb = LiveStateBuilder(window_sec=window_seconds)
     windows, anchored = [], False
     with open(path, "rb") as f:
         if len(f.read(24)) < 24:

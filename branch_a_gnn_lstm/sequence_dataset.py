@@ -170,21 +170,57 @@ class LazyHostSequenceDataset(Dataset):
     the last input step.
     """
 
-    def __init__(self, store, seq_len: int = 5, min_trajectory_len: int = 2):
+    def __init__(self, store, seq_len: int = 5, min_trajectory_len: int = 2,
+                 max_gap_seconds: "float | None" = None):
         self.store = store
         self.seq_len = seq_len
+        #: If set, a host's trajectory is cut wherever two consecutive active
+        #: windows are more than this many seconds apart, and no sample's
+        #: history or target crosses a cut.
+        #:
+        #: Rows are a host's ACTIVE windows, not its clock ticks, so "the next
+        #: window" is whenever the host next appears -- and that can be far
+        #: outside the contract's horizon. Measured on the train split with the
+        #: real adapters: consecutive active windows of a CTU-13 host are a
+        #: median 736 s apart and over an hour apart in 35% of pairs, against a
+        #: 2 s window and a 10 s forecast horizon. Uncapped, "15 steps of
+        #: history" can span hours and "the next step" can be an hour ahead.
+        #:
+        #: None (the default) keeps every sample, as the no-dilution rule asks.
+        #: Enabling it removes samples whose target lies beyond a gap, which
+        #: can be a large share -- see claude_latest_analysis/30_time_gaps.md.
+        self.max_gap_seconds = max_gap_seconds
+        self.n_dropped_by_gap = 0
+        ws_all = np.asarray(store.window_start) if max_gap_seconds is not None else None
 
-        hosts, host_idx, pos = [], [], []
+        hosts, host_idx, pos, lo = [], [], [], []
         for h in store:
             rows = store._rows_by_host[h]
             n = len(rows)
             if n < min_trajectory_len:
                 continue
+            if max_gap_seconds is None:
+                # end_idx from 1..n-1, matching create_host_sequence_samples
+                ends = np.arange(1, n, dtype=np.int32)
+                seg_lo = np.zeros(n - 1, dtype=np.int32)
+            else:
+                ts = ws_all[np.asarray(rows)]
+                cut = np.diff(ts) > float(max_gap_seconds)   # cut[i]: gap between rows i and i+1
+                # segment start of every position = the latest cut at or before it
+                starts = np.zeros(n, dtype=np.int64)
+                starts[1:] = np.where(cut, np.arange(1, n), 0)
+                starts = np.maximum.accumulate(starts)
+                keep = starts[1:] < np.arange(1, n)          # a target may not open a segment
+                ends = np.arange(1, n, dtype=np.int32)[keep]
+                seg_lo = starts[1:][keep].astype(np.int32)
+                self.n_dropped_by_gap += int((~keep).sum())
+            if len(ends) == 0:
+                continue
             hi = len(hosts)
             hosts.append(h)
-            # end_idx from 1..n-1, matching create_host_sequence_samples
-            host_idx.append(np.full(n - 1, hi, dtype=np.int32))
-            pos.append(np.arange(1, n, dtype=np.int32))
+            host_idx.append(np.full(len(ends), hi, dtype=np.int32))
+            pos.append(ends)
+            lo.append(seg_lo)
 
         self.hosts = hosts
         # Row arrays already exist in the store; holding references to them
@@ -192,6 +228,8 @@ class LazyHostSequenceDataset(Dataset):
         self._rows = [store._rows_by_host[h] for h in hosts]
         self._host_idx = np.concatenate(host_idx) if host_idx else np.zeros(0, np.int32)
         self._pos = np.concatenate(pos) if pos else np.zeros(0, np.int32)
+        #: earliest row a sample's history may reach back to (its segment start)
+        self._lo = np.concatenate(lo) if lo else np.zeros(0, np.int32)
 
     def __len__(self) -> int:
         return int(len(self._pos))
@@ -201,7 +239,7 @@ class LazyHostSequenceDataset(Dataset):
         host = self.hosts[h]
         end = int(self._pos[idx])
         rows = self._rows[h]
-        start = max(0, end - self.seq_len)
+        start = max(int(self._lo[idx]), end - self.seq_len)
 
         feats = self.store.feats[rows[start:end]]          # (<=seq_len, 27)
         if len(feats) < self.seq_len:

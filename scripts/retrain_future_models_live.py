@@ -270,8 +270,17 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             h = batch["h_history"].to(device, non_blocking=_nblk)
             target = batch["h_future"].to(device, non_blocking=_nblk)
             target_risk = batch["risk_future"].to(device, non_blocking=_nblk)
+            # Real elapsed times. LazyHostRolloutDataset has emitted these all
+            # along and rollout() encodes them, but this -- the trainer that
+            # produces the SERVED checkpoint -- never passed them, so the
+            # model was told every step was 2 s apart when the measured
+            # median is 14 s and 64% of CTU-13 steps are over 10 s. The
+            # standalone trainer's comment said it outright: "Passing these
+            # two tensors is the whole change it needs."
+            t_hist = batch["t_history"].to(device, non_blocking=_nblk) if "t_history" in batch else None
+            t_fut = batch["t_future"].to(device, non_blocking=_nblk) if "t_future" in batch else None
             optimizer.zero_grad(set_to_none=True)
-            pred = wdt.rollout(h, K=_c.forecast_steps)
+            pred = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut)
             pred_risk, _ = risk.forward_trajectory(pred)
             loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
             # Huber, not BCE.
@@ -317,7 +326,9 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                 h=batch["h_history"].to(device, non_blocking=_nblk)
                 target=batch["h_future"].to(device, non_blocking=_nblk)
                 target_risk=batch["risk_future"].to(device, non_blocking=_nblk)
-                pred=wdt.rollout(h,K=_c.forecast_steps); pred_risk,_=risk.forward_trajectory(pred)
+                t_hist=batch["t_history"].to(device, non_blocking=_nblk) if "t_history" in batch else None
+                t_fut=batch["t_future"].to(device, non_blocking=_nblk) if "t_future" in batch else None
+                pred=wdt.rollout(h,K=_c.forecast_steps,t_history=t_hist,t_future=t_fut); pred_risk,_=risk.forward_trajectory(pred)
                 _v_sum += (F.mse_loss(pred,target)+risk.risk_loss(pred_risk,target_risk)).double().sum()
                 _vn += 1
                 # persistence: repeat the last observed step across the horizon
@@ -427,8 +438,13 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
     t0, done = time.time(), 0
     with torch.no_grad():
         for b in loader:
-            h = b["h_history"].to(device, non_blocking=(str(device) == "cuda"))
-            out = wdt.rollout(h, K=K).detach().float().cpu().numpy()
+            _nb = (str(device) == "cuda")
+            h = b["h_history"].to(device, non_blocking=_nb)
+            # Same real elapsed times Branch B is trained with, so the cached
+            # rollouts are the ones Branch B actually produces.
+            t_h = b["t_history"].to(device, non_blocking=_nb) if "t_history" in b else None
+            t_f = b["t_future"].to(device, non_blocking=_nb) if "t_future" in b else None
+            out = wdt.rollout(h, K=K, t_history=t_h, t_future=t_f).detach().float().cpu().numpy()
             cache[done:done + len(out)] = out
             done += len(out)
             if done % (batch * 200) == 0:
@@ -507,7 +523,10 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                 # Condition on what Branch B actually predicts, which is what
                 # DeepOP receives in production.
                 with torch.no_grad():
-                    h_aug=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=h.shape[1]).detach()
+                    _th=batch["t_history"].to(device,non_blocking=_nblk) if "t_history" in batch else None
+                    _tf=batch["t_future"].to(device,non_blocking=_nblk) if "t_future" in batch else None
+                    h_aug=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=h.shape[1],
+                                      t_history=_th, t_future=_tf).detach()
             else:
                 step_sigma=torch.linspace(0.015,0.055,steps=h.shape[1],device=device).unsqueeze(0).unsqueeze(-1)
                 h_aug=h+torch.randn_like(h)*step_sigma
@@ -553,7 +572,10 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                 if "h_rollout" in batch:
                     hv=batch["h_rollout"].to(device,non_blocking=_nblk)
                 elif wdt is not None and "h_history" in batch:
-                    hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1]).detach()
+                    _th=batch["t_history"].to(device,non_blocking=_nblk) if "t_history" in batch else None
+                    _tf=batch["t_future"].to(device,non_blocking=_nblk) if "t_future" in batch else None
+                    hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1],
+                                   t_history=_th, t_future=_tf).detach()
                 tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
                 logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk))
                 _v_sum+=F.cross_entropy(logits.reshape(-1,V),tgt.reshape(-1)).double().sum()

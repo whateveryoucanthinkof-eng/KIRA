@@ -10,6 +10,8 @@ Zero CSV or disk roundtrips.
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
+from cyberworld_v4.config import get_contract
+
 FLOW_COLUMNS = [
     'new_flows_count', 'active_flows_count', 'total_fwd_pkts', 'total_bwd_pkts',
     'total_fwd_bytes', 'total_bwd_bytes', 'fwd_bwd_byte_ratio',
@@ -57,6 +59,13 @@ class FlowRecord:
         self.bwd_pkts = 0
         self.fwd_bytes = 0
         self.bwd_bytes = 0
+        # Bytes/packets already handed to a previous snapshot_flows() export.
+        # snapshot_flows() reports the delta since the last export, not the
+        # cumulative total since the flow started -- see its docstring.
+        self.exported_fwd_bytes = 0
+        self.exported_bwd_bytes = 0
+        self.exported_fwd_pkts = 0
+        self.exported_bwd_pkts = 0
         self.fwd_act_data_pkts = 0
         self.pkt_lengths: List[int] = []
         self.packet_timestamps: List[float] = [first_ts]
@@ -99,15 +108,38 @@ class LiveFlowTable:
     def snapshot_flows(self, max_flows: Optional[int] = None) -> List[Dict[str, Any]]:
         """Export active 5-tuple flows for downstream UnifiedFlowRecord ingestion.
 
+        fwd_bytes/bwd_bytes/fwd_packets/bwd_packets are the traffic seen SINCE
+        THIS FLOW'S LAST EXPORT, not the cumulative total since the flow
+        started. FlowRecord itself still accumulates cumulatively (needed for
+        idle/duration math elsewhere); only the exported snapshot is windowed.
+        A flow exported every window at a steady rate must report the same
+        volume each time -- training counts each flow's bytes once, against
+        the window they happened in, and a cumulative export instead ramps
+        (a steady 20 kB/2 s flow measured 20k, 40k, 60k, 80k, 100k across five
+        consecutive windows for traffic that never changed). Only flows
+        actually included in `out` advance their exported_* baseline: a flow
+        dropped by `max_flows` this window must still report its full volume
+        whole the next time it is exported, not lose it.
+
         max_flows=None means EVERY active flow. The default used to be 256,
-        which silently discarded every flow past the 256th for a host in a
-        window -- invisible data loss on the PCAP training path. The live
-        serving path (telemetry/state/state_builder.py) still passes an
+        applied as items[:256] in dict insertion (flow-creation) order --
+        oldest-inserted flows first. Under a port scan, scan probes are
+        constantly-arriving NEW flows, so they land at the END of insertion
+        order and were exactly what got truncated away: the signal, not the
+        noise. When a cap is given, this now keeps the max_flows MOST
+        RECENTLY ACTIVE flows (by last packet time, tie-broken by start time)
+        instead of an insertion-order prefix, so a scan's newest probes
+        survive the cap and its oldest idle flows are the ones dropped. The
+        live serving path (telemetry/state/state_builder.py) still passes an
         explicit bound, because there it is a latency guard, not a sample.
         """
-        out: List[Dict[str, Any]] = []
         items = list(self.active_flows.items())
-        for key, f in (items if max_flows is None else items[:max_flows]):
+        if max_flows is not None and len(items) > max_flows:
+            items.sort(key=lambda kv: (kv[1].last_ts, kv[1].first_ts), reverse=True)
+            items = items[:max_flows]
+
+        out: List[Dict[str, Any]] = []
+        for key, f in items:
             src, dst, sport, dport, proto = key
             out.append({
                 "src_ip": str(src),
@@ -117,11 +149,15 @@ class LiveFlowTable:
                 "protocol": int(proto),
                 "start_time": float(f.first_ts),
                 "end_time": float(f.last_ts),
-                "fwd_bytes": int(f.fwd_bytes),
-                "bwd_bytes": int(f.bwd_bytes),
-                "fwd_packets": int(f.fwd_pkts),
-                "bwd_packets": int(f.bwd_pkts),
+                "fwd_bytes": int(f.fwd_bytes - f.exported_fwd_bytes),
+                "bwd_bytes": int(f.bwd_bytes - f.exported_bwd_bytes),
+                "fwd_packets": int(f.fwd_pkts - f.exported_fwd_pkts),
+                "bwd_packets": int(f.bwd_pkts - f.exported_bwd_pkts),
             })
+            f.exported_fwd_bytes = f.fwd_bytes
+            f.exported_bwd_bytes = f.bwd_bytes
+            f.exported_fwd_pkts = f.fwd_pkts
+            f.exported_bwd_pkts = f.bwd_pkts
         return out
 
     def __init__(self):
@@ -152,8 +188,16 @@ class LiveFlowTable:
             self.active_flows[fwd_key] = flow
             self.new_flows_this_window.add(fwd_key)
 
-    def extract_window_features(self, window_sec: float = 2.0) -> Dict[str, float]:
-        """Extracts the 42 formal continuous flow features for the elapsed 2s window."""
+    def extract_window_features(self, window_sec: Optional[float] = None) -> Dict[str, float]:
+        """Extracts the 42 formal continuous flow features for the elapsed window.
+
+        window_sec defaults to the authoritative temporal contract
+        (cyberworld_v4.config.get_contract().window_seconds) rather than a
+        hardcoded literal, so this never silently drifts from the window size
+        every model here is actually trained and served at.
+        """
+        if window_sec is None:
+            window_sec = get_contract().window_seconds
         new_flows_cnt = len(self.new_flows_this_window)
         active_flows_cnt = len(self.active_flows)
 

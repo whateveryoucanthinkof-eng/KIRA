@@ -1152,6 +1152,14 @@ def main():
                              "binary target a 95%% interval is wide by "
                              "construction; that is the honest answer, and the "
                              "reason the hardcoded +/-0.05 was not one.")
+    parser.add_argument("--max-gap-seconds", type=float, default=None,
+                        help="Cut each host's trajectory where consecutive active "
+                             "windows are further apart than this, so no sample's "
+                             "history or target crosses the gap. Off by default. "
+                             "Rows are ACTIVE windows, not clock ticks: a CTU-13 "
+                             "host's next window is a median 736 s away, against a "
+                             "10 s contract horizon. Enabling this drops samples -- "
+                             "see claude_latest_analysis/30_time_gaps.md.")
     parser.add_argument("--patience", type=int, default=3,
                         help="Stop after N epochs without improving --select-on. "
                              "The best checkpoint is already written, so this "
@@ -1350,17 +1358,27 @@ def main():
     t0 = time.time()
     train_store = _store_per_capture(train_files, "train")
     _apply_risk_target(train_store, "train")
-    train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1,
+                                       max_gap_seconds=args.max_gap_seconds)
     print(f"train done in {time.time()-t0:.1f}s ({len(train_ds)} samples)", flush=True)
     t0 = time.time()
     val_store = _store_per_capture(val_files, "val")
     _apply_risk_target(val_store, "val")
-    val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1,
+                                       max_gap_seconds=args.max_gap_seconds)
     print(f"val done in {time.time()-t0:.1f}s ({len(val_ds)} samples)", flush=True)
     t0 = time.time()
     test_store = _store_per_capture(test_files, "test")
     _apply_risk_target(test_store, "test")
-    test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1,
+                                       max_gap_seconds=args.max_gap_seconds)
+    if args.max_gap_seconds is not None:
+        for _n, _d in (("train", train_ds), ("val", val_ds), ("test", test_ds)):
+            _tot = len(_d) + _d.n_dropped_by_gap
+            print(f"gap segmentation [{_n}] at {args.max_gap_seconds}s: kept {len(_d):,} of "
+                  f"{_tot:,} samples, dropped {_d.n_dropped_by_gap:,} "
+                  f"({100.0 * _d.n_dropped_by_gap / max(_tot, 1):.1f}%) whose target lay beyond a gap",
+                  flush=True)
     print(f"test done in {time.time()-t0:.1f}s ({len(test_ds)} samples)", flush=True)
 
     # Pairing guard. `bce` binarises at risk > 0; under the hazard target that
