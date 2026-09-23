@@ -162,10 +162,12 @@ def train_branch_b(
             h_hist = batch["h_history"].to(device)
             h_fut = batch["h_future"].to(device)
             r_fut = batch["risk_future"].to(device)
-            # REFERENCE USAGE. scripts/retrain_future_models_live.py still
-            # calls `wdt.rollout(h, K=...)` with no times, so its model is
-            # told every step is 2 s apart when the measured median is 14 s.
-            # Passing these two tensors is the whole change it needs.
+            # Real elapsed times. scripts/retrain_future_models_live.py -- the
+            # trainer that produces the served checkpoint -- used to call
+            # wdt.rollout(h, K=...) without these, telling the model every
+            # step was 2 s apart when the measured median is 14 s. It now
+            # passes both, as do DeepOP's rollout paths and both serving paths
+            # (pinned by tests/test_rollout_real_times.py).
             t_hist = batch["t_history"].to(device) if "t_history" in batch else None
             t_fut = batch["t_future"].to(device) if "t_future" in batch else None
 

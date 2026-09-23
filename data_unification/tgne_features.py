@@ -198,8 +198,13 @@ def build_scoped_host_id(
     capture_id: Optional[str] = None,
 ) -> str:
     """
-    Builds a globally unique, scoped host identifier to prevent IP collisions across datasets.
-    Example: 'cicids2017:Friday_DDoS:192.168.10.50'
+    Builds a scoped host identifier, e.g. 'cicids2017:Friday_DDoS:192.168.10.50'.
+
+    Unused. The trainers scope hosts with TrajectoryStoreBuilder.set_namespace
+    and trajectory_store.capture_namespace(path) instead, which is keyed by the
+    capture file itself. If this is ever wired in, `scenario_id` must be unique
+    per capture: the CIC-2018 adapter does not set one, and a shared value
+    would merge the same address across days again.
     """
     clean_src = str(dataset_source).strip().lower()
     clean_scen = str(scenario_id).strip()

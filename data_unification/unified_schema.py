@@ -130,7 +130,19 @@ class UnifiedFlowRecord:
 
     @property
     def src_host_key(self) -> str:
-        """Returns scoped global host identifier preventing IP collision across datasets."""
+        """Scoped host identifier. NOT the mechanism the trainers use -- see below.
+
+        Do not wire this in as the fix for cross-capture host merging. It
+        scopes by `scenario_id`, falling back to "default", and the CIC-2018
+        adapter never sets scenario_id -- so every one of its days would map
+        `192.168.10.5` to the same `CIC2018::default::192.168.10.5` and the
+        nine fabricated days would still merge into one trajectory, which is
+        the defect it was written to prevent.
+
+        The wired mechanism is TrajectoryStoreBuilder.set_namespace with
+        trajectory_store.capture_namespace(path), which scopes by the actual
+        capture file and so cannot collide.
+        """
         scenario = self.meta.get("scenario_id", "default")
         return f"{self.raw_label_source}::{scenario}::{self.src_ip}"
 
