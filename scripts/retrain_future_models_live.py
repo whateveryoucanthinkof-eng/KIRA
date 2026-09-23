@@ -469,17 +469,26 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _sp = os.environ.get("CYBERWORLD_SPILL_DIR")
         train_ds = _WithRollout(train_ds, _precompute_rollouts(
             wdt, train_ds, device, _sp, "train", _c.forecast_steps,
-            num_workers=max(1, num_workers)))
+            num_workers=num_workers))
         val_ds = _WithRollout(val_ds, _precompute_rollouts(
             wdt, val_ds, device, _sp, "val", _c.forecast_steps,
-            num_workers=max(1, num_workers)))
+            num_workers=num_workers))
 
     _lk=_loader_kwargs(device,num_workers)
     train_loader=DataLoader(train_ds,batch_size=64,shuffle=True,**_lk)
     val_loader=DataLoader(val_ds,batch_size=64,**_lk)
     decoder=DeepOPForecastDecoder(d_latent=12,d_model=72,vocab_size=vocab.vocab_size,n_heads=6,num_layers=2,window_sizes=[2,4,8],dim_feedforward=144).to(device)
     optimizer=torch.optim.AdamW(decoder.parameters(),lr=5e-4,weight_decay=1e-4)
-    best=float("inf"); best_epoch=0; _since_improve=0; _history=[]
+    best=float("-inf"); best_epoch=0; _since_improve=0; _history=[]   # maximised: see selection below
+    # Label smoothing only over tokens that occur as a target. Six of the ten
+    # vocabulary tokens never do; smoothing over all ten pushed 2.4% of every
+    # target's mass onto impossible answers. See smoothed_and_plain_ce.
+    _base_ds = getattr(train_ds, "base", train_ds)
+    _hist = np.asarray(_base_ds.target_token_histogram())
+    _support = torch.as_tensor(_hist > 0, dtype=torch.bool, device=device)
+    print(f"DeepOP label-smoothing support: {int(_support.sum())} of {len(_hist)} "
+          f"tokens occur as a target", flush=True)
+
     _nb_total=len(train_loader); _nblk=(str(device)=="cuda")
     for epoch in range(epochs):
         decoder.train()
@@ -508,7 +517,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             # generalisation gap. Identity: L_smooth = 0.96*plain + 0.04*U with
             # U >= ln(10), which put the real degradation at >= 0.2087 nats
             # against a printed 0.1404. Both are now reported.
-            loss, _plain = smoothed_and_plain_ce(logits, tgt, label_smoothing=0.04)
+            loss, _plain = smoothed_and_plain_ce(logits, tgt, label_smoothing=0.04,
+                                                 support=_support)
             loss.backward(); torch.nn.utils.clip_grad_norm_(decoder.parameters(),1.0); optimizer.step()
             _tr_sum+=loss.detach().double().sum(); _tr_plain+=_plain.detach().double().sum(); _nb+=1
             if _nb % 2000 == 0:
@@ -607,16 +617,33 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _history.append({"epoch": epoch + 1, "val_loss": score, "token_acc": acc,
                          "macro_f1": macro_f1, "acc_persistence": acc_persist,
                          "acc_majority": acc_majority, "lift": acc - _best_base})
-        if score < best:
-            best=score; best_epoch=epoch+1; _since_improve=0
-            output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"epoch_history":list(_history),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
+        # Select on FREE-RUNNING macro F1, not validation cross-entropy.
+        #
+        # Serving is free-running (model_adapter calls forecast_sequence), and
+        # with ~93% of target tokens Benign the validation CE is dominated by
+        # how well the model fits that prior -- the minimum-CE epoch is the
+        # one that best predicts "Benign", not the one that forecasts attacks.
+        # Macro F1 over the tokens present weights the rare ones equally and
+        # is scored on the decode an operator actually sees. Falls back to CE
+        # (negated, since this is maximised) if the scorer is unavailable.
+        _sel = None
+        if _scorer is not None:
+            _sel = _scorer.result().get("macro_f1_free")
+        _sel_metric = "macro_f1_free" if _sel is not None else "neg_val_ce"
+        if _sel is None:
+            _sel = -score
+        _history[-1]["selection_metric"] = _sel_metric
+        _history[-1]["selection_score"] = float(_sel)
+        if _sel > best:
+            best=_sel; best_epoch=epoch+1; _since_improve=0
+            output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"epoch_history":list(_history),"selection_metric":_sel_metric,"label_smoothing_support":_support.cpu().tolist(),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
         else:
             _since_improve += 1
             # Best weights are already on disk; stopping cannot cost quality.
             if patience and _since_improve >= patience:
                 print(f"DeepOP: early stop at epoch {epoch+1}; no improvement in "
                       f"{_since_improve} epochs, best was epoch {best_epoch} "
-                      f"(val_loss {best:.4f})", flush=True)
+                      f"(selection score {best:.4f})", flush=True)
                 break
 
 
