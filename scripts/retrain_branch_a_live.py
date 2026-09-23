@@ -908,7 +908,11 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
                 "technique": batch["technique"].to(device, non_blocking=non_blocking),
                 "gradation": batch["gradation"].to(device, non_blocking=non_blocking),
             }
-            predictions = model(x)
+            # Real elapsed time between the history steps -- see
+            # MultiTaskLSTM.time_proj. Validation must see what training sees.
+            t_hist = (batch["t_history"].to(device, non_blocking=non_blocking)
+                      if "t_history" in batch else None)
+            predictions = model(x, t_history=t_hist)
             loss, parts = model.compute_loss(predictions, targets)
             loss_sum += loss.detach().double().sum()
             # Per-task losses and their learned weights. Without these the
@@ -1622,8 +1626,13 @@ def main():
                 "technique": batch["technique"].to(device, non_blocking=_non_blocking),
                 "gradation": batch["gradation"].to(device, non_blocking=_non_blocking),
             }
+            # Real elapsed time between history steps. The model was blind to
+            # it: none of the 15 temporal attributes spans windows, so fifteen
+            # steps 2 s apart and fifteen spread over hours looked identical.
+            t_hist = (batch["t_history"].to(device, non_blocking=_non_blocking)
+                      if "t_history" in batch else None)
             optimizer.zero_grad(set_to_none=True)
-            predictions = model(x)
+            predictions = model(x, t_history=t_hist)
             loss, _ = model.compute_loss(predictions, targets)
             loss.backward()
             optimizer.step()

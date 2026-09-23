@@ -376,6 +376,33 @@ class MultiTaskLSTM(nn.Module):
         self.uncertainty_loss = MultiTaskUncertaintyLoss()
         self.tech_focal_loss = MultiClassFocalLoss(gamma=focal_gamma)
 
+        # Elapsed time between a host's history steps.
+        #
+        # A trajectory's rows are the host's ACTIVE windows, not clock ticks,
+        # and none of the 15 temporal attributes spans windows -- they are all
+        # per-window aggregates. So this model saw fifteen feature vectors with
+        # no way to tell whether they were 2 s or 2 hours apart. Measured over
+        # the full train split: 40.9% of targets lie more than 10 s from their
+        # history (64% on CTU-13, a median 736 s). Branch B already solved this
+        # by encoding real elapsed time; this is the same fix, so the gap is
+        # handled without dropping samples.
+        #
+        # Time is log-compressed before encoding: gaps run from 2 s to hours,
+        # and the encoder's learned term is cos(Linear(t)), which turns
+        # hour-scale raw seconds into noise.
+        #
+        # `time_proj` is ZERO-initialised, so x + time_proj(...) == x exactly
+        # until training moves it. A checkpoint written before this change has
+        # no time_* keys; load_state_dict backfills them, and since the
+        # projection is zero the model behaves identically -- existing
+        # checkpoints keep loading and serving unchanged.
+        from branch_b_world_model.rollout_encoder_decoder import ContinuousTimeEncoding
+        self.time_encoder = ContinuousTimeEncoding(d_time=16, d_model=16,
+                                                   min_period=1.0, max_period=32.0)
+        self.time_proj = nn.Linear(16, input_dim)
+        nn.init.zeros_(self.time_proj.weight)
+        nn.init.zeros_(self.time_proj.bias)
+
         # Temperature scaling, done the way temperature scaling is defined.
         #
         # This used to be `nn.Parameter(torch.ones(1))`, trained jointly with
@@ -420,10 +447,27 @@ class MultiTaskLSTM(nn.Module):
         # was not a 95% interval.
         self.register_buffer("risk_conformal_halfwidth", torch.full((1,), float("nan")))
 
+    _TIME_KEYS = ("time_encoder.", "time_proj.")
+
+    def load_state_dict(self, state_dict, strict: bool = True, **kw):
+        """Accept checkpoints written before the time channel existed.
+
+        Only the time_* keys are backfilled, from this module's own freshly
+        initialised values. time_proj starts at zero, so a backfilled model is
+        exactly the model that was saved. Every other key is still checked
+        strictly -- this is not a blanket strict=False.
+        """
+        sd = dict(state_dict)
+        for k, v in self.state_dict().items():
+            if k.startswith(self._TIME_KEYS) and k not in sd:
+                sd[k] = v
+        return super().load_state_dict(sd, strict=strict, **kw)
+
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        t_history: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -437,6 +481,10 @@ class MultiTaskLSTM(nn.Module):
                 attention_weights: [batch_size, seq_len]
                 context: [batch_size, hidden_dim]
         """
+        if t_history is not None:
+            # seconds relative to the last observed step (<= 0, last = 0)
+            _lt = torch.sign(t_history) * torch.log1p(t_history.abs())
+            x = x + self.time_proj(self.time_encoder(_lt.to(x.dtype)))
         lstm_out, _ = self.lstm(x)  # [batch_size, seq_len, hidden_dim]
         context, attn_weights = self.attention(lstm_out, mask=mask)
 

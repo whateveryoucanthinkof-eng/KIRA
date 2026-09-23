@@ -390,7 +390,8 @@ class AntigravityModelAdapter:
 
         raise RuntimeError(f"TGNE produced no embedding for target host {target_ip}")
 
-    def _explain(self, x_tensor: torch.Tensor) -> ExplainabilityPayload:
+    def _explain(self, x_tensor: torch.Tensor,
+                 t_history: Optional[torch.Tensor] = None) -> ExplainabilityPayload:
         """Input x Gradient attribution for the prediction actually made.
 
         Two defects this fixes:
@@ -418,7 +419,9 @@ class AntigravityModelAdapter:
             # RNN backward needs cuDNN disabled in eval; this replaces the
             # train()-mode workaround without enabling dropout.
             with torch.backends.cudnn.flags(enabled=False):
-                out = self.branch_a(x)
+                # Same time input as the served forward, or the attribution
+                # would describe a computation that was never served.
+                out = self.branch_a(x, t_history=t_history)
                 risk = out["risk_score"]
                 if risk.ndim > 0:
                     risk = risk.reshape(-1)[0]
@@ -504,6 +507,19 @@ class AntigravityModelAdapter:
                 ceiling, self.INTERNAL_SUPPRESSION_FACTOR, self.alert_threshold,
                 ceiling, self.alert_threshold / 1.0)
         return ceiling
+
+    def _relative_times(self, times):
+        """[1, history_steps] seconds relative to the latest window.
+
+        The convention both Branch A's time channel and Branch B's rollout are
+        trained with: <= 0, last entry exactly 0. Left-padded slots repeat the
+        earliest real time, matching the training datasets.
+        """
+        last = times[-1]
+        rel = [t - last for t in times]
+        while len(rel) < self.history_steps:
+            rel.insert(0, rel[0])
+        return torch.tensor([rel], dtype=torch.float32, device=self.device)
 
     def _alert_level(self, risk: float) -> str:
         """Band a risk score.
@@ -604,20 +620,31 @@ class AntigravityModelAdapter:
         model_contract.assert_shape(feature_vector, (model_contract.BRANCH_A_INPUT_DIM,), "Branch A Input Vector")
 
         feature_history = self.feature_history_by_target.setdefault(target_ip, [])
+        # One window time per history entry. Recorded HERE, alongside the
+        # feature vector, because Branch A runs before the Branch B state is
+        # appended below; recording it there left Branch A's forward one
+        # window short of times. Feature and state histories always hold the
+        # same windows (one append each per call, both capped at
+        # history_steps), so both models read this one list.
+        h_time_history = self.h_time_history_by_target.setdefault(target_ip, [])
         feature_history.append(
             torch.from_numpy(feature_vector).float().to(self.device)
         )
+        h_time_history.append(
+            float(max(r.end_time for r in flows)) if flows else float(time.time()))
         if len(feature_history) > self.history_steps:
             feature_history.pop(0)
+            h_time_history.pop(0)
         self.feature_history = feature_history
         feature_history = list(feature_history)
         while len(feature_history) < self.history_steps:
             feature_history.insert(0, torch.zeros_like(feature_history[0]))
         x_tensor = torch.stack(feature_history).unsqueeze(0)
+        t_history = self._relative_times(h_time_history)
 
         with torch.no_grad():
             logger.debug("[TGNE] -> [BRANCH_A] -> [BRANCH_B] -> [DEEPOP]")
-            branch_a_out = self.branch_a(x_tensor)
+            branch_a_out = self.branch_a(x_tensor, t_history=t_history)
             risk_pred = branch_a_out["risk_score"]
             obs_logits = branch_a_out["technique_logits"]
             obs_probs = torch.softmax(obs_logits, dim=-1)
@@ -703,13 +730,9 @@ class AntigravityModelAdapter:
 
         curr_h = torch.from_numpy(h_emb).float().unsqueeze(0).to(self.device)
         h_state_history = self.h_state_history_by_target.setdefault(target_ip, [])
-        h_time_history = self.h_time_history_by_target.setdefault(target_ip, [])
         h_state_history.append(curr_h)
-        h_time_history.append(
-            float(max(r.end_time for r in flows)) if flows else float(time.time()))
         if len(h_state_history) > self.history_steps:
             h_state_history.pop(0)
-            h_time_history.pop(0)
         self.h_state_history = h_state_history
         # Pad a COPY. `h_state_history` is the list held in
         # h_state_history_by_target, so padding it in place wrote the zero
@@ -730,11 +753,7 @@ class AntigravityModelAdapter:
         # (the convention HostWorldDynamicsTransformer._elapsed_times and both
         # training datasets use: <= 0, last entry exactly 0). Padded slots
         # repeat the earliest real time, as the DeepOP dataset does.
-        _t_last = h_time_history[-1]
-        _t_rel = [t - _t_last for t in h_time_history]
-        while len(_t_rel) < self.history_steps:
-            _t_rel.insert(0, _t_rel[0])
-        t_history = torch.tensor([_t_rel], dtype=torch.float32, device=self.device)
+        # t_history was built once above from the shared per-window times.
         # t_future is deliberately None: it falls back to the uniform
         # window_seconds grid, i.e. "forecast at +2, +4, ... +10 s" -- exactly
         # the contract's question. Training teaches h(t + dt) over real dt;
@@ -826,7 +845,7 @@ class AntigravityModelAdapter:
                         _lead_time = (_i + 1) * self.window_seconds
                         break
 
-        explain = self._explain(x_tensor)
+        explain = self._explain(x_tensor, t_history)
         inf_ms = (time.perf_counter() - t0) * 1000.0
         now_ts = time.time()
 

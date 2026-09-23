@@ -53,7 +53,7 @@ class _ConstantModel(torch.nn.Module):
     """Predicts BENIGN for everything -- the collapse we must detect."""
 
     def eval(self): return self
-    def forward(self, x):
+    def forward(self, x, t_history=None):   # MultiTaskLSTM's time channel
         n = x.shape[0]
         logits = torch.full((n, C), -10.0)
         logits[:, BENIGN] = 10.0
@@ -70,7 +70,7 @@ class _OracleModel(torch.nn.Module):
         super().__init__()
         self.it = iter([b["technique"] for b in loader.batches])
     def eval(self): return self
-    def forward(self, x):
+    def forward(self, x, t_history=None):   # MultiTaskLSTM's time channel
         t = next(self.it)
         logits = torch.full((len(t), C), -10.0)
         logits[torch.arange(len(t)), t] = 10.0

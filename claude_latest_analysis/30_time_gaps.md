@@ -54,9 +54,9 @@ class of sample: those whose target does not satisfy the task definition. I read
 that as correctness rather than dilution — but it removes 41% of samples, so it
 is your call, not mine.
 
-## Recommendation
+## Original recommendation (superseded above)
 
-**For Branch A: B (60 s) for the next run**, then A as a comparison. B removes every multi-hour
+B (60 s), then A as a comparison. B removes every multi-hour
 bridge (the samples that are unambiguously not forecasting) while keeping 76% of
 the data, and it gives an honest statement — "forecasts within a minute" — that
 the evidence supports. Running A alongside tells us what the true 10 s task
@@ -91,9 +91,42 @@ h(t + Δt) across real Δt; serving chooses which Δt to ask about. That is a
 query, not a leak.
 
 **This makes the gap problem a non-issue for Branch B and DeepOP with zero
-samples dropped**, which is what the no-dilution rule wants. The recommendation
-below therefore applies to **Branch A only** — its 27-D input has no time
-channel, so the same approach would mean changing the serving contract.
+samples dropped**, which is what the no-dilution rule wants.
+
+## Branch A: given the same time channel
+
+None of Branch A's 15 temporal attributes spans windows — all are per-window
+aggregates — so it saw fifteen feature vectors with no way to tell 2 s from
+2 hours. It now has the same fix as Branch B, without touching the 27-D
+contract:
+
+- `MultiTaskLSTM.forward(x, t_history=None)` adds `time_proj(time_encoder(log t))`
+  to the input. Time is **log-compressed** first, because gaps run from 2 s to
+  hours and the encoder's learned `cos(Linear(t))` turns hour-scale raw seconds
+  into noise.
+- `time_proj` is **zero-initialised**, so the output is bit-identical to the
+  old model until training moves it.
+- `load_state_dict` backfills **only** the new `time_*` keys, so every existing
+  checkpoint still loads — and every other key is still checked strictly
+  (pinned by a test that deletes an LSTM key and expects a failure).
+- The dataset, trainer, `_evaluate`, the serving adapter (including its
+  saliency path, so attributions describe the forward actually served) and
+  the assembler all pass it.
+
+**So Branch A no longer needs to drop anything either.** `--max-gap-seconds`
+stays as an option, off by default, for anyone who wants the strict 10 s task
+as a comparison — but the gap problem is now solved everywhere without
+dilution.
+
+## Updated recommendation
+
+Train all three with the time channels on and **no gap cut**. That keeps all
+19.9M samples, and it is the honest version of the task: the model forecasts a
+host's next activity *and knows how far away it is*. At serving, `t_future`
+asks about +2 … +10 s specifically.
+
+The strict 10 s cut (option A) is still worth one comparison run later, to see
+how the model does on the contract's literal task.
 
 ## What is built
 

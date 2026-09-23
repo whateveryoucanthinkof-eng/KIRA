@@ -191,6 +191,8 @@ class LazyHostSequenceDataset(Dataset):
         #: can be a large share -- see claude_latest_analysis/30_time_gaps.md.
         self.max_gap_seconds = max_gap_seconds
         self.n_dropped_by_gap = 0
+        from cyberworld_v4.config import get_contract as _gc
+        self._window_seconds = float(_gc().window_seconds)
         ws_all = np.asarray(store.window_start) if max_gap_seconds is not None else None
 
         hosts, host_idx, pos, lo = [], [], [], []
@@ -248,7 +250,9 @@ class LazyHostSequenceDataset(Dataset):
 
         # Four scalars, read straight off the columns. `_materialize` would
         # build a whole HostWindowSnapshot -- including both feature slices --
-        # to have all but four of its fields discarded here, at 87x the cost.
+        # to have all but four of its fields discarded here. Measured with a
+        # warm cache: 3.12 us against 0.86 us, 3.6x. (An earlier figure of 87x
+        # came from a benchmark that timed a module import inside the loop.)
         risk, category, first_tech, window_idx = self.store.target_fields(int(rows[end]))
         tech = first_tech if first_tech is not None else "Benign"
         return {
@@ -260,4 +264,20 @@ class LazyHostSequenceDataset(Dataset):
                 GRADATION_LEVELS.get(category, 0), dtype=torch.long),
             "host_ip": host,
             "window_idx": window_idx,
+            "t_history": torch.from_numpy(self._t_history(rows, start, end)),
         }
+
+    def _t_history(self, rows, start, end):
+        """Seconds of each history step relative to the last OBSERVED one.
+
+        The convention MultiTaskLSTM and Branch B's rollout both use: <= 0,
+        last entry exactly 0. Left-padded slots repeat the earliest real
+        time, matching how the features are left-padded with zeros -- a
+        padded slot is not a step further into the past.
+        """
+        w = self.store.window_idx
+        w0 = float(w[int(rows[end - 1])])
+        t = (np.asarray(w[rows[start:end]], dtype=np.float64) - w0) * self._window_seconds
+        if len(t) < self.seq_len:
+            t = np.concatenate([np.full(self.seq_len - len(t), t[0] if len(t) else 0.0), t])
+        return np.ascontiguousarray(t, dtype=np.float32)

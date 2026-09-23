@@ -151,6 +151,7 @@ class AttackTrajectoryAssembler:
             x_batch = np.zeros((B, max_la, 27), dtype=np.float32)
             h_hist_batch = np.zeros((B, max_lw, 12), dtype=np.float32)
             t_hist_batch = np.zeros((B, max_lw), dtype=np.float32)
+            t_a_batch = np.zeros((B, max_la), dtype=np.float32)   # Branch A history times
 
             # LEFT-pad, because that is what training does.
             #
@@ -177,6 +178,11 @@ class AttackTrajectoryAssembler:
                 off_w = max_lw - len(recent_w)
                 for j, s in enumerate(recent_a):
                     x_batch[i, off_a + j] = np.concatenate([s.embedding, s.temporal_attrs])
+                if recent_a:
+                    _a0 = float(recent_a[-1].window_start)
+                    _ta = [float(s.window_start) - _a0 for s in recent_a]
+                    t_a_batch[i, off_a:] = _ta
+                    t_a_batch[i, :off_a] = _ta[0]
                 for j, s in enumerate(recent_w):
                     h_hist_batch[i, off_w + j] = s.embedding
                 # Real elapsed seconds relative to the latest snapshot, in the
@@ -198,7 +204,8 @@ class AttackTrajectoryAssembler:
                 #    builds one), so the weights were fitted with attention
                 #    over the zero-pad positions. Masking them at serving time
                 #    is a different function from the one that was trained.
-                branch_a_out = self.branch_a(x_tensor)
+                branch_a_out = self.branch_a(
+                    x_tensor, t_history=torch.from_numpy(t_a_batch).to(self.device))
                 obs_risks = branch_a_out["risk_score"].cpu().numpy()  # [B]
                 obs_tech_probs = F.softmax(branch_a_out["technique_logits"], dim=-1)
                 obs_tech_indices = obs_tech_probs.argmax(dim=-1).cpu().numpy()  # [B]

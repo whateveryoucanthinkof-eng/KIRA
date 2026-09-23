@@ -193,7 +193,7 @@ class TestAssemblerMatchesTrainingLayout:
         seen = {}
         original = assembler.branch_a.forward
 
-        def spy(x, mask=None):
+        def spy(x, mask=None, t_history=None):
             seen["x"] = x.detach().clone()
             seen["mask"] = mask
             return original(x, mask=mask)
@@ -223,7 +223,7 @@ class TestAssemblerMatchesTrainingLayout:
         seen = {}
         original = assembler.branch_a.forward
 
-        def spy(x, mask=None):
+        def spy(x, mask=None, t_history=None):
             seen["mask"] = mask
             return original(x, mask=mask)
 
