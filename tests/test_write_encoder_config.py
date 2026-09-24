@@ -49,7 +49,11 @@ def test_the_canonical_dims_are_pinned(tmp_path):
     _ckpt, r = _run(tmp_path, LOG)
     cfg = json.loads((tmp_path / "enc-3_config.json").read_text())
     assert cfg["edge_feat_dim"] == 12 and cfg["node_feat_dim"] == 12
-    assert cfg["feature_schema_version"] == "1.0.0"
+    # Read from the module, never re-typed: a schema bump must propagate to
+    # every config this script writes, and a stale literal here would hide it.
+    from data_unification.tgne_features import SCHEMA_VERSION
+
+    assert cfg["feature_schema_version"] == SCHEMA_VERSION
 
 
 def test_config_sits_beside_the_checkpoint(tmp_path):

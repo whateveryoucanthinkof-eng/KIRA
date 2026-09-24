@@ -53,6 +53,17 @@ launch() {
         "$@"
 }
 
+# Risk target: hazard, not severity. The severity target is ~82% exact zeros
+# and describes the CURRENT window, so both risk heads were learning detection
+# with a one-step delay (Branch B's risk head was worse than predicting zero in
+# every epoch). hazard = exp(-seconds_to_next_attack / tau) is continuous and
+# forward-looking. soft_bce is its proper scoring rule; plain bce would
+# binarise it and throw the timing away. The previous run used
+# `--risk-objective bce --risk-target severity`; compare against it.
+#
+# DeepOP only starts if Branch B beats persistence (MIN_BRANCH_B_SKILL in
+# scripts/retrain_future_models_live.py). If it refuses, fix Branch B first.
+#
 # The measured peaks were ~6.7 GiB (A) and ~7.0 GiB (B). 10 GiB each keeps
 # their combined hard caps below the machine's 22 GiB physical memory.
 launch branch-a-retrain 10G 9G "$A_LOG" \
@@ -60,7 +71,7 @@ launch branch-a-retrain 10G 9G "$A_LOG" \
     --cic-dir /var/home/samito/Documents/SIH/DATA/CSV \
     --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
     --output "$REPO/saved_models/branch_a/branch_a_lstm.pt" \
-    --epochs 8 --patience 3 --risk-objective bce --risk-target severity \
+    --epochs 8 --patience 3 --risk-objective soft_bce --risk-target hazard \
     --spill-dir "$RUN_ROOT/branch-a" --num-workers 4 &
 A_PID=$!
 
@@ -70,7 +81,7 @@ launch branch-b-retrain 10G 9G "$B_LOG" \
     --ctu-dir /var/home/samito/Documents/SIH/CTU-13-Dataset \
     --tgne "$REPO/saved_models/bita_bigru_transformer-unified_final.pth" \
     --out-dir "$REPO/saved_models" \
-    --stages branch_b --epochs 6 --patience 2 \
+    --stages branch_b --epochs 6 --patience 2 --risk-target hazard \
     --spill-dir "$RUN_ROOT/branch-b" --num-workers 4 &
 B_PID=$!
 

@@ -30,8 +30,36 @@ WINDOW_SECONDS: float = 2.0
 HISTORY_STEPS: int = 15
 FORECAST_STEPS: int = 5
 
-HISTORY_SECONDS: float = WINDOW_SECONDS * HISTORY_STEPS    # 30.0
-FORECAST_SECONDS: float = WINDOW_SECONDS * FORECAST_STEPS  # 10.0
+#: Seconds per FORECAST step. Detection and forecasting do not want the same
+#: resolution and were sharing one by accident.
+#:
+#: At the original 2.0s the horizon was 5 x 2 = 10 seconds. Attack stage
+#: progression -- recon to initial access to lateral movement to exfiltration --
+#: takes minutes to hours, so over ten seconds "nothing changes" is almost
+#: always the right answer. That is not a modelling failure, it is the task
+#: being trivial: results/v4_benchmark.json shows a persistence baseline at
+#: Brier 0.00067 and PR-AUC 0.9997 at every step, and the credibility gate in
+#: scripts/train_v4.py fires DEGENERATE TASK on exactly this.
+#:
+#: Raising it instead of raising FORECAST_STEPS is deliberate. K=150 at a 2s
+#: step would give the same 5-minute horizon, but Branch B rolls out
+#: autoregressively, so 150 compounding steps is a far worse estimator than 10
+#: coarse ones -- and the technique/hazard heads would each need 150 outputs.
+#:
+#: History stays at 2s. Detection still sees fine detail; only the TARGETS are
+#: coarsened, by OR-aggregating the future windows in each bucket (an attack
+#: anywhere in the bucket makes the bucket an attack).
+FORECAST_WINDOW_SECONDS: float = 30.0
+
+HISTORY_SECONDS: float = WINDOW_SECONDS * HISTORY_STEPS             # 30.0
+FORECAST_SECONDS: float = FORECAST_WINDOW_SECONDS * FORECAST_STEPS  # 150.0
+
+#: How many input windows make one forecast bucket. Must be a whole number, or
+#: a bucket would straddle a window boundary.
+FORECAST_STRIDE: int = int(round(FORECAST_WINDOW_SECONDS / WINDOW_SECONDS))
+assert abs(FORECAST_STRIDE * WINDOW_SECONDS - FORECAST_WINDOW_SECONDS) < 1e-9, (
+    "FORECAST_WINDOW_SECONDS must be a whole multiple of WINDOW_SECONDS"
+)
 
 # --- Representation -------------------------------------------------------
 TGNE_LATENT_DIM: int = 12
@@ -51,6 +79,9 @@ class TemporalContract:
     window_seconds: float = WINDOW_SECONDS
     history_steps: int = HISTORY_STEPS
     forecast_steps: int = FORECAST_STEPS
+    #: Seconds per forecast step. Defaults to FORECAST_WINDOW_SECONDS; set it
+    #: equal to window_seconds to recover the original single-scale contract.
+    forecast_window_seconds: float = FORECAST_WINDOW_SECONDS
 
     @property
     def history_seconds(self) -> float:
@@ -58,30 +89,53 @@ class TemporalContract:
 
     @property
     def forecast_seconds(self) -> float:
-        return self.window_seconds * self.forecast_steps
+        return self.forecast_window_seconds * self.forecast_steps
+
+    @property
+    def forecast_stride(self) -> int:
+        """Input windows per forecast bucket."""
+        r = self.forecast_window_seconds / self.window_seconds
+        n = int(round(r))
+        if abs(n * self.window_seconds - self.forecast_window_seconds) > 1e-9 or n < 1:
+            raise ValueError(
+                f"forecast_window_seconds ({self.forecast_window_seconds}) must be a "
+                f"whole multiple of window_seconds ({self.window_seconds})"
+            )
+        return n
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["history_seconds"] = self.history_seconds
         d["forecast_seconds"] = self.forecast_seconds
+        d["forecast_stride"] = self.forecast_stride
         return d
 
     def matches(self, other: Dict[str, Any], tol: float = 1e-6) -> bool:
-        """True when `other` describes the same contract."""
+        """True when `other` describes the same contract.
+
+        `forecast_window_seconds` is compared too, and a checkpoint that
+        predates the field is assumed single-scale (it equals window_seconds),
+        which is what those checkpoints actually were.
+        """
         try:
+            fw = float(other.get("forecast_window_seconds",
+                                 other["window_seconds"]))
             return (
                 abs(float(other["window_seconds"]) - self.window_seconds) < tol
                 and int(other["history_steps"]) == self.history_steps
                 and int(other["forecast_steps"]) == self.forecast_steps
+                and abs(fw - self.forecast_window_seconds) < tol
             )
         except (KeyError, TypeError, ValueError):
             return False
 
     def describe(self) -> str:
+        scale = ("" if self.forecast_window_seconds == self.window_seconds
+                 else f" @ {self.forecast_window_seconds:g}s/step")
         return (
             f"{self.window_seconds:g}s windows | "
             f"{self.history_steps} history ({self.history_seconds:g}s) | "
-            f"{self.forecast_steps} forecast ({self.forecast_seconds:g}s)"
+            f"{self.forecast_steps} forecast ({self.forecast_seconds:g}s{scale})"
         )
 
 

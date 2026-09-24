@@ -1,9 +1,34 @@
 """
-DeepOP-Style ATT&CK CWA Decoder conditioned on World Model Future States.
+DeepOP attack-sequence predictor, conditioned on the world model.
 
-Novel conditioning formulation:
-Cross-attends into predicted future host embeddings [H_hat_{t+1..t+K}] from Branch B
-and autoregressively decodes upcoming MITRE ATT&CK technique tokens.
+Zhang, Xue and Su, "DeepOP: A Hybrid Framework for MITRE ATT&CK Sequence
+Prediction via Deep Learning and Ontology", Electronics 14(2):257, 2025,
+Section 3.4. The paper's model is an encoder-decoder:
+
+  Eq. 1-3   the OBSERVED attack sequence s = {t_1..t_n} of ATT&CK labels is
+            embedded and summed with sinusoidal positional encodings;
+  Eq. 4-6   an ENCODER of temporal multi-head attention (+FFN, residual,
+            LayerNorm) builds its contextual representation z;
+  Eq. 7-10  a DECODER generates the next techniques autoregressively with
+            causal window attention (deepop_decoder/cwa.py);
+  Eq. 11    cross-entropy over the technique vocabulary.
+
+In this system the observed sequence is Branch A's technique for each of the
+last `history_steps` windows of the host, and the decoder cross-attends to the
+encoder output AND to Branch B's predicted future states, so DeepOP receives
+both branches' outputs as learned inputs.
+
+Before this, the decoder had no encoder at all. Branch A reached DeepOP only
+through CONTINUITY_BONUS_*: a hand-set logit added at inference, not learned
+and not in the loss. That path is kept (default off) solely so that
+checkpoints trained without the encoder still load and behave as they did.
+
+Deviations from the paper, each forced by the data rather than chosen:
+  * token embeddings are learned (nn.Embedding), not Word2Vec: the network-
+    observable vocabulary here has 10 tokens, too few for skip-gram to learn
+    anything a learned embedding does not;
+  * the decoder also attends to Branch B's continuous future states, which the
+    paper (text-derived CTI sequences) has no equivalent of.
 """
 
 import math
@@ -39,6 +64,62 @@ CONTINUITY_BONUS_ATTACK = 1.2   # x3.32 odds on the observed attack token
 CONTINUITY_BONUS_BENIGN = 1.8   # x6.05 odds on Benign
 
 
+def observed_sequence_tokens(token_ids, n_obs: int, vocab) -> List[int]:
+    """The encoder input for one sample: the last n_obs observed technique
+    tokens, prefixed with <BOS> and left-padded with <PAD> to n_obs + 1.
+
+    Training builds it from the corpus labels of the host's history windows;
+    serving builds it from Branch A's technique for the same windows. One
+    function for both so the two cannot drift.
+    """
+    toks = [int(t) for t in list(token_ids)[-n_obs:]] if n_obs > 0 else []
+    return [vocab.pad_idx] * (n_obs - len(toks)) + [vocab.bos_idx] + toks
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """DeepOP Eq. 2: PE(i,2k) = sin(i / 10000^(2k/d)), PE(i,2k+1) = cos(...)."""
+
+    def __init__(self, d_model: int, max_len: int = 64):
+        super().__init__()
+        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32)
+                        * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
+        # Not a parameter and not saved: it is a fixed function of position.
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+
+    def forward(self, seq_len: int) -> torch.Tensor:
+        return self.pe[:, :seq_len, :]
+
+
+class ObservedSequenceEncoder(nn.Module):
+    """DeepOP encoder (Eq. 3-6): E_emb = H + PE, then L layers of temporal
+    multi-head self-attention with feed-forward, residual and LayerNorm."""
+
+    def __init__(self, token_embed: nn.Embedding, pos_enc: nn.Module, d_model: int,
+                 n_heads: int, num_layers: int, dim_feedforward: int, dropout: float,
+                 pad_idx: int):
+        super().__init__()
+        self.token_embed = token_embed   # shared with the decoder
+        self.pos_enc = pos_enc
+        self.d_model = d_model
+        self.pad_idx = pad_idx
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers,
+                                             enable_nested_tensor=False)
+
+    def forward(self, obs_tokens: torch.Tensor):
+        pad = obs_tokens == self.pad_idx
+        # A fully padded row would give every query nothing to attend to.
+        pad[pad.all(dim=1), -1] = False
+        x = self.token_embed(obs_tokens) * math.sqrt(self.d_model) + self.pos_enc(obs_tokens.shape[1])
+        return self.encoder(x, src_key_padding_mask=pad), pad
+
+
 class CWADecoderLayer(nn.Module):
     """
     Decoder layer combining:
@@ -55,12 +136,14 @@ class CWADecoderLayer(nn.Module):
         dim_feedforward: int = 128,
         dropout: float = 0.1,
         use_cwa: bool = True,
+        window_mode: str = "partitioned",
     ):
         super(CWADecoderLayer, self).__init__()
         self.use_cwa = use_cwa
         if self.use_cwa:
             self.cwa_self_attn = CausalWindowAttention(
-                d_model=d_model, n_heads=n_heads, window_sizes=window_sizes, dropout=dropout
+                d_model=d_model, n_heads=n_heads, window_sizes=window_sizes, dropout=dropout,
+                window_mode=window_mode,
             )
         else:
             self.cwa_self_attn = nn.MultiheadAttention(
@@ -87,6 +170,7 @@ class CWADecoderLayer(nn.Module):
         tgt: torch.Tensor,
         memory: torch.Tensor,
         tgt_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. Self-Attention (CWA or Plain Causal Attention)
         if self.use_cwa:
@@ -97,8 +181,9 @@ class CWADecoderLayer(nn.Module):
             tgt2, _ = self.cwa_self_attn(query=tgt, key=tgt, value=tgt, attn_mask=causal_mask, key_padding_mask=tgt_mask)
         tgt = self.norm1(tgt + self.dropout(tgt2))
 
-        # 2. Cross-Attention to predicted future state embeddings
-        tgt2, _ = self.cross_attn(query=tgt, key=memory, value=memory)
+        # 2. Cross-attention to [encoded observed sequence ; Branch B future states]
+        tgt2, _ = self.cross_attn(query=tgt, key=memory, value=memory,
+                                  key_padding_mask=memory_key_padding_mask)
         tgt = self.norm2(tgt + self.dropout(tgt2))
 
         # 3. Feedforward
@@ -110,15 +195,28 @@ class CWADecoderLayer(nn.Module):
 
 class DeepOPForecastDecoder(nn.Module):
     """
-    Forecasting Decoder: generates anticipated ATT&CK technique token sequences
-    conditioned on predicted future host states H_hat_{t+1..t+K}.
-    Supports modular ablations: use_cwa, use_direct_head, use_prototypes, use_future_gate.
+    DeepOP encoder-decoder (see module docstring). Generates the next ATT&CK
+    tokens from the observed technique sequence (Branch A) and the predicted
+    future states (Branch B).
+
+    Constructor defaults are the paper's model. The legacy_* flags reproduce
+    the pre-encoder decoder exactly, so its checkpoints still load:
+    use `DeepOPForecastDecoder.from_checkpoint`.
     """
+
+    #: The paper architecture.
+    PAPER_ARCH = dict(use_obs_encoder=True, pos_encoding="sinusoidal", window_mode="partitioned",
+                      use_direct_head=False, use_prototypes=False, use_future_gate=False,
+                      default_continuity_bonus=0.0)
+    #: What every checkpoint saved before the encoder existed was trained as.
+    LEGACY_ARCH = dict(use_obs_encoder=False, pos_encoding="learned", window_mode="sliding",
+                       use_direct_head=True, use_prototypes=True, use_future_gate=True,
+                       default_continuity_bonus=1.0)
 
     def __init__(
         self,
-        d_latent: int = 12,       # Branch B latent host embedding dimension
-        d_model: int = 72,        # Decoder model dimension (divisible by 6 heads and 3 scales)
+        d_latent: int = 27,       # world-state width s(t): TGNE latent + host attributes
+        d_model: int = 72,        # divisible by 6 heads and 3 window scales
         vocab_size: Optional[int] = None,
         n_heads: int = 6,
         num_layers: int = 2,
@@ -127,24 +225,55 @@ class DeepOPForecastDecoder(nn.Module):
         max_seq_len: int = 16,
         dropout: float = 0.1,
         use_cwa: bool = True,
-        use_direct_head: bool = True,
-        use_prototypes: bool = True,
-        use_future_gate: bool = True,
+        use_obs_encoder: bool = True,
+        pos_encoding: str = "sinusoidal",
+        window_mode: str = "partitioned",
+        use_direct_head: bool = False,
+        use_prototypes: bool = False,
+        use_future_gate: bool = False,
+        default_continuity_bonus: float = 0.0,
+        max_obs_len: int = 32,
     ):
         super(DeepOPForecastDecoder, self).__init__()
+        if pos_encoding not in ("sinusoidal", "learned"):
+            raise ValueError(f"pos_encoding must be 'sinusoidal' or 'learned', got {pos_encoding!r}")
         self.vocab = get_joint_vocab()
         self.vocab_size = vocab_size or self.vocab.vocab_size
+        self.d_latent = d_latent
         self.d_model = d_model
         self.max_seq_len = max_seq_len
         self.use_cwa = use_cwa
+        self.use_obs_encoder = use_obs_encoder
+        self.pos_encoding = pos_encoding
+        self.window_mode = window_mode
         self.use_direct_head = use_direct_head
         self.use_prototypes = use_prototypes
         self.use_future_gate = use_future_gate
+        self.default_continuity_bonus = float(default_continuity_bonus)
+        self._arch = dict(
+            d_latent=d_latent, d_model=d_model, vocab_size=self.vocab_size, n_heads=n_heads,
+            num_layers=num_layers, window_sizes=list(window_sizes or [2, 4, 8]),
+            dim_feedforward=dim_feedforward, max_seq_len=max_seq_len, dropout=dropout,
+            use_cwa=use_cwa, use_obs_encoder=use_obs_encoder, pos_encoding=pos_encoding,
+            window_mode=window_mode, use_direct_head=use_direct_head,
+            use_prototypes=use_prototypes, use_future_gate=use_future_gate,
+            default_continuity_bonus=float(default_continuity_bonus), max_obs_len=max_obs_len,
+        )
 
-        # Token embedding and sinusoidal positional encoding
+        # Token embedding and positional encoding (Eq. 1-3).
         self.token_embed = nn.Embedding(self.vocab_size, d_model, padding_idx=self.vocab.pad_idx)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        if pos_encoding == "learned":
+            self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        else:
+            self._pe = SinusoidalPositionalEncoding(d_model, max_len=max(max_seq_len, max_obs_len))
+
+        # Encoder over the observed attack sequence (Eq. 4-6).
+        if use_obs_encoder:
+            self.obs_encoder = ObservedSequenceEncoder(
+                self.token_embed,
+                SinusoidalPositionalEncoding(d_model, max_len=max_obs_len),
+                d_model, n_heads, num_layers, dim_feedforward, dropout, self.vocab.pad_idx)
 
         # Context projection from future state H_hat to d_model
         self.future_proj = nn.Linear(d_latent, d_model)
@@ -159,6 +288,7 @@ class DeepOPForecastDecoder(nn.Module):
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
                     use_cwa=use_cwa,
+                    window_mode=window_mode,
                 )
                 for _ in range(num_layers)
             ]
@@ -194,32 +324,72 @@ class DeepOPForecastDecoder(nn.Module):
         # Prediction projection from autoregressive decoder
         self.fc_out = nn.Linear(d_model, self.vocab_size)
 
+    # -- construction from a checkpoint ------------------------------------
+    def arch_config(self) -> Dict[str, Any]:
+        """Constructor kwargs; saved with every checkpoint as ckpt["arch"]."""
+        return dict(self._arch)
+
+    @classmethod
+    def from_checkpoint(cls, ckpt: Dict[str, Any], device="cpu") -> "DeepOPForecastDecoder":
+        """Build the architecture a checkpoint was trained as, then load it.
+
+        Checkpoints written before the encoder existed carry no "arch"; they
+        are the LEGACY_ARCH decoder over the 12-D TGNE latent.
+        """
+        sd = ckpt["decoder_state_dict"]
+        arch = ckpt.get("arch")
+        if arch is None:
+            arch = dict(cls.LEGACY_ARCH)
+            arch["d_latent"] = int(sd["future_proj.weight"].shape[1])
+            arch["d_model"] = int(sd["future_proj.weight"].shape[0])
+            arch["vocab_size"] = int(sd["fc_out.weight"].shape[0])
+            arch["max_seq_len"] = int(sd["pos_embed"].shape[1])
+            arch["num_layers"] = len({k.split(".")[1] for k in sd if k.startswith("layers.")})
+        model = cls(**arch).to(device)
+        model.load_state_dict(sd)
+        return model
+
+    def _positions(self, seq_len: int) -> torch.Tensor:
+        if self.pos_encoding == "learned":
+            return self.pos_embed[:, :seq_len, :]
+        return self._pe(seq_len)
+
     def forward(
         self,
         h_future: torch.Tensor,
         tgt_tokens: torch.Tensor,
+        obs_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Teacher-forced forward pass with continuous future state residual gating.
+        Teacher-forced forward pass.
         Args:
-            h_future: [batch_size, K, d_latent] predicted future host states
-            tgt_tokens: [batch_size, seq_len] input token sequence (e.g. <BOS> + tokens)
+            h_future:   [B, K, d_latent] Branch B's predicted future states
+            tgt_tokens: [B, S] decoder input (<BOS> + previous targets)
+            obs_tokens: [B, T_obs] observed technique sequence (Branch A over
+                        the history window), PAD-left-padded. Ignored by a
+                        legacy decoder.
         Returns:
-            logits: [batch_size, seq_len, vocab_size]
+            logits: [B, S, vocab_size]
         """
         B, S = tgt_tokens.shape
-        # Embed tokens and add positional encoding
         x = self.token_embed(tgt_tokens) * math.sqrt(self.d_model)
-        x = x + self.pos_embed[:, :S, :]
+        x = x + self._positions(S)
 
-        # Project future latent context
-        memory = self.future_proj(h_future)  # [B, K, d_model]
+        # Cross-attention memory: [encoded observed sequence ; future states].
+        future_mem = self.future_proj(h_future)  # [B, K, d_model]
+        memory, mem_pad = future_mem, None
+        if self.use_obs_encoder and obs_tokens is not None:
+            enc, enc_pad = self.obs_encoder(obs_tokens)
+            memory = torch.cat([enc, future_mem], dim=1)
+            mem_pad = torch.cat(
+                [enc_pad, torch.zeros(B, future_mem.shape[1], dtype=torch.bool, device=enc_pad.device)],
+                dim=1)
 
-        # Pass through decoder layers
         for layer in self.layers:
-            x = layer(x, memory=memory)
+            x = layer(x, memory=memory, memory_key_padding_mask=mem_pad)
 
         # Residual gating: anchor token representation directly to future world state
+        memory = future_mem
         K = memory.shape[1]
         if self.use_future_gate:
             if S <= K:
@@ -279,7 +449,8 @@ class DeepOPForecastDecoder(nn.Module):
         repetition_penalty: float = 1.0,
         temperature: float = 0.8,
         return_probs: bool = False,
-        continuity_bonus: float = 1.0,
+        continuity_bonus: Optional[float] = None,
+        observed_sequence: Optional[torch.Tensor] = None,
     ) -> Any:
         """
         Autoregressive sequence generation conditioned on h_future and optional observed_token.
@@ -295,9 +466,12 @@ class DeepOPForecastDecoder(nn.Module):
                 because callers pass it. Do not read it as "the model samples".
             return_probs: if True, additionally returns per-step attack and top token probabilities
             continuity_bonus: scale on the un-learned step-0 bonus towards
-                `observed_token` (see CONTINUITY_BONUS_* above). 1.0 is the
-                shipped serving behaviour; pass 0.0 to measure the model
-                without the hard-coded persistence prior mixed in.
+                `observed_token` (see CONTINUITY_BONUS_* above). None uses the
+                model's default: 0.0 for the paper architecture (no hand-set
+                prior), 1.0 for a legacy checkpoint, whose serving behaviour
+                it reproduces.
+            observed_sequence: [B, T_obs] observed technique tokens for the
+                encoder (Branch A over the history window).
         Returns:
             If return_probs is False:
                 pred_tokens: [batch_size, max_steps] integer token IDs
@@ -308,6 +482,8 @@ class DeepOPForecastDecoder(nn.Module):
         self.eval()
         B = h_future.shape[0]
         device = h_future.device
+        if continuity_bonus is None:
+            continuity_bonus = self.default_continuity_bonus
 
         # Start sequence cleanly with <BOS> token (prefix_len = 1) for 100% training/inference parity
         curr_tokens = torch.full((B, 1), self.vocab.bos_idx, dtype=torch.long, device=device)
@@ -318,7 +494,7 @@ class DeepOPForecastDecoder(nn.Module):
 
         with torch.no_grad():
             for step in range(max_steps):
-                logits = self.forward(h_future, curr_tokens)  # [B, curr_len, vocab_size]
+                logits = self.forward(h_future, curr_tokens, obs_tokens=observed_sequence)
                 next_logits = logits[:, -1, :].clone()  # [B, vocab_size]
 
                 # Suppress special tokens

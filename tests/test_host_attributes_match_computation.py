@@ -14,9 +14,16 @@ import numpy as np
 import pytest
 
 from data_unification.host_attributes import (
+    BYTE_LOG_SCALE,
+    BYTE_RATE_LOG_SCALE,
+    COUNT_LOG_SCALE,
+    DURATION_SCALE_SECONDS,
     HOST_ATTRIBUTES,
     HOST_ATTRIBUTE_INDEX,
     HOST_ATTR_DIM,
+    PEER_COUNT_LOG_SCALE,
+    PORT_COUNT_LOG_SCALE,
+    PORT_SPACE,
 )
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.unified_schema import LabelSource, UnifiedFlowRecord
@@ -67,13 +74,13 @@ def test_all_values_are_bounded_unit_interval():
 
 
 @pytest.mark.parametrize("name,expected", [
-    ("flow_count",    lambda n, **_: min(1.0, np.log1p(n) / 10.0)),
-    ("fwd_bytes",     lambda n, fb, **_: min(1.0, np.log1p(fb * n) / 20.0)),
-    ("bwd_bytes",     lambda n, bb, **_: min(1.0, np.log1p(bb * n) / 20.0)),
-    ("total_bytes",   lambda n, fb, bb, **_: min(1.0, np.log1p((fb + bb) * n) / 20.0)),
-    ("fwd_packets",   lambda n, fp, **_: min(1.0, np.log1p(fp * n) / 10.0)),
-    ("bwd_packets",   lambda n, bp, **_: min(1.0, np.log1p(bp * n) / 10.0)),
-    ("total_packets", lambda n, fp, bp, **_: min(1.0, np.log1p((fp + bp) * n) / 10.0)),
+    ("flow_count",    lambda n, **_: min(1.0, np.log1p(n) / COUNT_LOG_SCALE)),
+    ("fwd_bytes",     lambda n, fb, **_: min(1.0, np.log1p(fb * n) / BYTE_LOG_SCALE)),
+    ("bwd_bytes",     lambda n, bb, **_: min(1.0, np.log1p(bb * n) / BYTE_LOG_SCALE)),
+    ("total_bytes",   lambda n, fb, bb, **_: min(1.0, np.log1p((fb + bb) * n) / BYTE_LOG_SCALE)),
+    ("fwd_packets",   lambda n, fp, **_: min(1.0, np.log1p(fp * n) / COUNT_LOG_SCALE)),
+    ("bwd_packets",   lambda n, bp, **_: min(1.0, np.log1p(bp * n) / COUNT_LOG_SCALE)),
+    ("total_packets", lambda n, fp, bp, **_: min(1.0, np.log1p((fp + bp) * n) / COUNT_LOG_SCALE)),
 ])
 def test_volume_attributes_match_their_names(name, expected):
     """Each volume attribute equals its own formula over a controlled window."""
@@ -87,13 +94,13 @@ def test_unique_peers_counts_peers_not_flows():
     """Ten flows to two peers is two peers -- the name says peers."""
     recs = [_rec(peer="10.0.0.2") for _ in range(5)] + [_rec(peer="10.0.0.3") for _ in range(5)]
     got = _attrs(recs)[HOST_ATTRIBUTE_INDEX["unique_peers"]]
-    assert got == pytest.approx(min(1.0, np.log1p(2) / 5.0), rel=1e-5)
+    assert got == pytest.approx(min(1.0, np.log1p(2) / PEER_COUNT_LOG_SCALE), rel=1e-5)
 
 
 def test_unique_dst_ports_counts_distinct_ports():
     recs = [_rec(dport=p) for p in (80, 443, 80, 8080)]
     got = _attrs(recs)[HOST_ATTRIBUTE_INDEX["unique_dst_ports"]]
-    assert got == pytest.approx(min(1.0, np.log1p(3) / 5.0), rel=1e-5)
+    assert got == pytest.approx(min(1.0, np.log1p(3) / PORT_COUNT_LOG_SCALE), rel=1e-5)
 
 
 def test_tcp_and_udp_ratios_are_protocol_fractions():
@@ -114,7 +121,7 @@ def test_tcp_ratio_ignores_non_tcp_protocols():
 def test_avg_duration_is_a_mean_normalised_by_300s():
     recs = [_rec(dur=10.0), _rec(dur=20.0)]
     got = _attrs(recs)[HOST_ATTRIBUTE_INDEX["avg_duration"]]
-    assert got == pytest.approx(min(1.0, 15.0 / 300.0), rel=1e-5)
+    assert got == pytest.approx(min(1.0, 15.0 / DURATION_SCALE_SECONDS), rel=1e-5)
 
 
 def test_rates_divide_by_window_duration_not_flow_count():
@@ -128,9 +135,9 @@ def test_rates_divide_by_window_duration_not_flow_count():
 
     tot_b, tot_p, dur = 6000, 60, 100.0
     assert slow[HOST_ATTRIBUTE_INDEX["byte_rate"]] == pytest.approx(
-        min(1.0, np.log1p(tot_b / dur) / 15.0), rel=1e-5)
+        min(1.0, np.log1p(tot_b / dur) / BYTE_RATE_LOG_SCALE), rel=1e-5)
     assert slow[HOST_ATTRIBUTE_INDEX["packet_rate"]] == pytest.approx(
-        min(1.0, np.log1p(tot_p / dur) / 10.0), rel=1e-5)
+        min(1.0, np.log1p(tot_p / dur) / COUNT_LOG_SCALE), rel=1e-5)
 
 
 def test_peer_density_is_peers_per_flow():
@@ -152,7 +159,7 @@ def test_peer_is_resolved_from_whichever_side_is_not_the_host():
         coarse_category="Benign", attck_technique_ids=[],
     )
     got = _attrs([inbound])[HOST_ATTRIBUTE_INDEX["unique_peers"]]
-    assert got == pytest.approx(min(1.0, np.log1p(1) / 5.0), rel=1e-5)
+    assert got == pytest.approx(min(1.0, np.log1p(1) / PEER_COUNT_LOG_SCALE), rel=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -228,3 +235,45 @@ def test_the_dashboard_group_map_covers_every_attribute():
     dangling = [k for k in group_map
                 if not k.startswith("H_emb_") and k not in HOST_ATTRIBUTES]
     assert not dangling, f"group map keys that are not real attributes: {dangling}"
+
+
+# ---------------------------------------------------------------------------
+# Saturation: the fan-out attributes must stay discriminative over the range
+# the corpora actually contain. Both used to divide by 5.0, i.e. reach 1.0 at
+# 147 and stay there -- so a 148-port probe and a full 65,535-port sweep were
+# the identical feature value.
+# ---------------------------------------------------------------------------
+
+
+def test_unique_peers_still_separates_hosts_above_the_old_saturation_point():
+    def peers(k):
+        recs = [_rec(peer=f"10.{i // 65536}.{(i // 256) % 256}.{i % 256}") for i in range(k)]
+        return _attrs(recs)[HOST_ATTRIBUTE_INDEX["unique_peers"]]
+
+    assert peers(200) < peers(1000) < peers(5000), "fan-out saturates inside the observed range"
+    assert peers(5000) < 1.0
+
+
+def test_unique_dst_ports_reaches_one_only_at_the_full_port_space():
+    def ports(k):
+        return _attrs([_rec(dport=p) for p in range(1, k + 1)])[
+            HOST_ATTRIBUTE_INDEX["unique_dst_ports"]]
+
+    assert ports(200) < ports(2000) < ports(20000), "port sweep saturates inside the observed range"
+    # Exactly 1.0 when the whole port space has been touched, and not before.
+    assert min(1.0, np.log1p(PORT_SPACE) / PORT_COUNT_LOG_SCALE) == pytest.approx(1.0)
+    assert ports(20000) < 1.0
+
+
+def test_scales_are_not_duplicated_as_literals_in_the_computation():
+    """The computation must import the divisors, not re-type them."""
+    import inspect
+    from data_unification.multi_dataset_stream import HostTrajectoryExtractor
+
+    src = inspect.getsource(HostTrajectoryExtractor.compute_host_temporal_attributes)
+    body = src.split('"""', 2)[-1]
+    for literal in ("/ 5.0", "/ 20.0", "/ 15.0", "/ 300.0"):
+        assert literal not in body, (
+            f"{literal!r} is a hardcoded normalisation divisor; import it from "
+            "host_attributes so the spec table stays authoritative"
+        )

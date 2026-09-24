@@ -28,8 +28,26 @@ from typing import Dict, Iterator, List, Optional
 
 import numpy as np
 
+#: Default row width: embedding(12) + temporal_attrs(15). The builder takes it
+#: as a parameter because the attribute vector is 45 wide when the extractor is
+#: built with `include_packet_features=True` (the 30 packet-level features from
+#: telemetry/packet/pcap_engine.py). Hardcoding 27 here silently truncated the
+#: wide vector into a 27-column block.
 FEAT_DIM = 27          # embedding(12) + temporal_attrs(15)
 EMB_DIM = 12
+
+
+def world_state(snapshot) -> np.ndarray:
+    """s(t) = [TGNE embedding ; host attributes] for one snapshot.
+
+    This is the enriched tensor Branch A reads, and the state Branch B
+    models and DeepOP decodes. Branch B used to see only the first 12
+    columns -- the bare TGNE latent -- so the world model never saw the
+    flow volumes, peer counts and port counts the attributes carry, while
+    docs/ARCHITECTURE.md described it as modelling the 27-D state.
+    """
+    return np.concatenate([np.asarray(snapshot.embedding, dtype=np.float32),
+                           np.asarray(snapshot.temporal_attrs, dtype=np.float32)])
 _BLOCK = 262_144       # rows per in-RAM block before spilling
 
 
@@ -342,11 +360,12 @@ def _resident_or_random_advised(feats, n_rows):
 class TrajectoryStoreBuilder:
     """Accumulates snapshots columnar-side, spilling the bulk array to disk."""
 
-    def __init__(self, spill_dir: Optional[str] = None):
+    def __init__(self, spill_dir: Optional[str] = None, feat_dim: int = FEAT_DIM):
         self.spill_dir = spill_dir
+        self.feat_dim = int(feat_dim)
         self._spill_path: Optional[str] = None
         self._spill_fh = None
-        self._block = np.zeros((_BLOCK, FEAT_DIM), dtype=np.float32)
+        self._block = np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)
         self._block_n = 0
         self._n = 0
 
@@ -395,9 +414,19 @@ class TrajectoryStoreBuilder:
                 self._flush_block()
             else:
                 self._block = np.concatenate(
-                    [self._block, np.zeros((_BLOCK, FEAT_DIM), dtype=np.float32)]
+                    [self._block, np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)]
                 )
         row = self._block_n
+        got = EMB_DIM + len(temporal_attrs)
+        if got != self.feat_dim:
+            raise ValueError(
+                f"snapshot is {got} wide ({EMB_DIM} embedding + "
+                f"{len(temporal_attrs)} attributes) but this store was built "
+                f"for {self.feat_dim}. Build the store with "
+                f"feat_dim={got} -- e.g. TrajectoryStoreBuilder(feat_dim="
+                f"EMB_DIM + EXTENDED_HOST_ATTR_DIM) when the extractor has "
+                f"include_packet_features=True."
+            )
         self._block[row, :EMB_DIM] = embedding
         self._block[row, EMB_DIM:] = temporal_attrs
         self._block_n += 1
@@ -422,8 +451,8 @@ class TrajectoryStoreBuilder:
             self._spill_fh.close()
             self._spill_fh = None
             feats = (np.memmap(self._spill_path, dtype=np.float32, mode="r",
-                               shape=(self._n, FEAT_DIM))
-                     if self._n else np.zeros((0, FEAT_DIM), dtype=np.float32))
+                               shape=(self._n, self.feat_dim))
+                     if self._n else np.zeros((0, self.feat_dim), dtype=np.float32))
             feats = _resident_or_random_advised(feats, self._n)
             # Unlink the backing file NOW, while the mapping holds it open.
             #

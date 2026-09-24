@@ -15,14 +15,103 @@ import torch
 import pandas as pd
 
 from data_unification.unified_schema import UnifiedFlowRecord, CoarseCategory
+from data_unification.host_attributes import (
+    EXTENDED_HOST_ATTR_DIM,
+    HOST_ATTR_DIM,
+    PACKET_ATTR_DIM,
+    normalize_packet_features,
+    BYTE_LOG_SCALE,
+    BYTE_RATE_LOG_SCALE,
+    COUNT_LOG_SCALE,
+    DURATION_SCALE_SECONDS,
+    PEER_COUNT_LOG_SCALE,
+    PORT_COUNT_LOG_SCALE,
+)
 from data_unification.flow_to_temporal_event import FlowToTemporalEventAdapter, TemporalEventStream
 from data_unification.cic2017_adapter import CIC2017Adapter
 from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.warden_adapter import WardenAdapter
 from data_unification.auth_log_adapter import AuthEventRecord, AuthLogAdapter, AuthEventType, AuthLogSource
 from data_unification.behavioral_fingerprint import BehavioralFlowFingerprinter, BehavioralProfile
-from data_unification.trajectory_store import TrajectoryStore, TrajectoryStoreBuilder
+from data_unification.trajectory_store import EMB_DIM, TrajectoryStore, TrajectoryStoreBuilder
 from dataclasses import field
+
+
+def _packet_features_of(records) -> Optional[Dict[str, float]]:
+    """The packet-level feature dict attached to this host-window, if any.
+
+    `pcap_bridge` attaches ONE shared dict to every record of a host-window, so
+    reading the first record that carries one is both correct and cheap -- and
+    the sharing is why this does not cost 30 floats per record at corpus scale.
+    """
+    for r in records:
+        md = getattr(r, "metadata", None)
+        if md:
+            pf = md.get("packet_features")
+            if pf:
+                return pf
+    return None
+
+
+#: MITRE ATT&CK tactic -> base severity, used to rank which of several attack
+#: categories seen in one window describes the host's state. Module level
+#: because it is a constant: it used to be rebuilt inside the per-host loop,
+#: i.e. once per host per window (~25M dict constructions on a full-corpus run).
+TACTIC_BASE_SEVERITY = {
+    "Benign": 0.0,
+    "Recon": 0.35,
+    "Reconnaissance": 0.35,
+    "Discovery": 0.38,
+    "InitialAccess": 0.60,
+    "CredentialAccess": 0.65,
+    "Execution": 0.72,
+    "Persistence": 0.75,
+    "PrivilegeEscalation": 0.78,
+    "DefenseEvasion": 0.75,
+    "C2": 0.82,
+    "CommandAndControl": 0.82,
+    "LateralMovement": 0.85,
+    "Exfiltration": 0.92,
+    "Impact": 0.96,
+}
+
+#: How a host earns the attack label from the flows in its window.
+#:
+#:   "either"  host is either endpoint of an attack flow (attacker OR victim)
+#:   "target"  host is the DESTINATION of an attack flow (victim only)
+#:   "source"  host is the SOURCE of an attack flow (attacker only)
+#:
+#: "either" is the historical behaviour and stays the default, but it was never
+#: a decision -- `host_recs` simply matched on both endpoints. It is now named,
+#: recorded, and selectable, because the three targets mean different things and
+#: a benchmark has to say which one it scored.
+ATTACK_ROLES = ("either", "target", "source")
+
+
+def _window_attack_label(atk_recs):
+    """Coarse category and the UNION of technique ids for one host-window.
+
+    The previous form was `atk_recs[0].coarse_category` / `atk_recs[0].attck_technique_ids`
+    -- whichever attack flow happened to sort first decided the label and every
+    other technique in the window was discarded. That silently nullified the
+    multilabel technique target `cyberworld_v4.targets` builds downstream, which
+    can only be as multilabel as the snapshot it reads.
+
+    The category is now the most severe present (deterministic, and the one an
+    operator would triage on) and the technique list is the union, ordered by
+    first appearance so the result is stable across runs.
+    """
+    coarse = max(
+        (r.coarse_category for r in atk_recs),
+        key=lambda c: (TACTIC_BASE_SEVERITY.get(c, 0.50), c),
+    )
+    techs, seen = [], set()
+    for r in atk_recs:
+        for t in r.attck_technique_ids or ():
+            if t not in seen:
+                seen.add(t)
+                techs.append(t)
+    return coarse, techs
 
 
 @dataclass(slots=True)
@@ -125,8 +214,44 @@ class BoundedHostSlidingBuffer:
         return host_ip in self._buffers
 
 
+class _WindowedNeighborFinder:
+    """Restricts a NeighborFinder to interactions at or after `lower_bound`.
+
+    The TGNE graph for a window is that window's flows. Long-range history
+    reaches the embedding through the TGN memory (BiTA), not through the
+    neighbour lookup. Without this bound, offline extraction built one graph
+    per data chunk and each embedding took a host's 10 most recent
+    interactions from ANY earlier window, while live serving only ever had the
+    current window's flows -- the same model saw different graphs in training
+    and in serving. Padding id 0 is what the attention layer masks.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.lower_bound = -np.inf
+
+    def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=20):
+        nbrs, eidx, times = self.inner.get_temporal_neighbor(
+            source_nodes, timestamps, n_neighbors=n_neighbors)
+        stale = times < self.lower_bound
+        if stale.any():
+            nbrs = nbrs.copy(); eidx = eidx.copy(); times = times.copy()
+            nbrs[stale] = 0
+            eidx[stale] = 0
+            times[stale] = 0.0
+        return nbrs, eidx, times
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
 class HostTrajectoryExtractor:
-    """Extracts per-host embedding and temporal attribute trajectories across time windows."""
+    """Extracts per-host embedding and temporal attribute trajectories across time windows.
+
+    Per window: build the window's interaction graph, update TGN memory (BiTA)
+    from earlier windows, read the 12-D host embedding, then queue the window's
+    own interactions for the next memory update.
+    """
 
     def __init__(
         self,
@@ -135,14 +260,108 @@ class HostTrajectoryExtractor:
         n_temporal_attrs: int = 15,
         auth_events: Optional[List[AuthEventRecord]] = None,
         spill_dir: Optional[str] = None,
+        heuristic_label_augmentation: bool = False,
+        attack_role: str = "either",
+        include_packet_features: bool = False,
+        persist_memory: bool = False,
     ):
+        """
+        `persist_memory` -- keep the encoder's TGN memory and host-id map across
+        calls. Live serving sets it: each call is one 2 s window of one
+        continuous session. Offline extraction leaves it off: each call is a
+        separate capture and starts from empty memory, except the continuation
+        chunks of chunked extraction (`emit_after` set), which carry on.
+
+        `heuristic_label_augmentation` -- OFF by default, and the default changed.
+
+        Two blocks below used to overwrite `is_attack` from heuristics rather
+        than from the corpus label:
+
+          * auth: `auth_failed_count >= 5` -> CredentialAccess / T1110
+          * behavioural: `is_shell_detected` or `port_mismatch_count >= 2`
+            -> Execution / T1059
+
+        The second is the damaging one. `BehavioralFlowFingerprinter` classifies
+        any flow with `tot_bytes <= 1200`, 1-3 packets each way and mean packet
+        size < 180 as C2 beaconing, and marks it a port mismatch whenever the
+        destination port is not 80/443/8000/8080/8443. Two ordinary DNS lookups
+        in one window satisfy both, so the host was labelled "under attack".
+        Measured downstream: `results/v4_benchmark.json` reports a
+        `current_attack_rate` of 0.677 and a test-split base rate of 0.9997 on
+        corpora whose published attack fraction runs 0.03%-57%.
+
+        That is fatal in two separate ways. The labels stop being ground truth,
+        so no accuracy number measures detection; and the heuristic reads the
+        same flow statistics the model is given as input, so the model is graded
+        on reproducing a function of its own features.
+
+        The fingerprinter is still useful -- as a FEATURE. Leave this False and
+        feed `compute_host_behavioral_metrics` into the attribute vector if you
+        want the signal; do not let it write the target.
+
+        `attack_role` -- which endpoint of an attack flow earns the label; see
+        ATTACK_ROLES. Default "either" preserves existing behaviour.
+
+        `include_packet_features` -- append the 30 packet-level attributes
+        `telemetry/packet/pcap_engine.py` computes, widening the attribute
+        vector from 15 to 45 and the model input from 27-D to 57-D. OFF by
+        default because it changes the contract and invalidates every shipped
+        checkpoint; the features reach this class through
+        `record.metadata["packet_features"]`, which only the PCAP path can
+        populate. See host_attributes.PACKET_ATTRIBUTES for what is in it and
+        why it matters.
+        """
+        if attack_role not in ATTACK_ROLES:
+            raise ValueError(
+                f"attack_role must be one of {ATTACK_ROLES}, got {attack_role!r}"
+            )
         self.tgn = tgne_ta_model
         self.window_size_sec = window_size_sec
         self.n_temporal_attrs = n_temporal_attrs
         # When set, the bulk (N, 27) feature block is written here and mapped
         # back read-only, so a full-density corpus does not have to fit in RAM.
         self.spill_dir = spill_dir
+        self.heuristic_label_augmentation = bool(heuristic_label_augmentation)
+        self.attack_role = attack_role
+        self.include_packet_features = bool(include_packet_features)
+        if self.include_packet_features:
+            # n_temporal_attrs is the contract this extractor emits; widen it
+            # here rather than letting a 45-wide vector surprise a consumer
+            # that asked for 15.
+            expected = HOST_ATTR_DIM + PACKET_ATTR_DIM
+            if n_temporal_attrs == HOST_ATTR_DIM:
+                self.n_temporal_attrs = EXTENDED_HOST_ATTR_DIM
+            elif n_temporal_attrs != expected:
+                raise ValueError(
+                    f"include_packet_features needs n_temporal_attrs="
+                    f"{expected}, got {n_temporal_attrs}"
+                )
         self.auth_events: List[AuthEventRecord] = list(auth_events) if auth_events else []
+        self.persist_memory = bool(persist_memory)
+        # Host-id map that stays fixed while memory is carried, so memory row k
+        # keeps meaning the same host. Rebuilt whenever memory is reset.
+        self._event_adapter: Optional[FlowToTemporalEventAdapter] = None
+        # Timestamp of the newest interaction already queued for memory.
+        self._ingested_until = -np.inf
+
+    @property
+    def uses_memory(self) -> bool:
+        return bool(getattr(self.tgn, "use_memory", False))
+
+    def reset_memory_state(self) -> None:
+        """Forget the encoder's memory and host ids (new capture or session)."""
+        if hasattr(self.tgn, "reset_state"):
+            self.tgn.reset_state()
+        self._event_adapter = None
+        self._ingested_until = -np.inf
+
+    def _adapter_for_call(self, continuing: bool) -> FlowToTemporalEventAdapter:
+        if not self.uses_memory:
+            return FlowToTemporalEventAdapter(window_size_sec=self.window_size_sec)
+        if not continuing or self._event_adapter is None:
+            self.reset_memory_state()
+            self._event_adapter = FlowToTemporalEventAdapter(window_size_sec=self.window_size_sec)
+        return self._event_adapter
 
     def add_auth_events(self, events: List[AuthEventRecord]):
         """Ingests additional host authentication security events."""
@@ -153,6 +372,7 @@ class HostTrajectoryExtractor:
         host_ip: str,
         window_records: List[UnifiedFlowRecord],
         window_duration: float,
+        packet_features: Optional[Dict[str, float]] = None,
     ) -> np.ndarray:
         """
         Computes 15 per-host temporal scalar attributes for window t:
@@ -173,6 +393,11 @@ class HostTrajectoryExtractor:
         14: active_connection_density
         """
         attrs = np.zeros(self.n_temporal_attrs, dtype=np.float32)
+        if self.include_packet_features:
+            attrs[HOST_ATTR_DIM:] = normalize_packet_features(
+                packet_features if packet_features is not None
+                else _packet_features_of(window_records)
+            )
         n = len(window_records)
         if n == 0:
             return attrs
@@ -200,21 +425,26 @@ class HostTrajectoryExtractor:
                 udp_count += 1
             tot_dur += r.duration
 
+        # Divisors come from host_attributes so the values and the documented
+        # normalisation cannot drift apart. PEER_COUNT_LOG_SCALE and
+        # PORT_COUNT_LOG_SCALE were raised from 5.0, which saturated both
+        # attributes at 147 -- flattening exactly the fan-out and port-sweep
+        # range that distinguishes a scan from ordinary traffic.
         dur = max(1.0, window_duration)
-        attrs[0] = min(1.0, np.log1p(n) / 10.0)
-        attrs[1] = min(1.0, np.log1p(fwd_b) / 20.0)
-        attrs[2] = min(1.0, np.log1p(bwd_b) / 20.0)
-        attrs[3] = min(1.0, np.log1p(tot_b) / 20.0)
-        attrs[4] = min(1.0, np.log1p(fwd_p) / 10.0)
-        attrs[5] = min(1.0, np.log1p(bwd_p) / 10.0)
-        attrs[6] = min(1.0, np.log1p(tot_p) / 10.0)
-        attrs[7] = min(1.0, np.log1p(len(peers)) / 5.0)
-        attrs[8] = min(1.0, np.log1p(len(ports)) / 5.0)
+        attrs[0] = min(1.0, np.log1p(n) / COUNT_LOG_SCALE)
+        attrs[1] = min(1.0, np.log1p(fwd_b) / BYTE_LOG_SCALE)
+        attrs[2] = min(1.0, np.log1p(bwd_b) / BYTE_LOG_SCALE)
+        attrs[3] = min(1.0, np.log1p(tot_b) / BYTE_LOG_SCALE)
+        attrs[4] = min(1.0, np.log1p(fwd_p) / COUNT_LOG_SCALE)
+        attrs[5] = min(1.0, np.log1p(bwd_p) / COUNT_LOG_SCALE)
+        attrs[6] = min(1.0, np.log1p(tot_p) / COUNT_LOG_SCALE)
+        attrs[7] = min(1.0, np.log1p(len(peers)) / PEER_COUNT_LOG_SCALE)
+        attrs[8] = min(1.0, np.log1p(len(ports)) / PORT_COUNT_LOG_SCALE)
         attrs[9] = float(tcp_count) / n
         attrs[10] = float(udp_count) / n
-        attrs[11] = min(1.0, (tot_dur / n) / 300.0)
-        attrs[12] = min(1.0, np.log1p(tot_b / dur) / 15.0)
-        attrs[13] = min(1.0, np.log1p(tot_p / dur) / 10.0)
+        attrs[11] = min(1.0, (tot_dur / n) / DURATION_SCALE_SECONDS)
+        attrs[12] = min(1.0, np.log1p(tot_b / dur) / BYTE_RATE_LOG_SCALE)
+        attrs[13] = min(1.0, np.log1p(tot_p / dur) / COUNT_LOG_SCALE)
         attrs[14] = min(1.0, float(len(peers)) / max(1, n))
 
         return attrs
@@ -230,12 +460,13 @@ class HostTrajectoryExtractor:
         window_idx_base: int = 0,
     ) -> "TrajectoryStore | Dict[str, List[HostWindowSnapshot]]":
         """
-        Groups flows by 60s windows, extracts TGNE-TA embeddings H_t,
-        correlates multimodal host authentication logs (breaking L4 visibility ceiling),
-        and constructs per-host timelines using either bounded circular buffers or unbounded lists.
+        Groups flows into `window_size_sec` windows, extracts TGNE-TA embeddings
+        H_t, correlates host authentication logs, and builds per-host timelines.
         """
-        adapter = adapter or FlowToTemporalEventAdapter(window_size_sec=self.window_size_sec)
+        continuing = self.persist_memory or emit_after is not None
+        adapter = adapter or self._adapter_for_call(continuing)
         event_stream = adapter.process_records(records, sort_by_time=True)
+        windowed_nf: Optional[_WindowedNeighborFinder] = None
 
         all_auth_events: List[AuthEventRecord] = self.auth_events + (list(auth_events) if auth_events else [])
 
@@ -249,9 +480,9 @@ class HostTrajectoryExtractor:
                 t = float(event_stream.timestamps[i])
                 adj_list[u].append((v, i, t))
                 adj_list[v].append((u, i, t))
-            nf = NeighborFinder(adj_list, uniform=False)
-            self.tgn.neighbor_finder = nf
-            self.tgn.embedding_module.neighbor_finder = nf
+            windowed_nf = _WindowedNeighborFinder(NeighborFinder(adj_list, uniform=False))
+            self.tgn.neighbor_finder = windowed_nf
+            self.tgn.embedding_module.neighbor_finder = windowed_nf
             edge_feats_t = torch.from_numpy(event_stream.edge_features).float().to(self.tgn.device)
             self.tgn.edge_raw_features = edge_feats_t
             self.tgn.embedding_module.edge_features = edge_feats_t
@@ -270,6 +501,8 @@ class HostTrajectoryExtractor:
             self.tgn.node_raw_features = node_feats_t
             self.tgn.embedding_module.node_features = node_feats_t
             self.tgn.n_nodes = n_nodes
+            if hasattr(self.tgn, "ensure_capacity"):
+                self.tgn.ensure_capacity(n_nodes)
 
         # Map window boundaries to lists of records
         # `builder` lets a caller accumulate across several chunked calls, so a
@@ -280,7 +513,10 @@ class HostTrajectoryExtractor:
         # neighbour history it would have seen processing everything at once.
         owns_builder = builder is None
         if builder is None:
-            builder = TrajectoryStoreBuilder(spill_dir=self.spill_dir)
+            builder = TrajectoryStoreBuilder(
+                spill_dir=self.spill_dir,
+                feat_dim=EMB_DIM + self.n_temporal_attrs,
+            )
         sorted_records = sorted(records, key=lambda r: r.start_time)
 
         for win_idx, (win_start, win_end, s_idx, e_idx) in enumerate(event_stream.window_boundaries):
@@ -302,11 +538,36 @@ class HostTrajectoryExtractor:
             active_ips_sorted = sorted(list(active_ips))
             active_host_ids = np.array([adapter.ip_to_id.get(ip, 0) for ip in active_ips_sorted], dtype=int)
 
-            # Compute TGNE-TA embeddings H_t
+            # 1. Memory <- BiTA(messages from EARLIER windows) for this
+            #    window's hosts (TGN memory_update_at_start order).
+            if self.uses_memory:
+                self.tgn.update_memory_for(active_host_ids)
+
+            # 2. TGNE-TA embeddings H_t over THIS window's interaction graph.
+            if windowed_nf is not None:
+                windowed_nf.lower_bound = win_start
             with torch.no_grad():
                 H_t = self.tgn.get_host_embeddings(
                     active_host_ids, timestamp=win_end, n_neighbors=10
                 ).cpu().numpy()
+
+            # 3. Queue this window's interactions; they reach memory next time
+            #    one of their hosts is active, never this window's own embedding.
+            #    Only interactions newer than anything already queued: a
+            #    continuation chunk re-reads the previous chunk's tail (and
+            #    re-windows it on its own grid), and those flows must reach
+            #    memory exactly once.
+            if self.uses_memory:
+                ts_w = event_stream.timestamps[s_idx:e_idx]
+                new = ts_w > self._ingested_until
+                if new.any():
+                    self.tgn.store_interactions(
+                        event_stream.sources[s_idx:e_idx][new],
+                        event_stream.destinations[s_idx:e_idx][new],
+                        ts_w[new],
+                        event_stream.edge_idxs[s_idx:e_idx][new],
+                    )
+                    self._ingested_until = float(ts_w[new].max())
 
             # For each active host, compute temporal attributes, auth indicators & labels
             for idx, ip in enumerate(active_ips_sorted):
@@ -315,61 +576,56 @@ class HostTrajectoryExtractor:
                     ip, host_recs, self.window_size_sec
                 )
 
-                # Determine if host was victim/target of attack or attacking
-                atk_recs = [r for r in host_recs if r.is_attack]
+                # Attack flows this host took part in, in the role the caller
+                # asked for. `attack_role` used to be implicit: host_recs
+                # matched either endpoint, so an attacker and its victim -- and
+                # any benign server the attacker merely touched -- all carried
+                # the same positive label.
+                if self.attack_role == "target":
+                    atk_recs = [r for r in host_recs if r.is_attack and r.dst_ip == ip]
+                elif self.attack_role == "source":
+                    atk_recs = [r for r in host_recs if r.is_attack and r.src_ip == ip]
+                else:
+                    atk_recs = [r for r in host_recs if r.is_attack]
+
                 is_atk = len(atk_recs) > 0
-                coarse = atk_recs[0].coarse_category if is_atk else "Benign"
-                techs = list(atk_recs[0].attck_technique_ids) if is_atk else []
-                # Risk score: Grounded in MITRE ATT&CK tactic progression & volume intensity
-                TACTIC_BASE_SEVERITY = {
-                    "Benign": 0.0,
-                    "Recon": 0.35,
-                    "Reconnaissance": 0.35,
-                    "Discovery": 0.38,
-                    "InitialAccess": 0.60,
-                    "CredentialAccess": 0.65,
-                    "Execution": 0.72,
-                    "Persistence": 0.75,
-                    "PrivilegeEscalation": 0.78,
-                    "DefenseEvasion": 0.75,
-                    "C2": 0.82,
-                    "CommandAndControl": 0.82,
-                    "LateralMovement": 0.85,
-                    "Exfiltration": 0.92,
-                    "Impact": 0.96,
-                }
                 if is_atk:
+                    # Most severe category present + UNION of techniques, not
+                    # whichever record happened to sort first.
+                    coarse, techs = _window_attack_label(atk_recs)
                     base_sev = TACTIC_BASE_SEVERITY.get(coarse, 0.50)
                     atk_density = min(1.0, len(atk_recs) / max(1, len(host_recs)))
                     vol_scale = min(1.0, float(np.log1p(len(atk_recs)) / 5.0))
                     risk = min(1.0, max(0.20, base_sev + 0.04 * atk_density + 0.04 * vol_scale))
                 else:
-                    risk = 0.0
+                    coarse, techs, risk = "Benign", [], 0.0
 
-                # Extract and correlate multimodal authentication metrics
-                auth_metrics = {}
-                if all_auth_events:
-                    auth_metrics = AuthLogAdapter.extract_window_auth_metrics(
-                        all_auth_events, ip, win_start, win_end
-                    )
-                    # Break the L4 visibility ceiling: detect credential access / password spraying
-                    if auth_metrics.get("is_brute_force_flag", 0.0) == 1.0 or auth_metrics.get("auth_failed_count", 0.0) >= 5:
+                # Heuristic label augmentation. OFF by default -- see the
+                # constructor docstring for why these two blocks are the reason
+                # the measured attack rate was 0.68 on corpora whose published
+                # rate is a few percent.
+                if self.heuristic_label_augmentation:
+                    auth_metrics = {}
+                    if all_auth_events:
+                        auth_metrics = AuthLogAdapter.extract_window_auth_metrics(
+                            all_auth_events, ip, win_start, win_end
+                        )
+                        if auth_metrics.get("is_brute_force_flag", 0.0) == 1.0 or auth_metrics.get("auth_failed_count", 0.0) >= 5:
+                            is_atk = True
+                            coarse = "CredentialAccess"
+                            if "T1110" not in techs:
+                                techs = ["T1110"] + [t for t in techs if t != "T1110"]
+                            brute_score = auth_metrics.get("auth_brute_force_score", 0.5)
+                            risk = max(risk, min(1.0, 0.75 + 0.25 * brute_score))
+
+                    behavioral_metrics = BehavioralFlowFingerprinter.compute_host_behavioral_metrics(ip, host_recs)
+                    if behavioral_metrics.get("is_shell_detected", 0.0) == 1.0 or behavioral_metrics.get("port_mismatch_count", 0.0) >= 2:
                         is_atk = True
-                        coarse = "CredentialAccess"
-                        if "T1110" not in techs:
-                            techs = ["T1110"] + [t for t in techs if t != "T1110"]
-                        brute_score = auth_metrics.get("auth_brute_force_score", 0.5)
-                        risk = max(risk, min(1.0, 0.75 + 0.25 * brute_score))
-
-                # Compute behavioral flow size & protocol profile metrics (independent of static ports)
-                behavioral_metrics = BehavioralFlowFingerprinter.compute_host_behavioral_metrics(ip, host_recs)
-                if behavioral_metrics.get("is_shell_detected", 0.0) == 1.0 or behavioral_metrics.get("port_mismatch_count", 0.0) >= 2:
-                    is_atk = True
-                    if coarse == "Benign":
-                        coarse = "Execution"
-                    if "T1059" not in techs:
-                        techs = ["T1059"] + techs
-                    risk = max(risk, min(1.0, 0.65 + 0.35 * behavioral_metrics.get("behavioral_threat_score", 0.5)))
+                        if coarse == "Benign":
+                            coarse = "Execution"
+                        if "T1059" not in techs:
+                            techs = ["T1059"] + techs
+                        risk = max(risk, min(1.0, 0.65 + 0.35 * behavioral_metrics.get("behavioral_threat_score", 0.5)))
 
                 if sliding_buffer is not None:
                     sliding_buffer.append(HostWindowSnapshot(

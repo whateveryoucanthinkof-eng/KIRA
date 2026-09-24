@@ -16,10 +16,23 @@ s(t) = [ z(t) ; a(t) ] ∈ R^27,   z ∈ R^12 TGNE-TA latent,  a ∈ R^15 flow a
 `a` = flow count; forward/backward/total bytes and packets (log1p); unique peers; unique destination
 ports; TCP and UDP ratios; mean duration; byte rate; packet rate; connection density.
 
-**Temporal contract** (single source, `cyberworld_v4/config.py`): history `L = 15` windows (30 s),
-horizon `K = 5` windows (10 s). The input is `s(t−L+1 … t)`; every target lies at `t+1` or later.
-This supersedes the v3 live contract (`L=5, K=8`) and therefore invalidates all four existing
-checkpoints. `contract.py` refuses a mismatched checkpoint at load rather than serving it.
+**Temporal contract** (single source, `cyberworld_v4/config.py`): history `L = 15` windows of 2 s
+(30 s), horizon `K = 5` forecast steps of 30 s each (150 s; each step OR-aggregates 15 input windows).
+The input is `s(t−L+1 … t)`; every target lies at `t+1` or later. The shipped checkpoints were trained
+with 2 s forecast steps (10 s ahead) and are refused at load until retrained; each checkpoint's actual
+contract is in its generated `*.manifest.json`.
+
+**Scope.** This is near-term forecasting. Branches A and B see 30 s of explicit history. The TGNE-TA
+encoder attends over the current window's graph and carries older context only in its TGN memory,
+which the BiTA aggregator updates window by window (memory on by default; the shipped encoder predates
+this and ran without it). A compact GRU memory per host is not campaign reasoning over days.
+
+**Models.** Encoder = BiTA, Branch A = GNN-LSTM (Vitulyova et al. 2025), decoder = DeepOP (Zhang et al.
+2025). Equation-to-code map and deviations: `docs/PAPER_CONFORMANCE.md`.
+
+**Verdict.** The served risk, technique and alert are the model's output. A hand-written SOC rule layer
+can be enabled (`CYBERWORLD_ENABLE_RULES=1`) as an advisory opinion shown beside it; it never overwrites
+the model, and operator controls (ARM EXTERNAL, recorded mitigations) are never scoring inputs.
 
 | Output | Meaning | Loss semantics |
 |---|---|---|
@@ -64,10 +77,13 @@ Cumulative onset is derived, never predicted and never `max()`:
 ```
 
 **TGNE-TA** encodes the host-interaction graph into a 12-D latent; neighbour lookup respects the
-window cutoff (verified: no future-neighbour leakage). **Branch A** is a deliberately plain 2-layer
-LSTM — the ablation floor a graph or transformer encoder must beat before replacing it. **Branch B**
+window cutoff (verified: no future-neighbour leakage) and is limited to the current window; older
+context arrives through the BiTA-updated TGN memory. **Branch A** is the GNN-LSTM of Vitulyova et al.:
+one 256-unit LSTM layer over s(t), linear risk / technique / gradation heads. **Branch B**
 is the world model proper: it learns `P(s_{t+1} | s_t)` as a distribution, not a point estimate with
-an error bar attached afterwards. **DeepOP** decodes predicted future states into ATT&CK tokens.
+an error bar attached afterwards. **DeepOP** is an encoder-decoder: its encoder reads Branch A's
+technique for each history window, and its causal-window decoder cross-attends to that and to Branch
+B's predicted states to emit future ATT&CK tokens.
 Heads emit logits; sigmoid is applied at the serving boundary so temperature scaling has logits.
 
 **Uncertainty.** Temperature is fitted on a *calibration* split disjoint from validation.
@@ -103,3 +119,12 @@ overlapping windows. If a baseline wins, that is reported as the result.
 5. **v3 DeepOP was trained on oracle future states**; v4 requires training on world-model output.
 6. **Explainability** (attention and feature attribution) is specified and partially present; it
    must run in `eval()` mode on real inputs to be reproducible.
+7. **Campaign correlation is heuristic, not learned, and not in the live path.** `correlation/` links
+   alerts with hand-set kill-chain priors (`HEURISTIC_PARAMS`, none fitted). It previously ran an
+   untrained MLP and linked events up to an hour apart; it is now deterministic and bounded to the
+   models' evidence horizon (history + forecast = 180 s). A learned scorer would need labelled campaign
+   chains, which do not exist here.
+8. **Edge-feature choice is unablated.** `dst_port_norm_65535` may let the encoder learn "port ⇒ class".
+   The ablation is recorded in the encoder config and enforced at load; the comparison run is pending.
+9. **Class coverage.** The validation split has 2 technique classes against 7 in training, and the corpus
+   is ~82.5% Benign. Accuracy is therefore not a meaningful headline; report macro-F1, PR-AUC and Brier.

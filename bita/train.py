@@ -26,9 +26,11 @@ from evaluation.eval_edge_prediction_with_categories import eval_edge_prediction
 from data_unification.tgne_features import (
     EDGE_FEATURE_NAMES,
     SCHEMA_VERSION,
+    ablated_edge_features as _ablated_edge_features,
     extract_canonical_edge_features,
 )
 from data_unification.density import require_full_density
+from data_unification.ip_features import ablated_node_features as _ablated_node_features
 
 
 class FocalLoss(nn.Module):
@@ -153,6 +155,38 @@ class Data:
         self.n_unique_nodes = len(self.unique_nodes)
 
 
+def _contract_window_seconds() -> float:
+    from cyberworld_v4.config import get_contract
+    return get_contract().window_seconds
+
+
+def _is_memory_state(key: str) -> bool:
+    """TGN memory rows are per-node runtime state, sized to one graph's nodes."""
+    return key.endswith("memory.memory") or key.endswith("memory.last_update")
+
+
+def _init_from_checkpoint(tgn, path, device):
+    """Start from another encoder's weights (e.g. Warden -> fine-tune on CIC-2018).
+
+    Everything whose shape matches is copied: the graph attention, time
+    encoding, message function, BiTA aggregator and memory updater. Skipped:
+    per-node memory state (a different graph's nodes) and any head whose size
+    depends on the label set (the category head: Warden alert categories are
+    not CIC's coarse categories).
+    """
+    src = torch.load(path, map_location=device)
+    own = tgn.state_dict()
+    take, skipped = {}, []
+    for k, v in src.items():
+        if _is_memory_state(k) or k not in own or own[k].shape != v.shape:
+            skipped.append(k)
+            continue
+        take[k] = v
+    tgn.load_state_dict(take, strict=False)
+    logging.info("init_from %s: loaded %d tensors, skipped %d (%s)", path, len(take),
+                 len(skipped), ", ".join(sorted({k.split(".")[0] for k in skipped})) or "none")
+
+
 def compute_time_statistics(sources, destinations, timestamps):
     last_timestamp_sources = dict()
     last_timestamp_dst = dict()
@@ -179,7 +213,28 @@ def compute_time_statistics(sources, destinations, timestamps):
     return mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst
 
 
-def load_and_preprocess_dataset(dataset_dir="Dataset", embedding_dim=4):
+def median_resample(df, label_col="Category", time_col="DetectTime", seed=0):
+    """BiTA's Warden preprocessing: align every class to the MEDIAN class size.
+
+    Section 5 of the paper: random undersampling of classes above the median,
+    random oversampling (with replacement) of classes below it, each class
+    independently, then re-sorted chronologically BEFORE the temporal split,
+    so the split itself stays leakage-free.
+    """
+    counts = df[label_col].value_counts()
+    target = int(np.median(counts.values))
+    rng = np.random.RandomState(seed)
+    parts = []
+    for cat, n in counts.items():
+        g = df[df[label_col] == cat]
+        parts.append(g.iloc[rng.choice(len(g), size=target, replace=bool(n < target))])
+    return (pd.concat(parts)
+            .sort_values(time_col, kind="stable")
+            .reset_index(drop=True))
+
+
+def load_and_preprocess_dataset(dataset_dir="Dataset", embedding_dim=4, resample_to_median=True,
+                                ip_node_features=True):
     csv_files = sorted(glob.glob(os.path.join(dataset_dir, "*March_e.csv")))
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found in {dataset_dir}")
@@ -196,6 +251,11 @@ def load_and_preprocess_dataset(dataset_dir="Dataset", embedding_dim=4):
     df['Port'] = df['Port'].astype(str)
     df['Category'] = df['Category'].astype(str)
     df['FlowCount'] = df['FlowCount'].fillna(0)
+    if resample_to_median:
+        before = df['Category'].value_counts().to_dict()
+        df = median_resample(df)
+        logging.info("BiTA median resampling: %s -> %d per class", before,
+                     int(df['Category'].value_counts().iloc[0]))
 
     proto_encoder = LabelEncoder()
     attack_type_encoder = LabelEncoder()
@@ -210,8 +270,8 @@ def load_and_preprocess_dataset(dataset_dir="Dataset", embedding_dim=4):
     category_mapping = {index: label for index, label in enumerate(attack_type_encoder.classes_)}
     logging.info(f"Detected alert categories: {category_mapping}")
 
-    df['SourceIP_encoded'], _ = pd.factorize(df['SourceIP'])
-    df['TargetIP_encoded'], _ = pd.factorize(df['TargetIP'])
+    df['SourceIP_encoded'], src_ips = pd.factorize(df['SourceIP'])
+    df['TargetIP_encoded'], dst_ips = pd.factorize(df['TargetIP'])
 
     u_list = df['SourceIP_encoded'].values
     i_list = df['TargetIP_encoded'].values
@@ -265,9 +325,22 @@ def load_and_preprocess_dataset(dataset_dir="Dataset", embedding_dim=4):
     empty_edge = np.zeros((1, raw_edge_features.shape[1]), dtype=np.float32)
     edge_features = np.vstack([empty_edge, raw_edge_features])
 
-    # Node features: (total_nodes, feature_dim)
+    # Node features: the same intrinsic 12-D IP features the CIC/PCAP path and
+    # serving use (data_unification/ip_features.py), instead of zeros. An
+    # encoder trained here is applied to CIC traffic, whose hosts all carry
+    # these features; training it on all-zero rows would hand it an input
+    # distribution at extraction time it never saw. Bipartite ids: attacker
+    # k -> k + 1, victim k -> upper_u + k + 1 (the same IP on both sides gets
+    # two nodes with identical features).
     node_feat_dim = edge_features.shape[1]
-    node_features = np.zeros((total_nodes, node_feat_dim), dtype=np.float32)
+    if ip_node_features:
+        from data_unification.ip_features import build_node_feature_matrix
+        node_features = (
+            build_node_feature_matrix({ip: k + 1 for k, ip in enumerate(src_ips)}, total_nodes)
+            + build_node_feature_matrix({ip: int(upper_u) + k + 1 for k, ip in enumerate(dst_ips)},
+                                        total_nodes))
+    else:
+        node_features = np.zeros((total_nodes, node_feat_dim), dtype=np.float32)
 
     return graph_df, edge_features, node_features, category_mapping
 
@@ -280,6 +353,11 @@ def load_and_preprocess_unified_dataset(
     stride=1,
     splits=("train",),
     parallel_workers=0,
+    pcap2018_root=None,
+    pcap2018_label_dir=None,
+    scheme="frozen",
+    allow_cic2018_csv=False,
+    window_seconds=2.0,
 ):
     """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
 
@@ -339,16 +417,26 @@ def load_and_preprocess_unified_dataset(
                 return
 
     wanted = set(splits) if splits else None
+    if scheme == "cross_year" and cic2018_dir and not allow_cic2018_csv:
+        raise ValueError(
+            "cross_year trains on CIC-2018, and 9 of its 10 CSV days fabricate host IPs "
+            "from the row number; an encoder is a model of the host graph, so train it on "
+            "--pcap2018_root instead (or pass --allow_cic2018_csv knowingly).")
 
     def _in_split(path):
-        """True when the frozen lock assigns `path` to one of `splits`."""
-        if wanted is None:
-            return True
+        """True when the split scheme assigns `path` to one of `splits`."""
         try:
-            return split_of_path(path) in wanted
+            if str(path).endswith(("_pcap", "_pacap")):
+                from data_unification.split_policy import split_of
+                sp = split_of("PCAP2018", os.path.basename(str(path)), scheme)
+            else:
+                sp = split_of_path(path, scheme)
         except (KeyError, ValueError):
             logging.warning("%s is not in the frozen split -- skipped", path)
             return False
+        if sp is None:              # this scheme does not use the corpus at all
+            return False
+        return wanted is None or sp in wanted
 
     # ---------------------------------------------------------------- columnar
     #
@@ -465,11 +553,22 @@ def load_and_preprocess_unified_dataset(
         captures += [("CIC2018", f) for f in sorted(glob.glob(os.path.join(cic2018_dir, "*.csv")))]
     if ctu13_dir:
         captures += [("CTU13", f) for f in sorted(glob.glob(os.path.join(ctu13_dir, "*", "*.binetflow")))]
+    if pcap2018_root:
+        # Real host addresses; labels from the paired CSVs by timestamp
+        # (data_unification/training_sources.py).
+        if not pcap2018_label_dir:
+            raise ValueError("--pcap2018_root needs --pcap2018_label_dir (PCAPs carry no labels)")
+        captures += [("PCAP2018", os.path.join(pcap2018_root, d))
+                     for d in sorted(os.listdir(pcap2018_root))
+                     if os.path.isdir(os.path.join(pcap2018_root, d)) and d.endswith(("_pcap", "_pacap"))]
 
     skipped = [os.path.basename(f) for _k, f in captures if not _in_split(f)]
     captures = [(k, f) for k, f in captures if _in_split(f)]
     n_read = len(captures)
 
+    if parallel_workers and any(k == "PCAP2018" for k, _f in captures):
+        logging.info("PCAP captures are read serially (the parallel parser handles CSVs only)")
+        parallel_workers = 0
     if parallel_workers and len(captures) > 1:
         # Parallel path. Workers return LOCAL vocabularies; the merge below
         # assigns global ids in capture order, so the result is identical to
@@ -515,6 +614,10 @@ def load_and_preprocess_unified_dataset(
                 _consume(_take(CIC2017Adapter().parse_file(f, max_rows=None)))
             elif kind == "CIC2018":
                 _consume(_take(CIC2018Adapter().parse_file(f, max_rows=None)))
+            elif kind == "PCAP2018":
+                from data_unification.training_sources import iter_pcap_day_windows
+                _consume(_take(r for window in iter_pcap_day_windows(
+                    f, pcap2018_label_dir, window_seconds) for r in window))
             else:
                 _consume(_take(CTU13Adapter().parse_netflow_csv(f, max_rows=None)))
 
@@ -844,7 +947,7 @@ def train(args):
     logging.info(f"Training on device: {device}")
 
     # Load and Preprocess Data
-    if args.cic2017_dir or args.cic2018_dir or args.ctu13_dir:
+    if args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root:
         if args.data_name == 'warden_alerts':  # still the default; unified run wasn't given its own name
             args.data_name = 'unified_cic_ctu13'
         require_full_density(
@@ -860,10 +963,17 @@ def train(args):
             stride=args.stride,
             splits=tuple(args.train_splits.split(",")) if args.train_splits else None,
             parallel_workers=args.ingest_workers,
+            pcap2018_root=args.pcap2018_root,
+            pcap2018_label_dir=args.pcap2018_label_dir,
+            scheme=args.split_scheme,
+            allow_cic2018_csv=args.allow_cic2018_csv,
+            window_seconds=_contract_window_seconds(),
         )
     else:
         graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
-            dataset_dir=args.dataset_dir, embedding_dim=args.feature_dim
+            dataset_dir=args.dataset_dir, embedding_dim=args.feature_dim,
+            resample_to_median=not args.no_median_resample,
+            ip_node_features=not args.warden_zero_node_features,
         )
     num_categories = len(category_mapping)
 
@@ -918,6 +1028,9 @@ def train(args):
         num_categories=num_categories
     ).to(device)
 
+    if args.init_from:
+        _init_from_checkpoint(tgn, args.init_from, device)
+
     # Loss Functions & Optimizer
     edge_criterion = nn.BCELoss()
     if args.focal_loss:
@@ -946,6 +1059,34 @@ def train(args):
             "--shuffle_batches cannot be combined with --use_memory: TGN's memory "
             "module makes batch N depend on batch N-1, so shuffling would train on "
             "memory states that never existed. Use --no_shuffle_batches with memory."
+            "\n\nThat trade is not free, and turning memory on without handling it "
+            "can make the encoder WORSE, not better. Shuffling exists because TGN "
+            "slices batches contiguously in time and attacks are time-localised: "
+            "58.6%% of 128-sample batches on fri_16 hold a single class, and the "
+            "category head collapsed under that.\n\n"
+            "Raise --backprop_every instead. It accumulates gradients over that "
+            "many CONSECUTIVE batches before stepping, so one update spans "
+            "backprop_every x batch_size samples and far more time, which restores "
+            "class contrast per update -- while batch ORDER stays chronological, so "
+            "the memory state remains the one that actually existed.\n\n"
+            "  python bita/train.py --use_memory --no_shuffle_batches "
+            "--backprop_every 8 --batch_size 128   # 1024 samples per update\n\n"
+            "Check the per-epoch `cat` loss: if it oscillates rather than falling, "
+            "backprop_every is still too small."
+        )
+    if args.use_memory and args.backprop_every < 4:
+        logging.warning(
+            "--use_memory with --backprop_every %d: batches are time-ordered and "
+            "mostly single-class, so each update sees little class contrast. "
+            "8 or more is recommended; see the --shuffle_batches error text.",
+            args.backprop_every,
+        )
+    if args.use_memory and args.backprop_every < 4:
+        logging.warning(
+            "--use_memory with --backprop_every %d: batches are time-ordered and "
+            "mostly single-class, so each update sees little class contrast. "
+            "8 or more is recommended; see the --shuffle_batches error text.",
+            args.backprop_every,
         )
     logging.info("Batch sampling: %s",
                  "SHUFFLED (memory off)" if args.shuffle_batches else "time-ordered")
@@ -1193,6 +1334,14 @@ def train(args):
         "node_feat_dim": int(node_features.shape[1]),
         "feature_schema_version": SCHEMA_VERSION,
         "edge_feature_names": EDGE_FEATURE_NAMES,
+        # Which edge features were zeroed while training. The ablation is an
+        # env var read at feature extraction, so serving must apply the SAME
+        # mask; build_or_load_tgne_ta refuses a mismatch using this field.
+        "ablated_edge_features": _ablated_edge_features(),
+        # Same contract for the IP node features (CYBERWORLD_ABLATE_NODE_FEATURES).
+        "ablated_node_features": _ablated_node_features(),
+        "split_scheme": args.split_scheme,
+        "init_from": args.init_from,
         "model_name": getattr(args, "model_name", args.prefix),
         "dataset_name": getattr(args, "data", args.data_name),
     }
@@ -1323,22 +1472,43 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="BiTA Temporal Graph Network for Network Alert Prediction")
     parser.add_argument('--dataset_dir', type=str, default='Dataset', help='Directory containing Warden dataset CSVs (ignored if any --cic*/--ctu13-dir is given)')
     parser.add_argument('--data_name', type=str, default='warden_alerts', help='Dataset identifier name')
+    parser.add_argument('--pcap2018_root', type=str, default=None,
+                        help='CIC-IDS2018 PCAP root (<day>_pcap dirs): real host addresses. '
+                             'Use instead of --cic2018_dir, whose CSVs fabricate IPs on 9 of 10 days.')
+    parser.add_argument('--pcap2018_label_dir', type=str, default=None,
+                        help='CIC-2018 <day>_csv.csv files used only as labels for --pcap2018_root')
+    parser.add_argument('--split_scheme', type=str, default='frozen', choices=['frozen', 'cross_year'],
+                        help="'cross_year': the encoder reads only CIC-2018 train days; CIC-2017 is "
+                             "never loaded (it is the downstream test set). See split_policy.py.")
+    parser.add_argument('--allow_cic2018_csv', action='store_true', default=False)
+    parser.add_argument('--init_from', type=str, default=None,
+                        help='Start from this encoder checkpoint (e.g. a Warden-trained one) and '
+                             'fine-tune. Category head and per-node memory are re-initialised.')
+    parser.add_argument('--warden_zero_node_features', action='store_true', default=False,
+                        help='Warden only: all-zero node features (the old behaviour) instead of '
+                             'the intrinsic IP features every other path uses.')
+    parser.add_argument('--no_median_resample', action='store_true', default=False,
+                        help='Warden only: skip the BiTA paper step that resamples every alert '
+                             'category to the median class size before the temporal split.')
     parser.add_argument('--cic2017_dir', type=str, default=None, help='CIC-IDS2017 CSV directory (switches to the unified, non-bipartite loader)')
     parser.add_argument('--cic2018_dir', type=str, default=None, help='CIC-IDS2018 CSV directory (switches to the unified, non-bipartite loader)')
     parser.add_argument('--ctu13_dir', type=str, default=None, help='CTU-13 directory of <scenario>/*.binetflow files (switches to the unified, non-bipartite loader)')
     parser.add_argument('--rows_per_file', type=int, default=None, help='Max records KEPT per source file, after striding (not a row prefix)')
     parser.add_argument('--stride', type=int, default=1, help='Keep every Nth record DURING ingestion: spans the whole capture and bounds peak memory')
-    parser.add_argument('--shuffle_batches', action='store_true', default=True,
+    parser.add_argument('--shuffle_batches', action='store_true', default=None,
                         help='Shuffle batch ORDER within an epoch. Valid only with '
-                             'use_memory=False; TGN batches are contiguous in time and '
-                             '58%% of them are single-class, which collapses the category head.')
+                             '--no_memory; TGN batches are contiguous in time and '
+                             '58%% of them are single-class, which collapses the category head. '
+                             'Default: on without memory, off with it.')
     parser.add_argument('--no_shuffle_batches', dest='shuffle_batches', action='store_false',
                         help='Keep the original time-ordered batch sequence.')
     parser.add_argument('--cat_loss_weight', type=float, default=15.0,
                         help='Weight on the auxiliary category loss. The two terms were '
                              'summed equally, but focal loss drives the category term ~14x '
                              'below the edge loss (5700x once confident), so the head stopped '
-                             'learning. 1.0 restores the old behaviour.')
+                             'learning. 1.0 restores the old behaviour and is the BiTA paper value (lambda, Eq. 17); it '
+                             'is NOT the default here because on this corpus it was measured '
+                             'to starve the category head (tests/test_category_loss_is_not_swamped.py).')
     parser.add_argument('--ingest_workers', type=int, default=0,
                         help='Parse captures across N worker processes. 0 = serial. '
                              'Results are identical either way: workers return local '
@@ -1346,7 +1516,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_splits', type=str, default='train', help="Frozen-lock splits to read (comma separated). Default 'train' keeps val/test captures unseen by the encoder; pass '' to read everything (leaks labels downstream).")
     parser.add_argument('--prefix', type=str, default='bita_bigru_transformer', help='Prefix for saved artifacts')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
-    parser.add_argument('--n_epoch', type=int, default=30, help='Maximum number of epochs')
+    parser.add_argument('--n_epoch', type=int, default=50, help='Maximum number of epochs (BiTA paper: 50)')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
     parser.add_argument('--patience', type=int, default=5, help='Patience for early stopping')
@@ -1360,14 +1530,25 @@ if __name__ == '__main__':
     parser.add_argument('--node_dim', type=int, default=12, help='Node feature dimension')
     parser.add_argument('--time_dim', type=int, default=12, help='Time encoding dimension')
     parser.add_argument('--message_dim', type=int, default=100, help='Message dimension')
-    parser.add_argument('--memory_dim', type=int, default=9, help='Memory dimension')
-    parser.add_argument('--use_memory', action='store_true', default=False, help='Enable memory module')
+    # BiTA reports a memory width of 9. It cannot be 9 here: the embedding
+    # module ADDS memory to the node features (embedding_module.py), so the two
+    # widths must match, and the node features are the 12-D contract. 9 would
+    # crash the first time memory was used.
+    parser.add_argument('--memory_dim', type=int, default=12, help='Memory dimension (= node feature dim)')
+    # Memory is ON by default. BiTA's contribution IS the aggregator that feeds
+    # the TGN memory update; TGN only builds an aggregator when memory is on,
+    # so every encoder trained with memory off contained no BiTA at all.
+    parser.add_argument('--use_memory', dest='use_memory', action='store_true', default=True,
+                        help='Enable the TGN memory module and the BiTA aggregator (default)')
+    parser.add_argument('--no_memory', dest='use_memory', action='store_false',
+                        help='Memoryless ablation: plain temporal graph attention, NO BiTA aggregator')
     parser.add_argument('--embedding_module', type=str, default='graph_attention', choices=['graph_attention', 'graph_sum', 'identity', 'time'])
     parser.add_argument('--message_function', type=str, default='identity', choices=['identity', 'mlp'])
     parser.add_argument('--memory_updater', type=str, default='gru', choices=['gru', 'rnn'])
-    parser.add_argument('--aggregator', type=str, default='bigru_transformer', choices=[
-        'bigru_transformer', 'bitransformer', 'bitransformer_temporal', 'relative_transformer', 'stacked_bitransformer', 'mean', 'last'
-    ])
+    # Only the implemented aggregators. The paper's other ablation variants
+    # used to be accepted here and silently trained as the BiGRU-Transformer.
+    parser.add_argument('--aggregator', type=str, default='bigru_transformer',
+                        choices=['bigru_transformer', 'mean', 'last'])
     parser.add_argument('--memory_update_at_end', action='store_true', default=False)
     parser.add_argument('--different_new_nodes', action='store_true', default=True)
     parser.add_argument('--uniform', action='store_true', default=False)
@@ -1376,10 +1557,21 @@ if __name__ == '__main__':
     parser.add_argument('--use_source_embedding_in_message', action='store_true', default=False)
     parser.add_argument('--dyrep', action='store_true', default=False)
     parser.add_argument('--focal_loss', action='store_true', default=True)
-    parser.add_argument('--backprop_every', type=int, default=1)
+    parser.add_argument('--backprop_every', type=int, default=None,
+                        help='Consecutive batches per optimiser step. Default 8 with memory '
+                             '(time-ordered batches are mostly single-class), 1 without.')
     parser.add_argument('--save_dir', type=str, default='saved_models')
-    parser.add_argument('--checkpoint_dir', type=str, default='saved_checkpoints')
+    # Per-epoch snapshots are scratch, not models: nothing serves from here.
+    # This used to be a top-level saved_checkpoints/ that sat beside
+    # saved_models/ looking equally authoritative, and a retrain writing to the
+    # wrong one of the two has already been shipped once (analysis doc 23).
+    # Promote a winner with scripts/select_best_encoder.py --copy.
+    parser.add_argument('--checkpoint_dir', type=str, default='.spill/encoder_epochs')
     parser.add_argument('--log_dir', type=str, default='logs')
 
     args = parser.parse_args()
+    if args.shuffle_batches is None:
+        args.shuffle_batches = not args.use_memory
+    if args.backprop_every is None:
+        args.backprop_every = 8 if args.use_memory else 1
     train(args)

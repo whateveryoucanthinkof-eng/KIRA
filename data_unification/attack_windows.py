@@ -40,13 +40,35 @@ class AttackInterval:
     start_utc: float
     end_utc: float
     n_rows: int = 0
+    #: Addresses observed on the attack rows of this interval: the attacker
+    #: and its victims. EMPTY means "not known", not "nobody".
+    #:
+    #: Without this the interval is a pure time range, and `pcap_bridge`
+    #: stamped it on every host active in the window -- ~445 hosts per
+    #: CIC-2018 day, of which one or two were actually involved. A model
+    #: trained on that can score well by learning what time of day it is,
+    #: which is why it has to be scoped wherever the corpus allows.
+    participants: frozenset = field(default_factory=frozenset)
 
     @property
     def duration_seconds(self) -> float:
         return self.end_utc - self.start_utc
 
+    @property
+    def scoped(self) -> bool:
+        """True when this interval knows who took part."""
+        return bool(self.participants)
+
     def contains(self, ts_utc: float) -> bool:
         return self.start_utc <= ts_utc <= self.end_utc
+
+    def involves(self, *ips: str) -> bool:
+        """Whether any of `ips` took part. Unscoped intervals answer True:
+        an unknown participant set cannot exclude anyone, and silently
+        excluding everyone would delete the day's labels."""
+        if not self.participants:
+            return True
+        return any(ip in self.participants for ip in ips)
 
 
 @dataclass
@@ -58,14 +80,33 @@ class DerivedWindows:
     def ok(self) -> bool:
         return bool(self.intervals) and self.evidence.get("plausible", False)
 
-    def label_at(self, ts_utc: float) -> Optional[str]:
+    def interval_at(self, ts_utc: float) -> Optional[AttackInterval]:
         for iv in self.intervals:
             if iv.contains(ts_utc):
-                return iv.label
+                return iv
         return None
+
+    def label_at(self, ts_utc: float) -> Optional[str]:
+        iv = self.interval_at(ts_utc)
+        return iv.label if iv else None
 
     def is_attack(self, ts_utc: float) -> bool:
         return self.label_at(ts_utc) is not None
+
+    @property
+    def scoped(self) -> bool:
+        """True when every interval knows its participants, i.e. labels can be
+        attributed to hosts rather than only to instants."""
+        return bool(self.intervals) and all(iv.scoped for iv in self.intervals)
+
+    def participant_summary(self) -> Dict[str, Any]:
+        return {
+            "intervals": len(self.intervals),
+            "scoped_intervals": sum(1 for iv in self.intervals if iv.scoped),
+            "participants_by_label": {
+                iv.label: sorted(iv.participants)[:12] for iv in self.intervals if iv.scoped
+            },
+        }
 
 
 def _parse_local(stamp: str) -> Optional[datetime]:
@@ -103,6 +144,7 @@ def derive_windows(
     """
     path = Path(csv_path)
     per_label: Dict[str, List[float]] = {}
+    per_label_ips: Dict[str, set] = {}
     malformed = 0
     total = 0
 
@@ -114,6 +156,16 @@ def derive_windows(
             li = hdr.index("Label")
         except ValueError:
             return DerivedWindows(evidence={"error": "no Timestamp/Label column", "plausible": False})
+
+        # Src/Dst IP where the corpus has them. Nine of the ten CIC-2018 CSVs
+        # ship with 80 columns and no addresses at all (see
+        # claude_latest_analysis/15_downloads_csv_audit.md), so this is
+        # opportunistic: when the columns exist the interval can name its
+        # participants, and when they do not the interval stays a pure time
+        # range and says so.
+        _norm = {c.strip().lower(): i for i, c in enumerate(hdr)}
+        si = _norm.get("src ip", _norm.get("source ip"))
+        di = _norm.get("dst ip", _norm.get("destination ip"))
 
         for i, row in enumerate(r):
             if max_rows and i >= max_rows:
@@ -134,17 +186,28 @@ def derive_windows(
             per_label.setdefault(lab, []).append(
                 dt.replace(tzinfo=timezone.utc).timestamp() + CSV_TO_UTC.total_seconds()
             )
+            if si is not None and di is not None and len(row) > max(si, di):
+                ips = per_label_ips.setdefault(lab, set())
+                a, b = row[si].strip(), row[di].strip()
+                if a:
+                    ips.add(a)
+                if b:
+                    ips.add(b)
 
     intervals: List[AttackInterval] = []
     for lab, times in per_label.items():
         times.sort()
+        # Participants are collected per LABEL, not per merged run: the run
+        # boundaries come from `merge_gap_seconds`, while the campaign they
+        # belong to is the label.
+        who = frozenset(per_label_ips.get(lab, ()))
         run_start, prev, n = times[0], times[0], 1
         for t in times[1:]:
             if t - prev > merge_gap_seconds:
-                intervals.append(AttackInterval(lab, run_start, prev, n))
+                intervals.append(AttackInterval(lab, run_start, prev, n, who))
                 run_start, n = t, 0
             prev, n = t, n + 1
-        intervals.append(AttackInterval(lab, run_start, prev, n))
+        intervals.append(AttackInterval(lab, run_start, prev, n, who))
 
     intervals.sort(key=lambda iv: iv.start_utc)
 
@@ -158,7 +221,16 @@ def derive_windows(
         "labels": sorted(per_label),
         "n_intervals": len(intervals),
         "interval_seconds": [round(iv.duration_seconds, 1) for iv in intervals[:20]],
+        "has_ip_columns": bool(si is not None and di is not None),
+        "scoped_intervals": sum(1 for iv in intervals if iv.scoped),
     }
+    if intervals and not ev["has_ip_columns"]:
+        ev["label_scope_warning"] = (
+            "this CSV has no Src/Dst IP columns, so the intervals are time-only. "
+            "Every host active during an attack window will be labelled attacked "
+            "unless a participant map is supplied "
+            "(data_unification/attack_participants.py)."
+        )
     if all_t:
         lo = datetime.fromtimestamp(min(all_t), timezone.utc)
         hi = datetime.fromtimestamp(max(all_t), timezone.utc)

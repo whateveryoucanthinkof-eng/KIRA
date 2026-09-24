@@ -17,9 +17,10 @@ sys.path.insert(0, os.path.abspath("bita"))
 
 from branch_a_gnn_lstm.train_branch_a import load_sample_multi_dataset_records, build_or_load_tgne_ta
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
+from data_unification.trajectory_store import world_state
 from deepop_decoder.joint_vocab import get_joint_vocab
 from deepop_decoder.forecast_decoder import (
-    DeepOPForecastDecoder, DeepOPTokenScorer, smoothed_and_plain_ce,
+    DeepOPForecastDecoder, DeepOPTokenScorer, observed_sequence_tokens, smoothed_and_plain_ce,
 )
 from cyberworld_v4.config import get_contract
 
@@ -46,6 +47,7 @@ class CWASequenceDataset(Dataset):
             "input_tokens": torch.from_numpy(s["input_tokens"]).long(),
             "target_tokens": torch.from_numpy(s["target_tokens"]).long(),
             "obs_token": torch.tensor(s["obs_token"], dtype=torch.long),
+            **({"obs_tokens": torch.from_numpy(s["obs_tokens"]).long()} if "obs_tokens" in s else {}),
         }
 
 
@@ -79,11 +81,11 @@ def create_cwa_training_samples(trajectories, vocab, K: int = None, T: int = Non
 
         for i in range(first_i, n - K + 1):
             future_snaps = snaps[i : i + K]
-            h_fut = np.array([s.embedding for s in future_snaps], dtype=np.float32)
+            h_fut = np.array([world_state(s) for s in future_snaps], dtype=np.float32)
             h_hist = None
             if T > 0:
                 lo = max(0, i - T)
-                hist = [s.embedding for s in snaps[lo:i]]
+                hist = [world_state(s) for s in snaps[lo:i]]
                 # i >= 1 whenever T > 0, so `hist` is never empty here and the
                 # left-pad repeats a real PAST state, never a target.
                 assert hist, "T>0 window with no history -- first_i guard failed"
@@ -103,6 +105,15 @@ def create_cwa_training_samples(trajectories, vocab, K: int = None, T: int = Non
                 p_id = prev_s.technique_ids[0] if prev_s.technique_ids else "None"
                 obs_tok = vocab.encode(prev_s.coarse_category, p_id)
 
+            # DeepOP encoder input: the observed attack sequence over the
+            # history window (paper Eq. 1-3).
+            n_obs = _c.history_steps
+            obs_seq = observed_sequence_tokens(
+                [vocab.encode(ps.coarse_category,
+                              ps.technique_ids[0] if ps.technique_ids else "None")
+                 for ps in snaps[max(0, i - n_obs):i]],
+                n_obs, vocab)
+
             # Input: <BOS> + first K-1 tokens
             input_seq = [vocab.bos_idx] + token_ids[:-1]
             target_seq = token_ids
@@ -112,6 +123,7 @@ def create_cwa_training_samples(trajectories, vocab, K: int = None, T: int = Non
                 "input_tokens": np.array(input_seq, dtype=int),
                 "target_tokens": np.array(target_seq, dtype=int),
                 "obs_token": int(obs_tok),
+                "obs_tokens": np.array(obs_seq, dtype=int),
             }
             if h_hist is not None:
                 sample_item["h_history"] = h_hist
@@ -233,8 +245,9 @@ def train_cwa_decoder(
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
+    d_state = int(train_samples[0]["h_future"].shape[-1]) if train_samples else 27
     decoder = DeepOPForecastDecoder(
-        d_latent=12,
+        d_latent=d_state,
         d_model=72,
         vocab_size=vocab.vocab_size,
         n_heads=6,
@@ -243,10 +256,11 @@ def train_cwa_decoder(
         dim_feedforward=144,
     ).to(device)
 
-    # Initialize prototypes from training class centroids
-    centroids = torch.zeros(vocab.vocab_size, 12)
+    # Initialize prototypes from training class centroids (only when the
+    # optional prototype head is enabled; the paper architecture has none).
+    centroids = torch.zeros(vocab.vocab_size, d_state)
     counts_c = torch.zeros(vocab.vocab_size)
-    for s in train_samples:
+    for s in (train_samples if decoder.use_prototypes else []):
         h_arr = torch.from_numpy(s["h_future"])
         t_arr = torch.from_numpy(s["target_tokens"])
         for k in range(len(t_arr)):
@@ -260,7 +274,7 @@ def train_cwa_decoder(
     # receives no gradient -- it could never recover. The random init from
     # DeepOPForecastDecoder.__init__ is left in place for those.
     seeded = 0
-    for c in range(vocab.vocab_size):
+    for c in (range(vocab.vocab_size) if decoder.use_prototypes else []):
         if counts_c[c] > 0:
             decoder.prototypes.data[c] = (centroids[c] / counts_c[c]).to(device)
             seeded += 1
@@ -299,7 +313,8 @@ def train_cwa_decoder(
                 h_in = h_fut + torch.randn_like(h_fut) * step_sigma
 
             optimizer.zero_grad()
-            logits = decoder(h_in, inp_tok)
+            obs_seq = batch["obs_tokens"].to(device) if "obs_tokens" in batch else None
+            logits = decoder(h_in, inp_tok, obs_tokens=obs_seq)
 
             loss, plain = smoothed_and_plain_ce(
                 logits, tgt_tok, label_smoothing=label_smoothing, weight=weights_t)
@@ -336,7 +351,8 @@ def train_cwa_decoder(
                     h_fut = wdt.rollout(batch["h_history"].to(device),
                                         K=h_fut.shape[1]).detach()
 
-                logits = decoder(h_fut, inp_tok)
+                obs_seq = batch["obs_tokens"].to(device) if "obs_tokens" in batch else None
+                logits = decoder(h_fut, inp_tok, obs_tokens=obs_seq)
                 # Both numbers, because the objective and the reported metric
                 # were different functions: training optimised the smoothed CE
                 # and validation printed the plain one, so "val above train"
@@ -348,10 +364,10 @@ def train_cwa_decoder(
 
                 pred_tf = logits.argmax(dim=-1)
                 free, _ = decoder.forecast_sequence(
-                    h_fut, max_steps=K, observed_token=obs_tok,
+                    h_fut, max_steps=K, observed_token=obs_tok, observed_sequence=obs_seq,
                     repetition_penalty=1.0, continuity_bonus=1.0)
                 free_nb, _ = decoder.forecast_sequence(
-                    h_fut, max_steps=K, observed_token=obs_tok,
+                    h_fut, max_steps=K, observed_token=obs_tok, observed_sequence=obs_seq,
                     repetition_penalty=1.0, continuity_bonus=0.0)
                 scorer.update(tgt_tok, inp_tok, obs_tok, pred_tf=pred_tf, pred_free=free)
                 scorer_nb.update(tgt_tok, inp_tok, obs_tok, pred_free=free_nb)
@@ -459,6 +475,9 @@ class LazyCWADataset(Dataset):
         _c = get_contract()
         self.K = _c.forecast_steps if K is None else K
         self.T = _c.history_steps if T is None else T
+        # Length of the observed sequence the encoder reads. Independent of T,
+        # which only controls whether Branch B's input history is emitted.
+        self.n_obs = _c.history_steps
         self.store = store
         self.vocab = vocab
         self.oversample = oversample
@@ -573,7 +592,7 @@ class LazyCWADataset(Dataset):
         rows = self.store._rows_by_host[host]
         fut = rows[i:i + self.K]
 
-        h_fut = np.ascontiguousarray(self.store.feats[fut, :12], dtype=np.float32)
+        h_fut = np.ascontiguousarray(self.store.feats[fut], dtype=np.float32)
         token_ids = [self._token(int(r)) for r in fut]
 
         out = {
@@ -583,12 +602,16 @@ class LazyCWADataset(Dataset):
             "obs_token": torch.tensor(
                 self._token(int(rows[i - 1])) if i > 0 else self.vocab.bos_idx,
                 dtype=torch.long),
+            # DeepOP encoder input: observed techniques over the history window.
+            "obs_tokens": torch.tensor(observed_sequence_tokens(
+                [self._token(int(r)) for r in rows[max(0, i - self.n_obs):i]],
+                self.n_obs, self.vocab), dtype=torch.long),
         }
         if self.T > 0:
             lo = max(0, i - self.T)
             hist_rows = rows[lo:i]
             if len(hist_rows):
-                hist = self.store.feats[hist_rows, :12]
+                hist = self.store.feats[hist_rows]
                 if len(hist) < self.T:            # left-pad by repeating the first
                     hist = np.concatenate(
                         [np.repeat(hist[:1], self.T - len(hist), axis=0), hist], axis=0)

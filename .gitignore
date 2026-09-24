@@ -43,6 +43,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
+# Demo-mode flag for the dashboard. Carries no secret — only
+# VITE_DEMO_MODE=true — and npm run demo does nothing without it.
+!web_dashboard/.env.demo
 .venv/
 venv/
 ENV/

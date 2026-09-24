@@ -19,7 +19,8 @@ from data_unification.split_manager import ScientificSplitManager
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor, HostWindowSnapshot
 from branch_b_world_model.rollout_encoder_decoder import HostWorldDynamicsTransformer
 from branch_b_world_model.infiltration_head import InfiltrationRiskHead
-from cyberworld_v4.config import get_contract
+from cyberworld_v4.config import STATE_DIM, get_contract
+from data_unification.trajectory_store import world_state
 
 
 class HostRolloutDataset(Dataset):
@@ -63,13 +64,13 @@ def create_rollout_samples(trajectories, T: int = None, K: int = None):
         n = len(snaps)
 
         for i in range(T, n):
-            h_hist = np.array([s.embedding for s in snaps[i - T : i]], dtype=np.float32)
+            h_hist = np.array([world_state(s) for s in snaps[i - T : i]], dtype=np.float32)
             # Future slice up to K
             future_snaps = snaps[i : min(n, i + K)]
             k_avail = len(future_snaps)
 
             # Pad future if less than K
-            h_fut = np.array([s.embedding for s in future_snaps], dtype=np.float32)
+            h_fut = np.array([world_state(s) for s in future_snaps], dtype=np.float32)
             r_fut = np.array([s.risk_score for s in future_snaps], dtype=np.float32)
 
             # Real elapsed seconds, origin at the last observed step. See the
@@ -141,8 +142,9 @@ def train_branch_b(
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64, n_heads=4, n_layers=3).to(device)
-    risk_head = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(device)
+    d_state = int(train_samples[0]["h_history"].shape[-1]) if len(train_samples) else STATE_DIM
+    wdt = HostWorldDynamicsTransformer(d_latent=d_state, d_model=64, n_heads=4, n_layers=3).to(device)
+    risk_head = InfiltrationRiskHead(d_latent=d_state, hidden_dim=32).to(device)
 
     params = list(wdt.parameters()) + list(risk_head.parameters())
     optimizer = torch.optim.Adam(params, lr=lr, weight_decay=1e-4)
@@ -383,11 +385,11 @@ class LazyHostRolloutDataset(Dataset):
         i = int(self._pos[idx])
         rows = self.store._rows_by_host[host]
 
-        # embeddings are the first 12 columns of the 27-D feature block
-        h_hist = self.store.feats[rows[i - self.T:i], :12]
+        # The full feature block: TGNE embedding AND host attributes.
+        h_hist = self.store.feats[rows[i - self.T:i]]
 
         fut_rows = rows[i:i + self.K]
-        h_fut = self.store.feats[fut_rows, :12]
+        h_fut = self.store.feats[fut_rows]
         # risk_score is its own column -- one fancy-index, not K snapshot
         # builds. `_materialize` would construct K full HostWindowSnapshots
         # per sample and read one float off each.

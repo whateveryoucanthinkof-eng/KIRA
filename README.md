@@ -2,9 +2,27 @@
 
 cyberworld turns a **SPAN / port-mirror feed** into a **live host graph** and **ATT&CK-aware risk forecasts** for operators.
 
-> Passively watch live traffic → discover who is talking to whom → forecast near-future attack evolution → show it on a SOC console.
+> Passively watch live traffic → discover who is talking to whom → score each host and forecast the next few minutes → show it on a SOC console.
 
 It is **not** an inline firewall/IPS, and it does **not** rely on a hardcoded attacker glyph or a fixed 15-node cartoon topology. Topology is **discovery-first**: nodes and edges appear only when SPAN observes them.
+
+**The risk score, technique and alert on the dashboard are the model's output, unmodified.** An optional,
+hand-written SOC rule layer exists (`CYBERWORLD_ENABLE_RULES=1`, off by default). When enabled it is shown
+*beside* the model as an advisory opinion and never replaces the model's risk, technique or alert. The
+ARM EXTERNAL button only labels the console; it is never an input to scoring.
+
+It is **near-term forecasting, not campaign forecasting.** The models see 30 s of history and forecast at most
+150 s ahead. Longer history reaches the model only through the graph encoder's memory. See
+[Scope and limitations](#scope-and-limitations).
+
+Each model implements a published method: **BiTA** (encoder), **GNN-LSTM** (Branch A) and **DeepOP** (forecast
+decoder). [docs/PAPER_CONFORMANCE.md](docs/PAPER_CONFORMANCE.md) maps every equation to code and lists each
+deliberate deviation with its reason.
+
+**Evaluation protocol:** trained and tuned on CIC-IDS-2018 (from PCAP), scored once on CIC-IDS-2017, with
+classes 2018 never contained reported separately. Which encoder to use (Warden, CIC-2018, or Warden
+fine-tuned on CIC-2018) is decided by a measured comparison. See
+[docs/CROSS_YEAR_PROTOCOL.md](docs/CROSS_YEAR_PROTOCOL.md).
 
 ---
 
@@ -20,7 +38,7 @@ It is **not** an inline firewall/IPS, and it does **not** rely on a hardcoded at
 |------------|----------|
 | Capture | Local AF_PACKET sniff on the mirror NIC (lab sensor netns or real interface) |
 | Topology | Empty until traffic; fills from observed IPs/edges; external hosts appear only when seen |
-| ML | Dual-Branch + DeepOP on 2.0s flow windows (inference in control backend, not on the sniffer) |
+| ML | Dual-Branch + DeepOP on 2.0s flow windows (inference in control backend, not on the sniffer). The displayed verdict is the model's output |
 | Predictions | Bind to `focus_ips` / edges — never hardcoded `dmz-web` / `attacker` IDs |
 | Lab Mode | Optional Containerlab deploy/destroy/workloads when `lab_mode: true` |
 | Portability | Same model path for Containerlab **and** a real SPAN NIC via site YAML |
@@ -54,28 +72,35 @@ It is **not** an inline firewall/IPS, and it does **not** rely on a hardcoded at
 └─────────────────────────────────────┘
 ```
 
-### Live ML stack (v3 — what the shipped checkpoints implement)
+### Live ML stack
 
 ```text
-SPAN 5-tuple flows
+SPAN 5-tuple flows, grouped into 2 s windows
         │
         ▼
 Data unification → UnifiedFlowRecord  (labels never used live)
         │
-        ▼
-TGNE-TA (BiTA) → 12-D host latent H
-        ├──────────────────┐
-        ▼                  ▼
-  Branch A LSTM      Branch B WDT
-  technique/risk     K-step latent rollout
-        │                  │
-        └────────┬─────────┘
-                 ▼
-          DeepOP / CWA
-     future ATT&CK technique sequence
-                 ▼
-        PredictionEvent → dashboard
+        ▼  interaction graph of the window (nodes = IPs, edges = flows)
+TGNE-TA (BiTA): graph attention over the window + TGN memory updated by the
+                BiGRU-Transformer aggregator (carries history across windows)
+        │
+        ▼  12-D host latent z(t)  ⊕  15 host attributes a(t)
+s(t) ∈ R^27  ─────────────┬─────────────────────┐
+        ▼                                        ▼
+  Branch A (GNN-LSTM)                      Branch B (world model)
+  LSTM over s(t-14..t)                     s(t-14..t) → ŝ(t+1..t+5)
+  risk · technique · gradation                   │
+        │ technique per window                   │ predicted states
+        ▼                                        ▼
+  DeepOP encoder (observed sequence) ──► DeepOP decoder (causal window attention)
+                                                 │
+                                                 ▼
+                                  next ATT&CK techniques → PredictionEvent → dashboard
 ```
+
+The shipped checkpoints predate this wiring and load in their earlier architectures (12-D Branch B,
+decoder-only DeepOP, memoryless encoder). See "Reproducing" in
+[docs/PAPER_CONFORMANCE.md](docs/PAPER_CONFORMANCE.md) for the retrain order.
 
 | Contract | Value |
 |----------|-------|
@@ -83,9 +108,12 @@ TGNE-TA (BiTA) → 12-D host latent H
 | Temporal attrs | 15 |
 | Model input (Branch A) | **27-D** (12 + 15) |
 | Window \(\Delta t\) | **2.0 s** |
-| History | **5** steps (live) |
-| Forecast horizon \(K\) | **8** steps (~16 s) |
+| History | **15** steps (30 s) |
+| Forecast horizon \(K\) | **5** steps; see the v4 section for step size |
 | Label leakage | Forbidden on live path |
+
+The temporal contract has **one** source, `cyberworld_v4/config.py`. The old `config/temporal_contract.json`
+(5 / 8 / 16 s) was read by nothing and has been deleted.
 
 Retired: root `model/` V3.1 72-D PCAP transformer is **not** the live path.
 
@@ -103,19 +131,21 @@ prediction, post-hoc calibration, and mandatory baselines.
 |---|---|
 | Window `Δt` | **2.0 s** |
 | History `L` | **15** steps (30 s) |
-| Forecast `K` | **5** steps (10 s) |
+| Forecast `K` | **5** steps × **30 s** = **150 s** |
 | Model input | **27-D** (12-D TGNE-TA latent + 15 flow attributes) |
 
-This supersedes the v3 live contract above (`L=5, K=8`) and **invalidates all four shipped
-checkpoints** — v4 requires retraining, and `cyberworld_v4/contract.py` refuses a mismatched
-checkpoint at load. There is no trained v4 checkpoint and no benchmark result yet.
+**The shipped checkpoints do not match this contract yet.** Branch A, Branch B and DeepOP in
+`saved_models/` were trained with 15 × 2 s history and 5 × **2 s** forecast steps (10 s ahead), before
+the forecast step was coarsened to 30 s. The serving adapter refuses to load them unless
+`CYBERWORLD_ALLOW_CONTRACT_MISMATCH=1`. Each checkpoint's real contract, metrics and warnings are in its
+`*.manifest.json`, generated from the weights by `python scripts/write_model_manifests.py`.
 
 | Where | What |
 |---|---|
 | `cyberworld_v4/` | config, contract, identity, targets, splits, models, conformal, benchmark, manifest, `metrics/`, `baselines/` |
 | `docs/ARCHITECTURE.md` | the 2-page ML architecture document |
 | `docs/CYBER_RANGE.md` | Containerlab range, SPAN tap, capture path |
-| `claude_latest_analysis/` | verified audits; `07_v4_audit_and_migration_plan.md` is the current-state record |
+| `claude_latest_analysis/` | verified audits; `28_accuracy_changes.md` is the current-state record |
 
 ---
 
@@ -244,14 +274,21 @@ More detail: [docs/LOCAL_SPAN_RUNBOOK.md](docs/LOCAL_SPAN_RUNBOOK.md).
 
 ## Checkpoints
 
+Serving reads **only** `saved_models/`. Per-epoch encoder snapshots go to `.spill/encoder_epochs/`
+(scratch, gitignored); promote one with `scripts/select_best_encoder.py --copy`. The old top-level
+`saved_checkpoints/` folder has been removed: a retrain writing to the wrong one of two
+similar-looking folders has already happened once.
+
 | Component | Path |
 |-----------|------|
-| TGNE-TA (BiTA) | `bita/saved_models/bita_bigru_transformer-warden_alerts.pth` |
+| TGNE-TA (BiTA) | `saved_models/bita_bigru_transformer-unified_final.pth` (falls back to the legacy `bita/saved_models/bita_bigru_transformer-warden_alerts.pth`) |
 | Branch A LSTM | `saved_models/branch_a/branch_a_lstm.pt` |
 | Branch B WDT | `saved_models/branch_b/host_wdt.pt` |
 | DeepOP CWA | `saved_models/deepop/cwa_forecast_decoder.pt` |
 
-`scripts/ensure_checkpoints.py` can verify presence.
+`scripts/ensure_checkpoints.py` can verify presence. Each `*.manifest.json` states the checkpoint's
+temporal contract, the metrics it carries (and which expected ones it does not), and its credibility
+verdict. Regenerate them after every retrain with `python scripts/write_model_manifests.py`.
 
 ---
 
@@ -285,7 +322,12 @@ API: `GET /api/topology` · WS event: `topology_update` · Site: `GET /api/site`
 | `ws-file` | Bursty file transfer to `srv-file` |
 | `ws-app` | API traffic to `srv-app` (+ backend tiers) |
 
-External campaigns are **operator-driven** (ARM EXTERNAL). The UI does not inject synthetic attack packets as topology truth.
+External campaigns are **operator-driven** (ARM EXTERNAL). The UI does not inject synthetic attack packets as topology truth,
+and arming changes **no** score: it is echoed on the event for display only.
+
+SOAR actions (isolate, block IP/port, revoke) are **recorded, not enforced**. The model keeps scoring the traffic it
+actually sees after a mitigation is recorded. If flows that the recorded block should have stopped are still on the
+wire, the verdict panel shows **Mitigation not effective** instead of reporting the host as quiet.
 
 ---
 
@@ -299,13 +341,75 @@ Typical Containerlab policy (see `docs/CYBER_RANGE.md` for diagrams):
 
 ---
 
+## Access and exposure
+
+The console shows the internal host map and can record mitigations, so it is **loopback-only by default**
+(`127.0.0.1`). CORS allows only the local console origins (`CYBERWORLD_CORS_ORIGINS` adds more).
+
+To expose it deliberately:
+
+```bash
+python run_dashboard.py --host 0.0.0.0                            # prints a URL with a generated access token
+CYBERWORLD_API_TOKEN=... python run_dashboard.py --host 0.0.0.0   # or bring your own
+```
+
+With a token set, every request and the WebSocket must carry it (`Authorization: Bearer`, or open
+`/?token=…` once, which sets an HttpOnly cookie).
+
+`npm run demo` runs the UI on scripted fixtures (`web_dashboard/src/api/mock.ts`) with no backend. Every
+page shows a **DEMO DATA** banner in that mode so it cannot be mistaken for the live system.
+
+---
+
+## Scope and limitations
+
+Stated here so nobody has to discover them.
+
+**What the models can and cannot see**
+
+- **Near-term only.** 30 s of history (15 × 2 s windows); forecast at most 150 s ahead under the current
+  contract, and 10 s for the checkpoints actually shipped. If reconnaissance happened three days ago the
+  model cannot know. This is a scope gap against "attack forecasting", recorded in
+  `claude_latest_analysis/28_scope_and_feature_concerns.md`.
+- **Long-range history lives only in the encoder's memory.** The encoder attends over the current 2 s
+  window's graph; what happened earlier reaches the embedding through the TGN memory that BiTA's
+  aggregator updates (12-D per host, GRU-gated). That is BiTA's design, and it is on by default for
+  every new encoder. It makes training time-ordered (no batch shuffling) and serving stateful (memory
+  is per session and cleared on reset). **The shipped encoder was trained with memory off**, which meant
+  its BiTA aggregator never ran; it must be retrained to be a BiTA encoder at all.
+- **Campaign correlation is a heuristic and is not wired in.** `correlation/` links alerts with hand-set
+  kill-chain priors (every constant is in `causal_edge_scorer.HEURISTIC_PARAMS`; none were fitted). It is
+  bounded to the models' evidence horizon (history + forecast), splits campaigns on time gaps, and is not
+  called by the live backend. The dashboard's Campaign page is populated only by demo fixtures.
+- **Branch B may not be learning.** Its first run flatlined at epoch 1. Retraining now records its skill
+  against persistence (copying the last embedding forward) in the checkpoint, and DeepOP refuses to train
+  on a Branch B that does not beat it. The shipped Branch B predates that check.
+- **Edge-feature ablation has not been run.** `dst_port_norm_65535` is a shortcut risk: a model that can
+  read the port can learn "port ⇒ class" instead of behaviour. The ablation
+  (`CYBERWORLD_ABLATE_EDGE_FEATURES`) is now recorded in the encoder config and enforced at load, but the
+  comparison needs an encoder retrain that has not been done.
+
+**Training data problems that cannot be fixed in code**
+
+- 9 of 10 CIC-IDS-2018 CSV days fabricate host IPs from the row number, so host trajectories built from
+  them are synthetic. The PCAP path fixes this and is not yet wired into training.
+- All 158,930 CIC-IDS-2017 PortScan (recon) records come from a single host, `172.16.0.1`.
+- The held-out validation split has 2 technique classes against 7 in training, so performance on the
+  other 5 cannot be measured.
+- The corpus is ~82.5% Benign, so accuracy cannot visibly fail on it. **Quote macro-F1, AUC and Brier,
+  not accuracy.** The shipped Branch A checkpoint records only accuracy, and its manifest says so.
+
+---
+
 ## Tests
 
 ```bash
-python -m pytest tests/test_site_config.py tests/test_topology_service.py tests/test_control_backend.py -q
+python -m pytest tests/ -q
 ```
 
-Covers CIDR classification, primary-host selection, topology TTL/caps, Lab Mode gating, Dual-Branch smoke.
+`tests/test_verdict_is_the_model.py` pins the behaviour above: external traffic is not forced to
+ELEVATED, internal risk is not damped, the ARM button does not move the score, rules are advisory, and a
+recorded mitigation does not hide ongoing traffic.
 
 ---
 
@@ -327,3 +431,4 @@ Covers CIDR classification, primary-host selection, topology TTL/caps, Lab Mode 
 ## License / notes
 
 Research and competition-oriented cyber-range + predictive SOC observation stack. Blocking/SOAR actions in the UI are **recorded intents** unless wired to real enforcement.
+                                                                                                   

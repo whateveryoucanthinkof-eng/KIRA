@@ -392,13 +392,16 @@ def test_dataset_times_feed_straight_into_the_rollout():
     ds = LazyHostRolloutDataset(b.finalize(), T=15, K=5)
     batch = next(iter(DataLoader(ds, batch_size=8)))
 
-    m = _model()
+    # Branch B models the full 27-D world state, not the bare 12-D latent.
+    torch.manual_seed(0)
+    m = HostWorldDynamicsTransformer(
+        d_latent=batch["h_history"].shape[-1], d_model=64, n_heads=4, n_layers=3).eval()
     with torch.no_grad():
         with_times = m.rollout(batch["h_history"], K=5,
                                t_history=batch["t_history"],
                                t_future=batch["t_future"])
         assumed_uniform = m.rollout(batch["h_history"], K=5)
-    assert with_times.shape == (8, 5, 12)
+    assert with_times.shape == (8, 5, 27)
     assert float((with_times - assumed_uniform).pow(2).mean()) > 1e-6, (
         "the real spacing must change the forecast, or passing it is pointless")
 

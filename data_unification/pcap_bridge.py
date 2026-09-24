@@ -127,6 +127,7 @@ def _flow_dict_to_record(
     technique_ids: List[str],
     raw_label: str,
     scenario_id: str,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[UnifiedFlowRecord]:
     try:
         return UnifiedFlowRecord(
@@ -146,7 +147,12 @@ def _flow_dict_to_record(
             is_attack=is_attack,
             coarse_category=coarse_category,
             attck_technique_ids=list(technique_ids),
-            metadata={"scenario_id": scenario_id, "source": "pcap"},
+            # One SHARED dict per host-window, passed in by the caller. It was
+            # a fresh literal per record, which the schema's own docstring
+            # calls out as a 64 B/record cost, and it had nowhere to put the
+            # packet features the caller had just computed and discarded.
+            metadata=metadata if metadata is not None
+            else {"scenario_id": scenario_id, "source": "pcap"},
         )
     except Exception:
         return None
@@ -161,6 +167,8 @@ def iter_day_records(
     limit_hosts: Optional[int] = None,
     max_packets_per_host: Optional[int] = None,
     resolver: Optional[LabelResolver] = None,
+    scope_labels_to_participants: bool = True,
+    keep_packet_features: bool = True,
 ) -> Iterator[Tuple[float, float, List[UnifiedFlowRecord]]]:
     """Yields (window_start, window_end, records) for one capture day, all hosts active
     in that window bundled together -- ready for HostTrajectoryExtractor.extract_trajectories().
@@ -168,6 +176,18 @@ def iter_day_records(
     attack_windows must come from attack_windows.derive_windows() on that same day's CIC-2018
     CSV; callers should check attack_windows.ok before relying on the labels (see that
     module's docstring -- an implausible derivation should not be trained on silently).
+
+    `scope_labels_to_participants` restricts the attack label to the hosts the
+    interval knows took part. Without it the label is a pure function of the
+    clock, stamped on every one of a day's ~445 captured hosts -- so the target
+    is mostly "what time is it", and a model can score well without ever
+    looking at traffic. An interval with no known participants still labels
+    everyone (there is nothing to narrow it with) and says so in
+    `metadata["label_scope"]`, so a reader can tell the two cases apart.
+
+    `keep_packet_features` attaches the 30 packet-level features the engine
+    already computed for this host-window. They used to be unpacked into
+    `_packet_features` and dropped; nothing downstream had ever seen one.
     """
     resolver = resolver or get_default_resolver()
 
@@ -181,19 +201,36 @@ def iter_day_records(
         window_end = window_start + window_seconds
         mid_ts = (window_start + window_end) / 2.0
 
-        raw_label = attack_windows.label_at(mid_ts) or "BENIGN"
+        interval = attack_windows.interval_at(mid_ts)
+        raw_label = interval.label if interval else "BENIGN"
         coarse, technique_ids, is_attack = resolver.resolve(raw_label, source=LabelSource.CIC2018)
+        scoped = bool(interval and interval.scoped and scope_labels_to_participants)
 
         records: List[UnifiedFlowRecord] = []
-        for host_ip, (flows, _packet_features) in per_host.items():
+        for host_ip, (flows, packet_features) in per_host.items():
+            meta: Dict[str, Any] = {"scenario_id": scenario_id, "source": "pcap"}
+            if keep_packet_features and packet_features:
+                meta["packet_features"] = packet_features
+            meta["label_scope"] = (
+                "participants" if scoped else ("time_only" if is_attack else "benign")
+            )
             for f in flows:
+                # A window-level label is an interval in TIME; whether this
+                # particular host was in it is a separate question, and the
+                # answer is the interval's participant set when it has one.
+                if is_attack and scoped:
+                    hit = interval.involves(
+                        str(f.get("src_ip", "")), str(f.get("dst_ip", "")), host_ip)
+                else:
+                    hit = is_attack
                 rec = _flow_dict_to_record(
                     f,
-                    is_attack=is_attack,
-                    coarse_category=coarse,
-                    technique_ids=technique_ids,
-                    raw_label=raw_label,
+                    is_attack=hit,
+                    coarse_category=coarse if hit else "Benign",
+                    technique_ids=technique_ids if hit else [],
+                    raw_label=raw_label if hit else "BENIGN",
                     scenario_id=scenario_id,
+                    metadata=meta,
                 )
                 if rec is not None:
                     records.append(rec)

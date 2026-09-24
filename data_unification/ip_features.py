@@ -38,8 +38,9 @@ downstream contract is built on.
 from __future__ import annotations
 
 import ipaddress
+import os
 from functools import lru_cache
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -104,6 +105,107 @@ def ip_node_features(ip: str) -> tuple:
     return tuple(f)
 
 
+# ---------------------------------------------------------------------------
+# Ablation
+# ---------------------------------------------------------------------------
+#
+# The counterpart to CYBERWORLD_ABLATE_EDGE_FEATURES in tgne_features.py, and
+# it exists because the IP-feature ablation (scripts/ablate_ip_features.py)
+# found the leak is NOT where it was assumed to be.
+#
+# The suspicion was the octets: an identifier, and on a corpus where one host
+# carries a whole attack class, "which address" is most of "which attack".
+# Measured on a fixture reproducing CIC-2018's topology -- attacks staged from
+# public AWS addresses against RFC1918 victims -- the address recovers the
+# label at ROC-AUC 1.0000, permutation importance attributes it to
+# `is_private` (+0.496), and masking all four octets changes nothing. One
+# boolean separates attacker traffic from benign internal traffic perfectly.
+#
+# That is a property of how the capture was staged, not of the model, and a
+# model that keys on it scores well offline and transfers nothing to a live
+# network whose addresses are all internal. Removing it is a measurement, not
+# a guess -- zero the feature, retrain, compare inductive AUC.
+#
+# Zeroing rather than dropping keeps the 12-D node contract, so an ablated
+# encoder loads everywhere a normal one does and the comparison is not
+# confounded by an architecture change.
+#
+#     CYBERWORLD_ABLATE_NODE_FEATURES=is_private,is_global python bita/train.py ...
+#
+#: Shorthand for the two groups worth ablating as a unit.
+ABLATION_GROUPS: Dict[str, List[str]] = {
+    # the leak the ablation actually found on this corpus
+    "address_class": ["is_private", "is_global"],
+    # host identity: what the octets were suspected of
+    "host_identity": ["octet3", "octet4"],
+    # every octet, leaving only the class flags
+    "octets": ["octet1", "octet2", "octet3", "octet4"],
+    # Both of the above: only flags that mean the same thing on ANY network.
+    # For training on one network and testing on another (CIC-2018 on AWS
+    # 172.31/16 -> CIC-2017 on 192.168.10/24) the octets name a network the
+    # test set does not use, and is_private/is_global encode how each capture
+    # was staged (attackers on public addresses), not how attacks behave.
+    "cross_network": ["is_private", "is_global", "octet1", "octet2", "octet3", "octet4"],
+}
+
+_NODE_MASK = None
+_NODE_MASK_READ = False
+
+
+def _build_node_ablation_mask() -> Optional[np.ndarray]:
+    raw = os.environ.get("CYBERWORLD_ABLATE_NODE_FEATURES", "").strip()
+    if not raw:
+        return None
+    wanted: List[str] = []
+    for tok in (t.strip() for t in raw.split(",")):
+        if not tok:
+            continue
+        wanted.extend(ABLATION_GROUPS.get(tok, [tok]))
+    unknown = [n for n in wanted if n not in IP_FEATURE_NAMES]
+    if unknown:
+        raise ValueError(
+            f"unknown node feature(s) to ablate: {unknown}. "
+            f"Valid names: {IP_FEATURE_NAMES}. "
+            f"Group shorthands: {sorted(ABLATION_GROUPS)}")
+    if "bias" in wanted:
+        # The bias is how an unknown node is distinguished from a genuine
+        # 0.0.0.0; zeroing it makes every row look like "no information".
+        raise ValueError(
+            "refusing to ablate 'bias': an all-zero row is how the encoder "
+            "recognises an unknown node, so removing it changes the meaning "
+            "of every other row rather than removing one feature")
+    mask = np.ones(IP_FEATURE_DIM, dtype=np.float32)
+    for n in wanted:
+        mask[IP_FEATURE_NAMES.index(n)] = 0.0
+    return mask
+
+
+def node_ablation_mask() -> Optional[np.ndarray]:
+    """Cached; the env var is read once, not once per host."""
+    global _NODE_MASK, _NODE_MASK_READ
+    if not _NODE_MASK_READ:
+        _NODE_MASK = _build_node_ablation_mask()
+        _NODE_MASK_READ = True
+        if _NODE_MASK is not None:
+            dropped = [n for n, m in zip(IP_FEATURE_NAMES, _NODE_MASK) if m == 0.0]
+            print(f"NODE FEATURE ABLATION ACTIVE: zeroing {dropped}", flush=True)
+    return _NODE_MASK
+
+
+def ablated_node_features() -> List[str]:
+    """Names of the node features this process zeroes. [] when none."""
+    mask = node_ablation_mask()
+    if mask is None:
+        return []
+    return [n for n, m in zip(IP_FEATURE_NAMES, mask) if m == 0.0]
+
+
+def reset_node_ablation_cache() -> None:
+    """For tests, which change the env var between cases."""
+    global _NODE_MASK, _NODE_MASK_READ
+    _NODE_MASK, _NODE_MASK_READ = None, False
+
+
 def build_node_feature_matrix(ip_to_id: Dict[str, int], n_nodes: int = None) -> np.ndarray:
     """(n_nodes, 12) matrix indexed by node id, row 0 reserved for padding.
 
@@ -123,6 +225,12 @@ def build_node_feature_matrix(ip_to_id: Dict[str, int], n_nodes: int = None) -> 
     for ip, node_id in ip_to_id.items():
         if 0 <= node_id < total_nodes:
             m[node_id] = ip_node_features(ip)
+    mask = node_ablation_mask()
+    if mask is not None:
+        # Applied HERE rather than inside ip_node_features so the lru_cache on
+        # that function is never poisoned with ablated values that would then
+        # survive a cache reset in the same process.
+        m *= mask
     return m
 
 

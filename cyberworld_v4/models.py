@@ -49,8 +49,61 @@ class SequenceEncoder(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_dim)
         self.hidden_dim = hidden_dim
+        self.input_dim = input_dim
+
+        # Per-feature input standardisation, held as BUFFERS rather than
+        # computed on the fly.
+        #
+        # The 27-D state is two blocks glued together with no common scale:
+        # dims 0-11 are the TGNE graph-attention output, which is unbounded,
+        # and dims 12-26 are the host attributes, every one of them clipped to
+        # [0, 1] by construction (data_unification/host_attributes.py). An LSTM
+        # gate sees their sum, so whichever block happens to be larger
+        # dominates the input to every gate, and the other is compressed
+        # against it.
+        #
+        # Buffers, not a LayerNorm, for three reasons:
+        #   * LayerNorm here would normalise ACROSS the 27 features within one
+        #     sample, mixing the two blocks and destroying the overall
+        #     magnitude -- and magnitude IS signal in network traffic (a
+        #     100-flow window is not a 2-flow window).
+        #   * BatchNorm would make an inference depend on the rest of the
+        #     batch, which serving cannot guarantee.
+        #   * Buffers land in state_dict, so serving inherits exactly the
+        #     statistics training used. That is the train/serve parity this
+        #     repo checks for elsewhere; a normaliser refitted at serve time
+        #     would be the same class of silent mismatch as the zeroed node
+        #     features were.
+        #
+        # Identity until `fit_input_normalizer` is called, so an unfitted model
+        # behaves exactly as before and old checkpoints stay loadable.
+        self.register_buffer("input_mean", torch.zeros(input_dim))
+        self.register_buffer("input_std", torch.ones(input_dim))
+        self.register_buffer("input_normalizer_fitted", torch.zeros(1))
+
+    @torch.no_grad()
+    def fit_input_normalizer(self, x: torch.Tensor, eps: float = 1e-6) -> "SequenceEncoder":
+        """Fit per-feature mean/std on the TRAINING split only.
+
+        `x` is [N, L, D] or [N, D]. A feature with no variance keeps std 1.0
+        rather than being amplified by a near-zero divisor -- a constant
+        attribute carries no information and must not be turned into noise.
+        """
+        flat = x.reshape(-1, x.shape[-1]).float()
+        mean = flat.mean(0)
+        std = flat.std(0)
+        std = torch.where(std < eps, torch.ones_like(std), std)
+        self.input_mean.copy_(mean)
+        self.input_std.copy_(std)
+        self.input_normalizer_fitted.fill_(1.0)
+        return self
+
+    @property
+    def normalizer_fitted(self) -> bool:
+        return bool(self.input_normalizer_fitted.item())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.input_mean) / self.input_std
         out, _ = self.lstm(x)
         return self.norm(out[:, -1, :])
 
@@ -111,6 +164,16 @@ class CyberWorldForecaster(nn.Module):
         self.config = config
         self.encoder = SequenceEncoder(config.state_dim, hidden_dim, layers, dropout)
         self.heads = ForecastHeads(n_techniques, config, hidden_dim, dropout)
+
+    def fit_input_normalizer(self, x: torch.Tensor) -> "CyberWorldForecaster":
+        """Fit the encoder's input statistics on the training split. Call once,
+        before training, and never on validation or test."""
+        self.encoder.fit_input_normalizer(x)
+        return self
+
+    @property
+    def normalizer_fitted(self) -> bool:
+        return self.encoder.normalizer_fitted
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         return self.heads(self.encoder(x))

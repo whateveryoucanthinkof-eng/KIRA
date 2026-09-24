@@ -5,6 +5,7 @@ FastAPI Control Backend for the V3 SOC dashboard — wired to real Containerlab.
 
 import asyncio
 from contextlib import asynccontextmanager
+import hmac
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from typing import Dict, Any, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 sys.path.insert(0, os.path.abspath("."))
 sys.path.insert(0, os.path.abspath("bita"))
@@ -62,13 +63,67 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# --- Access control ----------------------------------------------------------
+#
+# This used to be CORS "*" with credentials, no authentication, and a 0.0.0.0
+# bind: on shared Wi-Fi anyone could open the SOC console, read the internal
+# host map and press mitigation buttons. Now:
+#
+#   * run_dashboard.py binds 127.0.0.1 by default;
+#   * CORS allows only the local console origins (extend with
+#     CYBERWORLD_CORS_ORIGINS, comma-separated);
+#   * if CYBERWORLD_API_TOKEN is set, every HTTP and WebSocket request must
+#     carry it -- as `Authorization: Bearer <token>`, the `cw_token` cookie, or
+#     `?token=<token>` once (which sets the cookie). run_dashboard.py generates
+#     one automatically whenever it is asked to bind a non-loopback address.
+
+_DEFAULT_ORIGINS = [
+    f"http://{h}:{p}" for h in ("localhost", "127.0.0.1") for p in (8000, 8443, 5173, 5174)
+]
+_extra_origins = [
+    o.strip() for o in os.environ.get("CYBERWORLD_CORS_ORIGINS", "").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_DEFAULT_ORIGINS + _extra_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+_TOKEN_COOKIE = "cw_token"
+
+
+def _api_token() -> str:
+    return os.environ.get("CYBERWORLD_API_TOKEN", "").strip()
+
+
+def _presented_token(headers, cookies, query_params) -> str:
+    auth = headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return cookies.get(_TOKEN_COOKIE) or query_params.get("token") or ""
+
+
+def _token_ok(presented: str) -> bool:
+    expected = _api_token()
+    return (not expected) or hmac.compare_digest(presented.encode(), expected.encode())
+
+
+@app.middleware("http")
+async def require_token(request, call_next):
+    if not _api_token():
+        return await call_next(request)
+    presented = _presented_token(request.headers, request.cookies, request.query_params)
+    if not _token_ok(presented):
+        return JSONResponse({"detail": "Unauthorized: missing or invalid access token"}, status_code=401)
+    if request.query_params.get("token"):
+        # Trade the URL token for an HttpOnly cookie so it drops out of the
+        # address bar and same-origin fetch/WebSocket calls carry it.
+        resp = RedirectResponse(request.url.remove_query_params("token"), status_code=303)
+        resp.set_cookie(_TOKEN_COOKIE, presented, httponly=True, samesite="strict")
+        return resp
+    return await call_next(request)
 
 FRONTEND_DIST_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "web_dashboard", "dist")
@@ -162,6 +217,8 @@ async def get_system_status():
         forecast_steps=_served.forecast_steps,
         checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
         threshold=_served.alert_threshold,
+        forecast_step_seconds=_served.step_seconds,
+        rules_enabled=_served.rules_enabled,
     )
 
     now_iso = utc_now_iso()
@@ -192,11 +249,11 @@ async def get_system_status():
         topology_edges=topo.stats.edges,
         sensor_interface=site.sensor_interface,
         uptime=int(time.time() - getattr(telemetry_service, "service_start_time", time.time())),
-        throughput=getattr(telemetry_service, "current_throughput", 35.0),
-        latency=getattr(telemetry_service, "current_latency", 8.5),
+        throughput=getattr(telemetry_service, "current_throughput", 0.0),
+        latency=getattr(telemetry_service, "current_latency", 0.0),
         packetLoss=getattr(telemetry_service, "current_packet_loss", 0.0),
-        activeConnections=getattr(telemetry_service, "current_active_connections", 24),
-        anomalyScore=getattr(telemetry_service, "current_anomaly_score", 8.0),
+        activeConnections=getattr(telemetry_service, "current_active_connections", 0),
+        anomalyScore=getattr(telemetry_service, "current_anomaly_score", 0.0),
         threatLevel=getattr(telemetry_service, "current_threat_level", "low"),
         timestamp=now_iso,
     )
@@ -246,9 +303,8 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     Runs entirely locally: no network egress, no cloud dependency. The upload is
     written to a temp file, parsed, scored window by window, and deleted.
 
-    Rules are disabled for this path regardless of the server's setting: an
-    offline analysis is an evaluation, and a heuristic that floors risk at 0.40
-    would make every uploaded file look alarming.
+    `risk` here is the model output. The advisory rule layer never changes it
+    anywhere, so there is nothing to switch off for this path.
     """
     import tempfile
 
@@ -266,9 +322,7 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     tmp = Path(tempfile.mkstemp(suffix=suffix or ".bin")[1])
     tmp.write_bytes(data)
 
-    prev_rules = getattr(model_adapter, "rules_enabled", False)
     try:
-        model_adapter.rules_enabled = False
         model_adapter.reset_history()
 
         if suffix in (".csv", ".binetflow"):
@@ -290,6 +344,7 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
                 "target": target,
                 "risk": ev.prediction.risk,
                 "ml_risk": ev.prediction.ml_risk,
+                "risk_source": ev.prediction.risk_source,
                 "alert": ev.prediction.alert,
                 "stage": ev.prediction.predicted_stage,
                 "mitre_tactic": ev.prediction.mitre_tactic,
@@ -313,7 +368,6 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
             "results": results,
         }
     finally:
-        model_adapter.rules_enabled = prev_rules
         tmp.unlink(missing_ok=True)
 
 
@@ -393,6 +447,10 @@ async def trigger_mitigation(payload: Dict[str, Any] = Body(...)):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # HTTP middleware does not see WebSocket upgrades, so check here too.
+    if not _token_ok(_presented_token(websocket.headers, websocket.cookies, websocket.query_params)):
+        await websocket.close(code=1008)
+        return
     await broker.connect(websocket)
     try:
         while True:

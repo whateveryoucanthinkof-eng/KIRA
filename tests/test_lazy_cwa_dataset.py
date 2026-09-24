@@ -96,10 +96,10 @@ def test_shapes_match_the_contract():
     v = get_joint_vocab()
     ds = LazyCWADataset(st, v, K=K, T=T)
     s = ds[0]
-    assert s["h_future"].shape == (K, 12)
+    assert s["h_future"].shape == (K, 27)
     assert s["input_tokens"].shape == (K,)
     assert s["target_tokens"].shape == (K,)
-    assert s["h_history"].shape == (T, 12)
+    assert s["h_history"].shape == (T, 27)
 
 
 def test_input_is_bos_plus_shifted_targets():
@@ -128,10 +128,10 @@ def test_history_is_left_padded_with_a_real_past_state():
     st = _store(n_hosts=1, n_win=8)
     ds = LazyCWADataset(st, get_joint_vocab(), K=K, T=T)
     first = ds[0]                       # i = 1 -> one real history row
-    assert first["h_history"].shape == (T, 12)
+    assert first["h_history"].shape == (T, 27)
     assert torch.allclose(first["h_history"][0], first["h_history"][-1])
     assert torch.allclose(first["h_history"][-1],
-                          torch.from_numpy(st.feats[st._rows_by_host["10.0.0.0"][0], :12]))
+                          torch.from_numpy(st.feats[st._rows_by_host["10.0.0.0"][0]]))
 
 
 def test_no_window_takes_its_history_from_its_own_target():
@@ -246,7 +246,7 @@ def test_it_works_through_a_dataloader():
     ds = LazyCWADataset(_store(), get_joint_vocab(), K=K, T=T)
     n = 0
     for b in DataLoader(ds, batch_size=8, shuffle=True):
-        assert b["h_future"].shape[1:] == (K, 12)
-        assert b["h_history"].shape[1:] == (T, 12)
+        assert b["h_future"].shape[1:] == (K, 27)
+        assert b["h_history"].shape[1:] == (T, 27)
         n += len(b["h_future"])
     assert n == len(ds)

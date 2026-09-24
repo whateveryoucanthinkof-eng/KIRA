@@ -58,16 +58,33 @@ TECHNIQUE_TO_MITRE = {
     "T1020": ("Exfiltration", "T1020 Automated Exfiltration", "TA0010", "Automated exfiltration"),
 }
 
-# The SOC rule layer emits its own coarse labels. They are not ATT&CK technique
-# ids, so TECHNIQUE_TO_MITRE used to miss and the dashboard rendered
-# "MITRE Unknown -> Exploit". Mapping them to the real technique each rule is
-# actually detecting keeps the displayed ATT&CK annotation meaningful; the
-# rules_applied flag still tells the operator the label came from a rule.
-RULE_TECHNIQUE_TO_ATTCK = {
-    "PortScan": "T1046",     # Network Service Discovery
-    "WebAttack": "T1190",    # Exploit Public-Facing Application
-    "Exploit": "T1190",      # Exploit Public-Facing Application
-}
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def advisory_rule_opinion(ext_flows: List[UnifiedFlowRecord]) -> tuple[Optional[float], Optional[str]]:
+    """The deterministic SOC heuristic, as a separate opinion. Never the verdict.
+
+    Hand-written, not learned: any inbound flow from outside the site CIDRs
+    scores at least 0.40 + 0.25, and the label is picked by counting ports.
+    That fires on ordinary web browsing, which is exactly why it must not be
+    allowed to overwrite the model. It is kept only so an operator who wants a
+    rule-based second opinion can see one, clearly labelled as such.
+
+    Returns (None, None) when there is no external traffic to have an opinion on.
+    """
+    if not ext_flows:
+        return None, None
+    ext_count = len(ext_flows)
+    rule_risk = float(min(0.96, 0.40 + min(0.65, (ext_count / 75.0) * 0.50 + 0.25)))
+    ports_seen = {getattr(r, "dst_port", 0) for r in ext_flows}
+    if len(ports_seen) >= 5:
+        label = "PortScan"
+    elif any(getattr(r, "dst_port", 0) in (80, 443, 8080) for r in ext_flows):
+        label = "WebAttack"
+    else:
+        label = "Exploit"
+    return rule_risk, label
 
 # Dashboard grouping for each feature, keyed off the CANONICAL names.
 #
@@ -118,10 +135,21 @@ class AntigravityModelAdapter:
         self.feature_history: List[torch.Tensor] = []
         self.h_state_history_by_target: Dict[str, List[torch.Tensor]] = {}
         self.feature_history_by_target: Dict[str, List[torch.Tensor]] = {}
+        # Branch A's technique token per window, per host: the "observed
+        # attack sequence" DeepOP's encoder reads.
+        self.technique_history_by_target: Dict[str, List[int]] = {}
         self.alert_threshold = 0.65
-        # Rules on by default so the operator console is unchanged; off for any
-        # scientific run. CYBERWORLD_DISABLE_RULES=1 yields ML-only output.
-        self.rules_enabled = os.environ.get("CYBERWORLD_DISABLE_RULES", "") not in ("1", "true", "True")
+        # The SOC rule layer is OFF by default and, when on, ADVISORY ONLY: it
+        # reports rule_risk / rule_technique next to the model's output and
+        # never replaces risk, predicted_stage or alert. It used to be on by
+        # default and overwrite all three, so anyone starting the dashboard was
+        # looking at port-count if-statements presented as model predictions.
+        self.rules_enabled = _env_flag("CYBERWORLD_ENABLE_RULES")
+        if os.environ.get("CYBERWORLD_DISABLE_RULES") is not None:
+            logger.warning(
+                "CYBERWORLD_DISABLE_RULES is obsolete: rules are off by default and "
+                "never override the model. Use CYBERWORLD_ENABLE_RULES=1 to compute "
+                "the advisory rule layer.")
         # Provisional; overwritten in _load_models by the contract the
         # checkpoints actually carry. A model's temporal contract is a property
         # of the model, not a global constant — hardcoding it here is how a v3
@@ -129,6 +157,9 @@ class AntigravityModelAdapter:
         self.window_seconds = LIVE_WINDOW_SIZE_SEC
         self.forecast_steps = DEFAULT_ROLLOUT_HORIZON_LIVE
         self.history_steps = DEFAULT_HISTORY_STEPS
+        # Seconds per FORECAST step. Checkpoints that predate the field were
+        # single-scale, so it falls back to window_seconds for them.
+        self.forecast_step_seconds: Optional[float] = None
         self.checkpoint_contract: Dict[str, Any] = {}
         self.fingerprinter = BehavioralFlowFingerprinter()
         self._load_models()
@@ -167,28 +198,42 @@ class AntigravityModelAdapter:
         self.technique_vocab = TECHNIQUE_VOCAB
 
         self.tgn = build_or_load_tgne_ta()
+        # persist_memory: every predict_window call is the next 2 s window of
+        # one continuous session, so a BiTA encoder's memory carries across
+        # calls (and is cleared by reset_history). No effect on a memoryless
+        # encoder.
         self.extractor = HostTrajectoryExtractor(
             tgne_ta_model=self.tgn,
             window_size_sec=self.window_seconds,
+            persist_memory=True,
         )
 
-        self.branch_a = MultiTaskLSTM(input_dim=27, hidden_dim=64).to(self.device)
         ba_path = os.path.join(repo, "saved_models/branch_a/branch_a_lstm.pt")
         if not os.path.exists(ba_path):
             raise RuntimeError(f"Missing Branch A checkpoint: {ba_path}")
         ckpt = torch.load(ba_path, map_location=self.device, weights_only=False)
-        self.branch_a.load_state_dict(ckpt["model_state_dict"])
+        # Rebuilds the architecture the checkpoint was trained as: the paper
+        # model (1 x 256 LSTM, linear heads) or the older 2 x 64 variant.
+        self.branch_a = MultiTaskLSTM.from_checkpoint(ckpt, device=self.device)
         self.branch_a.eval()
         self._adopt_contract(ckpt, "branch_a")
         self._warn_if_not_credible(ckpt, "branch_a")
 
-        self.wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64).to(self.device)
-        self.risk_head = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(self.device)
         bb_path = os.path.join(repo, "saved_models/branch_b/host_wdt.pt")
         if not os.path.exists(bb_path):
             raise RuntimeError(f"Missing Branch B checkpoint: {bb_path}")
         ckpt = torch.load(bb_path, map_location=self.device, weights_only=False)
+        # The world state Branch B was trained on: 27-D (TGNE latent + host
+        # attributes) for current checkpoints, 12-D (latent only) for older
+        # ones. Read it from the weights rather than assuming.
+        self.world_state_dim = int(
+            ckpt.get("d_state") or ckpt["wdt_state_dict"]["in_proj.weight"].shape[1])
+        self.wdt = HostWorldDynamicsTransformer(d_latent=self.world_state_dim, d_model=64).to(self.device)
+        self.risk_head = InfiltrationRiskHead(d_latent=self.world_state_dim, hidden_dim=32).to(self.device)
         self._adopt_contract(ckpt, "branch_b")
+        # A Branch B that does not beat "copy the last step" makes every
+        # forecast on the dashboard a restatement of the present.
+        self._warn_if_not_credible(ckpt, "branch_b")
         self.wdt.load_state_dict(ckpt["wdt_state_dict"])
         self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
         self.wdt.eval()
@@ -196,15 +241,18 @@ class AntigravityModelAdapter:
 
         self.vocab = get_joint_vocab()
         self.consolidate_network_technique = consolidate_network_technique
-        self.deepop = DeepOPForecastDecoder(
-            d_latent=12, d_model=72, vocab_size=self.vocab.vocab_size
-        ).to(self.device)
         dp_path = os.path.join(repo, "saved_models/deepop/cwa_forecast_decoder.pt")
         if not os.path.exists(dp_path):
             raise RuntimeError(f"Missing DeepOP checkpoint: {dp_path}")
         ckpt = torch.load(dp_path, map_location=self.device, weights_only=False)
-        self.deepop.load_state_dict(ckpt["decoder_state_dict"])
+        # Builds whichever architecture the checkpoint was trained as: the
+        # DeepOP encoder-decoder, or the older decoder-only model.
+        self.deepop = DeepOPForecastDecoder.from_checkpoint(ckpt, device=self.device)
         self.deepop.eval()
+        if self.deepop.d_latent != self.world_state_dim:
+            raise RuntimeError(
+                f"DeepOP decodes {self.deepop.d_latent}-D states but Branch B predicts "
+                f"{self.world_state_dim}-D ones; retrain them together.")
         # DeepOP was the only checkpoint whose contract was never adopted, even
         # though its horizon is what defines the served forecast length.
         self._adopt_contract(ckpt, "deepop")
@@ -228,6 +276,7 @@ class AntigravityModelAdapter:
             "window_seconds": self.window_seconds,
             "history_steps": self.history_steps,
             "forecast_steps": self.forecast_steps,
+            "forecast_window_seconds": self.step_seconds,
         }
         served = get_contract().matches(served_contract)
 
@@ -300,6 +349,8 @@ class AntigravityModelAdapter:
             found["history_steps"] = int(src["history_steps"])
         if src.get("forecast_steps"):
             found["forecast_steps"] = int(src["forecast_steps"])
+        if src.get("forecast_window_seconds"):
+            found["forecast_window_seconds"] = float(src["forecast_window_seconds"])
         if not found:
             return
 
@@ -313,8 +364,17 @@ class AntigravityModelAdapter:
                 )
             self.checkpoint_contract[k] = v
 
+        self._apply_checkpoint_contract()
         if name == "branch_a":
             self._adopt_risk_semantics(ckpt)
+
+    def _apply_checkpoint_contract(self) -> None:
+        """Serve with whatever the checkpoints loaded so far agree on."""
+        c = self.checkpoint_contract
+        self.window_seconds = c.get("window_seconds", self.window_seconds)
+        self.history_steps = c.get("history_steps", self.history_steps)
+        self.forecast_steps = c.get("forecast_steps", self.forecast_steps)
+        self.forecast_step_seconds = c.get("forecast_window_seconds", self.forecast_step_seconds)
 
     def _adopt_risk_semantics(self, ckpt):
         """What `risk_score` means, and where to alert on it.
@@ -358,15 +418,20 @@ class AntigravityModelAdapter:
                 "quiet. Re-run Branch A so it fits and stores a threshold.",
                 self.alert_threshold, "low")
 
-        self.window_seconds = self.checkpoint_contract.get("window_seconds", self.window_seconds)
-        self.history_steps = self.checkpoint_contract.get("history_steps", self.history_steps)
-        self.forecast_steps = self.checkpoint_contract.get("forecast_steps", self.forecast_steps)
+    @property
+    def step_seconds(self) -> float:
+        """Seconds per forecast step, as the loaded checkpoints were trained."""
+        return float(self.forecast_step_seconds or self.window_seconds)
 
     def reset_history(self):
         self.h_state_history.clear()
         self.feature_history.clear()
         self.h_state_history_by_target.clear()
         self.feature_history_by_target.clear()
+        self.technique_history_by_target.clear()
+        extractor = getattr(self, "extractor", None)
+        if extractor is not None and hasattr(extractor, "reset_memory_state"):
+            extractor.reset_memory_state()
 
     def _build_embedding(
         self, target_ip: str, flows: List[UnifiedFlowRecord]
@@ -488,16 +553,27 @@ class AntigravityModelAdapter:
         window_id: int = 0,
         attack_active: bool = False,
         attack_phase: Optional[str] = None,
-        is_mitigated: bool = False,
+        mitigation_recorded: bool = False,
+        mitigation_bypass_flows: int = 0,
         packet_count: int = 0,
         pipeline_latency_ms: float = 0.0,
         active_flows: Optional[int] = None,
         throughput: float = 0.0,
     ) -> PredictionEvent:
-        t0 = time.perf_counter()
+        """Score one window. The verdict is the model's and only the model's.
 
-        if is_mitigated:
-            flows = []
+        `attack_active` / `attack_phase` are the operator's ARM EXTERNAL state.
+        They are echoed on the event for display and are NEVER an input to
+        scoring: they are knowledge of the answer, and pressing a button must
+        not move the risk number.
+
+        `mitigation_recorded` / `mitigation_bypass_flows` describe a block or
+        isolation the operator recorded. The dashboard does not enforce it, so
+        the model keeps scoring the traffic it actually sees; if traffic the
+        block should have stopped is still present, that is reported rather
+        than hidden.
+        """
+        t0 = time.perf_counter()
 
         host_flows = [
             record
@@ -569,63 +645,35 @@ class AntigravityModelAdapter:
             )
             raw_risk = float(risk_pred.item()) if risk_pred.numel() == 1 else float(risk_pred.mean().item())
 
-        from control_backend.site_config import get_site_config
-        site = get_site_config()
-        ext_flows = [
-            r for r in host_flows 
-            if site.classify_ip(getattr(r, "src_ip", "")) == "external"
-        ]
-        if not ext_flows:
-            ext_flows = [
-                r for r in flows 
-                if site.classify_ip(getattr(r, "src_ip", "")) == "external"
-            ]
-        ext_count = len(ext_flows)
-
-        # --- SOC rule layer, isolated (spec 41) -------------------------------
+        # --- The verdict: model output, untouched ------------------------------
         #
-        # This block used to be inline, so the number on the dashboard was
-        # `max(model_output, 0.40) + f(external_flow_count)` during every attack
-        # demo -- a rule, not a prediction, and indistinguishable from one.
-        #
-        # It is retained because hybrid detection is legitimate in production
-        # SOC tooling, but it is now: named, separable, reported alongside the
-        # untouched model output, and switchable off via CYBERWORLD_DISABLE_RULES=1.
-        #
-        # `attack_active` is an operator/harness flag -- it is knowledge of the
-        # answer. Any benchmark path must run with rules disabled (spec 42); the
-        # offline harness in cyberworld_v4/benchmark.py never touches this code.
+        # This used to be overwritten by an inline rule block, on by default:
+        # any external flow floored risk at 0.40 + 0.2567 (= the 0.6567 people
+        # saw on the dashboard) and replaced the LSTM's technique with a port
+        # count; no external flow multiplied risk by 0.4, so internal lateral
+        # movement at 0.80 was shown as 0.32 -- under the alert line. Pressing
+        # ARM EXTERNAL (attack_active) raised risk with zero traffic.
         ml_risk = float(raw_risk)
         ml_technique = obs_technique
+        obs_risk = ml_risk
+
+        # --- Advisory SOC rule layer (opt-in, never the verdict) ---------------
         rule_risk: Optional[float] = None
-        rules_applied = False
+        rule_technique: Optional[str] = None
+        if self.rules_enabled:
+            from control_backend.site_config import get_site_config
+            site = get_site_config()
+            ext_flows = [
+                r for r in host_flows
+                if site.classify_ip(getattr(r, "src_ip", "")) == "external"
+            ]
+            rule_risk, rule_technique = advisory_rule_opinion(ext_flows)
 
-        if is_mitigated:
-            obs_risk = max(0.02, raw_risk * 0.15)
-            obs_technique = "Benign"
-            rules_applied = True
-        elif self.rules_enabled:
-            if ext_count > 0 or attack_active:
-                threat_boost = min(0.65, (max(1, ext_count) / 75.0) * 0.50 + 0.25)
-                rule_risk = float(min(0.96, max(raw_risk, 0.40) + threat_boost))
-                obs_risk = rule_risk
-                ports_seen = {getattr(r, "dst_port", 0) for r in ext_flows}
-                if len(ports_seen) >= 5:
-                    obs_technique = "PortScan"
-                elif any(getattr(r, "dst_port", 0) in (80, 443, 8080) for r in ext_flows):
-                    obs_technique = "WebAttack"
-                else:
-                    obs_technique = "Exploit"
-                rules_applied = True
-            else:
-                obs_risk = max(0.05, raw_risk * 0.4)
-                rules_applied = True
-        else:
-            # Research mode: the displayed number IS the model output.
-            obs_risk = ml_risk
-            obs_technique = ml_technique
-
-        curr_h = torch.from_numpy(h_emb).float().unsqueeze(0).to(self.device)
+        # Branch B's input is the world state it was trained on: the enriched
+        # tensor Branch A also reads (27-D), or the bare latent for a legacy
+        # 12-D checkpoint.
+        state = feature_vector if self.world_state_dim == feature_vector.shape[0] else h_emb
+        curr_h = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
         h_state_history = self.h_state_history_by_target.setdefault(target_ip, [])
         h_state_history.append(curr_h)
         if len(h_state_history) > self.history_steps:
@@ -663,10 +711,18 @@ class AntigravityModelAdapter:
             obs_token_tensor = torch.tensor(
                 [obs_token_id], dtype=torch.long, device=self.device
             )
+            tech_hist = self.technique_history_by_target.setdefault(target_ip, [])
+            tech_hist.append(int(obs_token_id))
+            del tech_hist[:-self.history_steps]
+            from deepop_decoder.forecast_decoder import observed_sequence_tokens
+            observed_seq = torch.tensor(
+                [observed_sequence_tokens(tech_hist, self.history_steps, self.vocab)],
+                dtype=torch.long, device=self.device)
             _, decoded_names, _, step_token_probs = self.deepop.forecast_sequence(
                 h_future,
                 max_steps=self.forecast_steps,
                 observed_token=obs_token_tensor,
+                observed_sequence=observed_seq,
                 return_probs=True,
             )
             deepop_confidences = step_token_probs[0] if step_token_probs else []
@@ -680,26 +736,37 @@ class AntigravityModelAdapter:
                 else:
                     forecast_techniques.append(str(item))
         while len(forecast_techniques) < self.forecast_steps:
-            forecast_techniques.append(obs_technique if not is_mitigated else "Benign")
-
-        if is_mitigated:
-            fut_risks = [max(0.01, r * 0.1) for r in fut_risks]
-            forecast_techniques = ["Benign"] * self.forecast_steps
+            forecast_techniques.append(obs_technique)
 
         # Clamp risks
         obs_risk = float(np.clip(obs_risk, 0.0, 1.0))
         fut_risks = [float(np.clip(r, 0.0, 1.0)) for r in fut_risks]
         max_future = max(fut_risks) if fut_risks else obs_risk
 
-        # Resolve rule-emitted labels to their real ATT&CK technique before lookup.
-        mitre_key = RULE_TECHNIQUE_TO_ATTCK.get(obs_technique, obs_technique)
         mitre = TECHNIQUE_TO_MITRE.get(
-            mitre_key,
+            obs_technique,
             ("Unknown", obs_technique, "TA0000", "Model-predicted technique"),
         )
-        alert = (not is_mitigated) and (
-            obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
-        )
+        alert = obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
+
+        # Early warning: how far ahead the FORECAST first crosses the threshold
+        # while the current window is still below it. This used to be the
+        # constant forecast_steps * window_seconds on every alert -- a config
+        # value shown as if it were a measured lead time.
+        step_s = self.step_seconds
+        lead_time: Optional[float] = None
+        if obs_risk < self.alert_threshold:
+            for k, r in enumerate(fut_risks):
+                if r >= self.alert_threshold:
+                    lead_time = (k + 1) * step_s
+                    break
+
+        if not mitigation_recorded:
+            mitigation_status = None
+        elif mitigation_bypass_flows > 0:
+            mitigation_status = "traffic_persists"
+        else:
+            mitigation_status = "recorded_quiet"
 
         explain = self._explain(x_tensor)
         inf_ms = (time.perf_counter() - t0) * 1000.0
@@ -707,7 +774,7 @@ class AntigravityModelAdapter:
 
         forecast_points = [
             ForecastPoint(
-                horizon_seconds=(i + 1) * self.window_seconds,
+                horizon_seconds=(i + 1) * step_s,
                 risk=round(fut_risks[i], 4),
                 confidence=round(deepop_confidences[i], 4)
                 if i < len(deepop_confidences)
@@ -741,6 +808,8 @@ class AntigravityModelAdapter:
                 forecast_steps=self.forecast_steps,
                 checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
                 threshold=self.alert_threshold,
+                forecast_step_seconds=step_s,
+                rules_enabled=self.rules_enabled,
             ),
             state=StateMetadata(
                 window_id=int(window_id),
@@ -752,11 +821,16 @@ class AntigravityModelAdapter:
             ),
             prediction=PredictionData(
                 risk=round(obs_risk, 4),
-                # Provenance of the number above, so a rule-driven demo cannot
-                # be read as a model result (spec 21, 41).
+                # Provenance (spec 21, 41): `risk` IS the model output. The
+                # advisory rule opinion, if enabled, sits beside it.
                 ml_risk=round(ml_risk, 4),
+                ml_technique=ml_technique,
                 rule_risk=(round(rule_risk, 4) if rule_risk is not None else None),
-                rules_applied=rules_applied,
+                rule_technique=rule_technique,
+                rules_applied=False,
+                risk_source="model",
+                mitigation_status=mitigation_status,
+                mitigation_bypass_flows=(int(mitigation_bypass_flows) if mitigation_recorded else None),
                 max_future_risk=round(max_future, 4),
                 hazard_score=round(max_future, 4),
                 malicious_confidence=round(obs_risk, 4),
@@ -788,8 +862,11 @@ class AntigravityModelAdapter:
             early_warning=EarlyWarningData(
                 is_alert=alert,
                 alert_timestamp=now_ts if alert else None,
-                lead_time_seconds=self.forecast_steps * self.window_seconds if alert else None,
-                target_milestone_desc=forecast_techniques[0] if alert else None,
+                lead_time_seconds=lead_time,
+                target_milestone_desc=(
+                    forecast_techniques[int(round(lead_time / step_s)) - 1]
+                    if lead_time is not None else None
+                ),
             ),
             attack_active=attack_active,
             attack_phase=attack_phase,
@@ -871,5 +948,16 @@ def flows_from_span_dicts(raw_flows: List[Dict[str, Any]]) -> List[UnifiedFlowRe
     return out
 
 
-# Module singleton used by tests and telemetry service
-model_adapter = AntigravityModelAdapter()
+# Module singleton used by the telemetry service and main.py, built on first
+# access (PEP 562) rather than at import. Importing this module for its helpers
+# or its class used to load all four checkpoints as a side effect.
+_singleton: Optional[AntigravityModelAdapter] = None
+
+
+def __getattr__(name: str):
+    global _singleton
+    if name == "model_adapter":
+        if _singleton is None:
+            _singleton = AntigravityModelAdapter()
+        return _singleton
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -17,7 +17,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
+
+# Run directly as a script (that is how the tests and the runbook invoke it),
+# so the repo root has to be on the path before the import below.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from data_unification.tgne_features import SCHEMA_VERSION
 
 DEFAULTS = {
     "n_layers": 1, "n_heads": 2, "dropout": 0.1, "use_memory": False,
@@ -25,7 +32,7 @@ DEFAULTS = {
     "embedding_module_type": "graph_attention", "message_function": "identity",
     "aggregator_type": "bigru_transformer", "memory_updater_type": "gru",
     "edge_feat_dim": 12, "node_feat_dim": 12,
-    "feature_schema_version": "1.0.0",
+    "feature_schema_version": SCHEMA_VERSION,
 }
 
 

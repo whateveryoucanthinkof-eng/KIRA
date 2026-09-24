@@ -4,7 +4,7 @@ A reviewer asked how the 12 edge features were chosen and what makes them the
 right ones. Nothing in the repository justified them -- they are conventional
 NetFlow summaries with no ablation and no importance analysis behind them.
 
-`dst_port_norm_65535` is the sharp end of it: several CIC-2018 attack classes
+`dst_port_log_norm` is the sharp end of it: several CIC-2018 attack classes
 sit on fixed destination ports, so a model can learn "port => class" and score
 well without learning behaviour, then collapse when an attacker changes port.
 Zeroing one feature and re-measuring inductive AUC turns that from an argument
@@ -13,6 +13,15 @@ into a measurement.
 Zeroing rather than removing keeps the 12-D contract, so an ablated encoder
 still loads everywhere a normal one does and the comparison is not confounded
 by an architecture change.
+
+Note on the rename: the feature was `dst_port_norm_65535` (port / 65535) and is
+now `dst_port_log_norm` (log1p(port) / log1p(65535)), under feature schema
+2.0.0. That makes this ablation MORE important, not less. The linear form
+squeezed 22, 53, 80 and 443 into the bottom 0.7% of the range, so the shortcut
+was there but hard for a model to exploit precisely; log scaling spreads them
+over 0.28-0.55, which is the point for detection and also makes "port => class"
+easier to memorise. Run this ablation on the retrained encoder before trusting
+any port-sensitive result.
 """
 import os
 
@@ -45,10 +54,10 @@ def test_no_ablation_by_default_changes_nothing():
 
 def test_ablating_dst_port_zeroes_only_that_feature(monkeypatch):
     base = extract_canonical_edge_features(**ARGS).copy()
-    monkeypatch.setenv("CYBERWORLD_ABLATE_EDGE_FEATURES", "dst_port_norm_65535")
+    monkeypatch.setenv("CYBERWORLD_ABLATE_EDGE_FEATURES", "dst_port_log_norm")
     reset_ablation_cache()
     ab = extract_canonical_edge_features(**ARGS)
-    i = EDGE_FEATURE_NAMES.index("dst_port_norm_65535")
+    i = EDGE_FEATURE_NAMES.index("dst_port_log_norm")
     assert ab[i] == 0.0
     for j in range(12):
         if j != i:
@@ -57,17 +66,17 @@ def test_ablating_dst_port_zeroes_only_that_feature(monkeypatch):
 
 def test_the_vector_stays_12d_so_checkpoints_still_load(monkeypatch):
     monkeypatch.setenv("CYBERWORLD_ABLATE_EDGE_FEATURES",
-                       "dst_port_norm_65535,is_tcp,is_udp")
+                       "dst_port_log_norm,is_tcp,is_udp")
     reset_ablation_cache()
     assert extract_canonical_edge_features(**ARGS).shape == (12,)
 
 
 def test_several_features_can_be_ablated_at_once(monkeypatch):
     monkeypatch.setenv("CYBERWORLD_ABLATE_EDGE_FEATURES",
-                       "dst_port_norm_65535, is_icmp ,log1p_fwd_bytes")
+                       "dst_port_log_norm, is_icmp ,log1p_fwd_bytes")
     reset_ablation_cache()
     v = extract_canonical_edge_features(**ARGS)
-    for n in ("dst_port_norm_65535", "is_icmp", "log1p_fwd_bytes"):
+    for n in ("dst_port_log_norm", "is_icmp", "log1p_fwd_bytes"):
         assert v[EDGE_FEATURE_NAMES.index(n)] == 0.0
     assert v[EDGE_FEATURE_NAMES.index("log1p_bwd_bytes")] != 0.0
 
@@ -87,7 +96,7 @@ def test_dst_port_actually_separates_classes_in_this_corpus():
     memorise."""
     http = extract_canonical_edge_features(**{**ARGS, "dst_port": 80})
     ssh = extract_canonical_edge_features(**{**ARGS, "dst_port": 22})
-    i = EDGE_FEATURE_NAMES.index("dst_port_norm_65535")
+    i = EDGE_FEATURE_NAMES.index("dst_port_log_norm")
     assert http[i] != ssh[i], "port must be distinguishable for the leak to exist"
     assert np.allclose(np.delete(http, i), np.delete(ssh, i)), (
         "two flows identical but for the port differ in exactly one feature -- "

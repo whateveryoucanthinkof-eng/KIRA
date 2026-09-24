@@ -43,11 +43,14 @@ class LiveTelemetryService:
         self.external_attack_armed = False
 
         self.service_start_time: float = time.time()
-        self.current_throughput: float = 35.0
-        self.current_latency: float = 8.5
+        # Measured values only. These used to start at plausible-looking
+        # constants (35 Mbps, 8.5 ms, 24 connections) that the status bar
+        # showed before a single packet had been seen.
+        self.current_throughput: float = 0.0
+        self.current_latency: float = 0.0
         self.current_packet_loss: float = 0.0
-        self.current_active_connections: int = 24
-        self.current_anomaly_score: float = 8.0
+        self.current_active_connections: int = 0
+        self.current_anomaly_score: float = 0.0
         self.current_threat_level: str = "low"
 
         self.isolated_hosts: set = set()
@@ -258,19 +261,26 @@ class LiveTelemetryService:
         )
         return msg
 
-    def _filter_flows(self, flows):
+    def _mitigation_bypass_flows(self, flows) -> int:
+        """Flows a recorded block/isolation should have stopped but did not.
+
+        Mitigations here are recorded intents, not enforcement. This used to be
+        _filter_flows(), which DROPPED those flows before scoring -- so if the
+        real block had not been applied, the attack traffic was hidden from the
+        model and the dashboard reported the host as quiet. The flows are now
+        always scored; this count is how the operator learns the block failed.
+        """
         if not self.is_mitigated():
-            return flows
-        out = []
+            return 0
+        n = 0
         for r in flows:
-            if r.src_ip in self.blocked_ips or r.dst_ip in self.blocked_ips:
-                continue
-            if r.dst_port in self.blocked_ports:
-                continue
-            if r.src_ip in self.isolated_hosts or r.dst_ip in self.isolated_hosts:
-                continue
-            out.append(r)
-        return out
+            if (
+                r.src_ip in self.blocked_ips or r.dst_ip in self.blocked_ips
+                or r.dst_port in self.blocked_ports
+                or r.src_ip in self.isolated_hosts or r.dst_ip in self.isolated_hosts
+            ):
+                n += 1
+        return n
 
     def _stdout_logger(self):
         if not self.process or not self.process.stdout:
@@ -308,7 +318,7 @@ class LiveTelemetryService:
                 try:
                     record = json.loads(line)
                     raw_flows = record.get("flows") or []
-                    flows = self._filter_flows(flows_from_span_dicts(raw_flows))
+                    flows = flows_from_span_dicts(raw_flows)
                     target = select_primary_target(flows)
                     self.last_window_at = time.time()
                     window_end = float(
@@ -324,20 +334,22 @@ class LiveTelemetryService:
                     )
 
                     # Compute live reality metrics
+                    # Measured only. Throughput used to be floored at
+                    # 20 + 0.35 x flows, "packet loss" was synthesised from the
+                    # wall clock when it was zero, and latency had fake jitter
+                    # and an 8 ms floor added -- none of it observed.
                     total_bytes = sum((getattr(f, "fwd_bytes", 0) + getattr(f, "bwd_bytes", 0)) for f in flows)
-                    raw_mbps = round((total_bytes * 8.0) / (2.0 * 1_000_000.0), 2)
-                    self.current_throughput = max(raw_mbps, round(len(flows) * 0.35 + 20.0, 1))
+                    window_s = float(getattr(self.adapter, "window_seconds", 2.0) or 2.0)
+                    self.current_throughput = round((total_bytes * 8.0) / (window_s * 1_000_000.0), 2)
                     self.current_active_connections = len(flows)
 
+                    # Share of flows with no reverse packets. Not true packet
+                    # loss, but it is what the sensor can actually observe.
                     unanswered = sum(1 for f in flows if getattr(f, "bwd_packets", 0) == 0)
-                    loss_pct = (unanswered / max(1, len(flows))) * 100.0
-                    if loss_pct == 0.0:
-                        loss_pct = round((int(time.time()) % 4) * 0.1, 1)
-                    self.current_packet_loss = round(min(100.0, loss_pct), 1)
+                    self.current_packet_loss = round(
+                        min(100.0, (unanswered / max(1, len(flows))) * 100.0), 1)
 
-                    raw_lat = float(record.get("pipeline_latency_ms", 0.0))
-                    jitter = float((int(time.time() * 2) % 7) - 3) * 0.5
-                    self.current_latency = round(max(4.0, raw_lat + min(120.0, len(flows) * 0.25 + 8.0) + jitter), 1)
+                    self.current_latency = round(float(record.get("pipeline_latency_ms", 0.0)), 1)
 
                     if self.is_ml_active:
                         self.windows_streamed += 1
@@ -345,9 +357,11 @@ class LiveTelemetryService:
                             target_ip=target,
                             flows=flows,
                             window_id=int(record.get("window_id", self.windows_streamed)),
+                            # Display-only: never an input to scoring.
                             attack_active=self.external_attack_armed,
                             attack_phase="EXTERNAL" if self.external_attack_armed else None,
-                            is_mitigated=self.is_mitigated() and len(flows) == 0,
+                            mitigation_recorded=self.is_mitigated(),
+                            mitigation_bypass_flows=self._mitigation_bypass_flows(flows),
                             packet_count=int(record.get("packet_count", 0)),
                             pipeline_latency_ms=float(record.get("pipeline_latency_ms", 0.0)),
                             active_flows=int(record.get("active_flows", len(flows)) or 0),
@@ -401,7 +415,7 @@ class LiveTelemetryService:
                         else:
                             self.current_threat_level = "low"
                     else:
-                        self.current_anomaly_score = 8.0
+                        self.current_anomaly_score = 0.0
                         self.current_threat_level = "low"
 
                     now_iso = utc_now_iso()

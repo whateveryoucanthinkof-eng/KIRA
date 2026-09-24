@@ -29,6 +29,7 @@ from branch_a_gnn_lstm.sequence_dataset import (
 )
 from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
 from cyberworld_v4.config import get_contract
+from data_unification.tgne_features import SCHEMA_VERSION
 
 
 def load_sample_multi_dataset_records(max_per_source: int = 500):
@@ -133,10 +134,50 @@ def build_or_load_tgne_ta(
         with open(config_path, "r") as f:
             loaded_cfg = json.load(f)
             config.update({k: v for k, v in loaded_cfg.items() if k in config})
-            if loaded_cfg.get("feature_schema_version") != "1.0.0":
-                raise ValueError("TGNE checkpoint has no supported canonical feature schema")
+            _want = SCHEMA_VERSION
+            _got = loaded_cfg.get("feature_schema_version")
+            if _got != _want:
+                # Not cosmetic. A schema bump means the VALUES changed, so the
+                # encoder would receive an input distribution it never saw --
+                # with matching shapes and no error anywhere. Refusing here is
+                # the only place that can catch it.
+                raise ValueError(
+                    f"TGNE checkpoint {ckpt_path} was trained under feature "
+                    f"schema {_got!r}; this tree is {_want!r}.\n\n"
+                    f"What changed in 2.0.0: dst_port is log-scaled instead of "
+                    f"divided by 65535, and the unique_peers / unique_dst_ports "
+                    f"host attributes no longer saturate at 147. Every stored "
+                    f"feature value is different, so the encoder must be "
+                    f"retrained -- there is no conversion.\n\n"
+                    f"Retrain:  see claude_latest_analysis/16_downstream_retrain_runbook.md"
+                )
             if loaded_cfg.get("edge_feat_dim") != 12 or loaded_cfg.get("node_feat_dim") != 12:
                 raise ValueError("TGNE checkpoint dimensions do not match the canonical 12-D contract")
+            # Edge-feature ablation (CYBERWORLD_ABLATE_EDGE_FEATURES) zeroes
+            # features at extraction time, for training AND serving. An encoder
+            # trained with dst_port zeroed and served with it present (or the
+            # reverse) sees an input distribution it never saw, with matching
+            # shapes and no error. Configs that predate the field were trained
+            # with nothing ablated.
+            from data_unification.tgne_features import ablated_edge_features
+            _trained = sorted(loaded_cfg.get("ablated_edge_features") or [])
+            _serving = sorted(ablated_edge_features())
+            if _trained != _serving:
+                raise ValueError(
+                    f"TGNE checkpoint {ckpt_path} was trained with edge features "
+                    f"{_trained or 'none'} ablated, but this process ablates "
+                    f"{_serving or 'none'} (CYBERWORLD_ABLATE_EDGE_FEATURES). "
+                    f"Set the variable to match the checkpoint.")
+            # And the IP node features (CYBERWORLD_ABLATE_NODE_FEATURES).
+            from data_unification.ip_features import ablated_node_features
+            _trained_n = sorted(loaded_cfg.get("ablated_node_features") or [])
+            _serving_n = sorted(ablated_node_features())
+            if _trained_n != _serving_n:
+                raise ValueError(
+                    f"TGNE checkpoint {ckpt_path} was trained with node features "
+                    f"{_trained_n or 'none'} ablated, but this process ablates "
+                    f"{_serving_n or 'none'} (CYBERWORLD_ABLATE_NODE_FEATURES). "
+                    f"Set the variable to match the checkpoint.")
 
     n_nodes = 5000
     adj_list = [[] for _ in range(n_nodes)]
@@ -171,6 +212,15 @@ def build_or_load_tgne_ta(
     )
 
     state_dict = torch.load(ckpt_path, map_location="cpu")
+    # A memory-enabled encoder saves its per-node memory rows, sized to the
+    # training graph's node count. They are runtime state, not weights:
+    # extraction and serving reset memory per capture/session and grow the
+    # table as hosts appear. Keep this model's own (empty) rows so the strict
+    # load checks every real weight.
+    _own = tgn.state_dict()
+    for _k in list(state_dict):
+        if _k.endswith("memory.memory") or _k.endswith("memory.last_update"):
+            state_dict[_k] = _own[_k]
     try:
         tgn.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:

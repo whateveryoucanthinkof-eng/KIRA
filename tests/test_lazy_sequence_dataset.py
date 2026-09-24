@@ -81,12 +81,53 @@ def test_every_sample_matches_the_eager_path():
         assert e[k]["gradation"] == l[k]["gradation"], k
 
 
-def test_windows_are_left_padded_when_history_is_short():
+def test_windows_are_left_padded_when_padding_is_explicitly_requested():
+    """Padding still works -- it is just no longer the default. `min_history_steps=1`
+    restores the old behaviour for a caller who wants it."""
     st = _store(n_hosts=1, n_win=3)
-    lazy = LazyHostSequenceDataset(st, seq_len=SEQ, min_trajectory_len=2)
+    lazy = LazyHostSequenceDataset(st, seq_len=SEQ, min_trajectory_len=2,
+                                   min_history_steps=1)
     first = lazy[0]                       # end_idx = 1 -> only 1 real step
     assert first["features"].shape == (SEQ, 27)
     assert torch.count_nonzero(first["features"][:SEQ - 1]) == 0, "should be left-padded"
+
+
+def test_the_default_refuses_a_sample_that_would_be_mostly_padding():
+    """The shipped checkpoint records a MEDIAN host trajectory of one window,
+    so under the old default the median training example was 14/15 zeros."""
+    st = _store(n_hosts=1, n_win=3)
+    lazy = LazyHostSequenceDataset(st, seq_len=SEQ, min_trajectory_len=2)
+    assert len(lazy) == 0, (
+        f"a 3-window host cannot fill a {SEQ}-step window; it should yield no samples"
+    )
+
+
+def test_every_sample_under_the_default_is_fully_observed():
+    st = _store(n_hosts=1, n_win=SEQ + 6)
+    lazy = LazyHostSequenceDataset(st, seq_len=SEQ, min_trajectory_len=2)
+    assert len(lazy) == 6, f"expected n - seq_len samples, got {len(lazy)}"
+    for i in range(len(lazy)):
+        f = lazy[i]["features"]
+        assert torch.count_nonzero(f.sum(dim=1)) == SEQ, "a step is all zeros (padding)"
+
+
+def test_the_drop_is_reported_not_silent():
+    st = _store(n_hosts=1, n_win=3)
+    rep = {}
+    LazyHostSequenceDataset(st, seq_len=SEQ, min_trajectory_len=2, report=rep)
+    assert rep["kept"] == 0 and rep["dropped_short_history"] == 2
+    assert rep["min_history_steps"] == SEQ
+
+
+def test_lazy_and_eager_agree_on_the_history_floor():
+    """The two sample builders must not disagree about what counts as a sample."""
+    from branch_a_gnn_lstm.sequence_dataset import create_host_sequence_samples
+
+    st = _store(n_hosts=1, n_win=SEQ + 4)
+    traj = {h: list(st[h]) for h in st}
+    eager = create_host_sequence_samples(traj, seq_len=SEQ, min_trajectory_len=2)
+    lazy = LazyHostSequenceDataset(st, seq_len=SEQ, min_trajectory_len=2)
+    assert len(eager) == len(lazy) == 4
 
 
 def test_the_target_is_strictly_in_the_future():

@@ -44,47 +44,86 @@ from cyberworld_v4.metrics.forecasting import horizon_metrics
 from cyberworld_v4.metrics.calibration import TemperatureScaler
 from cyberworld_v4.metrics.bootstrap import group_bootstrap_ci, format_ci
 from cyberworld_v4.models import CyberWorldForecaster, forecast_loss
-from cyberworld_v4.splits import chronological_split, partition, leakage_report, TRAIN, VAL, CALIB, TEST
+from cyberworld_v4.splits import (chronological_split, frozen_capture_split, partition,
+                                 leakage_report, TRAIN, VAL, CALIB, TEST)
+from cyberworld_v4.metrics.earlywarning import lead_time_from_samples
+from cyberworld_v4.conformal import SplitConformal
 from cyberworld_v4.targets import build_samples, describe_targets
 from cyberworld_v4.baselines import LogisticBaseline, GradientBoostingBaseline, PersistenceBaseline
 
 
-def load_records(cic_dir: Path, ctu_dir: Path, rows: int, stride: int = 1):
-    from data_unification.cic2018_adapter import CIC2018Adapter
-    from data_unification.ctu13_adapter import CTU13Adapter
+def load_captures(cic_dir: Path, ctu_dir: Path, rows: int, stride: int = 1):
+    """Load records grouped BY CAPTURE, with unmappable labels dropped.
 
-    """Load records spanning each file's full time range.
+    Two changes from the previous `load_records`, which returned one flat list.
+
+    **Capture identity is preserved.** Flattening threw away which file each
+    record came from, and main() then had to call
+    `offline_host("mixed", "mixed", "mixed", ip)` -- collapsing the whole point
+    of `cyberworld_v4.identity`, whose docstring exists to stop 192.168.1.10 in
+    CIC-2018 and the same address in CTU-13 becoming one host. It also left the
+    bare IP as the only available split group, which is how a run ended up with
+    11 train hosts, 1 validation host, 1 calibration host and 1 test host
+    (results/v4_benchmark.json), a test base rate of 0.9997, and a confidence
+    interval that could not be computed. Captures are the unit the frozen lock
+    already uses, and there are 41 of them.
+
+    **Unresolved labels are dropped.** label_resolver returns UNKNOWN with
+    is_attack=False for a label its maps do not recognise, and says callers
+    building a benchmark must exclude those rows. Nothing did, so they were
+    trained and scored as confident negatives.
 
     max_rows in the adapters is a PREFIX (pandas nrows). Measured on this
     corpus, the first 60k rows of a CIC-2018 day are 87-100% a single label,
     because the CSVs are ordered in time and attacks occur in contiguous blocks.
     Training on a prefix therefore yields host trajectories that never change
-    label — label churn 0.0000 — so persistence scores a perfect 1.0 and the
+    label -- label churn 0.0000 -- so persistence scores a perfect 1.0 and the
     forecasting task has no content at all.
 
     Reading with a stride covers the whole day instead, so trajectories can span
     benign -> attack transitions, which is the only thing a forecaster can learn.
-    """
-    recs = []
 
-    def strided(gen, stride: int, want: int):
+    Returns ([(dataset, scenario, capture, path, records), ...], coverage_report).
+    """
+    from data_unification.cic2018_adapter import CIC2018Adapter
+    from data_unification.ctu13_adapter import CTU13Adapter
+    from data_unification.label_filter import (
+        drop_unresolved, format_unresolved_report, merge_unresolved_reports)
+    from data_unification.split_policy import capture_name_for_path
+
+    def strided(gen, stride: int, want):
         out = []
         for i, r in enumerate(gen):
             if i % stride == 0:
                 out.append(r)
-                if len(out) >= want:
+                if want is not None and len(out) >= want:
                     break
         return out
 
+    cap = None if rows is None else rows * stride
+    captures, coverage = [], []
+
+    def _add(path: str, got):
+        got, rep = drop_unresolved(got)
+        coverage.append(rep)
+        if not got:
+            return
+        dataset, capture = capture_name_for_path(path)
+        # CTU-13 capture names are "<scenario>/<file>"; a CIC day is one
+        # scenario, so the day stem serves as both.
+        scenario = capture.split("/")[0] if "/" in capture else Path(capture).stem
+        captures.append((dataset, scenario, capture, path, got))
+        drop = "" if not rep["unresolved_records"] else f"  -{rep['unresolved_records']} unmapped"
+        print(f"  {capture[-30:]:<30} {len(got):>7} records (stride {stride}){drop}")
+
     for f in sorted(glob.glob(str(cic_dir / "*.csv"))):
-        got = strided(CIC2018Adapter().parse_file(f, max_rows=rows * stride), stride, rows)
-        recs.extend(got)
-        print(f"  {Path(f).name:<24} {len(got):>7} records (stride {stride})")
+        _add(f, strided(CIC2018Adapter().parse_file(f, max_rows=cap), stride, rows))
     for f in sorted(glob.glob(str(ctu_dir / "*/*.binetflow"))):
-        got = strided(CTU13Adapter().parse_netflow_csv(f, max_rows=rows * stride), stride, rows)
-        recs.extend(got)
-        print(f"  {(Path(f).parent.name + '/' + Path(f).name)[:24]:<24} {len(got):>7} records (stride {stride})")
-    return recs
+        _add(f, strided(CTU13Adapter().parse_netflow_csv(f, max_rows=cap), stride, rows))
+
+    merged = merge_unresolved_reports(coverage)
+    print(format_unresolved_report(merged, where="corpus"))
+    return captures, merged
 
 
 def main() -> int:
@@ -102,6 +141,32 @@ def main() -> int:
                     help="permit CPU training (refused by default)")
     ap.add_argument("--output", type=Path, default=REPO / "saved_models/v4/forecaster.pt")
     ap.add_argument("--results", type=Path, default=REPO / "results/v4_benchmark.json")
+    ap.add_argument("--split", choices=("frozen", "chronological"), default="frozen",
+                    help="frozen: apply data_unification/splits.lock.json, the same "
+                         "capture assignment every v3 trainer uses, with CALIBRATION "
+                         "carved off the end of its train captures. chronological: "
+                         "recompute a time-ordered split over the captures present.")
+    ap.add_argument("--calibration-fraction", type=float, default=0.15,
+                    help="share of the lock's TRAIN captures held out for calibration "
+                         "(--split frozen only). Never taken from validation or test.")
+    ap.add_argument("--attack-role", choices=("either", "target", "source"), default="either",
+                    help="which endpoint of an attack flow is labelled attacked")
+    ap.add_argument("--alert-persistence", type=int, default=1,
+                    help="consecutive windows above threshold before an alert counts, "
+                         "for the lead-time report")
+    ap.add_argument("--pos-weight", default="auto",
+                    help="positive-class weight for the BCE terms. 'auto' uses "
+                         "(#neg/#pos) from the train split, clamped by "
+                         "--max-pos-weight; a number sets it explicitly; 1 disables it.")
+    ap.add_argument("--max-pos-weight", type=float, default=20.0,
+                    help="ceiling on the automatic pos_weight, so a near-empty "
+                         "positive class cannot produce a term that destabilises training")
+    ap.add_argument("--patience", type=int, default=3,
+                    help="stop after this many epochs without improving validation "
+                         "AUC; 0 disables early stopping")
+    ap.add_argument("--conformal-alpha", type=float, default=0.05,
+                    help="miscoverage rate for the split-conformal interval fitted on "
+                         "the calibration split")
     args = ap.parse_args()
 
     logging.disable(logging.INFO)
@@ -128,44 +193,83 @@ def main() -> int:
         dataset_sources=[str(args.cic_dir), str(args.ctu_dir)],
     )
 
-    print("Loading records:")
-    records = load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, args.stride)
-    print(f"  total {len(records)} records\n")
+    print("Loading captures:")
+    captures, coverage = load_captures(args.cic_dir, args.ctu_dir,
+                                       args.rows_per_file, args.stride)
+    n_records = sum(len(r) for *_x, r in captures)
+    print(f"  {len(captures)} captures, {n_records} records")
+    print()
+    if not captures:
+        print("no captures loaded")
+        return 1
 
     from data_unification.multi_dataset_stream import HostTrajectoryExtractor
     from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
     from branch_a_gnn_lstm.sequence_dataset import TECHNIQUE_VOCAB
 
-    print("Extracting host trajectories (TGNE-TA)...")
+    print("Extracting host trajectories (TGNE-TA), one capture at a time...")
+    # Per capture, not over the pooled corpus. A CIC-2018 day and a CTU-13
+    # botnet scenario are unrelated networks; one merged TGNE neighbour graph
+    # would make their hosts each other's temporal neighbours. Branch A already
+    # extracts this way (scripts/retrain_branch_a_live.py::_store_per_capture);
+    # this trainer did not.
     ex = HostTrajectoryExtractor(tgne_ta_model=build_or_load_tgne_ta(),
-                                 window_size_sec=c.window_seconds)
-    traj = ex.extract_trajectories(records)
-    print(f"  {len(traj)} hosts\n")
+                                 window_size_sec=c.window_seconds,
+                                 attack_role=args.attack_role)
 
     print("Building FUTURE targets (v4)...")
     samples = []
-    for host_ip, snaps in traj.items():
-        h = offline_host("mixed", "mixed", "mixed", host_ip)
-        samples.extend(build_samples(snaps, h, TECHNIQUE_VOCAB, cfg))
+    for dataset, scenario, capture, _path, recs in captures:
+        traj = ex.extract_trajectories(recs)
+        for host_ip, snaps in traj.items():
+            # Full namespaced identity. This was offline_host("mixed", "mixed",
+            # "mixed", ip), which made the same private address in two corpora
+            # one host and left no group above the IP to split on.
+            h = offline_host(dataset, scenario, capture, host_ip)
+            samples.extend(build_samples(snaps, h, TECHNIQUE_VOCAB, cfg))
+        print(f"  {capture[-30:]:<30} {len(traj):>5} hosts, {len(samples):>7} samples cumulative")
     if not samples:
         print("no samples built")
         return 1
     bal = describe_targets(samples)
+    print()
     print(f"  {bal['n']} samples over {bal['hosts']} hosts")
     print(f"  current attack rate      : {bal['current_attack_rate']:.3f}")
     print(f"  future attack rate by step: {[round(v,3) for v in bal['future_attack_rate_by_step']]}")
     print(f"  onset within horizon     : {bal['onset_within_horizon']:.3f}")
-    print(f"  censored (already under attack): {bal['censored_already_attacking']:.3f}\n")
+    print(f"  censored (already under attack): {bal['censored_already_attacking']:.3f}")
+    print()
 
-    # --- grouped, chronological splits -----------------------------------
-    assign = chronological_split(samples, lambda s: s.t_end, lambda s: s.host.host)
-    parts = partition(samples, assign, lambda s: s.host.host)
-    rep = leakage_report(parts, lambda s: s.host.host, lambda s: s.t_end)
-    print("Splits (grouped by host, chronological):")
-    print(f"  sizes {rep['sizes']} | host overlap clean: {rep['clean']} | test after train: {rep.get('test_after_train')}\n")
+    # --- grouped splits ---------------------------------------------------
+    # The group is the CAPTURE, not the host. Splitting on the host put 1 host
+    # in test and made the bootstrap interval undefined; the capture is also
+    # the unit the frozen lock already assigns, so the two strategies below
+    # speak the same language.
+    def group_of(sample):
+        return f"{sample.host.dataset}|{sample.host.capture}"
+
+    if args.split == "frozen":
+        from data_unification.split_policy import load_lock
+        assign = frozen_capture_split(samples, group_of, load_lock(),
+                                      calibration_fraction=args.calibration_fraction)
+    else:
+        assign = chronological_split(samples, lambda s: s.t_end, group_of)
+    parts = partition(samples, assign, group_of)
+    rep = leakage_report(parts, group_of, lambda s: s.t_end)
+    rep["strategy"] = assign.strategy
+    rep["notes"] = assign.notes
+    rep["groups"] = assign.groups
+    rep["unique_hosts_by_split"] = {
+        k: len({s.host.key for s in v}) for k, v in parts.items()}
+    rep["label_coverage"] = coverage
+    print(f"Splits (grouped by capture, {assign.strategy}):")
+    print(f"  sizes {rep['sizes']}")
+    print(f"  captures {assign.counts()} | hosts {rep['unique_hosts_by_split']}")
+    print(f"  capture overlap clean: {rep['clean']} | test after train: {rep.get('test_after_train')}")
+    print()
     for k in (TRAIN, VAL, CALIB, TEST):
         if not parts[k]:
-            print(f"split {k} is empty — increase --rows-per-file")
+            print(f"split {k} is empty -- increase --rows-per-file, or add captures")
             return 1
 
     def pack(ss):
@@ -182,14 +286,72 @@ def main() -> int:
 
     P = {k: pack(v) for k, v in parts.items()}
     model = CyberWorldForecaster(n_techniques=len(TECHNIQUE_VOCAB), config=cfg).to(dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
     tr = P[TRAIN]
+
+    # Input standardisation, fitted on TRAIN only. The 27-D state is an
+    # unbounded TGNE latent glued to 15 attributes clipped to [0, 1]; an LSTM
+    # gate sums them, so without this whichever block is larger dominates.
+    model.fit_input_normalizer(tr["X"].to(dev))
+    _m = model.encoder.input_mean.detach().cpu().numpy()
+    _s = model.encoder.input_std.detach().cpu().numpy()
+    print(f"Input normaliser fitted on {len(tr['X'])} train windows:")
+    print(f"  latent dims 0-11  mean |{np.abs(_m[:12]).mean():.3f}|  std {_s[:12].mean():.3f}")
+    print(f"  attrs  dims 12-26 mean |{np.abs(_m[12:]).mean():.3f}|  std {_s[12:].mean():.3f}")
+    _ratio = _s[:12].mean() / max(_s[12:].mean(), 1e-9)
+    print(f"  latent/attr scale ratio {_ratio:.1f}x"
+          + ("  <- the two blocks were NOT comparable" if _ratio > 3 or _ratio < 1 / 3 else ""))
+    print()
+
+    # Class imbalance. `forecast_loss` has always accepted pos_weight and
+    # nothing ever passed one, so the positive class was weighted 1.0 against
+    # a base rate the shipped run measured at 0.2263. pos_weight is the
+    # standard BCE correction, (#neg / #pos), and is clamped so a near-empty
+    # positive class cannot produce a 1000x term that destabilises training.
+    _pos = float(tr["current"].mean())
+    if args.pos_weight == "auto":
+        _pw = min(max((1.0 - _pos) / max(_pos, 1e-6), 1.0), args.max_pos_weight)
+    else:
+        _pw = float(args.pos_weight)
+    pos_weight = torch.tensor([_pw], device=dev) if _pw > 1.0 else None
+    print(f"Class balance: train positive rate {_pos:.4f} -> pos_weight "
+          f"{_pw:.2f}" + ("" if pos_weight is not None else " (disabled)"))
+    print()
+
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     ds = TensorDataset(tr["X"], tr["current"], tr["future"], tr["hazard"], tr["at_risk"], tr["tech"], tr["sev"])
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
 
     print("Training:")
-    best, best_state = np.inf, None
+    # Select on the METRIC, not on validation loss.
+    #
+    # Loss and ranking quality are not the same thing, and this trainer reports
+    # ROC-AUC and PR-AUC while selecting the epoch with the lowest multi-task
+    # loss -- a sum of five terms, four of which the headline numbers do not
+    # measure. The same defect was already fixed for Branch A (composite
+    # selection, claude_latest_analysis/27) and not here.
+    #
+    # The score is the mean of nowcast ROC-AUC and forecast ROC-AUC, both on
+    # VALIDATION. ROC rather than PR because the base rate moves between
+    # splits and ROC-AUC does not move with it; mean of the two because
+    # optimising nowcast alone is what produced a model that loses to
+    # persistence at every horizon.
+    from sklearn.metrics import roc_auc_score
+
+    def _val_score(m):
+        m.eval()
+        with torch.no_grad():
+            pr = m.predict(P[VAL]["X"].to(dev))
+        y_now = P[VAL]["current"].numpy().astype(int)
+        p_now = pr["current_attack"].cpu().numpy()
+        y_fut = P[VAL]["future"].numpy().astype(int).ravel()
+        p_fut_ = pr["future_attack"].cpu().numpy().ravel()
+        a = roc_auc_score(y_now, p_now) if len(np.unique(y_now)) > 1 else float("nan")
+        b = roc_auc_score(y_fut, p_fut_) if len(np.unique(y_fut)) > 1 else float("nan")
+        both = [v for v in (a, b) if np.isfinite(v)]
+        return (float(np.mean(both)) if both else float("nan")), a, b
+
+    best, best_state, best_ep, stale = -np.inf, None, 0, 0
     for ep in range(1, args.epochs + 1):
         model.train()
         losses = []
@@ -198,7 +360,7 @@ def main() -> int:
                          hazard_target=hz.to(dev), at_risk=ar.to(dev),
                          future_techniques=te.to(dev), severity=sv.to(dev))
             opt.zero_grad()
-            loss, _ = forecast_loss(model(X.to(dev)), batch)
+            loss, _ = forecast_loss(model(X.to(dev)), batch, pos_weight=pos_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -209,15 +371,27 @@ def main() -> int:
             vb = dict(current_attack=va["current"].to(dev), future_attack=va["future"].to(dev),
                       hazard_target=va["hazard"].to(dev), at_risk=va["at_risk"].to(dev),
                       future_techniques=va["tech"].to(dev), severity=va["sev"].to(dev))
-            vloss, parts_l = forecast_loss(model(va["X"].to(dev)), vb)
-        print(f"  epoch {ep:>2}  train {np.mean(losses):7.4f}  val {float(vloss):7.4f}  "
-              f"(cur {parts_l['current']:.3f} fut {parts_l['future']:.3f} haz {parts_l['hazard']:.3f})")
-        if float(vloss) < best:
-            best = float(vloss)
+            vloss, parts_l = forecast_loss(model(va["X"].to(dev)), vb, pos_weight=pos_weight)
+        score, auc_now, auc_fut = _val_score(model)
+        flag = ""
+        if np.isfinite(score) and score > best:
+            best, best_ep, stale = score, ep, 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            flag = "  *best"
+        else:
+            stale += 1
+        print(f"  epoch {ep:>2}  train {np.mean(losses):7.4f}  val {float(vloss):7.4f}  "
+              f"| val AUC now {auc_now:.4f} fut {auc_fut:.4f} -> {score:.4f}{flag}")
+        if args.patience and stale >= args.patience:
+            print(f"  early stop: {stale} epochs without improving validation AUC")
+            break
 
     if best_state:
         model.load_state_dict(best_state)
+        print(f"  selected epoch {best_ep} (validation AUC {best:.4f})")
+    else:
+        print("  WARNING: no epoch produced a finite validation AUC; keeping the last "
+              "weights. The validation split is probably single-class.")
 
     # --- calibrate on CALIB, then score TEST once -------------------------
     print("\nCalibrating on the calibration split...")
@@ -263,7 +437,10 @@ def main() -> int:
           f"{[round(v,3) for v in base['persistence_forecast']['pr_auc_by_step']]}")
 
     idx = np.arange(len(y_cur))
-    groups = np.array([s.host.host for s in parts[TEST]])
+    # Bootstrap resamples CAPTURES. Resampling on the bare host made n_groups=1
+    # and the interval undefined; the capture is also the unit the split is
+    # made on, which is what a grouped bootstrap is supposed to respect.
+    groups = np.array([group_of(s) for s in parts[TEST]])
     from sklearn.metrics import average_precision_score
     ci = group_bootstrap_ci(
         list(idx), lambda i: str(groups[i]),
@@ -271,6 +448,31 @@ def main() -> int:
                      if len(np.unique(y_cur[np.asarray(sub, int)])) > 1 else float("nan")),
         n_resamples=300, seed=args.seed,
     )
+
+    # --- early warning: lead time, the metric the product claim is about ---
+    # cyberworld_v4/metrics/earlywarning.py has existed and been tested since
+    # v4 landed, and had no caller. "Forecast horizon x window seconds" is not
+    # lead time; lead time is measured against the event, over episodes the
+    # model missed as well as the ones it caught.
+    # The forecast head needs its OWN operating point. `thr` was chosen for
+    # P(attack now); applying it to P(attack at t+k) compares a threshold to a
+    # distribution it was never fitted on. Both are still chosen on validation,
+    # never on test.
+    p_val_fut = val_pred["future_attack"].cpu().numpy()
+    y_val_fut_any = (P[VAL]["future"].numpy().astype(int).max(axis=1))
+    thr_fut = float(choose_threshold(y_val_fut_any, p_val_fut.max(axis=1)))
+    lead = lead_time_from_samples(parts[TEST], p_fut, threshold=thr_fut,
+                                  persistence=args.alert_persistence,
+                                  window_seconds=c.window_seconds)
+    lead["threshold_from_validation"] = thr_fut
+
+    # --- conformal intervals on the hazard curve, fitted on CALIB only ------
+    with torch.no_grad():
+        cal_fut = model.predict(P[CALIB]["X"].to(dev))["future_attack"].cpu().numpy()
+    conf = SplitConformal(alpha=args.conformal_alpha)
+    conf.fit(P[CALIB]["future"].numpy().ravel(), cal_fut.ravel())
+    conformal = conf.evaluate(y_fut.ravel(), p_fut.ravel())
+    conformal["fitted_on"] = "calibration"
 
     print("\n" + "=" * 68)
     print("RESULT — nowcasting vs forecasting")
@@ -291,6 +493,18 @@ def main() -> int:
         print("     Increase --rows-per-file so trajectories span label transitions.")
     label_churn = float(np.mean(y_fut[:, -1] != y_cur))
     print(f"  label churn over the horizon (fraction where A_t+K != A_t): {label_churn:.4f}")
+    print()
+    print(f"  EARLY WARNING over {lead['episodes']} onset episodes:")
+    if lead.get("detected"):
+        print(f"     detection rate {lead['detection_rate']:.3f}  "
+              f"median lead {lead['median_lead_seconds']:.1f}s  "
+              f"p10 {lead['p10_lead_seconds']:.1f}s  p90 {lead['p90_lead_seconds']:.1f}s")
+        print(f"     recall at lead: {lead.get('recall_at_lead')}")
+    else:
+        print(f"     {lead.get('note', 'no episodes')}")
+    print(f"  CONFORMAL  target {conformal['target_coverage']:.2f}  "
+          f"empirical {conformal['empirical_coverage']:.4f}  "
+          f"median width {conformal['median_width']:.4f}")
     globals()["_label_churn"] = label_churn
     print("=" * 68)
 
@@ -304,7 +518,20 @@ def main() -> int:
     if label_churn < 0.01:
         problems.append(f"label churn {label_churn:.4f}: almost nothing to forecast")
     if ci.get("n_groups", 0) < 5:
-        problems.append(f"test split has {ci.get('n_groups')} host group(s): no usable confidence interval")
+        problems.append(f"test split has {ci.get('n_groups')} capture group(s): no usable confidence interval")
+    if coverage.get("unresolved_rate", 0.0) > 0.05:
+        problems.append(
+            f"{coverage['unresolved_rate']:.1%} of the corpus could not be mapped to a "
+            f"label ontology and was dropped: the metric describes the mapped subset only")
+    if lead.get("episodes", 0) and not lead.get("detected"):
+        problems.append("no attack onset was warned about before it happened: "
+                        "lead time is undefined, so there is no early warning to report")
+    _cov_gap = abs(conformal["empirical_coverage"] - conformal["target_coverage"])
+    if _cov_gap > 0.05:
+        problems.append(
+            f"conformal coverage {conformal['empirical_coverage']:.3f} misses its "
+            f"{conformal['target_coverage']:.2f} target by {_cov_gap:.3f}: the "
+            f"calibration split does not represent test")
     if now.get("extreme_base_rate"):
         problems.append(f"test base rate {now['positive_rate']:.4f} is extreme: PR-AUC is near 1.0 for any ranking")
     if scaler.report().get("at_grid_boundary"):
@@ -329,6 +556,19 @@ def main() -> int:
         "nowcast": now, "nowcast_pr_auc_ci": ci,
         "forecast": hor, "baselines": base,
         "calibration": scaler.report(),
+        "early_warning": lead,
+        "conformal": conformal,
+        "label_coverage": coverage,
+        "split_strategy": assign.strategy,
+        "attack_role": args.attack_role,
+        "training": {
+            "pos_weight": float(_pw),
+            "selection_metric": "mean(val nowcast ROC-AUC, val forecast ROC-AUC)",
+            "selected_epoch": int(best_ep),
+            "best_validation_auc": float(best) if np.isfinite(best) else None,
+            "patience": int(args.patience),
+            "input_normalizer_fitted": bool(model.normalizer_fitted),
+        },
     }
     args.results.parent.mkdir(parents=True, exist_ok=True)
     args.results.write_text(json.dumps(out, indent=2, default=float))

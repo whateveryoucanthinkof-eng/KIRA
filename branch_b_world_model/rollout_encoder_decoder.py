@@ -128,8 +128,12 @@ class MultiHostInteractionLayer(nn.Module):
     def __init__(self, d_latent: int = 12, n_heads: int = 2, dropout: float = 0.1):
         super(MultiHostInteractionLayer, self).__init__()
         self.d_latent = d_latent
+        # Attention runs directly on the state width, which must divide by the
+        # head count. The 27-D world state does not divide by 2; use the
+        # largest head count <= n_heads that fits (27 -> 1, 12 -> 2).
+        heads = max(h for h in range(1, n_heads + 1) if d_latent % h == 0)
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_latent, num_heads=n_heads, dropout=dropout, batch_first=True
+            embed_dim=d_latent, num_heads=heads, dropout=dropout, batch_first=True
         )
         self.norm = nn.LayerNorm(d_latent)
         self.gate = nn.Sequential(

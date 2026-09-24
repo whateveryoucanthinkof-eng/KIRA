@@ -7,7 +7,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
 from branch_a_gnn_lstm.sequence_dataset import (
+    format_history_report as _fmt_history,
     TECHNIQUE_VOCAB,
     TECH_TO_IDX,
     GRADATION_LEVELS,
@@ -27,62 +28,32 @@ from branch_a_gnn_lstm.sequence_dataset import (
     LazyHostSequenceDataset,
 )
 from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
-from data_unification.cic2018_adapter import CIC2018Adapter
-from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
-from data_unification.split_policy import partition_paths
 from data_unification.density import require_full_density
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
-def _strided(gen, stride: int, want=None):
-    """Samples every Nth record across a wider read instead of a plain file-prefix.
+def _make_samples(records, extractor, seq_len: int, min_history_steps=None):
+    """Samples for one record batch, with the history floor applied and reported.
 
-    max_rows in the adapters is a prefix (pandas nrows); CIC-2018 CSVs are
-    time-ordered with attacks in contiguous blocks, so a plain prefix is
-    87-100% single-label (see claude_latest_analysis/07_v4_audit_and_migration_plan.md,
-    D6). Reading stride*want rows and keeping every `stride`-th one instead
-    spans much more of the file's time range for the same record budget.
+    `min_history_steps=None` requires a fully observed window. The old call
+    passed `min_trajectory_len=1` and let the rest be zero-padded, which on
+    this corpus means the median sample was 14/15 padding -- see
+    `create_host_sequence_samples`.
     """
-    out = []
-    for i, r in enumerate(gen):
-        if i % stride == 0:
-            out.append(r)
-            # want is None at FULL DENSITY -- keep everything. Comparing an
-            # int to None raises, and defaulting it to 0 would silently
-            # return an empty list, which is worse.
-            if want is not None and len(out) >= want:
-                break
-    return out
-
-
-def _load_records(cic_dir: Path, ctu_dir: Path, rows_per_file: int, files: List[Path], stride: int = 1):
-    import time
-    cic = CIC2018Adapter()
-    ctu = CTU13Adapter()
-    records = []
-    for i, path in enumerate(files):
-        t0 = time.time()
-        # rows_per_file is None at FULL DENSITY (the default since the
-        # subsampling sweep), so `rows_per_file * stride` raised TypeError.
-        # None must propagate as "no cap" rather than becoming 0.
-        _cap = None if rows_per_file is None else rows_per_file * stride
-        gen = cic.parse_file(str(path), max_rows=_cap) if path.suffix.lower() == ".csv" \
-            else ctu.parse_netflow_csv(str(path), max_rows=_cap)
-        got = _strided(gen, stride, rows_per_file)
-        records.extend(got)
-        print(f"  [{i+1}/{len(files)}] {path.name}: {len(got)} records in {time.time()-t0:.1f}s (cumulative {len(records)})", flush=True)
-    return records
-
-
-def _make_samples(records, extractor, seq_len: int):
+    from branch_a_gnn_lstm.sequence_dataset import format_history_report
     trajectories = extractor.extract_trajectories(records)
-    return create_host_sequence_samples(
+    rep = {}
+    out = create_host_sequence_samples(
         trajectories,
         seq_len=seq_len,
         min_trajectory_len=1,
+        min_history_steps=min_history_steps,
+        report=rep,
     )
+    print("  " + format_history_report(rep), flush=True)
+    return out
 
 
 def _selection_score(metrics, mode):
@@ -249,7 +220,7 @@ def target_label_counts(dataset):
 #: checkpoint that carried them per epoch would be gigabytes.
 BULKY_METRIC_KEYS = (
     "risk_pos_hist", "risk_neg_hist", "risk_resid_hist",
-    "technique_logits", "technique_labels",
+    "technique_logits", "technique_labels", "tech_confusion",
 )
 
 
@@ -997,6 +968,9 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         "tech_classes_present": tech["classes_present"],
         "tech_classes_predicted": tech["classes_predicted"],
         "tech_per_class": per_class,
+        # Full matrix, so a cross-dataset test can show what an UNSEEN class
+        # was predicted as (cyberworld_v4/cross_dataset.py).
+        "tech_confusion": cm,
         # -- the gradation head, judged the same way as the technique head --
         "gradation_accuracy": (float(grad_correct.item()) / grad_total) if grad_total else None,
         "gradation_macro_f1": grad["macro_f1"],
@@ -1018,13 +992,37 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cic-dir", type=Path, required=True)
-    parser.add_argument("--ctu-dir", type=Path, required=True)
+    parser.add_argument("--cic-dir", type=Path, default=None,
+                        help="CIC-IDS-2018 CSV directory. Refused under --split-scheme "
+                             "cross_year: 9 of its 10 days fabricate host IPs; use --pcap-root.")
+    parser.add_argument("--ctu-dir", type=Path, default=None, help="CTU-13 directory")
+    parser.add_argument("--cic2017-dir", type=Path, default=None,
+                        help="CIC-IDS-2017 CSV directory (TrafficLabelling). Parsed with the "
+                             "CIC-2017 adapter, which repairs its 12-hour clock.")
+    parser.add_argument("--pcap-root", type=Path, default=None,
+                        help="CIC-IDS-2018 PCAP root: one <day>_pcap directory per day. "
+                             "Real host addresses; labels come from --cic2018-csv-dir.")
+    parser.add_argument("--cic2018-csv-dir", type=Path, default=None,
+                        help="CIC-2018 <day>_csv.csv files used ONLY as labels for --pcap-root")
+    parser.add_argument("--pcap-max-windows-per-day", type=int, default=None)
+    parser.add_argument("--pcap-window-stride", type=int, default=1)
+    parser.add_argument("--allow-cic2018-csv", action="store_true",
+                        help="Accept CIC-2018 CSVs under cross_year despite their synthetic IPs")
+    parser.add_argument("--split-scheme", choices=("frozen", "cross_year"), default="frozen",
+                        help="'frozen': splits.lock.json as is. 'cross_year': train on CIC-2018 "
+                             "(its lock train days), tune on its other days, test ONCE on all "
+                             "of CIC-2017; CTU-13 unused. See data_unification/split_policy.py.")
+    parser.add_argument("--tgne", type=Path, default=None,
+                        help="Encoder checkpoint to extract host states with (default: the "
+                             "served one). The encoder comparison passes each arm's encoder.")
+    parser.add_argument("--results-json", type=Path, default=None,
+                        help="Also write validation/test metrics, including the unseen-class "
+                             "report, to this JSON file")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows-per-file", type=int, default=None,
                         help="Cap records kept per capture. Default None = FULL DENSITY.")
     parser.add_argument("--spill-dir", type=Path, default=None, help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
-    parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (see _strided)")
+    parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (applied in data_unification/training_sources.read_capture)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--risk-objective", choices=("bce", "soft_bce", "smooth_l1"),
@@ -1061,12 +1059,21 @@ def main():
                              "from an attack scores exp(-1) = 0.368 -- which is "
                              "also the cut that defines the positive class for "
                              "AUC/Brier/the operating point under this target.")
-    parser.add_argument("--focal-gamma", type=float, default=2.0,
+    parser.add_argument("--architecture", choices=("paper", "legacy"), default="paper",
+                        help="'paper' = Vitulyova et al. 2025 (Computers 14:301): 1 x 256 "
+                             "LSTM, heads on the last hidden state H_t, linear heads, scalar "
+                             "gradation trained with MSE, fixed loss weights 0.5/0.3/0.2, "
+                             "class-weighted CE for techniques. 'legacy' = the 2 x 64 "
+                             "attention/MLP/uncertainty-weighted model earlier checkpoints "
+                             "were trained as.")
+    parser.add_argument("--focal-gamma", type=float, default=None,
                         help="Focusing exponent of the technique focal loss. "
                              "2.0 is Lin et al.'s value and the one this head "
                              "has always used; exposed because gamma and the "
                              "per-class alpha both correct imbalance and their "
-                             "combination has never been swept on this corpus.")
+                             "combination has never been swept on this corpus. "
+                             "Default: 0 with --architecture paper (alpha-weighted CE), "
+                             "2 with legacy.")
     parser.add_argument("--no-focal-alpha", action="store_true",
                         help="Train the technique head with a FLAT focal alpha. "
                              "The default is the damped, clipped, geometric-mean "
@@ -1146,6 +1153,12 @@ def main():
                         help="Print a progress line every N batches. At full "
                              "density an epoch is ~161k batches; with no "
                              "progress line a run is unobservable for an hour.")
+    parser.add_argument("--min-history-steps", type=int, default=None,
+                        help="a sample must have at least this many REAL history "
+                             "steps; default is the full window. Pass 1 to restore "
+                             "the old zero-padding behaviour (the median host on "
+                             "this corpus has one window, so the default drops a lot "
+                             "and says so).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -1155,11 +1168,12 @@ def main():
 
     _cfg = DEFAULT_CONFIG
     _manifest = ExperimentManifest.create(
-        f"branch_a_v4_seed{args.seed}",
+        f"branch_a_v4_seed{args.seed}_{args.split_scheme}",
         seed=args.seed,
         config=_cfg,
         repo=Path(__file__).resolve().parent.parent,
-        dataset_sources=[str(args.cic_dir), str(args.ctu_dir)],
+        dataset_sources=[str(x) for x in (args.cic_dir, args.ctu_dir, args.cic2017_dir,
+                                          args.pcap_root) if x],
     )
     set_all_seeds(args.seed)
 
@@ -1167,13 +1181,11 @@ def main():
         'Branch A retrain',
         stride=args.stride,
         rows_per_file=args.rows_per_file,
+        pcap_window_stride=args.pcap_window_stride,
+        pcap_max_windows_per_day=args.pcap_max_windows_per_day,
     )
-
-    cic_files = sorted(args.cic_dir.glob("*.csv"))
-    ctu_files = sorted(args.ctu_dir.glob("*/*.binetflow"))
-    all_files = cic_files + ctu_files
-    if len(all_files) < 4:
-        raise RuntimeError(f"Expected supplied SIH/CTU files, found {len(all_files)}")
+    if args.pcap_root and not args.cic2018_csv_dir:
+        parser.error("--pcap-root needs --cic2018-csv-dir: PCAP packets carry no labels")
 
     # Three-way, capture-disjoint, and READ FROM THE FROZEN LOCK.
     #
@@ -1185,20 +1197,31 @@ def main():
     #
     # Test is scored once, after the model is frozen, and never influences
     # training.
-    partition = partition_paths(all_files)
+    from data_unification.training_sources import (
+        describe as _describe_captures, discover_captures, read_capture)
+    partition = discover_captures(
+        scheme=args.split_scheme,
+        cic2017_dir=args.cic2017_dir,
+        cic2018_dir=args.cic_dir,
+        ctu13_dir=args.ctu_dir,
+        pcap2018_root=args.pcap_root,
+        allow_cic2018_csv=args.allow_cic2018_csv,
+    )
     train_files, val_files, test_files = (
         partition["train"], partition["val"], partition["test"],
     )
     for _name, _files in (("train", train_files), ("val", val_files), ("test", test_files)):
         if not _files:
             raise RuntimeError(
-                f"frozen split '{_name}' matched no files under {args.cic_dir} / "
-                f"{args.ctu_dir}. Refusing to train on a split that does not exist."
-            )
-    print(f"frozen split: {len(train_files)} train / {len(val_files)} val / "
-          f"{len(test_files)} test captures", flush=True)
+                f"split '{_name}' ({args.split_scheme}) matched no captures. "
+                f"Refusing to train on a split that does not exist.")
+    print(f"{args.split_scheme} split -- {_describe_captures(partition)}", flush=True)
+    if args.split_scheme == "cross_year":
+        print("  every tuning decision (early stopping, threshold, temperature, conformal "
+              "width) uses CIC-2018 validation days only; CIC-2017 is scored once, at the end",
+              flush=True)
     import time
-    tgn = build_or_load_tgne_ta()
+    tgn = build_or_load_tgne_ta(checkpoint_path=str(args.tgne) if args.tgne else None)
     # Contract-bound (v4). Previously 2.0s / seq_len=5 hardcoded, which matched
     # the v3 contract by coincidence rather than by construction. Under v4 this
     # produces history_steps=15, so it yields a v4 checkpoint, not a v3 one.
@@ -1226,21 +1249,29 @@ def main():
         each other's temporal neighbours, which they never were.
         """
         from data_unification.trajectory_store import TrajectoryStoreBuilder
+        from data_unification.label_filter import (
+            format_unresolved_report, merge_unresolved_reports)
         shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
         widx_base = 0
         total_recs = 0
+        coverage: List[dict] = []
         for i, f in enumerate(files):
             t = time.time()
-            recs = _load_records(args.cic_dir, args.ctu_dir, args.rows_per_file, [f], args.stride)
+            recs = read_capture(
+                f, window_seconds=_c.window_seconds, pcap_label_dir=args.cic2018_csv_dir,
+                rows_per_file=args.rows_per_file, stride=args.stride,
+                pcap_max_windows=args.pcap_max_windows_per_day,
+                pcap_window_stride=args.pcap_window_stride, coverage=coverage)
             total_recs += len(recs)
             extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
             if shared._window_idx.n:
                 widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
-            print(f"  [{label} {i+1}/{len(files)}] {f.name}: {len(recs)} recs, "
+            print(f"  [{label} {i+1}/{len(files)}] {f.label}: {len(recs)} recs, "
                   f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
             del recs
             gc.collect()
         store = shared.finalize()
+        print(format_unresolved_report(merge_unresolved_reports(coverage), where=label), flush=True)
         print(f"{label}: {total_recs} records -> {store.n_snapshots} snapshots "
               f"over {len(store)} hosts | {store.memory_report()}", flush=True)
         # The record count is returned, not just printed: the run summary below
@@ -1297,17 +1328,26 @@ def main():
     t0 = time.time()
     train_store = _store_per_capture(train_files, "train")
     _apply_risk_target(train_store, "train")
-    train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    _rep_train = {}
+    train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1,
+        min_history_steps=args.min_history_steps, report=_rep_train)
+    print(f"  [train] " + _fmt_history(_rep_train), flush=True)
     print(f"train done in {time.time()-t0:.1f}s ({len(train_ds)} samples)", flush=True)
     t0 = time.time()
     val_store = _store_per_capture(val_files, "val")
     _apply_risk_target(val_store, "val")
-    val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    _rep_val = {}
+    val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1,
+        min_history_steps=args.min_history_steps, report=_rep_val)
+    print(f"  [val] " + _fmt_history(_rep_val), flush=True)
     print(f"val done in {time.time()-t0:.1f}s ({len(val_ds)} samples)", flush=True)
     t0 = time.time()
     test_store = _store_per_capture(test_files, "test")
     _apply_risk_target(test_store, "test")
-    test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1)
+    _rep_test = {}
+    test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1,
+        min_history_steps=args.min_history_steps, report=_rep_test)
+    print(f"  [test] " + _fmt_history(_rep_test), flush=True)
     print(f"test done in {time.time()-t0:.1f}s ({len(test_ds)} samples)", flush=True)
 
     # Pairing guard. `bce` binarises at risk > 0; under the hazard target that
@@ -1402,16 +1442,19 @@ def main():
               f"{ {GRADATION_NAMES.get(i, i): round(float(w), 3) for i, w in enumerate(grad_weights)} }",
               flush=True)
 
+    _arch = dict(MultiTaskLSTM.PAPER_ARCH if args.architecture == "paper"
+                 else MultiTaskLSTM.LEGACY_ARCH)
+    if args.focal_gamma is not None:
+        _arch["focal_gamma"] = args.focal_gamma
+    print(f"Branch A architecture: {args.architecture} {_arch}", flush=True)
     model = MultiTaskLSTM(
         input_dim=27,
-        hidden_dim=64,
-        num_layers=2,
         num_techniques=len(TECHNIQUE_VOCAB),
         num_gradations=4,
         risk_objective=args.risk_objective,
-        focal_gamma=args.focal_gamma,
         gradation_class_weights=(grad_weights.to(device)
                                  if grad_weights is not None else None),
+        **_arch,
     ).to(device)
     if focal_alpha is not None:
         model.tech_focal_loss.alpha = focal_alpha.to(device)
@@ -1440,7 +1483,8 @@ def main():
         _src = args.eval_only if str(args.eval_only) != "-" else args.output
         print(f"EVAL-ONLY: scoring {_src} (no training)", flush=True)
         _ck = torch.load(_src, map_location=device, weights_only=False)
-        model.load_state_dict(_ck["model_state_dict"])
+        # The checkpoint's own architecture, not the one these flags describe.
+        model = MultiTaskLSTM.from_checkpoint(_ck, device=device)
         print(f"checkpoint epoch={_ck.get('epoch')} "
               f"recorded_metrics={_ck.get('metrics')}", flush=True)
 
@@ -1619,6 +1663,12 @@ def main():
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    # Architecture kwargs, so serving rebuilds this exact model.
+                    "arch": model.arch_config(),
+                    # Which technique classes training contained, so any later
+                    # evaluation on another dataset can report unseen classes
+                    # separately (cyberworld_v4/cross_dataset.py).
+                    "train_technique_counts": [int(x) for x in _t_counts],
                     "epoch": epoch,
                     "metrics": metrics,
                     "epoch_history": list(_history),
@@ -1632,7 +1682,8 @@ def main():
                         "history_steps": _c.history_steps,
                         "forecast_steps": _c.forecast_steps,
                         "feature_dim": _cfg.state_dim,
-                        "sources": [str(args.cic_dir), str(args.ctu_dir)],
+                        "sources": [str(x) for x in (args.cic_dir, args.ctu_dir, args.cic2017_dir, args.pcap_root) if x],
+                        "split_scheme": args.split_scheme,
                         # What `risk_score` MEANS. Serving reads this to decide
                         # whether the number it is thresholding is a severity
                         # magnitude or a probability -- and to say so loudly
@@ -1644,7 +1695,7 @@ def main():
                         "hazard_tau_seconds": (hazard_tau
                                                if args.risk_target == "hazard"
                                                else None),
-                        "focal_gamma": args.focal_gamma,
+                        "focal_gamma": model.tech_focal_loss.gamma,
                     },
                     "focal_alpha": (focal_alpha.detach().cpu().tolist()
                                     if focal_alpha is not None else None),
@@ -1714,6 +1765,14 @@ def main():
                              risk_positive_above=risk_positive_above)
     _per_class = test_metrics.pop("tech_per_class", {})
     _grad_per_class = test_metrics.pop("gradation_per_class", {})
+    # Seen vs unseen classes. Under cross_year, CIC-2017 has PortScan and
+    # Heartbleed and CIC-2018 has neither; averaging them in as ordinary misses
+    # would hide that the model cannot name what it never saw.
+    from cyberworld_v4.cross_dataset import format_unseen_report, unseen_class_report
+    _unseen = unseen_class_report(
+        _t_counts, test_metrics["tech_confusion"],
+        {v: k for k, v in TECH_TO_IDX.items()})
+    print(format_unseen_report(_unseen, "held-out test"), flush=True)
     # `slim` keeps the histograms out of the printed line and out of the
     # checkpoint; they are 2 x 2000 arrays of working data.
     print(f"HELD-OUT TEST (best epoch {ckpt.get('epoch')}): "
@@ -1745,6 +1804,8 @@ def main():
     test_metrics = slim(test_metrics)
     test_metrics["tech_per_class"] = _per_class
     test_metrics["gradation_per_class"] = _grad_per_class
+    test_metrics["unseen_class_report"] = _unseen
+    test_metrics["split_scheme"] = args.split_scheme
     # The credibility verdict travels WITH the checkpoint.
     #
     # It used to be computed, printed to stdout, and thrown away. The
@@ -1772,7 +1833,25 @@ def main():
 
     ckpt["test_metrics"] = test_metrics
     ckpt["credibility"] = credibility
+    ckpt["split_scheme"] = args.split_scheme
+    ckpt["encoder"] = str(args.tgne) if args.tgne else "served default"
     torch.save(ckpt, args.output)
+    if args.results_json:
+        import json as _json
+        args.results_json.parent.mkdir(parents=True, exist_ok=True)
+        args.results_json.write_text(_json.dumps({
+            "split_scheme": args.split_scheme,
+            "encoder": ckpt["encoder"],
+            "branch_a_checkpoint": str(args.output),
+            "best_epoch": ckpt.get("epoch"),
+            "validation": {k: v for k, v in slim(best_metrics, True).items()
+                           if isinstance(v, (int, float, str))},
+            "test": {k: v for k, v in test_metrics.items()
+                     if isinstance(v, (int, float, str, dict))},
+            "operating_point": ckpt.get("operating_point"),
+            "credibility": credibility,
+        }, indent=2, default=str))
+        print(f"results written to {args.results_json}", flush=True)
     if credibility.get("checked") and not credibility.get("credible"):
         print("WARNING: checkpoint saved but marked NOT CREDIBLE -- "
               "its metrics must not be reported as results.", flush=True)

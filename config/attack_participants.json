@@ -1,0 +1,40 @@
+{
+  "_README": [
+    "Who took part in each attack, per capture day, so a PCAP window's label can",
+    "be scoped to the hosts involved instead of stamped on every host active at",
+    "that moment. Consumed by data_unification/attack_participants.py.",
+    "",
+    "THIS FILE SHIPS EMPTY ON PURPOSE. Days listed here scope their labels; days",
+    "left out stay time-only, which is exactly the previous behaviour plus a",
+    "warning in the training log. An empty file is honest; a guessed one would",
+    "put real attack labels on the wrong hosts, which is a worse defect than the",
+    "one it is meant to fix.",
+    "",
+    "Fill it from the CSE-CIC-IDS2018 published attack schedule, which documents",
+    "an attacker and a victim per attack, then verify before training on it:",
+    "",
+    "    python scripts/verify_attack_participants.py ~/Documents/SIH/DATA/CSV/tue_20_csv.csv",
+    "",
+    "tue_20 is the one CIC-2018 day whose CSV carries Src/Dst IP columns (84 of",
+    "them, against 80 with no addresses for the other nine days), so it can check",
+    "a transcription against the data. Every CIC-2017 file can too. Days that",
+    "cannot check themselves are reported as unverified rather than trusted.",
+    "",
+    "Labels match by normalised substring, so a 'Hulk' entry answers for the CSV",
+    "label 'DoS attacks-Hulk'. 'attackers', 'victims', 'hosts' and 'ips' are all",
+    "merged into one participant set; the distinction is kept only for readers.",
+    "",
+    "Days with IP columns do not need an entry at all: derive_windows() recovers",
+    "their participants from the CSV directly, and an entry would not override",
+    "observed data anyway."
+  ],
+  "provenance": "",
+  "days": {
+    "_example_delete_me": {
+      "SSH-Bruteforce": {
+        "attackers": ["203.0.113.10"],
+        "victims": ["172.31.69.25"]
+      }
+    }
+  }
+}

@@ -173,6 +173,55 @@ class ExtendedTGN(TGN):
 
         return node_embeddings
 
+    # ------------------------------------------------------------------
+    # Streaming memory (window-by-window extraction and live serving)
+    #
+    # Training (bita/train.py) drives memory through compute_temporal_embeddings
+    # one batch at a time. Trajectory extraction and serving do not score
+    # edges, they read host embeddings at the end of each 2 s window, so they
+    # need the same causal protocol without the link-prediction machinery:
+    #
+    #   1. update_memory_for(nodes)   memory <- BiTA(messages stored EARLIER)
+    #   2. get_host_embeddings(...)   read embeddings from that memory
+    #   3. store_interactions(...)    queue this window's messages for later
+    #
+    # This is TGN's memory_update_at_start order (Rossi et al. 2020, and BiTA
+    # Section "Causality"): a window's own interactions never reach the
+    # memory that its own embedding is computed from.
+    # ------------------------------------------------------------------
+
+    def reset_state(self) -> None:
+        """Forget all memory and pending messages (start of a new capture/session)."""
+        if self.use_memory:
+            self.memory.__init_memory__()
+
+    def ensure_capacity(self, n_nodes: int) -> None:
+        if self.use_memory:
+            self.memory.ensure_capacity(n_nodes)
+
+    @torch.no_grad()
+    def update_memory_for(self, node_ids) -> None:
+        if not self.use_memory or len(node_ids) == 0:
+            return
+        nodes = np.unique(np.asarray(node_ids, dtype=int))
+        self.update_memory(nodes, self.memory.messages)
+        self.memory.clear_messages(nodes)
+
+    @torch.no_grad()
+    def store_interactions(self, sources, destinations, timestamps, edge_idxs) -> None:
+        if not self.use_memory or len(sources) == 0:
+            return
+        sources = np.asarray(sources, dtype=int)
+        destinations = np.asarray(destinations, dtype=int)
+        timestamps = np.asarray(timestamps, dtype=float)
+        edge_idxs = np.asarray(edge_idxs, dtype=int)
+        u_src, src_msgs = self.get_raw_messages(
+            sources, sources, destinations, destinations, timestamps, edge_idxs)
+        u_dst, dst_msgs = self.get_raw_messages(
+            destinations, destinations, sources, sources, timestamps, edge_idxs)
+        self.memory.store_raw_messages(u_src, src_msgs)
+        self.memory.store_raw_messages(u_dst, dst_msgs)
+
     def get_global_state(self, host_embeddings: torch.Tensor) -> torch.Tensor:
         """
         Computes pooled global network summary state ĥ_t = pool(H_t) ∈ R^d.

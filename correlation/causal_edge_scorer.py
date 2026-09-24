@@ -1,21 +1,42 @@
 """
-GRAIN-Inspired Learned Causal Edge Scorer.
+Heuristic causal-edge scorer. HAND-SET, NOT LEARNED.
 
-Scores causal plausibility between security trajectory entries (u, t1, tech1) -> (v, t2, tech2)
-without relying on rigid predefined attack templates.
-Uses a learned classifier over temporal distance, transition plausibility,
-host identity, communication links, and risk deltas.
+Scores how plausible it is that trajectory entry (u, t1, tech1) led to
+(v, t2, tech2), for linking alerts into candidate campaign chains.
+
+What this file used to be, and why it changed:
+
+* It was titled "Learned Causal Edge Scorer" and the architecture diagram
+  called it an ML-compatible causal scorer. Its `score_edge` ran a 7->32->32->1
+  MLP whose weights were never trained, never saved and never loaded -- every
+  edge score was the output of a randomly initialised network. The features fed
+  into it (0.1 / 0.85 / 0.95 - 0.15*gap / floor 0.2, threshold 0.35) were
+  typed in by hand, fitted to nothing and taken from no paper.
+* It linked events up to 3600 s apart and measured time in hours, on top of a
+  model that sees 30 s of history and forecasts 150 s ahead. It drew hour-long
+  attack chains from 30 seconds of evidence.
+
+It is now what it always actually was: a transparent heuristic. Every constant
+lives in HEURISTIC_PARAMS so it can be read, questioned and replaced. The
+default linking window is the model's own evidence horizon (history +
+forecast, from cyberworld_v4/config.py) instead of an hour. A learned scorer
+would need labelled campaign chains to fit against; none exist in this
+repository, so none is claimed.
 """
 
-from typing import List, Tuple, Optional, Set
-import numpy as np
-import torch
-import torch.nn as nn
+from typing import Dict, List, Optional, Set, Tuple
 
-from correlation.trajectory_assembler import TrajectoryEntry, Provenance
+from cyberworld_v4.config import get_contract
+from correlation.trajectory_assembler import Provenance, TrajectoryEntry
 
+_CONTRACT = get_contract()
 
-# Standard Kill-Chain / ATT&CK Stage Transitions Prior Matrix
+#: Longest gap over which two events may be linked by default: the span the
+#: models can actually see (history) plus the span they forecast. Linking
+#: across more than this asserts a connection no model output supports.
+EVIDENCE_HORIZON_SEC: float = _CONTRACT.history_seconds + _CONTRACT.forecast_seconds
+
+# Kill-chain stage ordering (hand-set). -1 = not an attack stage.
 TACTIC_ORDER = {
     "Recon": 0,
     "InitialAccess": 1,
@@ -28,83 +49,66 @@ TACTIC_ORDER = {
     "Unknown": -1,
 }
 
+#: Every tunable number in the scorer. None of these were fitted.
+HEURISTIC_PARAMS: Dict[str, float] = {
+    "non_attack_plausibility": 0.1,   # either side benign/unknown
+    "same_stage_plausibility": 0.85,  # repeated scans, persistent C2
+    "forward_base": 0.95,             # next kill-chain stage
+    "forward_step_penalty": 0.15,     # per skipped stage
+    "forward_floor": 0.2,
+    "backward_plausibility": 0.2,     # e.g. Impact -> Recon
+    "same_host_locality": 1.0,
+    "observed_link_locality": 0.8,    # traffic seen between the two hosts
+    "unknown_link_locality": 0.5,     # cross-host, no communication data given
+    "provenance_both_observed": 1.0,
+    "provenance_mixed": 0.75,
+    "provenance_both_forecast": 0.5,
+    "min_score_threshold": 0.35,
+}
+
 
 def compute_transition_plausibility(coarse1: str, coarse2: str) -> float:
-    """Computes empirical attack stage transition plausibility."""
+    """Hand-set kill-chain transition prior in [0, 1]."""
+    p = HEURISTIC_PARAMS
     s1 = TACTIC_ORDER.get(coarse1, -1)
     s2 = TACTIC_ORDER.get(coarse2, -1)
-
     if s1 == -1 or s2 == -1:
-        return 0.1  # Low baseline for benign/unknown transitions
-
-    # Same stage continuation (e.g. repeated scans or persistent C2)
+        return p["non_attack_plausibility"]
     if s1 == s2:
-        return 0.85
-
-    # Forward kill-chain progression (e.g. Recon -> InitialAccess -> C2)
+        return p["same_stage_plausibility"]
     if s2 > s1:
         gap = s2 - s1
-        return round(max(0.2, 0.95 - 0.15 * gap), 4)
-
-    # Backward jump (e.g. Impact -> Recon, less likely in single chain)
-    return 0.2
+        return round(max(p["forward_floor"], p["forward_base"] - p["forward_step_penalty"] * gap), 4)
+    return p["backward_plausibility"]
 
 
-class CausalEdgeScorer(nn.Module):
-    """
-    MLP-based pairwise causality scoring module.
-    """
+class HeuristicCausalEdgeScorer:
+    """Deterministic pairwise scorer: plausibility x time decay x locality x provenance."""
 
-    def __init__(self, input_dim: int = 7, hidden_dim: int = 32):
-        super(CausalEdgeScorer, self).__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
-        )
+    def __init__(self, max_time_delta_sec: float = EVIDENCE_HORIZON_SEC):
+        self.max_time_delta_sec = float(max_time_delta_sec)
 
-    def extract_pair_features(
-        self,
-        e1: TrajectoryEntry,
-        e2: TrajectoryEntry,
-        communicating_pairs: Optional[Set[Tuple[str, str]]] = None,
-    ) -> np.ndarray:
-        """
-        Features:
-        0: delta_t in hours (clipped to [0, 24])
-        1: is_same_host (1.0 or 0.0)
-        2: is_lateral_link (traffic observed between e1.host and e2.host)
-        3: transition_plausibility in [0, 1]
-        4: delta_risk (risk2 - risk1)
-        5: min_confidence (min(conf1, conf2))
-        6: provenance_weight (1.0 if both observed, 0.6 if forecast)
-        """
-        feat = np.zeros(7, dtype=np.float32)
-        dt_hours = max(0.0, e2.timestamp - e1.timestamp) / 3600.0
-        feat[0] = min(1.0, dt_hours / 24.0)
-        feat[1] = 1.0 if e1.host_ip == e2.host_ip else 0.0
+    def _locality(self, e1: TrajectoryEntry, e2: TrajectoryEntry,
+                  communicating_pairs: Optional[Set[Tuple[str, str]]]) -> float:
+        p = HEURISTIC_PARAMS
+        if e1.host_ip == e2.host_ip:
+            return p["same_host_locality"]
+        if communicating_pairs is None:
+            return p["unknown_link_locality"]
+        linked = ((e1.host_ip, e2.host_ip) in communicating_pairs
+                  or (e2.host_ip, e1.host_ip) in communicating_pairs)
+        return p["observed_link_locality"] if linked else 0.0
 
-        is_lat = False
-        if communicating_pairs and e1.host_ip != e2.host_ip:
-            if (e1.host_ip, e2.host_ip) in communicating_pairs or (e2.host_ip, e1.host_ip) in communicating_pairs:
-                is_lat = True
-        feat[2] = 1.0 if is_lat else 0.0
-
-        feat[3] = compute_transition_plausibility(e1.coarse_category, e2.coarse_category)
-        feat[4] = float(np.clip(e2.risk_score - e1.risk_score, -1.0, 1.0))
-        feat[5] = min(e1.confidence, e2.confidence)
-
-        if e1.provenance == Provenance.OBSERVED.value and e2.provenance == Provenance.OBSERVED.value:
-            feat[6] = 1.0
-        elif e1.provenance == Provenance.FORECAST.value and e2.provenance == Provenance.FORECAST.value:
-            feat[6] = 0.5
-        else:
-            feat[6] = 0.75
-
-        return feat
+    @staticmethod
+    def _provenance(e1: TrajectoryEntry, e2: TrajectoryEntry) -> float:
+        p = HEURISTIC_PARAMS
+        obs = Provenance.OBSERVED.value
+        fc = Provenance.FORECAST.value
+        if e1.provenance == obs and e2.provenance == obs:
+            return p["provenance_both_observed"]
+        if e1.provenance == fc and e2.provenance == fc:
+            return p["provenance_both_forecast"]
+        return p["provenance_mixed"]
 
     def score_edge(
         self,
@@ -112,51 +116,35 @@ class CausalEdgeScorer(nn.Module):
         e2: TrajectoryEntry,
         communicating_pairs: Optional[Set[Tuple[str, str]]] = None,
     ) -> float:
-        if e2.timestamp < e1.timestamp:
-            return 0.0  # Causality requires non-decreasing time
-
-        device = next(self.parameters()).device
-        feat = self.extract_pair_features(e1, e2, communicating_pairs)
-        t_feat = torch.from_numpy(feat).unsqueeze(0).to(device)
-        with torch.no_grad():
-            score = self.mlp(t_feat).item()
-        return float(score)
+        dt = e2.timestamp - e1.timestamp
+        if dt < 0 or dt > self.max_time_delta_sec:
+            return 0.0  # causality needs non-decreasing time, within the evidence horizon
+        time_decay = 1.0 - dt / self.max_time_delta_sec if self.max_time_delta_sec > 0 else 0.0
+        return float(
+            compute_transition_plausibility(e1.coarse_category, e2.coarse_category)
+            * time_decay
+            * self._locality(e1, e2, communicating_pairs)
+            * self._provenance(e1, e2)
+        )
 
     def score_candidate_edges(
         self,
         entries: List[TrajectoryEntry],
-        max_time_delta_sec: float = 3600.0,
         communicating_pairs: Optional[Set[Tuple[str, str]]] = None,
-        min_score_threshold: float = 0.35,
+        min_score_threshold: Optional[float] = None,
     ) -> List[Tuple[int, int, float]]:
-        """
-        Builds and scores candidate causality edges between all trajectory entries within max_time_delta.
-        Returns: list of (src_idx, dst_idx, score).
-        """
-        # Sort indices by timestamp to reduce complexity from O(N^2) to temporal window O(N * W)
-        indexed_entries = sorted(enumerate(entries), key=lambda x: x[1].timestamp)
-        n = len(indexed_entries)
-        candidate_edges = []
-
-        for pos, (i, e1) in enumerate(indexed_entries):
-            for next_pos in range(pos + 1, n):
-                j, e2 = indexed_entries[next_pos]
-                dt = e2.timestamp - e1.timestamp
-                if dt > max_time_delta_sec:
-                    # Non-decreasing timestamp invariant: subsequent entries are also > max_time_delta_sec
-                    break
-
-                # Ignore transitions between purely benign background events
+        """(src_idx, dst_idx, score) for every pair within the evidence horizon."""
+        threshold = (HEURISTIC_PARAMS["min_score_threshold"]
+                     if min_score_threshold is None else min_score_threshold)
+        indexed = sorted(enumerate(entries), key=lambda x: x[1].timestamp)
+        out: List[Tuple[int, int, float]] = []
+        for pos, (i, e1) in enumerate(indexed):
+            for j, e2 in (x for x in indexed[pos + 1:]):
+                if e2.timestamp - e1.timestamp > self.max_time_delta_sec:
+                    break  # sorted: every later entry is further away
                 if e1.coarse_category == "Benign" and e2.coarse_category == "Benign":
                     continue
-
-                # Causal plausibility: must be same host progression or observed network communication
-                if e1.host_ip != e2.host_ip and communicating_pairs is not None:
-                    if (e1.host_ip, e2.host_ip) not in communicating_pairs and (e2.host_ip, e1.host_ip) not in communicating_pairs:
-                        continue
-
                 score = self.score_edge(e1, e2, communicating_pairs)
-                if score >= min_score_threshold:
-                    candidate_edges.append((i, j, score))
-
-        return candidate_edges
+                if score >= threshold:
+                    out.append((i, j, score))
+        return out

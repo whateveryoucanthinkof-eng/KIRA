@@ -158,6 +158,11 @@ def build_samples(
     """
     L = config.temporal.history_steps
     K = config.temporal.forecast_steps
+    # Forecast buckets are `S` input windows wide. S=1 is the original
+    # single-scale contract; S>1 coarsens the TARGETS only, so the model still
+    # sees 2-second detail on its input while predicting minutes ahead.
+    S = config.temporal.forecast_stride
+    span = K * S                       # input windows covered by the horizon
     vocab_index = {t: i for i, t in enumerate(technique_vocab)}
     n_tech = len(technique_vocab)
 
@@ -165,11 +170,11 @@ def build_samples(
 
     for segment in split_on_gaps(snapshots, config.max_gap_seconds):
         n = len(segment)
-        if n < L + K:
+        if n < L + span:
             continue  # cannot form a full history AND a full horizon
 
         start = L - 1 if require_full_history else 0
-        for i in range(start, n - K, stride):
+        for i in range(start, n - span, stride):
             hist = segment[max(0, i - L + 1) : i + 1]
             if require_full_history and len(hist) < L:
                 continue
@@ -181,14 +186,28 @@ def build_samples(
                 pad = np.zeros((L - feats.shape[0], feats.shape[1]), dtype=np.float32)
                 feats = np.concatenate([pad, feats], axis=0)
 
-            future = segment[i + 1 : i + 1 + K]
-            fut_attack = np.array([int(bool(s.is_attack)) for s in future], dtype=np.int64)
-            fut_tech = np.stack(
-                [_multilabel(s.technique_ids, vocab_index, n_tech) for s in future]
+            future = segment[i + 1 : i + 1 + span]
+            # Aggregate each bucket of S windows. An attack anywhere inside a
+            # bucket makes the bucket an attack, because the question the
+            # bucket answers is "will this host be under attack in the next
+            # 30 seconds", not "at exactly t+30s". Techniques take the union
+            # for the same reason; the latent state takes the mean, which is
+            # what Branch B regresses against.
+            buckets = [future[b * S : (b + 1) * S] for b in range(K)]
+            fut_attack = np.array(
+                [int(any(bool(w.is_attack) for w in b)) for b in buckets], dtype=np.int64
             )
-            fut_states = np.stack(
-                [np.asarray(s.embedding, dtype=np.float32) for s in future]
-            )
+            fut_tech = np.stack([
+                np.clip(
+                    np.sum([_multilabel(w.technique_ids, vocab_index, n_tech) for w in b], axis=0),
+                    0.0, 1.0,
+                ).astype(np.float32)
+                for b in buckets
+            ])
+            fut_states = np.stack([
+                np.mean([np.asarray(w.embedding, dtype=np.float32) for w in b], axis=0)
+                for b in buckets
+            ])
 
             cur = int(bool(segment[i].is_attack))
             onset, hazard, at_risk, censored = _hazard_targets(fut_attack, cur)

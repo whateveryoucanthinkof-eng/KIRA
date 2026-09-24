@@ -107,25 +107,39 @@ class TGN(nn.Module):
                 raw_message_dimension=raw_message_dimension,
                 message_dimension=message_dimension,
             )
+            # The identity message function passes the raw message through, so
+            # the message width IS the raw width. Sizing the memory updater from
+            # `message_dimension` regardless (as this used to) built a GRUCell
+            # for 100-D input that received 48-D messages -- latent only because
+            # memory had never been switched on.
+            computed_message_dim = (
+                raw_message_dimension if message_function == "identity" else message_dimension
+            )
+            is_bita = aggregator_type.lower() in ("bita", "bigru_transformer")
+            # BiTA (paper Step 1) applies MSG before aggregating and emits
+            # d_trans-wide vectors for the memory update; last/mean aggregate
+            # raw messages and MSG runs afterwards (Rossi et al.).
+            memory_input_dim = message_dimension if is_bita else computed_message_dim
             self.message_aggregator = get_message_aggregator(
                 aggregator_type=aggregator_type,
                 device=device,
-                input_dim=raw_message_dimension,
+                input_dim=computed_message_dim if is_bita else raw_message_dimension,
                 hidden_dim=raw_message_dimension,
                 n_heads=n_heads,
                 dropout=dropout,
+                d_trans=message_dimension if is_bita else None,
             )
             self.memory = Memory(
                 n_nodes=self.n_nodes,
                 memory_dimension=self.memory_dimension,
-                input_dimension=message_dimension,
-                message_dimension=message_dimension,
+                input_dimension=memory_input_dim,
+                message_dimension=memory_input_dim,
                 device=device,
             )
             self.memory_updater = get_memory_updater(
                 module_type=memory_updater_type,
                 memory=self.memory,
-                message_dimension=message_dimension,
+                message_dimension=memory_input_dim,
                 memory_dimension=self.memory_dimension,
                 device=device,
             )
@@ -278,22 +292,28 @@ class TGN(nn.Module):
 
         return pos_score, neg_score
 
-    def update_memory(self, nodes, messages):
+    def _aggregate(self, nodes, messages):
+        """(nodes, memory-updater inputs, timestamps) for the configured aggregator."""
+        if getattr(self.message_aggregator, "applies_message_function", False):
+            # BiTA: MSG -> time encoding -> BiGRU -> Transformer -> mean pool.
+            return self.message_aggregator.aggregate(nodes, messages, self.message_function)
         unique_nodes, unique_messages, unique_timestamps = (
             self.message_aggregator.aggregate(nodes, messages)
         )
         if len(unique_nodes) > 0:
             unique_messages = self.message_function.compute_message(unique_messages)
+        return unique_nodes, unique_messages, unique_timestamps
+
+    def update_memory(self, nodes, messages):
+        unique_nodes, unique_messages, unique_timestamps = self._aggregate(nodes, messages)
+        if len(unique_nodes) > 0:
             self.memory_updater.update_memory(
                 unique_nodes, unique_messages, timestamps=unique_timestamps
             )
 
     def get_updated_memory(self, nodes, messages):
-        unique_nodes, unique_messages, unique_timestamps = (
-            self.message_aggregator.aggregate(nodes, messages)
-        )
+        unique_nodes, unique_messages, unique_timestamps = self._aggregate(nodes, messages)
         if len(unique_nodes) > 0:
-            unique_messages = self.message_function.compute_message(unique_messages)
             updated_memory, updated_last_update = (
                 self.memory_updater.get_updated_memory(
                     unique_nodes, unique_messages, timestamps=unique_timestamps
@@ -333,10 +353,13 @@ class TGN(nn.Module):
             dim=1,
         )
 
+        # (raw message, time, peer). The peer lets BiTA group a node's messages
+        # by the edge they arrived on (paper Algorithm 1, Step 2).
         messages = defaultdict(list)
         unique_sources = np.unique(source_nodes)
         for i in range(len(source_nodes)):
-            messages[source_nodes[i]].append((source_message[i], edge_times[i]))
+            messages[source_nodes[i]].append(
+                (source_message[i], edge_times[i], int(destination_nodes[i])))
 
         return unique_sources, messages
 

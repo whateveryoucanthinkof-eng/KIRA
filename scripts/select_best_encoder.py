@@ -82,12 +82,17 @@ def score_log(log_text: str):
     return out
 
 
+#: The encoder build_or_load_tgne_ta() prefers. Relative to the repo root.
+SERVED_ENCODER = "saved_models/bita_bigru_transformer-unified_final.pth"
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("log", type=Path)
     p.add_argument("--prefix", default="bita_bigru_transformer-unified_final")
-    p.add_argument("--checkpoint-dir", type=Path, default=Path("saved_checkpoints"))
+    p.add_argument("--checkpoint-dir", type=Path, default=Path(".spill/encoder_epochs"),
+                   help="Where bita/train.py wrote per-epoch snapshots (scratch).")
     p.add_argument("--smooth", type=int, default=3,
                    help="Window for the informational smoothed column. Selection "
                         "always uses the raw score; see smooth().")
@@ -141,6 +146,11 @@ def main() -> int:
         a.copy.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ckpt, a.copy)
         print(f"copied -> {a.copy}")
+    else:
+        print()
+        print(f"NOTHING WAS PROMOTED. Serving loads {SERVED_ENCODER}; the "
+              f"per-epoch snapshots are never read. Re-run with "
+              f"--copy {SERVED_ENCODER} (and write its _config.json) to serve it.")
     return 0
 
 

@@ -13,12 +13,16 @@ import type {
   ContributingSignal,
   ExplainabilityPayload,
 } from "./types";
+import type { ReplayReport } from "../types/replay";
+import type { ReplaySample } from "./mock";
 import {
   mockFetchStatus,
   mockFetchSite,
   mockFetchTopology,
   mockSendCommand,
   mockSendMitigate,
+  mockReplay,
+  mockReplaySample,
   MockWebSocket
 } from "./mock";
 
@@ -199,6 +203,40 @@ export async function sendCommand(command: string): Promise<void> {
     return mockSendCommand(command);
   }
   await apiFetch<void>(`/command/${command}`, { method: "POST" });
+}
+
+/**
+ * Offline analysis of an uploaded capture or flow CSV (`POST /api/replay`,
+ * control_backend/main.py:237). Runs fully local — no egress — and the backend
+ * forces the SOC rule layer off for this path, so `risk` here is pure model
+ * output. Multipart, so no JSON Content-Type header.
+ */
+export async function uploadReplay(file: File, maxWindows = 200): Promise<ReplayReport> {
+  if (import.meta.env.VITE_DEMO_MODE === "true") {
+    return mockReplay(file, maxWindows);
+  }
+  const body = new FormData();
+  body.append("file", file);
+  const res = await fetch(`${BASE_URL}/replay?max_windows=${maxWindows}`, { method: "POST", body });
+  if (!res.ok) throw new Error(`API /replay → ${res.status} ${res.statusText}`);
+  return res.json() as Promise<ReplayReport>;
+}
+
+/**
+ * Runs one of the built-in captures listed in `REPLAY_SAMPLES`.
+ *
+ * Against a live backend the sample ships as a static asset, so it is fetched
+ * and posted through the same multipart endpoint a dropped file uses — the
+ * analysis path is identical either way.
+ */
+export async function analyseSample(sample: ReplaySample): Promise<ReplayReport> {
+  if (import.meta.env.VITE_DEMO_MODE === "true") {
+    return mockReplaySample(sample.id);
+  }
+  const res = await fetch(`/samples/${sample.name}`);
+  if (!res.ok) throw new Error(`sample ${sample.name} not available (${res.status})`);
+  const blob = await res.blob();
+  return uploadReplay(new File([blob], sample.name, { type: blob.type }));
 }
 
 export async function sendMitigate(payload: MitigationPayload): Promise<void> {

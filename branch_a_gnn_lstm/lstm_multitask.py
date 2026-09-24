@@ -9,7 +9,7 @@ and jointly predicts:
 """
 
 import math
-from typing import Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional
 
 import numpy as np
 import torch
@@ -292,8 +292,44 @@ class MultiTaskUncertaintyLoss(nn.Module):
 
 class MultiTaskLSTM(nn.Module):
     """
-    2-Layer LSTM with Temporal Sequence Attention and 3 multi-task output heads.
+    Branch A: graph embedding + temporal attributes -> LSTM -> three heads.
+
+    Vitulyova, Babenko, Kolesnikova, Kiktev and Abramkina, "A Hybrid Approach
+    Using Graph Neural Networks and LSTM for Attack Vector Reconstruction",
+    Computers 14(8):301, 2025, Section 3.2.3 and 3.4:
+
+      Eq. 1, 4  H_t = LSTM([H_GNN, X_t])      graph embedding concatenated with
+                                             15 temporal attributes (here the
+                                             12-D TGNE latent + 15 attributes)
+      Table 6   R_t = sigmoid(W_R H_t + b_R)  risk score
+                P_t = softmax(W_p H_t + b_p)  technique probabilities
+                G_t = sigmoid(W_G H_t + b_G)  probability gradation, a scalar
+      Sec. 3.4  L = 0.5 L_risk(BCE) + 0.3 L_tech(CE) + 0.2 L_grad(MSE),
+                1 LSTM layer x 256 hidden units, dropout 0.2, Adam lr 1e-3
+
+    PAPER_ARCH is that model. LEGACY_ARCH is the variant earlier checkpoints
+    were trained as (2 x 64 LSTM, attention readout, MLP heads, 4-class
+    gradation, uncertainty-weighted loss); `from_checkpoint` rebuilds it for
+    them.
+
+    Two deviations are kept on purpose and apply to both:
+      * the risk target follows `risk_objective` ("bce" = the paper's BCE on
+        risk > 0, the default);
+      * the technique loss is class-weighted (focal_gamma=0 makes the focal
+        loss exactly alpha-weighted cross-entropy). The paper balances classes
+        with SMOTE on flat CICIDS2017 records; SMOTE does not apply to
+        overlapping host sequences, and on this ~82.5%-Benign corpus plain CE
+        collapses the head onto Benign.
     """
+
+    PAPER_ARCH = dict(hidden_dim=256, num_layers=1, dropout=0.2, readout="last",
+                      head_type="linear", gradation_mode="scalar",
+                      loss_weighting="fixed", focal_gamma=0.0)
+    LEGACY_ARCH = dict(hidden_dim=64, num_layers=2, dropout=0.2, readout="attention",
+                       head_type="mlp", gradation_mode="classes",
+                       loss_weighting="uncertainty", focal_gamma=2.0)
+    #: Paper Section 3.4: alpha, beta, gamma for risk, technique, gradation.
+    PAPER_LOSS_WEIGHTS = (0.5, 0.3, 0.2)
 
     def __init__(
         self,
@@ -306,8 +342,33 @@ class MultiTaskLSTM(nn.Module):
         risk_objective: str = "bce",
         focal_gamma: float = 2.0,
         gradation_class_weights: Optional[torch.Tensor] = None,
+        readout: str = "attention",
+        head_type: str = "mlp",
+        gradation_mode: str = "classes",
+        loss_weighting: str = "uncertainty",
+        loss_weights: Tuple[float, float, float] = (0.5, 0.3, 0.2),
     ):
         super(MultiTaskLSTM, self).__init__()
+        for name, value, allowed in (
+            ("readout", readout, ("attention", "last")),
+            ("head_type", head_type, ("mlp", "linear")),
+            ("gradation_mode", gradation_mode, ("classes", "scalar")),
+            ("loss_weighting", loss_weighting, ("uncertainty", "fixed")),
+        ):
+            if value not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
+        self.readout = readout
+        self.head_type = head_type
+        self.gradation_mode = gradation_mode
+        self.loss_weighting = loss_weighting
+        self.loss_weights = tuple(float(w) for w in loss_weights)
+        self._arch = dict(
+            input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers,
+            num_techniques=num_techniques, num_gradations=num_gradations,
+            dropout=dropout, risk_objective=risk_objective, focal_gamma=focal_gamma,
+            readout=readout, head_type=head_type, gradation_mode=gradation_mode,
+            loss_weighting=loss_weighting, loss_weights=list(self.loss_weights),
+        )
         if risk_objective not in ("bce", "soft_bce", "smooth_l1"):
             raise ValueError(
                 f"risk_objective must be 'bce', 'soft_bce' or 'smooth_l1', "
@@ -349,29 +410,38 @@ class MultiTaskLSTM(nn.Module):
         self.attention = TemporalSelfAttention(hidden_dim=hidden_dim, attn_dim=hidden_dim // 2)
 
         # Head 1: Risk score regression in [0, 1]
-        self.risk_head = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-            nn.Sigmoid(),
-        )
+        grad_out = 1 if gradation_mode == "scalar" else num_gradations
+        if head_type == "linear":
+            # Paper: each head is one affine map of H_t; dropout 0.2 on H_t.
+            self.head_dropout = nn.Dropout(dropout)
+            self.risk_head = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+            self.technique_head = nn.Linear(hidden_dim, num_techniques)
+            self.gradation_head = nn.Linear(hidden_dim, grad_out)
+        else:
+            self.head_dropout = nn.Identity()
+            self.risk_head = nn.Sequential(
+                nn.Linear(hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1),
+                nn.Sigmoid(),
+            )
 
         # Head 2: MITRE ATT&CK technique classification
-        self.technique_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, num_techniques),
-        )
+            self.technique_head = nn.Sequential(
+                nn.Linear(hidden_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, num_techniques),
+            )
 
         # Head 3: Attack gradation / severity stage (0=Benign, 1=Recon, 2=Infiltration, 3=C2/DDoS)
-        self.gradation_head = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, num_gradations),
-        )
+            self.gradation_head = nn.Sequential(
+                nn.Linear(hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, grad_out),
+            )
 
         self.uncertainty_loss = MultiTaskUncertaintyLoss()
         self.tech_focal_loss = MultiClassFocalLoss(gamma=focal_gamma)
@@ -438,11 +508,28 @@ class MultiTaskLSTM(nn.Module):
                 context: [batch_size, hidden_dim]
         """
         lstm_out, _ = self.lstm(x)  # [batch_size, seq_len, hidden_dim]
-        context, attn_weights = self.attention(lstm_out, mask=mask)
+        if self.readout == "last":
+            # Paper: the heads read H_t, the hidden state at the last step.
+            context = lstm_out[:, -1, :]
+            attn_weights = torch.zeros(lstm_out.shape[:2], device=lstm_out.device,
+                                       dtype=lstm_out.dtype)
+            attn_weights[:, -1] = 1.0
+        else:
+            context, attn_weights = self.attention(lstm_out, mask=mask)
 
-        risk_score = self.risk_head(context)
-        tech_logits_raw = self.technique_head(context)
-        grad_logits = self.gradation_head(context)
+        h = self.head_dropout(context)
+        risk_score = self.risk_head(h)
+        tech_logits_raw = self.technique_head(h)
+        gradation_score = None
+        if self.gradation_mode == "scalar":
+            # G_t in [0, 1]. The evaluation code scores discrete levels, so the
+            # nearest of the num_gradations evenly spaced levels is also
+            # exposed as logits (argmax = nearest level).
+            gradation_score = torch.sigmoid(self.gradation_head(h)).squeeze(-1)
+            levels = torch.linspace(0.0, 1.0, self.num_gradations, device=h.device, dtype=h.dtype)
+            grad_logits = -50.0 * (gradation_score.unsqueeze(-1) - levels) ** 2
+        else:
+            grad_logits = self.gradation_head(h)
 
         # `technique_logits` is the SERVED quantity, so the fitted temperature
         # is applied here rather than at the call site. The serving path
@@ -462,9 +549,33 @@ class MultiTaskLSTM(nn.Module):
             "technique_logits": tech_logits,
             "technique_logits_raw": tech_logits_raw,
             "gradation_logits": grad_logits,
+            "gradation_score": gradation_score,
             "attention_weights": attn_weights,
             "context": context,
         }
+
+    # -- construction from a checkpoint ------------------------------------
+    def arch_config(self) -> Dict[str, Any]:
+        """Constructor kwargs; saved with every checkpoint as ckpt["arch"]."""
+        return dict(self._arch)
+
+    @classmethod
+    def from_checkpoint(cls, ckpt: Dict[str, Any], device="cpu") -> "MultiTaskLSTM":
+        """Rebuild the architecture a checkpoint was trained as, then load it."""
+        arch = ckpt.get("arch")
+        if arch is None:
+            sd = ckpt["model_state_dict"]
+            arch = dict(cls.LEGACY_ARCH)
+            arch["input_dim"] = int(sd["lstm.weight_ih_l0"].shape[1])
+            arch["hidden_dim"] = int(sd["lstm.weight_hh_l0"].shape[1])
+            tc = ckpt.get("training_contract") or {}
+            arch["risk_objective"] = tc.get("risk_objective") or ckpt.get("risk_objective") or "bce"
+        arch = dict(arch)
+        if "loss_weights" in arch:
+            arch["loss_weights"] = tuple(arch["loss_weights"])
+        model = cls(**arch).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        return model
 
     @property
     def effective_temperature(self) -> torch.Tensor:
@@ -573,10 +684,29 @@ class MultiTaskLSTM(nn.Module):
         if _gw is not None and _gw.device != predictions["gradation_logits"].device:
             _gw = _gw.to(predictions["gradation_logits"].device)
             self.gradation_class_weights = _gw
-        grad_loss = F.cross_entropy(
-            predictions["gradation_logits"], batch["gradation"], weight=_gw)
+        if self.gradation_mode == "scalar":
+            # Paper: MSE between G_t and the target g_t in [0, 1]; the target
+            # here is the severity level scaled onto [0, 1].
+            g_target = batch["gradation"].to(predictions["gradation_score"].dtype) / max(1, self.num_gradations - 1)
+            grad_loss = F.mse_loss(predictions["gradation_score"], g_target)
+        else:
+            grad_loss = F.cross_entropy(
+                predictions["gradation_logits"], batch["gradation"], weight=_gw)
 
-        total_loss, metrics = self.uncertainty_loss(risk_loss, tech_loss, grad_loss)
+        if self.loss_weighting == "fixed":
+            a, b, c = self.loss_weights
+            total_loss = a * risk_loss + b * tech_loss + c * grad_loss
+            metrics = {
+                "loss_total": total_loss.detach(),
+                "loss_risk": risk_loss.detach(),
+                "loss_tech": tech_loss.detach(),
+                "loss_grad": grad_loss.detach(),
+                "weight_risk": torch.tensor(a),
+                "weight_tech": torch.tensor(b),
+                "weight_grad": torch.tensor(c),
+            }
+        else:
+            total_loss, metrics = self.uncertainty_loss(risk_loss, tech_loss, grad_loss)
         # Reported so a run can see whether a temperature has been fitted yet;
         # it is 1.0 (inert) for the whole of training by construction.
         metrics["temperature"] = self.effective_temperature.detach()

@@ -23,6 +23,11 @@ class ModelMetadata(BaseModel):
     forecast_steps: int = Field(..., description="Number of forward prediction steps, e.g. 8")
     checkpoint: Optional[str] = Field(None, description="Model checkpoint file name")
     threshold: float = Field(..., description="Calibrated operating alert threshold, e.g. 0.40")
+    forecast_step_seconds: Optional[float] = Field(
+        None, description="Seconds per forecast step (may differ from window_seconds)")
+    rules_enabled: bool = Field(
+        False, description="Whether the advisory SOC rule layer is computed. It never "
+                            "changes `risk`, `predicted_stage` or `alert`.")
 
 
 class StateMetadata(BaseModel):
@@ -79,12 +84,21 @@ class PredictionData(BaseModel):
     technique_confidence: Optional[float] = None
     stage_provenance: Optional[Dict[str, str]] = None
 
-    # Provenance of the displayed risk (spec 21, 41). The SOC layer may blend
-    # model output with deterministic rules, but the three numbers must be
-    # separable or a rule-driven demo can be mistaken for a model result.
-    ml_risk: Optional[float] = None          # model output, untouched
-    rule_risk: Optional[float] = None        # deterministic SOC rules alone
-    rules_applied: Optional[bool] = None     # whether `risk` was rule-adjusted
+    # Provenance (spec 21, 41). `risk`, `predicted_stage` and `alert` are always
+    # the model's output. The optional SOC rule layer is advisory: its opinion
+    # is reported here, next to the model's, and never replaces it.
+    ml_risk: Optional[float] = None          # model output (== risk)
+    ml_technique: Optional[str] = None       # model technique (== predicted_stage)
+    rule_risk: Optional[float] = None        # advisory rule layer, None when off/not fired
+    rule_technique: Optional[str] = None     # advisory rule label, None when off/not fired
+    rules_applied: Optional[bool] = None     # always False: rules never adjust `risk`
+    risk_source: str = "model"               # what produced `risk`; only "model" today
+
+    # Mitigation is recorded by the dashboard, not enforced by it. The model
+    # keeps scoring the traffic it actually sees; these say whether traffic
+    # that a recorded block/isolation should have stopped is still present.
+    mitigation_status: Optional[str] = None  # None | "recorded_quiet" | "traffic_persists"
+    mitigation_bypass_flows: Optional[int] = None
 
 
 class LatencyData(BaseModel):

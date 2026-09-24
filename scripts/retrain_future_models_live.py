@@ -180,46 +180,28 @@ def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_
 
 
 def iter_pcap_day_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_day=None,
-                          max_packets_per_host=None, window_stride=1):
+                          max_packets_per_host=None, window_stride=1, scheme="frozen"):
     """Yields (split, day_name, records) one capture day at a time.
 
     load_pcap_records() accumulates every day's records before returning, which
     at full density is ~9.9M UnifiedFlowRecord objects held at once. Yielding
     per day lets the caller extract and free each day, so peak memory is one
     day rather than the corpus -- the same reason Branch A now loads per file.
+    Discovery and reading are data_unification/training_sources.py, shared with
+    Branch A and the encoder.
     """
-    day_re = re.compile(r"^(?P<day>.+)_pa?cap$")
-    day_dirs = sorted((p, day_re.match(p.name)) for p in Path(pcap_root).iterdir() if p.is_dir())
-    day_dirs = sorted((p, m.group("day")) for p, m in day_dirs if m)
-    # Frozen per-day assignment; see splits.lock.json / _pcap_day_split.
+    from data_unification.training_sources import discover_captures, iter_pcap_day_windows
 
-    for i, (day_dir, day) in enumerate(day_dirs):
-        split = _pcap_day_split(day_dir)
-        csv_path = Path(csv_label_dir) / f"{day}_csv.csv"
-        if not csv_path.exists():
-            prefix = day.rsplit("_", 1)[0]
-            cands = sorted(Path(csv_label_dir).glob(f"{prefix}_*_csv.csv"))
-            if not cands:
-                print(f"skipping {day_dir.name}: no label CSV", flush=True)
-                continue
-            csv_path = cands[0]
-        dw = derive_windows(str(csv_path))
-        if not dw.ok:
-            print(f"skipping {day_dir.name}: implausible windows ({dw.evidence})", flush=True)
-            continue
-        recs = []
-        n_win = 0
-        for w_idx, (_s, _e, wr) in enumerate(iter_day_records(
-                day_dir, dw, scenario_id=day, window_seconds=window_seconds,
-                max_packets_per_host=max_packets_per_host)):
-            if window_stride > 1 and (w_idx % window_stride) != 0:
-                continue
-            recs.extend(wr)
+    caps = discover_captures(scheme=scheme, pcap2018_root=pcap_root)
+    for cap in sorted((c for sp in caps.values() for c in sp), key=lambda c: c.name):
+        recs, n_win = [], 0
+        for window in iter_pcap_day_windows(cap.path, csv_label_dir, window_seconds,
+                                            max_windows_per_day, window_stride,
+                                            max_packets_per_host):
+            recs.extend(window)
             n_win += 1
-            if max_windows_per_day is not None and n_win >= max_windows_per_day:
-                break
-        print(f"  [{split}] {day_dir.name}: {n_win} windows, {len(recs)} records", flush=True)
-        yield split, day, recs
+        print(f"  [{cap.split}] {cap.name}: {n_win} windows, {len(recs)} records", flush=True)
+        yield cap.split, cap.name, recs
 
 
 def _loader_kwargs(device, num_workers: int):
@@ -249,8 +231,11 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     _lk = _loader_kwargs(device, num_workers)
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, **_lk)
     val_loader = DataLoader(val_ds, batch_size=128, **_lk)
-    wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64, n_heads=4, n_layers=3).to(device)
-    risk = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(device)
+    # World state = the full enriched tensor (TGNE latent + host attributes),
+    # the same s(t) Branch A reads. Its width is the store's.
+    d_state = int(train_traj.feats.shape[1])
+    wdt = HostWorldDynamicsTransformer(d_latent=d_state, d_model=64, n_heads=4, n_layers=3).to(device)
+    risk = InfiltrationRiskHead(d_latent=d_state, hidden_dim=32).to(device)
     optimizer = torch.optim.Adam(list(wdt.parameters()) + list(risk.parameters()), lr=1e-3, weight_decay=1e-4)
     best = float("inf")
     best_epoch, _since_improve = 0, 0
@@ -355,7 +340,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         if score < best:
             best=score; best_epoch=epoch+1; _since_improve=0
             output.parent.mkdir(parents=True,exist_ok=True)
-            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar}},output)
+            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar}},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
         else:
             _since_improve += 1
@@ -369,7 +354,68 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                 break
     wdt.load_state_dict(best_state)
     wdt.eval()
+
+    # Stamp the verdict into the served checkpoint, where the adapter and the
+    # DeepOP stage can both read it, instead of leaving it in a log line.
+    cred = branch_b_credibility(_history, best_epoch)
+    if output.exists():
+        _ck = torch.load(output, map_location="cpu", weights_only=False)
+        _ck["credibility"] = cred
+        torch.save(_ck, output)
+    print(f"Branch B credibility: {'CREDIBLE' if cred['credible'] else 'NOT CREDIBLE'}"
+          + (f" -- {'; '.join(cred['problems'])}" if cred["problems"] else ""), flush=True)
     return wdt
+
+
+#: Minimum fractional MSE improvement over persistence ("copy the last
+#: embedding forward") for Branch B to count as having learned dynamics.
+#: Below it, DeepOP would be trained on rollouts that are the last observed
+#: state repeated, and could only learn the label prior. Tuning DeepOP cannot
+#: fix that, so the pipeline stops instead of spending hours on it.
+MIN_BRANCH_B_SKILL = 0.02
+
+
+def branch_b_credibility(history, best_epoch):
+    """Verdict on whether the saved Branch B beats persistence."""
+    entry = next((h for h in history if h.get("epoch") == best_epoch), None)
+    if entry is None:
+        return {"checked": False, "credible": False,
+                "problems": ["no validation history for the saved epoch"]}
+    skill = float(entry.get("skill", float("nan")))
+    problems = []
+    if not math.isfinite(skill):
+        problems.append("skill vs persistence is undefined (persistence MSE was 0)")
+    elif skill < MIN_BRANCH_B_SKILL:
+        problems.append(
+            f"embedding skill vs persistence is {skill:+.4f} (< {MIN_BRANCH_B_SKILL}); "
+            f"the world model is not measurably better than copying the last step")
+    if entry.get("risk_mae_model", 0.0) >= entry.get("risk_mae_zero", float("inf")):
+        problems.append("risk head is no better than predicting zero")
+    return {
+        "checked": True,
+        "credible": not problems,
+        "problems": problems,
+        "stats": {"best_epoch": best_epoch, "skill": skill,
+                  "mse_model": entry.get("mse_model"),
+                  "mse_persistence": entry.get("mse_persistence"),
+                  "risk_mae_model": entry.get("risk_mae_model"),
+                  "risk_mae_zero": entry.get("risk_mae_zero"),
+                  "min_skill": MIN_BRANCH_B_SKILL},
+    }
+
+
+def require_credible_branch_b(ckpt, allow: bool) -> None:
+    cred = ckpt.get("credibility") or {}
+    if cred.get("checked") and cred.get("credible"):
+        return
+    why = "; ".join(cred.get("problems") or []) or (
+        "the checkpoint carries no skill verdict (it predates the check)")
+    msg = (f"Branch B is not credible: {why}. DeepOP trains on Branch B's "
+           f"rollouts, so it would be learning from a near-copy of the input. "
+           f"Fix Branch B first, or pass --allow-noncredible-branch-b.")
+    if not allow:
+        raise SystemExit(f"REFUSING TO TRAIN DEEPOP. {msg}")
+    print(f"WARNING (overridden): {msg}", flush=True)
 
 
 class _WithRollout(torch.utils.data.Dataset):
@@ -414,9 +460,13 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
             "epoch would otherwise see a different conditioning signal")
 
     n = len(ds)
+    # The rollout has the width of its input: 27 for the world state
+    # s(t) = [TGNE ; attributes], not the bare 12-D embedding. A hard-coded 12
+    # here crashed every Branch-B-conditioned DeepOP run.
+    d = int(ds[0]["h_history"].shape[-1])
     path = os.path.join(spill_dir or tempfile.gettempdir(),
                         f"rollout_{label}_{os.getpid()}.f32")
-    cache = np.memmap(path, dtype=np.float32, mode="w+", shape=(n, K, 12))
+    cache = np.memmap(path, dtype=np.float32, mode="w+", shape=(n, K, d))
     try:
         os.unlink(path)          # reclaimed when the mapping is dropped
     except OSError:
@@ -443,6 +493,22 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
     return cache
 
 
+#: Probability of dropping each observed technique from DeepOP's encoder input
+#: during training. At serve time that sequence is Branch A's predictions, not
+#: labels, so some entries will be wrong or missing. DeepOP's own robustness
+#: experiment (Section 4.4, Fig. 7) removes a fraction of the observed
+#: techniques to simulate detection failure; this trains against the same.
+OBS_TOKEN_DROPOUT = 0.1
+
+
+def _drop_observed(obs, vocab, p: float):
+    if p <= 0.0:
+        return obs
+    droppable = (obs != vocab.pad_idx) & (obs != vocab.bos_idx)
+    drop = (torch.rand(obs.shape, device=obs.device) < p) & droppable
+    return obs.masked_fill(drop, vocab.pad_idx)
+
+
 def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4, patience: int = 2):
     vocab=get_joint_vocab(network_observable_only=True)
     _c=get_contract()
@@ -462,6 +528,9 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
     # number reported before this was read against a distribution that does
     # not exist. It moved the printed lift by +0.024 on its own.
     val_ds=LazyCWADataset(val_traj,vocab,K=_c.forecast_steps,T=_T,oversample=False)
+    # Recorded in the checkpoint so an evaluation on another dataset can tell
+    # tokens training never contained from tokens it got wrong.
+    _train_token_counts=[int(x) for x in train_ds.target_token_histogram()]
     print(f"DeepOP samples: train={len(train_ds)} val={len(val_ds)}",flush=True)
     print(f"DeepOP conditioning: {'Branch-B rollouts (E1 fixed)' if wdt is not None else 'oracle + noise (interim)'}",flush=True)
     # Precompute the frozen rollout once instead of recomputing it every epoch.
@@ -469,15 +538,18 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _sp = os.environ.get("CYBERWORLD_SPILL_DIR")
         train_ds = _WithRollout(train_ds, _precompute_rollouts(
             wdt, train_ds, device, _sp, "train", _c.forecast_steps,
-            num_workers=max(1, num_workers)))
+            num_workers=num_workers))
         val_ds = _WithRollout(val_ds, _precompute_rollouts(
             wdt, val_ds, device, _sp, "val", _c.forecast_steps,
-            num_workers=max(1, num_workers)))
+            num_workers=num_workers))
 
     _lk=_loader_kwargs(device,num_workers)
     train_loader=DataLoader(train_ds,batch_size=64,shuffle=True,**_lk)
     val_loader=DataLoader(val_ds,batch_size=64,**_lk)
-    decoder=DeepOPForecastDecoder(d_latent=12,d_model=72,vocab_size=vocab.vocab_size,n_heads=6,num_layers=2,window_sizes=[2,4,8],dim_feedforward=144).to(device)
+    # DeepOP as published: encoder over the observed technique sequence,
+    # causal-window decoder (h=6, n_cw=3). Conditioned on the full world state.
+    d_state=int(train_traj.feats.shape[1])
+    decoder=DeepOPForecastDecoder(d_latent=d_state,d_model=72,vocab_size=vocab.vocab_size,n_heads=6,num_layers=2,window_sizes=[2,4,8],dim_feedforward=144).to(device)
     optimizer=torch.optim.AdamW(decoder.parameters(),lr=5e-4,weight_decay=1e-4)
     best=float("inf"); best_epoch=0; _since_improve=0; _history=[]
     _nb_total=len(train_loader); _nblk=(str(device)=="cuda")
@@ -502,7 +574,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             else:
                 step_sigma=torch.linspace(0.015,0.055,steps=h.shape[1],device=device).unsqueeze(0).unsqueeze(-1)
                 h_aug=h+torch.randn_like(h)*step_sigma
-            optimizer.zero_grad(set_to_none=True); logits=decoder(h_aug,inp)
+            obs_seq=_drop_observed(batch["obs_tokens"].to(device,non_blocking=_nblk),vocab,OBS_TOKEN_DROPOUT)
+            optimizer.zero_grad(set_to_none=True); logits=decoder(h_aug,inp,obs_tokens=obs_seq)
             # Train used smoothed CE while validation used plain CE, so the two
             # printed numbers were different functions and their gap was not a
             # generalisation gap. Identity: L_smooth = 0.96*plain + 0.04*U with
@@ -545,7 +618,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                 elif wdt is not None and "h_history" in batch:
                     hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1]).detach()
                 tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
-                logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk))
+                obs_seq=batch["obs_tokens"].to(device,non_blocking=_nblk)
+                logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk),obs_tokens=obs_seq)
                 _v_sum+=F.cross_entropy(logits.reshape(-1,V),tgt.reshape(-1)).double().sum()
                 _vn+=1
                 pred = logits.argmax(dim=-1)
@@ -555,6 +629,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                         _free, _ = decoder.forecast_sequence(
                             hv, max_steps=hv.shape[1],
                             observed_token=_obs.to(device, non_blocking=_nblk),
+                            observed_sequence=obs_seq,
                             continuity_bonus=0.0)
                         _scorer.update(tgt, batch["input_tokens"].to(device, non_blocking=_nblk),
                                        _obs.to(device, non_blocking=_nblk),
@@ -609,7 +684,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                          "acc_majority": acc_majority, "lift": acc - _best_base})
         if score < best:
             best=score; best_epoch=epoch+1; _since_improve=0
-            output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"epoch_history":list(_history),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
+            output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"d_state":d_state,"arch":decoder.arch_config(),"train_token_counts":_train_token_counts,"epoch_history":list(_history),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
         else:
             _since_improve += 1
             # Best weights are already on disk; stopping cannot cost quality.
@@ -639,7 +714,8 @@ def _pcap_trajectories_per_day(args, extractor):
     wbase = {"train": 0, "val": 0, "test": 0}
     for split, day, recs in iter_pcap_day_records(
             args.pcap_root, args.cic2018_csv_dir, get_contract().window_seconds,
-            args.pcap_max_windows_per_day, window_stride=args.pcap_window_stride):
+            args.pcap_max_windows_per_day, window_stride=args.pcap_window_stride,
+            scheme=args.split_scheme):
         b = builders[split]
         t = time.time()
         extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
@@ -663,6 +739,13 @@ def main():
     parser.add_argument("--cic2018-csv-dir",type=Path,help="Directory of <day>_csv.csv label files, required with --pcap-root")
     parser.add_argument("--pcap-max-windows-per-day",type=int,default=None)
     parser.add_argument("--pcap-window-stride",type=int,default=1,help="Keep every Nth window across the full day")
+    parser.add_argument("--split-scheme",choices=("frozen","cross_year"),default="frozen",
+                        help="'cross_year': train/tune on CIC-2018 PCAP days, then score the best "
+                             "checkpoints ONCE on all of CIC-2017 (--cic2017-dir). Needs --pcap-root.")
+    parser.add_argument("--cic2017-dir",type=Path,default=None,
+                        help="CIC-IDS-2017 CSVs, the cross_year test set")
+    parser.add_argument("--results-json",type=Path,default=None,
+                        help="Write the cross_year CIC-2017 scores here")
     parser.add_argument("--tgne",type=Path,required=True); parser.add_argument("--out-dir",type=Path,required=True)
     parser.add_argument("--rows-per-file",type=int,default=None,
                         help="Cap records kept per capture. Default None = FULL DENSITY.")
@@ -692,6 +775,9 @@ def main():
                              "only stops paying for epochs that do nothing. Run 1 "
                              "took 6 Branch B epochs and its best was epoch 1. "
                              "0 disables.")
+    parser.add_argument("--allow-noncredible-branch-b",action="store_true",
+                        help="Train DeepOP even if Branch B does not beat the "
+                             "persistence baseline (see MIN_BRANCH_B_SKILL).")
     parser.add_argument("--num-workers",type=int,default=4,
                         help="DataLoader worker processes; 0 loads in the main "
                              "process and serialises loading with GPU compute.")
@@ -712,6 +798,11 @@ def main():
         pcap_max_windows_per_day=args.pcap_max_windows_per_day,
     )
 
+    if args.split_scheme == "cross_year" and not args.pcap_root:
+        parser.error("--split-scheme cross_year trains on CIC-2018 and needs --pcap-root: "
+                     "9 of 10 CIC-2018 CSV days fabricate host IPs")
+    if args.split_scheme == "cross_year" and not args.cic2017_dir:
+        parser.error("--split-scheme cross_year needs --cic2017-dir (the test set)")
     if args.pcap_root:
         if not args.cic2018_csv_dir:
             parser.error("--pcap-root requires --cic2018-csv-dir (PCAP packets carry no label of their own)")
@@ -831,6 +922,9 @@ def main():
     # looking. Both stores are swapped together, or the train and validation
     # targets would be on different scales.
     if args.risk_target == "hazard":
+        # `_c` was referenced here but never defined in main(), so
+        # --risk-target hazard crashed with NameError before training began.
+        _c = get_contract()
         _tau = _c.forecast_steps * _c.window_seconds
         for _nm, _st in (("train", train_traj), ("val", val_traj)):
             _info = _st.use_hazard_target(_tau)
@@ -854,6 +948,10 @@ def main():
         print(f"served checkpoint updated: {bb_out}", flush=True)
 
     if args.stages in ("both", "deepop"):
+        if bb_out.exists():
+            require_credible_branch_b(
+                torch.load(bb_out, map_location="cpu", weights_only=False),
+                args.allow_noncredible_branch_b)
         if wdt is None:
             # deepop-only: condition on the Branch B already on disk rather
             # than retraining it. eval() matters -- the rollout has dropout,
@@ -862,7 +960,8 @@ def main():
             if not bb_out.exists():
                 parser.error(f"--stages deepop needs a trained Branch B at {bb_out}")
             _bb = torch.load(bb_out, map_location=device, weights_only=False)
-            wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64, n_heads=4,
+            _d_state = int(_bb.get("d_state") or _bb["wdt_state_dict"]["in_proj.weight"].shape[1])
+            wdt = HostWorldDynamicsTransformer(d_latent=_d_state, d_model=64, n_heads=4,
                                                n_layers=3).to(device)
             wdt.load_state_dict(_bb["wdt_state_dict"])
             wdt.eval()
@@ -871,6 +970,68 @@ def main():
         train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,
                           num_workers=args.num_workers,patience=args.patience)
         print(f"served checkpoint updated: {dp_out}", flush=True)
+
+    if args.split_scheme == "cross_year":
+        _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device)
+
+
+def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
+    """Score the best Branch B / DeepOP checkpoints ONCE on all of CIC-2017.
+
+    Nothing here feeds back into training or selection; both models were frozen
+    on CIC-2018 validation days before this runs.
+    """
+    import json
+    from cyberworld_v4.cross_dataset import (
+        branch_b_on_store, deepop_on_store, format_unseen_report)
+    from data_unification.trajectory_store import TrajectoryStoreBuilder
+    from data_unification.training_sources import discover_captures, read_capture
+
+    _c = get_contract()
+    caps = discover_captures(scheme="cross_year", cic2017_dir=args.cic2017_dir)["test"]
+    b = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+    wbase = 0
+    for cap in caps:
+        recs = read_capture(cap, window_seconds=_c.window_seconds)
+        extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase)
+        if b._window_idx.n:
+            wbase = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+        print(f"  [test] {cap.label}: {len(recs)} records", flush=True)
+        del recs
+        gc.collect()
+    test_store = b.finalize()
+    out = {"split_scheme": "cross_year", "test_snapshots": int(test_store.n_snapshots)}
+
+    if bb_out.exists():
+        ck = torch.load(bb_out, map_location=device, weights_only=False)
+        d_state = int(ck.get("d_state") or ck["wdt_state_dict"]["in_proj.weight"].shape[1])
+        wdt = HostWorldDynamicsTransformer(d_latent=d_state, d_model=64, n_heads=4, n_layers=3).to(device)
+        wdt.load_state_dict(ck["wdt_state_dict"])
+        risk = InfiltrationRiskHead(d_latent=d_state, hidden_dim=32).to(device)
+        risk.load_state_dict(ck["risk_head_state_dict"])
+        out["branch_b"] = branch_b_on_store(wdt, risk, test_store, device,
+                                            _c.history_steps, _c.forecast_steps)
+        print(f"CIC-2017 Branch B: {out['branch_b']}", flush=True)
+        ck["test_metrics_cross_year"] = out["branch_b"]
+        torch.save(ck, bb_out)
+
+        if dp_out.exists():
+            vocab = get_joint_vocab(network_observable_only=True)
+            dck = torch.load(dp_out, map_location=device, weights_only=False)
+            decoder = DeepOPForecastDecoder.from_checkpoint(dck, device=device)
+            train_counts = LazyCWADataset(train_traj, vocab, K=_c.forecast_steps,
+                                          T=_c.history_steps).target_token_histogram()
+            out["deepop"] = deepop_on_store(decoder, wdt, test_store, vocab, device,
+                                            train_counts, _c.history_steps, _c.forecast_steps)
+            print(format_unseen_report(out["deepop"], "CIC-2017 DeepOP tokens"), flush=True)
+            print(f"  persistence token accuracy {out['deepop']['acc_persistence']:.4f}", flush=True)
+            dck["test_metrics_cross_year"] = out["deepop"]
+            torch.save(dck, dp_out)
+
+    if args.results_json:
+        args.results_json.parent.mkdir(parents=True, exist_ok=True)
+        args.results_json.write_text(json.dumps(out, indent=2, default=str))
+        print(f"results written to {args.results_json}", flush=True)
 
 
 if __name__ == "__main__":

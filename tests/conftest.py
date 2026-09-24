@@ -87,11 +87,10 @@ def _adapter_is_constructible():
     except Exception:
         return None          # a different failure is the tests' to report
 
-    # model_adapter builds a module-level adapter at import time, so the
-    # contract conflict surfaces on the import itself, not on a constructor
-    # call. Check the import.
+    # The module-level adapter is built on first access, so touch it: that is
+    # where a contract conflict surfaces.
     try:
-        import control_backend.model_adapter  # noqa: F401
+        from control_backend.model_adapter import model_adapter  # noqa: F401
     except RuntimeError as exc:
         if "contract conflict" in str(exc):
             return str(exc)

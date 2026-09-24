@@ -123,12 +123,19 @@ class FlowToTemporalEventAdapter:
             current_win_start = first_t
             start_idx = 0
 
+            W = self.window_size_sec
             for i in range(n):
-                if timestamps[i] >= current_win_start + self.window_size_sec:
+                if timestamps[i] >= current_win_start + W:
                     window_boundaries.append(
-                        (current_win_start, current_win_start + self.window_size_sec, start_idx, i)
+                        (current_win_start, current_win_start + W, start_idx, i)
                     )
-                    current_win_start = current_win_start + self.window_size_sec
+                    # Jump to the window that actually CONTAINS this record.
+                    # This used to advance by exactly one window, so after a
+                    # quiet gap a flow at t=10s was filed under [2s, 4s): wrong
+                    # timestamps on the trajectory, and the flow fell outside
+                    # its own window's neighbour cut-off. Empty windows are not
+                    # emitted; trajectory gaps are handled downstream.
+                    current_win_start = first_t + np.floor((timestamps[i] - first_t) / W) * W
                     start_idx = i
             window_boundaries.append(
                 (current_win_start, max(current_win_start + self.window_size_sec, last_t), start_idx, n)

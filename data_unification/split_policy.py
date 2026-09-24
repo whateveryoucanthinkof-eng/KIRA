@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 Split = Literal["train", "val", "test"]
 
@@ -62,14 +62,51 @@ def load_lock() -> Dict[str, Dict[str, str]]:
     return doc["assignment"]
 
 
-def split_of(dataset: str, capture_name: str) -> Split:
+# ---------------------------------------------------------------------------
+# Split schemes
+# ---------------------------------------------------------------------------
+#
+# "frozen"      the lock above, unchanged: every corpus split 4:1:1 by capture.
+#
+# "cross_year"  train on CIC-IDS-2018, test on CIC-IDS-2017. A DERIVED view of
+#               the lock, not a second lock, so it is reproducible from the
+#               same file:
+#                 * CIC-2018 (CSV or PCAP): the lock's train days -> train; its
+#                   val AND test days -> val. Every tuning decision (early
+#                   stopping, alert threshold, temperature, conformal width)
+#                   is therefore made on 2018 alone.
+#                 * CIC-2017: every capture -> test, scored once, after the
+#                   model is frozen. Nothing trained or tuned has seen 2017.
+#                 * CTU-13: excluded (None).
+#               A different year, network (AWS 172.31/16 vs lab 192.168.10/24),
+#               toolset and CICFlowMeter build: a generalisation test, not an
+#               in-distribution one. Expect lower numbers than "frozen", and
+#               read them as the honest ones.
+SCHEMES = ("frozen", "cross_year")
+
+
+def _scheme_split(dataset: str, locked: str, scheme: str) -> Optional[Split]:
+    if scheme == "frozen":
+        return locked  # type: ignore[return-value]
+    if scheme == "cross_year":
+        if dataset == "CIC2017":
+            return "test"
+        if dataset in ("CIC2018", "PCAP2018"):
+            return "train" if locked == "train" else "val"
+        return None
+    raise ValueError(f"unknown split scheme {scheme!r}; expected one of {SCHEMES}")
+
+
+def split_of(dataset: str, capture_name: str, scheme: str = "frozen") -> Optional[Split]:
+    """The split a capture belongs to under `scheme`; None = not used at all."""
     a = load_lock()
     try:
-        return a[dataset][capture_name]  # type: ignore[return-value]
+        locked = a[dataset][capture_name]
     except KeyError:
         raise KeyError(
             f"{dataset}/{capture_name} is not in the frozen split. Add it to "
             f"{_LOCK} rather than assigning it on the fly.")
+    return _scheme_split(dataset, locked, scheme)
 
 
 def captures_for(split: Split, dataset: str | None = None) -> List[str]:
@@ -110,12 +147,12 @@ def capture_name_for_path(path) -> tuple:
     raise ValueError(f"cannot map {path} to a corpus the frozen split knows")
 
 
-def split_of_path(path) -> Split:
+def split_of_path(path, scheme: str = "frozen") -> Optional[Split]:
     dataset, capture = capture_name_for_path(path)
-    return split_of(dataset, capture)
+    return split_of(dataset, capture, scheme)
 
 
-def partition_paths(paths) -> Dict[str, List]:
+def partition_paths(paths, scheme: str = "frozen") -> Dict[str, List]:
     """Group real file paths into {'train': [...], 'val': [...], 'test': [...]}
     according to the frozen lock.
 
@@ -127,9 +164,12 @@ def partition_paths(paths) -> Dict[str, List]:
     unknown = []
     for p in paths:
         try:
-            out[split_of_path(p)].append(p)
+            sp = split_of_path(p, scheme)
         except (KeyError, ValueError):
             unknown.append(str(p))
+            continue
+        if sp is not None:          # None: this scheme does not use the corpus
+            out[sp].append(p)
     if unknown:
         raise KeyError(
             f"{len(unknown)} file(s) are not in the frozen split: {unknown[:5]}"

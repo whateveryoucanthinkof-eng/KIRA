@@ -82,15 +82,46 @@ def create_host_sequence_samples(
     trajectories_by_host: Dict[str, List[HostWindowSnapshot]],
     seq_len: int = 5,
     min_trajectory_len: int = 2,
+    min_history_steps: Optional[int] = None,
+    report: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, np.ndarray]]:
     """
     Extracts sliding window sequence samples of length seq_len from per-host trajectories.
-    Pads shorter sequences with initial zero/replicated states.
+
+    ## min_history_steps -- how much REAL history a sample must have
+
+    A host with two observed windows used to produce a sample anyway: the
+    sequence was left-padded to `seq_len` with zero vectors, so 13 of 15 input
+    steps were zeros and the LSTM read mostly blank space.
+
+    That is not a rare edge case on this corpus. The shipped Branch A
+    checkpoint records `val_traj_len_median = 1.0` over 2,172,277 hosts -- the
+    MEDIAN host appears in exactly one window. With `seq_len=15` the median
+    training example is therefore fourteen-fifteenths padding, and the model
+    spends most of its capacity learning what zeros mean.
+
+    Padding is not free, either: a zero vector is a valid point in feature
+    space, not a "missing" marker, so the model cannot tell an absent step from
+    a host that genuinely sent nothing.
+
+    `min_history_steps` sets the floor. None means `seq_len` -- require the
+    window to be fully observed, which is what `cyberworld_v4.targets`
+    already does via `require_full_history`. Pass a smaller integer to allow
+    some padding, or 1 to restore the old behaviour.
+
+    `report` is filled in with the counts, because silently dropping most of a
+    corpus is exactly as bad as silently padding it. Both numbers belong in
+    the training log.
     """
     samples = []
+    need = seq_len if min_history_steps is None else max(1, int(min_history_steps))
+    stats = {"hosts": 0, "hosts_too_short": 0, "kept": 0,
+             "dropped_short_history": 0, "padded": 0, "min_history_steps": need}
 
     for host_ip, snapshots in trajectories_by_host.items():
+        stats["hosts"] += 1
         if len(snapshots) < min_trajectory_len:
+            stats["hosts_too_short"] += 1
             continue
 
         # Sort snapshots by window index
@@ -103,6 +134,10 @@ def create_host_sequence_samples(
             start_idx = max(0, end_idx - seq_len)
             window_slice = snapshots[start_idx:end_idx]
 
+            if len(window_slice) < need:
+                stats["dropped_short_history"] += 1
+                continue
+
             feature_vectors = []
             for snap in window_slice:
                 # x_t = concat(H_t[v], attrs_t)
@@ -113,6 +148,7 @@ def create_host_sequence_samples(
 
             # Left-pad if sequence is shorter than seq_len
             if len(feature_vectors) < seq_len:
+                stats["padded"] += 1
                 pad_len = seq_len - len(feature_vectors)
                 padding = [np.zeros(feat_dim, dtype=np.float32) for _ in range(pad_len)]
                 feature_seq = np.array(padding + feature_vectors, dtype=np.float32)
@@ -139,8 +175,27 @@ def create_host_sequence_samples(
                 "window_idx": target_snap.window_idx,
             }
             samples.append(sample)
+            stats["kept"] += 1
 
+    if report is not None:
+        report.update(stats)
     return samples
+
+
+def format_history_report(stats: Dict[str, int]) -> str:
+    """One line for the training log. Print it; do not let it be inferred."""
+    kept, dropped = stats.get("kept", 0), stats.get("dropped_short_history", 0)
+    total = kept + dropped
+    pad = stats.get("padded", 0)
+    frac = (dropped / total) if total else 0.0
+    out = (f"history: kept {kept} samples, dropped {dropped} with fewer than "
+           f"{stats.get('min_history_steps')} real steps ({frac:.1%}), "
+           f"{pad} still partially padded")
+    if frac > 0.5:
+        out += ("\n  WARNING: more than half the candidate samples had too little "
+                "history. The corpus is mostly one-window hosts; either lower "
+                "seq_len or accept that the split is small.")
+    return out
 
 
 class LazyHostSequenceDataset(Dataset):
@@ -170,21 +225,39 @@ class LazyHostSequenceDataset(Dataset):
     the last input step.
     """
 
-    def __init__(self, store, seq_len: int = 5, min_trajectory_len: int = 2):
+    def __init__(self, store, seq_len: int = 5, min_trajectory_len: int = 2,
+                 min_history_steps=None, report=None):
         self.store = store
         self.seq_len = seq_len
+        # Kept in lockstep with create_host_sequence_samples: a window ending
+        # at `end` has min(end, seq_len) REAL steps, so requiring `need` real
+        # steps is exactly `end >= need`. None means the full window.
+        need = seq_len if min_history_steps is None else max(1, int(min_history_steps))
+        self.min_history_steps = need
 
         hosts, host_idx, pos = [], [], []
+        kept = dropped = 0
         for h in store:
             rows = store._rows_by_host[h]
             n = len(rows)
             if n < min_trajectory_len:
                 continue
+            # end_idx from `need`..n-1. It used to start at 1, so a host with
+            # two windows produced a sample whose input was seq_len-1 zeros.
+            dropped += max(0, min(need, n) - 1)
+            if n <= need:
+                continue
             hi = len(hosts)
             hosts.append(h)
-            # end_idx from 1..n-1, matching create_host_sequence_samples
-            host_idx.append(np.full(n - 1, hi, dtype=np.int32))
-            pos.append(np.arange(1, n, dtype=np.int32))
+            k = n - need
+            kept += k
+            host_idx.append(np.full(k, hi, dtype=np.int32))
+            pos.append(np.arange(need, n, dtype=np.int32))
+
+        if report is not None:
+            report.update({"kept": kept, "dropped_short_history": dropped,
+                           "padded": 0, "min_history_steps": need,
+                           "hosts": len(hosts)})
 
         self.hosts = hosts
         # Row arrays already exist in the store; holding references to them

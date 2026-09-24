@@ -1,9 +1,26 @@
 """
 Causal Window Attention (CWA) Module for DeepOP Decoder.
 
-Implements multi-scale causal window attention:
-Allocates attention heads across different temporal window sizes (e.g., local cw=2, medium cw=4, full history),
-enforcing strict causal masking (no future leakage) within each window scale.
+Zhang, Xue and Su, "DeepOP: A Hybrid Framework for MITRE ATT&CK Sequence
+Prediction via Deep Learning and Ontology", Electronics 14(2):257, 2025,
+Section 3.4, Eqs. 7-10:
+
+  * the h heads are divided into n_cw groups, one per window size cw_i
+    (paper example and default here: h = 6, n_cw = 3);
+  * Eq. 7   Split(x, cw_i) = {X^(1)_cw_i, X^(2)_cw_i, ...}: the sequence is
+            PARTITIONED into consecutive non-overlapping windows of size cw_i;
+  * Eq. 9-10 causal attention inside each window;
+  * Eq. 8   the window groups are concatenated and projected.
+
+window_mode="partitioned" is the paper. window_mode="sliding" (each position
+attends to the previous cw_i positions, across window borders) is what this
+module implemented before; it is kept for checkpoints trained that way.
+
+Eq. 9 literally writes the mask as 1 for t' < t and -inf for t' >= t, which
+would forbid a position from attending to itself and leave the first position
+of every window with no admissible key (an undefined softmax). The standard
+causal mask t' <= t is used; it is the only reading under which Eq. 10 is
+defined.
 """
 
 import math
@@ -25,8 +42,12 @@ class CausalWindowAttention(nn.Module):
         n_heads: int = 6,
         window_sizes: Optional[List[int]] = None,
         dropout: float = 0.1,
+        window_mode: str = "partitioned",
     ):
         super(CausalWindowAttention, self).__init__()
+        if window_mode not in ("partitioned", "sliding"):
+            raise ValueError(f"window_mode must be 'partitioned' or 'sliding', got {window_mode!r}")
+        self.window_mode = window_mode
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.d_model = d_model
         self.n_heads = n_heads
@@ -42,6 +63,17 @@ class CausalWindowAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
 
         self.dropout = nn.Dropout(dropout)
+
+    def _partitioned_mask(self, n_q: int, n_k: int, window_size: int, device) -> torch.Tensor:
+        """Additive mask for Eq. 7 + 9: key j is visible to query i iff j <= i and
+        both lie in the same window block. Queries are aligned to the END of the
+        key sequence, which covers both full-sequence attention (n_q == n_k)
+        and single-step autoregressive decoding (n_q == 1)."""
+        q_pos = torch.arange(n_k - n_q, n_k, device=device).unsqueeze(1)
+        k_pos = torch.arange(n_k, device=device).unsqueeze(0)
+        ok = (k_pos <= q_pos) & ((k_pos // window_size) == (q_pos // window_size))
+        mask = torch.full((n_q, n_k), float("-inf"), device=device)
+        return mask.masked_fill(ok, 0.0)
 
     def _build_window_mask(self, seq_len: int, window_size: int, device: torch.device) -> torch.Tensor:
         """
@@ -99,6 +131,18 @@ class CausalWindowAttention(nn.Module):
             q_group = Q[:, h_start:h_end]  # [B, h_group, N_q, d_head]
             k_group = K[:, h_start:h_end]  # [B, h_group, N_k, d_head]
             v_group = V[:, h_start:h_end]  # [B, h_group, N_k, d_head]
+
+            if self.window_mode == "partitioned":
+                # Sequences here are a handful of forecast steps, so the dense
+                # (N_q x N_k) mask is cheaper than any unfolding.
+                scores = torch.matmul(q_group, k_group.transpose(-2, -1)) * scale_factor
+                scores = scores + self._partitioned_mask(N_q, N_k, win_size, q.device)
+                if key_padding_mask is not None:
+                    scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+                attn_weights = torch.nan_to_num(F.softmax(scores, dim=-1), 0.0)
+                attn_weights = self.dropout(attn_weights)
+                head_outputs.append(torch.matmul(attn_weights, v_group))
+                continue
 
             if N_q == 1 and N_k >= 1:
                 # Autoregressive single-step generation: attend only to last min(N_k, W) tokens

@@ -15,6 +15,18 @@ from cyberworld_v4.identity import HostId, offline_host, live_host, stable_id
 from cyberworld_v4.targets import (
     NO_ONSET, build_samples, cumulative_from_hazard, split_on_gaps,
 )
+from cyberworld_v4.config import TemporalContract
+import dataclasses
+
+#: Target SEMANTICS (a target is future, hazard fires once, techniques are
+#: multilabel) are independent of how wide a forecast bucket is. These tests
+#: use a single-scale contract so they stay short and keep testing semantics;
+#: the bucketing itself is tested separately below.
+SINGLE_SCALE = dataclasses.replace(
+    DEFAULT_CONFIG,
+    temporal=TemporalContract(window_seconds=2.0, history_steps=15,
+                              forecast_steps=5, forecast_window_seconds=2.0),
+)
 
 
 @dataclass
@@ -46,7 +58,13 @@ def make_snaps(n, attack_from=None, step=2.0, t0=0.0):
 def test_contract_is_the_v4_values():
     c = get_contract()
     assert (c.window_seconds, c.history_steps, c.forecast_steps) == (2.0, 15, 5)
-    assert c.history_seconds == 30.0 and c.forecast_seconds == 10.0
+    assert c.history_seconds == 30.0
+    # The horizon is now 150s (5 steps x 30s), not 10s. At 10s the label
+    # essentially never changed, so persistence scored Brier 0.00067 and the
+    # credibility gate fired DEGENERATE TASK on every run.
+    assert c.forecast_window_seconds == 30.0
+    assert c.forecast_seconds == 150.0
+    assert c.forecast_stride == 15
 
 
 def test_contract_refuses_mismatch():
@@ -106,10 +124,10 @@ def test_live_host_namespace():
 def test_no_target_comes_from_the_input_window():
     """The v3 defect: target_snap = window_slice[-1]."""
     snaps = make_snaps(40, attack_from=25)
-    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"])
-    L, K = DEFAULT_CONFIG.temporal.history_steps, DEFAULT_CONFIG.temporal.forecast_steps
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"], SINGLE_SCALE)
+    L, K = SINGLE_SCALE.temporal.history_steps, SINGLE_SCALE.temporal.forecast_steps
     for s in ss:
-        assert s.features.shape == (L, DEFAULT_CONFIG.state_dim)
+        assert s.features.shape == (L, SINGLE_SCALE.state_dim)
         assert s.future_attack.shape == (K,)
         # the last input state is at index t_index; targets start at t_index+1
         assert s.t_end == snaps[s.t_index].window_end
@@ -117,7 +135,7 @@ def test_no_target_comes_from_the_input_window():
 
 def test_future_targets_are_actually_future():
     snaps = make_snaps(40, attack_from=25)
-    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"])
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"], SINGLE_SCALE)
     for s in ss:
         expected = [int(snaps[s.t_index + 1 + k].is_attack) for k in range(len(s.future_attack))]
         assert list(s.future_attack) == expected
@@ -125,7 +143,7 @@ def test_future_targets_are_actually_future():
 
 def test_hazard_marks_onset_once_and_censors_ongoing():
     snaps = make_snaps(40, attack_from=25)
-    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"])
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"], SINGLE_SCALE)
     onsets = [s for s in ss if s.onset_step != NO_ONSET]
     assert onsets, "no onset detected in a trajectory that contains one"
     for s in onsets:
@@ -150,7 +168,7 @@ def test_techniques_are_multilabel():
     snaps = make_snaps(30, attack_from=10)
     for s in snaps[10:]:
         s.technique_ids = ["T1046", "T1071"]
-    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046", "T1071"])
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046", "T1071"], SINGLE_SCALE)
     multi = [s for s in ss if s.future_techniques.sum() > 0]
     assert multi, "no technique targets produced"
     assert max(s.future_techniques.sum(axis=1).max() for s in multi) >= 2
@@ -167,3 +185,89 @@ def test_gaps_split_trajectories():
 def test_short_trajectory_yields_nothing():
     """Fewer than history+horizon states cannot form a sample."""
     assert build_samples(make_snaps(10), offline_host("d", "s", "c", "h"), ["Benign"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Two-scale forecasting: fine input, coarse targets
+# ---------------------------------------------------------------------------
+
+
+def _two_scale(stride, K=3, L=4):
+    import dataclasses
+    return dataclasses.replace(
+        DEFAULT_CONFIG,
+        temporal=TemporalContract(window_seconds=2.0, history_steps=L,
+                                  forecast_steps=K,
+                                  forecast_window_seconds=2.0 * stride),
+    )
+
+
+def test_the_input_window_stays_fine_grained():
+    """Coarsening must change TARGETS only; detection still sees 2s detail."""
+    cfg = _two_scale(stride=5)
+    snaps = make_snaps(60, attack_from=40)
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"], cfg)
+    assert ss
+    for s in ss:
+        assert s.features.shape == (cfg.temporal.history_steps, cfg.state_dim)
+
+
+def test_a_bucket_is_an_attack_if_any_window_in_it_is():
+    """The question is 'under attack in the next 30s', not 'at exactly t+30s'."""
+    cfg = _two_scale(stride=5, K=2, L=3)
+    snaps = make_snaps(40)
+    snaps[9].is_attack = True          # a single attack window
+    snaps[9].technique_ids = ["T1046"]
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"], cfg)
+    hit = [s for s in ss if s.future_attack.sum() > 0]
+    assert hit, "a lone attack window vanished from every bucket"
+    # the sample whose first bucket covers windows 5..9
+    s = [x for x in ss if x.t_index == 4][0]
+    assert s.future_attack[0] == 1
+
+
+def test_a_bucket_takes_the_union_of_techniques():
+    cfg = _two_scale(stride=4, K=2, L=3)
+    snaps = make_snaps(40)
+    snaps[4].is_attack = True; snaps[4].technique_ids = ["T1046"]
+    snaps[6].is_attack = True; snaps[6].technique_ids = ["T1071"]
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"),
+                       ["Benign", "T1046", "T1071"], cfg)
+    s = [x for x in ss if x.t_index == 2][0]   # bucket 0 covers windows 3..6
+    assert s.future_techniques[0].sum() == 2, "one technique was dropped by bucketing"
+
+
+def test_the_horizon_covers_stride_times_K_windows():
+    cfg = _two_scale(stride=5, K=3, L=4)
+    snaps = make_snaps(60, attack_from=50)
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"], cfg)
+    span = cfg.temporal.forecast_stride * cfg.temporal.forecast_steps
+    assert max(x.t_index for x in ss) + span <= len(snaps) - 1, "horizon ran past the segment"
+    assert cfg.temporal.forecast_seconds == 2.0 * span
+
+
+def test_stride_one_is_identical_to_the_old_single_scale_behaviour():
+    """A guarantee for anyone comparing against a pre-existing run."""
+    cfg = _two_scale(stride=1, K=5, L=15)
+    snaps = make_snaps(40, attack_from=25)
+    ss = build_samples(snaps, offline_host("d", "s", "c", "h"), ["Benign", "T1046"], cfg)
+    for s in ss:
+        expected = [int(snaps[s.t_index + 1 + k].is_attack) for k in range(5)]
+        assert list(s.future_attack) == expected
+
+
+def test_a_non_integer_bucket_is_refused():
+    import dataclasses
+    bad = TemporalContract(window_seconds=2.0, history_steps=4, forecast_steps=3,
+                           forecast_window_seconds=5.0)
+    with pytest.raises(ValueError, match="whole multiple"):
+        bad.forecast_stride
+
+
+def test_a_legacy_checkpoint_is_read_as_single_scale():
+    """Checkpoints written before the field existed really were 1:1."""
+    c = TemporalContract(window_seconds=2.0, history_steps=15, forecast_steps=5,
+                         forecast_window_seconds=2.0)
+    assert c.matches({"window_seconds": 2.0, "history_steps": 15, "forecast_steps": 5})
+    assert not get_contract().matches(
+        {"window_seconds": 2.0, "history_steps": 15, "forecast_steps": 5}),         "a 10s-horizon checkpoint must not silently pass as a 150s one"

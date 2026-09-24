@@ -24,10 +24,15 @@ C2 = get_joint_vocab().encode("C2", "T1071")
 
 
 def _decoder(**kw):
+    """The decoder-only architecture these defects were found in. The DeepOP
+    encoder-decoder (the default now) is covered by
+    test_models_follow_the_papers.py."""
     torch.manual_seed(0)
+    arch = dict(DeepOPForecastDecoder.LEGACY_ARCH, max_seq_len=16)
+    arch.update(kw)
     return DeepOPForecastDecoder(
         d_latent=12, d_model=72, vocab_size=V, n_heads=6, num_layers=2,
-        window_sizes=[2, 4, 8], dim_feedforward=144, **kw)
+        window_sizes=[2, 4, 8], dim_feedforward=144, **arch)
 
 
 # ---------------------------------------------------------------------------

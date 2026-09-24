@@ -87,33 +87,6 @@ def get_default_history_steps() -> int:
     return DEFAULT_HISTORY_STEPS
 
 
-def validate_temporal_contract(
-    runtime_window_size: float,
-    model_window_size: float,
-    requested_horizon: int,
-    model_horizon: int,
-    requested_history: int = DEFAULT_HISTORY_STEPS,
-    model_history: int = DEFAULT_HISTORY_STEPS,
-) -> None:
-    """Fails loudly with ValueError on an irreconcilable temporal mismatch."""
-    if abs(runtime_window_size - model_window_size) > 1e-3:
-        raise ValueError(
-            f"Temporal mismatch: runtime window ({runtime_window_size}s) != model window "
-            f"({model_window_size}s). A model trained on {model_window_size}s transitions "
-            f"cannot be deployed with {runtime_window_size}s windows."
-        )
-    if requested_horizon > model_horizon:
-        raise ValueError(
-            f"Horizon mismatch: requested horizon ({requested_horizon}) exceeds model "
-            f"capability ({model_horizon})."
-        )
-    if requested_history != model_history:
-        raise ValueError(
-            f"History mismatch: requested history ({requested_history}) != model history "
-            f"({model_history})."
-        )
-
-
 def normalize_time_delta(
     delta_t: Union[float, torch.Tensor],
     reference_dt: float = LIVE_WINDOW_SIZE_SEC,

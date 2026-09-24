@@ -89,7 +89,10 @@ def test_shuffling_is_refused_when_memory_is_enabled():
 
 def test_shuffling_is_on_by_default_and_can_be_disabled():
     src = open("bita/train.py").read()
-    assert "'--shuffle_batches', action='store_true', default=True" in src
+    # Resolved after parsing: on for the memoryless ablation, off with the
+    # BiTA memory (the default), which needs time-ordered batches.
+    assert "'--shuffle_batches', action='store_true', default=None" in src
+    assert "args.shuffle_batches = not args.use_memory" in src
     assert "'--no_shuffle_batches'" in src
 
 

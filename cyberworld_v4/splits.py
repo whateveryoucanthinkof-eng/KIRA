@@ -183,6 +183,100 @@ def chronological_split(
     return assign
 
 
+def frozen_capture_split(
+    items,
+    group_of,
+    lock,
+    *,
+    calibration_fraction: float = 0.15,
+    time_of=None,
+) -> SplitAssignment:
+    """Apply `data_unification/splits.lock.json` to v4 samples.
+
+    The lock is the repository's existing answer to "which capture is in which
+    split": 41 captures, stratified by measured attack fraction and dealt
+    round-robin 4:1:1 so no split clusters all the quiet days together. Every
+    v3 trainer reads it. The v4 trainer did not -- it recomputed a split at
+    training time from bare IPs, which is both a weaker design and a different
+    answer, so v3 and v4 numbers were never comparable.
+
+    The lock names three splits and v4 needs four. CALIBRATION is carved out of
+    the LOCK'S TRAIN captures -- never out of validation, which would inherit
+    model-selection optimism, and never out of test. It takes the last
+    `calibration_fraction` of train captures in time order, so calibration data
+    is also the most recent train data, which is the closest stand-in for
+    deployment conditions.
+
+    `lock` is `{dataset: {capture_name: split}}`, i.e. the output of
+    `data_unification.split_policy.load_lock()`. A group the lock does not name
+    is an error: dropping it silently would shrink a split, and assigning it on
+    the fly would make the split unreproducible.
+    """
+    if not 0.0 <= calibration_fraction < 1.0:
+        raise ValueError(f"calibration_fraction must be in [0, 1), got {calibration_fraction}")
+
+    flat = {f"{ds}|{cap}": split for ds, m in lock.items() for cap, split in m.items()}
+
+    first_seen: Dict[str, float] = {}
+    sizes: Dict[str, int] = defaultdict(int)
+    order: List[str] = []
+    for idx, it in enumerate(items):
+        g = group_of(it)
+        if g not in sizes:
+            order.append(g)
+        sizes[g] += 1
+        t = float(time_of(it)) if time_of is not None else float(idx)
+        if g not in first_seen or t < first_seen[g]:
+            first_seen[g] = t
+
+    unknown = [g for g in order if g not in flat]
+    if unknown:
+        raise KeyError(
+            f"{len(unknown)} capture(s) are not in the frozen split lock: "
+            f"{sorted(unknown)[:5]}{'...' if len(unknown) > 5 else ''}. Add them "
+            f"with scripts/freeze_splits.py rather than assigning them here."
+        )
+
+    buckets: Dict[SplitName, List[str]] = {k: [] for k in SPLIT_ORDER}
+    lock_train = []
+    for g in order:
+        where = flat[g]
+        if where == "train":
+            lock_train.append(g)
+        elif where == "val":
+            buckets[VAL].append(g)
+        elif where == "test":
+            buckets[TEST].append(g)
+        else:
+            raise ValueError(f"lock assigns {g} to unknown split {where!r}")
+
+    # Carve calibration off the END of train, in time order.
+    lock_train.sort(key=lambda g: (first_seen[g], g))
+    n_cal = int(round(calibration_fraction * len(lock_train)))
+    n_cal = max(1, n_cal) if lock_train and calibration_fraction > 0 else n_cal
+    n_cal = min(n_cal, max(0, len(lock_train) - 1))   # never empty train
+    buckets[CALIB] = lock_train[len(lock_train) - n_cal:] if n_cal else []
+    buckets[TRAIN] = lock_train[: len(lock_train) - n_cal]
+
+    achieved = {k: sum(sizes[g] for g in v) for k, v in buckets.items()}
+    total = sum(sizes.values())
+    assign = SplitAssignment(
+        groups=buckets,
+        strategy="frozen_capture_lock",
+        notes={
+            "lock_captures": len(flat),
+            "groups_present": len(order),
+            "samples_per_split": achieved,
+            "fractions_achieved": {k: round(v / total, 4) for k, v in achieved.items()} if total else {},
+            "calibration_fraction_requested": calibration_fraction,
+            "calibration_from": "last train captures in time order",
+            "unit": "capture",
+        },
+    )
+    assign.assert_disjoint()
+    return assign
+
+
 def scenario_held_out_split(
     groups: Sequence[str],
     *,

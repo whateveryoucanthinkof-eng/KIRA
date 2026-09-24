@@ -161,7 +161,9 @@ def test_the_guard_keeps_none_as_none():
         assert cap == expected
 
 
-@pytest.mark.parametrize("script", ["retrain_branch_a_live", "retrain_future_models_live"])
+# Branch A reads through data_unification.training_sources (shared with the
+# encoder and the Branch B/DeepOP PCAP path), so that is where its stride lives.
+@pytest.mark.parametrize("script", ["data_unification.training_sources", "retrain_future_models_live"])
 def test_strided_keeps_everything_when_want_is_none(script):
     """`want` is None at full density. Comparing int >= None raises, and
     defaulting it to 0 would silently return an empty list -- worse than the
@@ -181,7 +183,7 @@ def test_strided_keeps_everything_when_want_is_none(script):
     assert _strided(iter([]), 1, None) == []
 
 
-@pytest.mark.parametrize("script", ["retrain_branch_a_live", "retrain_future_models_live"])
+@pytest.mark.parametrize("script", ["data_unification.training_sources", "retrain_future_models_live"])
 def test_strided_defaults_want_to_none(script):
     """The default must be 'no cap', matching full density."""
     import importlib

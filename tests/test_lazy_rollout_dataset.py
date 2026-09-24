@@ -72,7 +72,7 @@ def test_edge_padding_at_the_end_of_a_trajectory():
     st = _store(n_hosts=1, n_win=T + 2)       # only 2 samples, both short on future
     lazy = LazyHostRolloutDataset(st, T=T, K=K)
     last = lazy[len(lazy) - 1]
-    assert last["h_future"].shape == (K, 12)
+    assert last["h_future"].shape == (K, 27)
     assert last["risk_future"].shape == (K,)
     # edge padding repeats the final real value
     assert torch.allclose(last["h_future"][-1], last["h_future"][-2])
@@ -83,8 +83,8 @@ def test_history_is_exactly_T_steps_and_strictly_before_the_future():
     lazy = LazyHostRolloutDataset(st, T=T, K=K)
     for i in range(min(20, len(lazy))):
         s = lazy[i]
-        assert s["h_history"].shape == (T, 12)
-        assert s["h_future"].shape == (K, 12)
+        assert s["h_history"].shape == (T, 27)
+        assert s["h_future"].shape == (K, 27)
 
 
 def test_hosts_with_too_little_history_are_excluded():
@@ -105,7 +105,7 @@ def test_it_works_through_a_dataloader():
     ds = LazyHostRolloutDataset(st, T=T, K=K)
     n = 0
     for b in DataLoader(ds, batch_size=8, shuffle=True):
-        assert b["h_history"].shape[1:] == (T, 12)
-        assert b["h_future"].shape[1:] == (K, 12)
+        assert b["h_history"].shape[1:] == (T, 27)
+        assert b["h_future"].shape[1:] == (K, 27)
         n += len(b["h_history"])
     assert n == len(ds)

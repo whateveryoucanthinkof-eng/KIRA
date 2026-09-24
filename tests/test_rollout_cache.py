@@ -133,3 +133,20 @@ def test_cache_file_is_unlinked_so_it_cannot_leak():
     wdt, ds = _wdt(7), _HistoryOnly(n=24)
     rfm._precompute_rollouts(wdt, ds, "cpu", tmp, "leak", K, batch=8, num_workers=0)
     assert glob.glob(os.path.join(tmp, "*.f32")) == [], "spill file was left on disk"
+
+
+def test_cache_takes_the_world_state_width():
+    """Branch B rolls out the 27-D world state; a 12-wide cache crashed DeepOP."""
+    torch.manual_seed(3)
+    wdt = HostWorldDynamicsTransformer(d_latent=27, d_model=64, n_heads=4, n_layers=3).eval()
+
+    class _Wide(_HistoryOnly):
+        def __init__(self):
+            self.h = torch.randn(10, T, 27)
+
+    ds = _Wide()
+    cache = rfm._precompute_rollouts(wdt, ds, "cpu", None, "wide", K, batch=4, num_workers=0)
+    assert cache.shape == (10, K, 27)
+    with torch.no_grad():
+        ref = wdt.rollout(ds.h[:4], K=K).numpy()
+    np.testing.assert_allclose(cache[:4], ref, atol=1e-5)

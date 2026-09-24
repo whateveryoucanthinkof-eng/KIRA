@@ -403,9 +403,9 @@ The live adapter computes input saliency for the Branch A risk output. Gradients
 The `correlation/` package is downstream analytical infrastructure:
 
 - `trajectory_assembler.py`: builds host attack trajectories from temporal entries.
-- `causal_edge_scorer.py`: scores likely causal transitions between events.
+- `causal_edge_scorer.py`: hand-set heuristic (not learned) scoring of causal transitions between events, bounded to the models' 180 s evidence horizon. Not called by the live backend.
 - `graph_compaction.py`: reduces detailed alert graphs while preserving important evidence.
-- `campaign_merge.py`: merges related host trajectories into campaigns.
+- `campaign_merge.py`: merges related host trajectories into campaigns, split on time gaps wider than the evidence horizon.
 
 These modules are useful for future campaign-level SOC correlation, but the current telemetry-to-dashboard path primarily emits per-window topology and prediction events. They are not the source of live model inference.
 
@@ -475,7 +475,8 @@ Profiles:
 - `config/sites/containerlab-enterprise.yaml`: Lab Mode, Containerlab sensor, enterprise CIDRs, and lab assets.
 - `config/sites/local-default.yaml`: non-lab Local SPAN profile.
 
-`config/temporal_contract.json` records shared timing and shape expectations.
+The temporal contract lives only in `cyberworld_v4/config.py` (`get_contract()`). The old
+`config/temporal_contract.json` (5 history / 8 forecast / 16 s) was read by nothing and has been deleted.
 
 ## 13. Commands and Event Transport
 
@@ -614,7 +615,6 @@ The production tests focus on contracts at the backend boundary rather than pack
 - `implementation.md`: local implementation plan and design decisions; intentionally ignored from Git.
 - `run_dashboard.py`: primary application launcher.
 - `.gitignore`: generated files, datasets, caches, secrets, frontend dependencies, and local planning files.
-- `config/temporal_contract.json`: temporal contract metadata.
 - `captures/live.pcap`: local capture artifact.
 - `captures/states.jsonl`: local state-stream artifact.
 
