@@ -40,6 +40,32 @@ def test_cross_year_tunes_only_on_2018_and_tests_only_on_2017():
         assert split_of("CTU13", cap, "cross_year") is None
 
 
+def test_cross_year_ctu_adds_ctu13_to_training_and_never_tests_it():
+    from data_unification.split_policy import is_cross_year, load_lock, split_of
+    lock = load_lock()
+    assert is_cross_year("cross_year_ctu") and is_cross_year("cross_year")
+    assert not is_cross_year("frozen")
+    got = {split_of("CTU13", cap, "cross_year_ctu") for cap in lock["CTU13"]}
+    assert got == {"train", "val"}, got
+    for cap, locked in lock["CTU13"].items():
+        assert (split_of("CTU13", cap, "cross_year_ctu") == "train") == (locked == "train")
+    # Everything else is exactly cross_year: same 2018 split, same 2017 test.
+    for ds in ("CIC2017", "CIC2018", "PCAP2018"):
+        for cap in lock[ds]:
+            assert split_of(ds, cap, "cross_year_ctu") == split_of(ds, cap, "cross_year")
+
+
+def test_cross_year_ctu_is_accepted_by_every_trainer():
+    for rel in ("bita/train.py", "scripts/retrain_branch_a_live.py",
+                "scripts/retrain_future_models_live.py"):
+        src = (REPO / rel).read_text(encoding="utf-8")
+        assert "cross_year_ctu" in src, f"{rel} does not accept cross_year_ctu"
+    fut = (REPO / "scripts/retrain_future_models_live.py").read_text(encoding="utf-8")
+    # The PCAP path used to read PCAP days only; CTU-13 must reach Branch B too.
+    assert 'if args.split_scheme == "cross_year_ctu":' in fut
+    assert "ctu13_dir=args.ctu_dir" in fut
+
+
 def test_frozen_scheme_is_unchanged():
     from data_unification.split_policy import load_lock, split_of
     lock = load_lock()

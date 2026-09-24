@@ -58,6 +58,39 @@ def conformal_quantile(scores: np.ndarray, alpha: float) -> float:
     return float(s[k - 1])
 
 
+def halfwidth_from_histogram(hist, alpha: float = 0.05) -> Dict[str, Any]:
+    """Split-conformal half-width from a histogram of |residuals| in [0, 1].
+
+    For residuals too many to hold (a full-corpus validation split), binned on
+    device as `floor(r * (bins - 1))`. Same order statistic as
+    `conformal_quantile`: the ceil((n+1)(1-alpha))-th smallest residual. Binning
+    rounds it UP to the bin's upper edge, so the interval over-covers by at
+    most one bin -- the safe direction; rounding down would over-state
+    coverage. `empirical_coverage` is what that rounded width achieves on the
+    same residuals, reported rather than assumed.
+    """
+    h = np.asarray(hist, dtype=np.int64).ravel()
+    bins = h.size
+    n = int(h.sum())
+    if n == 0:
+        return {"fitted": False, "n": 0, "reason": "no residuals"}
+    k = int(np.ceil((n + 1) * (1.0 - alpha)))
+    if k > n:
+        return {"fitted": False, "n": n,
+                "reason": f"{n} points cannot support {(1 - alpha) * 100:.1f}% coverage"}
+    cum = np.cumsum(h)
+    b = int(np.searchsorted(cum, k, side="left"))
+    return {
+        "fitted": True,
+        "alpha": float(alpha),
+        "target_coverage": 1.0 - float(alpha),
+        "half_width": min(float(b + 1) / (bins - 1), 1.0),
+        "empirical_coverage": float(cum[b] / n),
+        "n": n,
+        "bin_width": 1.0 / (bins - 1),
+    }
+
+
 @dataclass
 class SplitConformal:
     """Split conformal intervals from calibration residuals.
@@ -79,17 +112,141 @@ class SplitConformal:
         p = np.asarray(y_pred, dtype=float)
         return p - self.quantile_, p + self.quantile_
 
-    def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
-        """Empirical coverage vs target. Report both; never claim the target alone."""
+    def evaluate(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        groups: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """Empirical coverage vs target. Report both; never claim the target alone.
+
+        `groups` -- pass the label. Split conformal guarantees MARGINAL coverage
+        only. On a target that is 0 for most windows the quantile is set by the
+        benign majority, so 95% overall coverage can sit on top of far lower
+        coverage for the attack windows -- the ones that matter. With `groups`
+        the per-group coverage is reported instead of being averaged away.
+        """
         lo, hi = self.interval(y_pred)
-        y = np.asarray(y_true, dtype=float)
-        covered = (y >= lo) & (y <= hi)
-        return {
+        y = np.asarray(y_true, dtype=float).ravel()
+        covered = (y >= lo.ravel()) & (y <= hi.ravel())
+        out = {
             "target_coverage": 1 - self.alpha,
             "empirical_coverage": float(covered.mean()),
             "median_width": float(np.median(hi - lo)),
             "quantile": self.quantile_,
             "n_calibration": self.n_calibration_,
+            "n_test": int(y.size),
+        }
+        if groups is not None:
+            out.update(coverage_by_group(covered, groups))
+        return out
+
+
+def coverage_by_group(covered: np.ndarray, groups: np.ndarray) -> Dict[str, Any]:
+    """Coverage within each group, plus the worst group.
+
+    Keys are str(group) so the result survives a JSON round trip unchanged.
+    """
+    covered = np.asarray(covered, dtype=bool).ravel()
+    groups = np.asarray(groups).ravel()
+    if groups.size != covered.size:
+        raise ValueError(f"groups has {groups.size} entries but there are "
+                         f"{covered.size} predictions")
+    per: Dict[str, Dict[str, float]] = {}
+    for g in np.unique(groups):
+        m = groups == g
+        key = str(g.item() if hasattr(g, "item") else g)
+        per[key] = {"n": int(m.sum()), "empirical_coverage": float(covered[m].mean())}
+    worst = min(per, key=lambda k: per[k]["empirical_coverage"]) if per else None
+    return {
+        "coverage_by_group": per,
+        "worst_group": worst,
+        "worst_group_coverage": per[worst]["empirical_coverage"] if worst is not None else float("nan"),
+    }
+
+
+@dataclass
+class LabelConditionalConformal:
+    """Label-conditional (Mondrian) conformal prediction sets for a classifier.
+
+    Vovk, Gammerman & Shafer, "Algorithmic Learning in a Random World" (2005),
+    Sec. 4.5; Sadinle, Lei & Wasserman, JASA 2019. One quantile per class,
+    fitted only on the calibration points OF THAT CLASS:
+
+        s(x, c) = 1 - p_c(x)
+        q_c     = conformal_quantile({s(x_i, c) : y_i = c}, alpha)
+        C(x)    = {c : s(x, c) <= q_c}
+
+    Guarantee: P(y in C(x) | y = c) >= 1 - alpha for EVERY class c, under
+    exchangeability within that class. Marginal split conformal gives no such
+    thing for the minority class: on a ~17% attack base rate its 95% can be
+    met almost entirely by benign windows. Here the attack class gets its own
+    95%, paid for with larger (ambiguous) sets where the model cannot separate
+    the classes -- `ambiguous_rate` says how often.
+
+    A class with too few calibration points for `alpha` gets q_c = inf: it is
+    in every set, because no guarantee can be given without data. That shows
+    up in `quantiles_` and in `mean_set_size` rather than silently.
+
+    Like every split method this assumes the calibration windows represent
+    test. An attacker who shifts their traffic away from the calibration
+    distribution breaks that assumption, which is why coverage is measured
+    on test by `evaluate` and never taken from the target.
+    """
+
+    alpha: float = 0.05
+    quantiles_: Dict[int, float] = field(default_factory=dict)
+    n_calibration_: Dict[int, int] = field(default_factory=dict)
+
+    @staticmethod
+    def _as_proba(proba: np.ndarray) -> np.ndarray:
+        p = np.asarray(proba, dtype=float)
+        if p.ndim == 1:  # binary, given as P(class 1)
+            p = np.stack([1.0 - p, p], axis=1)
+        if p.ndim != 2:
+            raise ValueError(f"expected [N] or [N, C] probabilities, got shape {p.shape}")
+        return p
+
+    def fit(self, y_true: np.ndarray, proba: np.ndarray) -> "LabelConditionalConformal":
+        p = self._as_proba(proba)
+        y = np.asarray(y_true).astype(int).ravel()
+        if y.size != p.shape[0]:
+            raise ValueError(f"{y.size} labels for {p.shape[0]} predictions")
+        self.quantiles_, self.n_calibration_ = {}, {}
+        for c in range(p.shape[1]):
+            s = 1.0 - p[y == c, c]
+            self.quantiles_[c] = conformal_quantile(s, self.alpha)
+            self.n_calibration_[c] = int(s.size)
+        return self
+
+    def predict_sets(self, proba: np.ndarray) -> np.ndarray:
+        """[N, C] boolean: is class c in the prediction set of sample n."""
+        if not self.quantiles_:
+            raise RuntimeError("fit() on the calibration split first")
+        p = self._as_proba(proba)
+        q = np.array([self.quantiles_.get(c, float("inf")) for c in range(p.shape[1])])
+        return (1.0 - p) <= q[None, :]
+
+    def evaluate(self, y_true: np.ndarray, proba: np.ndarray) -> Dict[str, Any]:
+        sets = self.predict_sets(proba)
+        y = np.asarray(y_true).astype(int).ravel()
+        if y.size != sets.shape[0]:
+            raise ValueError(f"{y.size} labels for {sets.shape[0]} predictions")
+        covered = sets[np.arange(y.size), y]
+        by_class = coverage_by_group(covered, y)
+        for c, rec in by_class["coverage_by_group"].items():
+            rec["quantile"] = self.quantiles_.get(int(c), float("inf"))
+            rec["n_calibration"] = self.n_calibration_.get(int(c), 0)
+        size = sets.sum(axis=1)
+        return {
+            "target_coverage": 1 - self.alpha,
+            "empirical_coverage": float(covered.mean()),
+            "coverage_by_class": by_class["coverage_by_group"],
+            "worst_class": by_class["worst_group"],
+            "worst_class_coverage": by_class["worst_group_coverage"],
+            "mean_set_size": float(size.mean()),
+            "empty_set_rate": float((size == 0).mean()),
+            "ambiguous_rate": float((size > 1).mean()),
             "n_test": int(y.size),
         }
 

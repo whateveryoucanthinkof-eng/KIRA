@@ -33,6 +33,9 @@ DEFAULTS = {
     "aggregator_type": "bigru_transformer", "memory_updater_type": "gru",
     "edge_feat_dim": 12, "node_feat_dim": 12,
     "feature_schema_version": SCHEMA_VERSION,
+    # bita/train.py defaults (--n_degree 10, no --uniform): what every shipped
+    # encoder was trained with.
+    "n_neighbors": 10, "neighbor_sampling": "most_recent",
 }
 
 

@@ -617,6 +617,98 @@ class MultiTaskLSTM(nn.Module):
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes multi-task loss with calibrated focal loss and uncertainty weighting."""
+        risk_loss, tech_loss, grad_loss = self.task_losses(predictions, batch)
+
+        if self.loss_weighting == "fixed":
+            a, b, c = self.loss_weights
+            total_loss = a * risk_loss + b * tech_loss + c * grad_loss
+            metrics = {
+                "loss_total": total_loss.detach(),
+                "loss_risk": risk_loss.detach(),
+                "loss_tech": tech_loss.detach(),
+                "loss_grad": grad_loss.detach(),
+                "weight_risk": torch.tensor(a),
+                "weight_tech": torch.tensor(b),
+                "weight_grad": torch.tensor(c),
+            }
+        else:
+            total_loss, metrics = self.uncertainty_loss(risk_loss, tech_loss, grad_loss)
+        # Reported so a run can see whether a temperature has been fitted yet;
+        # it is 1.0 (inert) for the whole of training by construction.
+        metrics["temperature"] = self.effective_temperature.detach()
+        return total_loss, metrics
+
+    #: Parameters owned by one task. Everything else -- the LSTM and, in the
+    #: legacy architecture, the attention readout -- is the shared trunk.
+    TASK_PARAM_PREFIXES = ("risk_head.", "technique_head.", "gradation_head.", "uncertainty_loss.")
+
+    def task_gradient_conflict(
+        self,
+        x: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> Dict[str, Any]:
+        """Do the three tasks pull the shared LSTM in opposing directions?
+
+        Negative transfer between tasks is the failure PCGrad and GradNorm
+        exist for. Whether it happens here is an empirical question, and this
+        answers it directly: the cosine between each pair of per-task gradients
+        on the shared parameters. cos < 0 means one task's step undoes the
+        other's; persistently negative values across epochs are the evidence
+        that would justify gradient surgery. Near zero or positive means it
+        would buy nothing.
+
+        `weighted_grad_norm` is each task's gradient scaled by the weight the
+        objective currently gives it (fixed 0.5/0.3/0.2, or exp(-log_var)), so
+        a task that dominates the shared update is visible even when the
+        directions agree.
+
+        Uses torch.autograd.grad, so no `.grad` is written and an optimizer
+        step is unaffected. One extra forward and three backwards: call it on
+        one batch per epoch, not every batch.
+        """
+        shared = [p for n, p in self.named_parameters()
+                  if p.requires_grad and not n.startswith(self.TASK_PARAM_PREFIXES)]
+        # cuDNN refuses an RNN backward in eval mode; this is a measurement,
+        # not the training step, so the slower kernel is fine.
+        with torch.backends.cudnn.flags(enabled=False):
+            losses = dict(zip(("risk", "tech", "grad"),
+                              self.task_losses(self(x), batch)))
+            flat = {}
+            for name, loss in losses.items():
+                g = torch.autograd.grad(loss, shared, retain_graph=True, allow_unused=True)
+                flat[name] = torch.cat([
+                    (gi if gi is not None else torch.zeros_like(p)).reshape(-1)
+                    for gi, p in zip(g, shared)]).double()
+
+        if self.loss_weighting == "fixed":
+            weights = dict(zip(("risk", "tech", "grad"), map(float, self.loss_weights)))
+        else:
+            u = self.uncertainty_loss
+            weights = {k: float(torch.exp(-lv.detach()).reshape(()))
+                       for k, lv in (("risk", u.log_var_risk), ("tech", u.log_var_tech),
+                                     ("grad", u.log_var_grad))}
+        norms = {k: float(v.norm()) for k, v in flat.items()}
+        cosine = {}
+        for a, b in (("risk", "tech"), ("risk", "grad"), ("tech", "grad")):
+            den = norms[a] * norms[b]
+            cosine[f"{a}_vs_{b}"] = float(flat[a] @ flat[b]) / den if den > 0 else float("nan")
+        weighted = {k: norms[k] * weights[k] for k in norms}
+        finite = [c for c in cosine.values() if c == c]
+        return {
+            "cosine": cosine,
+            "min_cosine": min(finite) if finite else float("nan"),
+            "grad_norm": norms,
+            "weighted_grad_norm": weighted,
+            "dominant_task": max(weighted, key=weighted.get),
+            "n_shared_params": int(sum(p.numel() for p in shared)),
+        }
+
+    def task_losses(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The three unweighted task losses: risk, technique, gradation."""
         # Risk loss.
         #
         # `risk_score` is bimodal by construction: exactly 0.0 for a benign
@@ -692,25 +784,7 @@ class MultiTaskLSTM(nn.Module):
         else:
             grad_loss = F.cross_entropy(
                 predictions["gradation_logits"], batch["gradation"], weight=_gw)
-
-        if self.loss_weighting == "fixed":
-            a, b, c = self.loss_weights
-            total_loss = a * risk_loss + b * tech_loss + c * grad_loss
-            metrics = {
-                "loss_total": total_loss.detach(),
-                "loss_risk": risk_loss.detach(),
-                "loss_tech": tech_loss.detach(),
-                "loss_grad": grad_loss.detach(),
-                "weight_risk": torch.tensor(a),
-                "weight_tech": torch.tensor(b),
-                "weight_grad": torch.tensor(c),
-            }
-        else:
-            total_loss, metrics = self.uncertainty_loss(risk_loss, tech_loss, grad_loss)
-        # Reported so a run can see whether a temperature has been fitted yet;
-        # it is 1.0 (inert) for the whole of training by construction.
-        metrics["temperature"] = self.effective_temperature.detach()
-        return total_loss, metrics
+        return risk_loss, tech_loss, grad_loss
 
     # ---------------------------------------------------------------- #
     # Post-hoc calibration. Fitted after training, on held-out data,    #

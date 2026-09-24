@@ -185,3 +185,5 @@ checkpoints by design, and the CSV path may not be able to support a forecasting
 is why `pcap_adapter.py` exists. Packet features are extracted but not yet in a model's input space.
 | [`13_MASTER_STATE.md`](13_MASTER_STATE.md) | **Start here.** Context-recovery document: machine limits, the contract, corpus reality, the full fix ledger, what is still open |
 | [`14_remediation_session.md`](14_remediation_session.md) | Evidence log for the 2026-09-21 remediation: 17 defects fixed, each with a measurement |
+| [`29_external_review_assessed.md`](29_external_review_assessed.md) | An external critique checked claim by claim; label-conditional conformal, sensor drop accounting, neighbour cut-off exposure, task-gradient conflict |
+| [`30_training_decisions.md`](30_training_decisions.md) | **Before training:** every design decision for the next run and for the campaign model, and `scripts/run_training_plan.sh` |

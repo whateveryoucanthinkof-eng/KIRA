@@ -126,6 +126,10 @@ def build_or_load_tgne_ta(
         "num_categories": 4,
         "edge_feat_dim": 12,
         "node_feat_dim": 12,
+        # bita/train.py defaults, which every encoder predating these config
+        # keys was trained with.
+        "n_neighbors": 10,
+        "neighbor_sampling": "most_recent",
     }
     if checkpoint_path:
         config_path = os.path.splitext(checkpoint_path)[0] + "_config.json"
@@ -271,7 +275,26 @@ def build_or_load_tgne_ta(
             ) from exc
         raise
     tgn.eval()
+    _attach_neighbor_sampling(tgn, config)
     return tgn
+
+
+def _attach_neighbor_sampling(tgn, config: Dict[str, Any]) -> None:
+    """Carry the training-time neighbour sampling onto the model for serving.
+
+    HostTrajectoryExtractor used a literal n_neighbors=10 with most-recent
+    sampling, which matched bita/train.py's defaults by coincidence rather than
+    by construction. It now reads these attributes, so an encoder trained with
+    another --n_degree or --uniform is served the way it was trained.
+    """
+    sampling = config.get("neighbor_sampling", "most_recent")
+    if sampling not in ("most_recent", "uniform"):
+        raise ValueError(f"unknown neighbor_sampling {sampling!r} in the encoder config")
+    n = int(config.get("n_neighbors", 10))
+    if n < 1:
+        raise ValueError(f"n_neighbors must be >= 1, got {n}")
+    tgn.serving_n_neighbors = n
+    tgn.serving_neighbor_uniform = sampling == "uniform"
 
 
 

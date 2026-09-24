@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
-from data_unification.split_policy import SCHEMES, capture_name_for_path, split_of
+from data_unification.split_policy import SCHEMES, capture_name_for_path, is_cross_year, split_of
 
 #: PCAP day directories: "<day>_pcap". Two days are misspelled "_pacap" in the
 #: corpus itself (fri_23_pacap, thu_15_pacap).
@@ -71,7 +71,7 @@ def discover_captures(
         raise CorpusRefused(
             "pass CIC-2018 as --pcap-root (real host addresses) OR as CSVs, not both: "
             "the same days would be read twice")
-    if scheme == "cross_year" and cic2018_dir and not allow_cic2018_csv:
+    if is_cross_year(scheme) and cic2018_dir and not allow_cic2018_csv:
         raise CorpusRefused(
             "cross_year trains on CIC-2018, and 9 of its 10 CSV days fabricate host IPs "
             "from the row number, so the host graph would be synthetic. Use the PCAPs "
@@ -111,16 +111,48 @@ def discover_captures(
     return out
 
 
+#: PCAP day -> label-CSV day where the corpus names them differently. The
+#: 28 Feb capture's CSV is named wed_29 in this corpus (there is no 29 Feb 2018).
+#:
+#: This replaces a weekday-prefix fallback that picked the FIRST `wed_*_csv.csv`
+#: in sorted order -- wed_14, the 14 Feb brute-force day. Its intervals are
+#: dated 14 Feb, so no 28 Feb packet ever fell inside one and the whole
+#: infiltration day was labelled benign, silently. check_label_day() now makes
+#: any such mismatch an error.
+PCAP_LABEL_ALIASES = {"wed_28": "wed_29"}
+
+
 def _pcap_label_csv(day_dir: Path, label_dir: Path) -> Optional[Path]:
-    day = _PCAP_DAY.match(day_dir.name).group("day")
-    csv_path = Path(label_dir) / f"{day}_csv.csv"
-    if csv_path.exists():
-        return csv_path
-    # The PCAP and CSV corpora name one day differently ("wed_28" vs "wed_29",
-    # verified in the corpus): fall back to the weekday prefix.
-    prefix = day.rsplit("_", 1)[0]
-    cands = sorted(Path(label_dir).glob(f"{prefix}_*_csv.csv"))
-    return cands[0] if cands else None
+    day = _PCAP_DAY.match(Path(day_dir).name).group("day")
+    for name in (day, PCAP_LABEL_ALIASES.get(day)):
+        if name:
+            csv_path = Path(label_dir) / f"{name}_csv.csv"
+            if csv_path.exists():
+                return csv_path
+    return None
+
+
+def check_label_day(day: str, intervals) -> None:
+    """Refuse labels whose attack intervals are dated on a different day.
+
+    `day` is the PCAP day key (`wed_28`); its number is the day of the month.
+    Intervals are UTC, and the capture window (~12:15-21:30 UTC) never crosses
+    midnight, so the dominant interval date must equal that number.
+    """
+    from collections import Counter
+    from datetime import datetime, timezone
+    want = int(day.rsplit("_", 1)[1])
+    days = Counter()
+    for iv in intervals:
+        days[datetime.fromtimestamp(iv.start_utc, tz=timezone.utc).day] += max(1, iv.n_rows)
+    if not days:
+        return
+    got = days.most_common(1)[0][0]
+    if got != want:
+        raise ValueError(
+            f"label CSV for PCAP day {day!r} has its attacks on day {got} of the month, not "
+            f"{want}: it belongs to another capture day. Every packet would be labelled "
+            f"benign. Fix the file name or PCAP_LABEL_ALIASES.")
 
 
 def iter_pcap_day_windows(day_dir: Path, label_dir: Path, window_seconds: float,
@@ -140,6 +172,7 @@ def iter_pcap_day_windows(day_dir: Path, label_dir: Path, window_seconds: float,
         print(f"skipping {day_dir.name}: implausible attack windows ({dw.evidence})", flush=True)
         return
     day = _PCAP_DAY.match(day_dir.name).group("day")
+    check_label_day(day, dw.intervals)
     n = 0
     for w_idx, (_s, _e, recs) in enumerate(iter_day_records(
             day_dir, dw, scenario_id=day, window_seconds=window_seconds,

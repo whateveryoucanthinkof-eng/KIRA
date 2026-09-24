@@ -33,7 +33,7 @@ from data_unification.ctu13_adapter import CTU13Adapter
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.pcap_bridge import iter_day_records
 from data_unification.density import require_full_density
-from data_unification.split_policy import partition_paths, split_of
+from data_unification.split_policy import is_cross_year, partition_paths, split_of
 
 
 def _pcap_day_split(day_dir) -> str:
@@ -140,23 +140,20 @@ def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_
 
     def _load(days):
         records = []
+        from data_unification.training_sources import _pcap_label_csv, check_label_day
         for day_dir, day in days:
-            csv_path = Path(csv_label_dir) / f"{day}_csv.csv"
-            if not csv_path.exists():
-                # The PCAP and CSV corpora name one day differently ("wed_28" vs
-                # "wed_29" -- verified, not a typo in this code). Fall back to
-                # matching on weekday prefix before giving up on the day.
-                prefix = day.rsplit("_", 1)[0]
-                candidates = sorted(Path(csv_label_dir).glob(f"{prefix}_*_csv.csv"))
-                if candidates:
-                    csv_path = candidates[0]
-                else:
-                    print(f"skipping {day_dir.name}: no matching label CSV at {csv_path}")
-                    continue
+            # Shared resolver: exact name, then the wed_28 -> wed_29 alias. The
+            # weekday-prefix fallback that used to live here labelled wed_28
+            # from wed_14's CSV (see training_sources.PCAP_LABEL_ALIASES).
+            csv_path = _pcap_label_csv(day_dir, csv_label_dir)
+            if csv_path is None:
+                print(f"skipping {day_dir.name}: no matching label CSV under {csv_label_dir}")
+                continue
             dw = derive_windows(str(csv_path))
             if not dw.ok:
                 print(f"skipping {day_dir.name}: implausible attack-window derivation ({dw.evidence})")
                 continue
+            check_label_day(day, dw.intervals)
             n_windows = 0
             # window_stride keeps every Nth window across the WHOLE day rather than
             # truncating to a prefix. A prefix would drop late-starting campaigns
@@ -297,12 +294,20 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _risk_mae_model = torch.zeros((), device=device, dtype=torch.float64)
         _risk_sum = torch.zeros((), device=device, dtype=torch.float64)
         _risk_n = 0
+        # Per-step |risk residual| histograms for the forecast's conformal band
+        # (see _forecast_risk_conformal). One bincount per batch, on device.
+        _K = _c.forecast_steps
+        _resid_hist = torch.zeros(_K * FORECAST_RISK_BINS, device=device, dtype=torch.long)
+        _step_offset = (torch.arange(_K, device=device) * FORECAST_RISK_BINS).view(1, _K)
         with torch.no_grad():
             for batch in val_loader:
                 h=batch["h_history"].to(device, non_blocking=_nblk)
                 target=batch["h_future"].to(device, non_blocking=_nblk)
                 target_risk=batch["risk_future"].to(device, non_blocking=_nblk)
                 pred=wdt.rollout(h,K=_c.forecast_steps); pred_risk,_=risk.forward_trajectory(pred)
+                _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
+                _resid_hist += torch.bincount((_rb.view(-1, _K) + _step_offset).reshape(-1),
+                                              minlength=_K * FORECAST_RISK_BINS)
                 _v_sum += (F.mse_loss(pred,target)+risk.risk_loss(pred_risk,target_risk)).double().sum()
                 _vn += 1
                 # persistence: repeat the last observed step across the horizon
@@ -340,7 +345,15 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         if score < best:
             best=score; best_epoch=epoch+1; _since_improve=0
             output.parent.mkdir(parents=True,exist_ok=True)
-            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar}},output)
+            # Fitted from THIS epoch's validation residuals, so the band always
+            # belongs to the weights saved beside it.
+            _conf = _forecast_risk_conformal(_resid_hist.view(_K, FORECAST_RISK_BINS).cpu().numpy())
+            for _k, _c_k in enumerate(_conf["by_step"], start=1):
+                print(f"  forecast risk band step {_k}: "
+                      + (f"+/-{_c_k['half_width']:.4f} (empirical {_c_k['empirical_coverage']:.3f}, "
+                         f"n={_c_k['n']:,})" if _c_k["fitted"] else f"NOT FITTED -- {_c_k['reason']}"),
+                      flush=True)
+            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
         else:
             _since_improve += 1
@@ -365,6 +378,36 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     print(f"Branch B credibility: {'CREDIBLE' if cred['credible'] else 'NOT CREDIBLE'}"
           + (f" -- {'; '.join(cred['problems'])}" if cred["problems"] else ""), flush=True)
     return wdt
+
+
+#: Bins for the per-step |forecast risk residual| histograms; one bin is 5e-4.
+FORECAST_RISK_BINS = 2000
+FORECAST_RISK_ALPHA = 0.05
+
+
+def _forecast_risk_conformal(step_hists, alpha: float = FORECAST_RISK_ALPHA):
+    """Per-step split-conformal half-widths for the served forecast risk.
+
+    The dashboard used to draw each forecast step's band as
+    risk +/- 20 * (DeepOP token confidence): not a measurement of anything, and
+    backwards -- a more confident token gave a WIDER band. This is the band the
+    served risk actually earns: at step k, the ceil((n+1)(1-alpha))-th smallest
+    |risk_pred - risk_true| over the validation windows, which covers
+    1 - alpha of held-out windows under exchangeability. Wider at later steps
+    when the model is less sure there, which is what a band should show.
+
+    Fitted on validation, like Branch A's conformal width: that split also
+    picks the epoch, so the band is mildly optimistic. It is marginal over all
+    windows, not per class; see cyberworld_v4.conformal.coverage_by_group.
+    """
+    from cyberworld_v4.conformal import halfwidth_from_histogram
+    by_step = [halfwidth_from_histogram(h, alpha) for h in np.asarray(step_hists)]
+    return {
+        "alpha": float(alpha),
+        "fitted_on": "validation",
+        "by_step": by_step,
+        "half_width_by_step": [c["half_width"] if c["fitted"] else None for c in by_step],
+    }
 
 
 #: Minimum fractional MSE improvement over persistence ("copy the last
@@ -724,6 +767,26 @@ def _pcap_trajectories_per_day(args, extractor):
         print(f"    -> {split} store: {b._n} snapshots ({time.time()-t:.1f}s)", flush=True)
         del recs
         gc.collect()
+    # cross_year_ctu: CTU-13 joins train/val (never test). Without this the
+    # PCAP path read PCAP days only, so the scheme would have silently trained
+    # Branch B and DeepOP on a different corpus than Branch A and the encoder.
+    if args.split_scheme == "cross_year_ctu":
+        from data_unification.training_sources import discover_captures
+        _cic, _ctu = CIC2018Adapter(), CTU13Adapter()
+        ctu_caps = discover_captures(scheme=args.split_scheme, ctu13_dir=args.ctu_dir)
+        assert not ctu_caps["test"], "cross_year_ctu must never test on CTU-13"
+        for split in ("train", "val"):
+            for cap in ctu_caps[split]:
+                t = time.time()
+                recs = read_one_capture(Path(cap.path), _cic, _ctu, args.rows_per_file, args.stride)
+                b = builders[split]
+                extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
+                if b._window_idx.n:
+                    wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+                print(f"  [CTU13 {split}] {cap.name}: {len(recs)} recs -> {b._n} snapshots "
+                      f"({time.time()-t:.1f}s)", flush=True)
+                del recs
+                gc.collect()
     out = {}
     for k, b in builders.items():
         st = b.finalize()
@@ -739,9 +802,10 @@ def main():
     parser.add_argument("--cic2018-csv-dir",type=Path,help="Directory of <day>_csv.csv label files, required with --pcap-root")
     parser.add_argument("--pcap-max-windows-per-day",type=int,default=None)
     parser.add_argument("--pcap-window-stride",type=int,default=1,help="Keep every Nth window across the full day")
-    parser.add_argument("--split-scheme",choices=("frozen","cross_year"),default="frozen",
+    parser.add_argument("--split-scheme",choices=("frozen","cross_year","cross_year_ctu"),default="frozen",
                         help="'cross_year': train/tune on CIC-2018 PCAP days, then score the best "
-                             "checkpoints ONCE on all of CIC-2017 (--cic2017-dir). Needs --pcap-root.")
+                             "checkpoints ONCE on all of CIC-2017 (--cic2017-dir). Needs --pcap-root. "
+                             "'cross_year_ctu': the same, with CTU-13 in train/val only (--ctu-dir).")
     parser.add_argument("--cic2017-dir",type=Path,default=None,
                         help="CIC-IDS-2017 CSVs, the cross_year test set")
     parser.add_argument("--results-json",type=Path,default=None,
@@ -798,11 +862,13 @@ def main():
         pcap_max_windows_per_day=args.pcap_max_windows_per_day,
     )
 
-    if args.split_scheme == "cross_year" and not args.pcap_root:
-        parser.error("--split-scheme cross_year trains on CIC-2018 and needs --pcap-root: "
+    if is_cross_year(args.split_scheme) and not args.pcap_root:
+        parser.error(f"--split-scheme {args.split_scheme} trains on CIC-2018 and needs --pcap-root: "
                      "9 of 10 CIC-2018 CSV days fabricate host IPs")
-    if args.split_scheme == "cross_year" and not args.cic2017_dir:
-        parser.error("--split-scheme cross_year needs --cic2017-dir (the test set)")
+    if is_cross_year(args.split_scheme) and not args.cic2017_dir:
+        parser.error(f"--split-scheme {args.split_scheme} needs --cic2017-dir (the test set)")
+    if args.split_scheme == "cross_year_ctu" and not args.ctu_dir:
+        parser.error("--split-scheme cross_year_ctu needs --ctu-dir")
     if args.pcap_root:
         if not args.cic2018_csv_dir:
             parser.error("--pcap-root requires --cic2018-csv-dir (PCAP packets carry no label of their own)")
@@ -971,7 +1037,7 @@ def main():
                           num_workers=args.num_workers,patience=args.patience)
         print(f"served checkpoint updated: {dp_out}", flush=True)
 
-    if args.split_scheme == "cross_year":
+    if is_cross_year(args.split_scheme):
         _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device)
 
 

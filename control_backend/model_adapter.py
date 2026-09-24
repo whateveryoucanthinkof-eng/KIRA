@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Any
 import numpy as np
 import torch
 
+from control_backend.forecast_band import forecast_band, forecast_band_halfwidths
 from control_backend.schema import (
     ModelMetadata,
     StateMetadata,
@@ -238,6 +239,12 @@ class AntigravityModelAdapter:
         self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
         self.wdt.eval()
         self.risk_head.eval()
+        self.forecast_risk_halfwidths = forecast_band_halfwidths(ckpt)
+        if self.forecast_risk_halfwidths is None:
+            logger.warning(
+                "Branch B checkpoint carries no fitted forecast_risk_conformal: the "
+                "forecast is served WITHOUT an uncertainty band. Retrain with "
+                "scripts/retrain_future_models_live.py to fit one.")
 
         self.vocab = get_joint_vocab()
         self.consolidate_network_technique = consolidate_network_technique
@@ -685,9 +692,9 @@ class AntigravityModelAdapter:
 
         with torch.no_grad():
             if hasattr(self.wdt, "rollout_with_uncertainty"):
-                # NOTE: _radii holds per-step confidence bands. They are computed but
-                # not yet carried in the prediction payload; wire them into the
-                # PredictionEvent schema to draw confidence bands on the forecast.
+                # _radii are LATENT-space radii (NaN unless calibrate_radii was
+                # run) and cannot be drawn on a risk chart. The served band is
+                # the risk-space conformal interval: forecast_band() below.
                 h_future, _radii = self.wdt.rollout_with_uncertainty(
                     h_seq, K=self.forecast_steps, stabilize_horizon=True
                 )
@@ -772,6 +779,7 @@ class AntigravityModelAdapter:
         inf_ms = (time.perf_counter() - t0) * 1000.0
         now_ts = time.time()
 
+        _hw = getattr(self, "forecast_risk_halfwidths", None)
         forecast_points = [
             ForecastPoint(
                 horizon_seconds=(i + 1) * step_s,
@@ -780,6 +788,7 @@ class AntigravityModelAdapter:
                 if i < len(deepop_confidences)
                 else None,
                 predicted_stage=forecast_techniques[i],
+                **forecast_band(fut_risks[i], _hw, i),
             )
             for i in range(self.forecast_steps)
         ]

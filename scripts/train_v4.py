@@ -47,7 +47,7 @@ from cyberworld_v4.models import CyberWorldForecaster, forecast_loss
 from cyberworld_v4.splits import (chronological_split, frozen_capture_split, partition,
                                  leakage_report, TRAIN, VAL, CALIB, TEST)
 from cyberworld_v4.metrics.earlywarning import lead_time_from_samples
-from cyberworld_v4.conformal import SplitConformal
+from cyberworld_v4.conformal import LabelConditionalConformal, SplitConformal
 from cyberworld_v4.targets import build_samples, describe_targets
 from cyberworld_v4.baselines import LogisticBaseline, GradientBoostingBaseline, PersistenceBaseline
 
@@ -471,8 +471,16 @@ def main() -> int:
         cal_fut = model.predict(P[CALIB]["X"].to(dev))["future_attack"].cpu().numpy()
     conf = SplitConformal(alpha=args.conformal_alpha)
     conf.fit(P[CALIB]["future"].numpy().ravel(), cal_fut.ravel())
-    conformal = conf.evaluate(y_fut.ravel(), p_fut.ravel())
+    # groups=label: the interval's marginal coverage is set by the benign
+    # majority, so attack-window coverage is reported on its own.
+    conformal = conf.evaluate(y_fut.ravel(), p_fut.ravel(),
+                              groups=y_fut.ravel().astype(int))
     conformal["fitted_on"] = "calibration"
+    # Per-class guarantee: one quantile per label, so attack windows get their
+    # own 1-alpha coverage instead of borrowing it from the benign ones.
+    lcc = LabelConditionalConformal(alpha=args.conformal_alpha)
+    lcc.fit(P[CALIB]["future"].numpy().ravel().astype(int), cal_fut.ravel())
+    conformal["label_conditional"] = lcc.evaluate(y_fut.ravel().astype(int), p_fut.ravel())
 
     print("\n" + "=" * 68)
     print("RESULT — nowcasting vs forecasting")
@@ -505,6 +513,13 @@ def main() -> int:
     print(f"  CONFORMAL  target {conformal['target_coverage']:.2f}  "
           f"empirical {conformal['empirical_coverage']:.4f}  "
           f"median width {conformal['median_width']:.4f}")
+    for g, rec in sorted(conformal.get("coverage_by_group", {}).items()):
+        print(f"     interval coverage on {'attack' if g == '1' else 'benign'} windows: "
+              f"{rec['empirical_coverage']:.4f}  (n={rec['n']})")
+    _lc = conformal["label_conditional"]
+    print(f"  LABEL-CONDITIONAL SETS  worst class {_lc['worst_class']} coverage "
+          f"{_lc['worst_class_coverage']:.4f}  mean set size {_lc['mean_set_size']:.3f}  "
+          f"ambiguous {_lc['ambiguous_rate']:.3f}")
     globals()["_label_churn"] = label_churn
     print("=" * 68)
 
@@ -532,6 +547,20 @@ def main() -> int:
             f"conformal coverage {conformal['empirical_coverage']:.3f} misses its "
             f"{conformal['target_coverage']:.2f} target by {_cov_gap:.3f}: the "
             f"calibration split does not represent test")
+    # Marginal coverage can pass while the attack windows are badly under-
+    # covered; the benign majority sets the average. Gate on the worst label.
+    _worst = conformal.get("worst_group_coverage", float("nan"))
+    if np.isfinite(_worst) and conformal["target_coverage"] - _worst > 0.05:
+        problems.append(
+            f"conformal interval covers only {_worst:.3f} of "
+            f"{'attack' if conformal['worst_group'] == '1' else 'benign'} windows against a "
+            f"{conformal['target_coverage']:.2f} target: the marginal figure hides it")
+    _lcw = conformal["label_conditional"]["worst_class_coverage"]
+    if np.isfinite(_lcw) and conformal["target_coverage"] - _lcw > 0.05:
+        problems.append(
+            f"label-conditional coverage for class {conformal['label_conditional']['worst_class']} "
+            f"is {_lcw:.3f} against {conformal['target_coverage']:.2f}: that class's "
+            f"calibration windows do not represent its test windows")
     if now.get("extreme_base_rate"):
         problems.append(f"test base rate {now['positive_rate']:.4f} is extreme: PR-AUC is near 1.0 for any ranking")
     if scaler.report().get("at_grid_boundary"):

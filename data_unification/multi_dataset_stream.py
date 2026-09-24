@@ -264,8 +264,22 @@ class HostTrajectoryExtractor:
         attack_role: str = "either",
         include_packet_features: bool = False,
         persist_memory: bool = False,
+        n_neighbors: Optional[int] = None,
     ):
         """
+        `n_neighbors` -- how many temporal neighbours the graph-attention
+        embedding reads per host. None (the default) takes the value the
+        encoder was trained with, which build_or_load_tgne_ta attaches from its
+        config; override only to study the effect, since the attention weights
+        were fitted to the trained count.
+
+        Each host's 12-D latent sees at most that many of its most recent flows
+        in the window; the 15 attributes see all of them. A host with more
+        flows than that -- a busy server, or one an attacker floods with benign
+        traffic after an attack flow -- has the rest left out of its latent
+        entirely. `neighbor_exposure_report()` counts how often that happens and
+        how often it hides every attack flow of an attack window.
+
         `persist_memory` -- keep the encoder's TGN memory and host-id map across
         calls. Live serving sets it: each call is one 2 s window of one
         continuous session. Offline extraction leaves it off: each call is a
@@ -338,6 +352,12 @@ class HostTrajectoryExtractor:
                 )
         self.auth_events: List[AuthEventRecord] = list(auth_events) if auth_events else []
         self.persist_memory = bool(persist_memory)
+        self.n_neighbors = int(n_neighbors if n_neighbors is not None
+                               else getattr(tgne_ta_model, "serving_n_neighbors", 10))
+        self.neighbor_uniform = bool(getattr(tgne_ta_model, "serving_neighbor_uniform", False))
+        self._exposure = dict.fromkeys(
+            ("host_windows", "truncated_host_windows", "flows", "flows_outside_latent",
+             "attack_host_windows", "attack_host_windows_all_attack_flows_outside_latent"), 0)
         # Host-id map that stays fixed while memory is carried, so memory row k
         # keeps meaning the same host. Rebuilt whenever memory is reset.
         self._event_adapter: Optional[FlowToTemporalEventAdapter] = None
@@ -366,6 +386,62 @@ class HostTrajectoryExtractor:
     def add_auth_events(self, events: List[AuthEventRecord]):
         """Ingests additional host authentication security events."""
         self.auth_events.extend(events)
+
+    def _account_exposure(self, host_recs, atk_recs) -> None:
+        """Count flows the host's latent cannot see (most-recent sampling only).
+
+        The windowed neighbour finder hands the encoder the host's last
+        `n_neighbors` interactions before the window end, ordered by start
+        time -- the same order as `host_recs`. Anything earlier is absent from
+        this window's latent, though still counted by the 15 attributes. With
+        use_memory on (not the shipped config) every interaction is also queued
+        for the host's memory, so an evicted flow reaches a LATER window's
+        latent that way; this counts the current window only.
+        """
+        if self.neighbor_uniform:
+            return  # uniform sampling draws from all of them; no fixed cut-off
+        e = self._exposure
+        n = len(host_recs)
+        hidden = max(0, n - self.n_neighbors)
+        e["host_windows"] += 1
+        e["flows"] += n
+        if hidden:
+            e["truncated_host_windows"] += 1
+            e["flows_outside_latent"] += hidden
+        if atk_recs:
+            e["attack_host_windows"] += 1
+            if hidden:
+                visible = {id(r) for r in host_recs[-self.n_neighbors:]}
+                if not any(id(r) in visible for r in atk_recs):
+                    e["attack_host_windows_all_attack_flows_outside_latent"] += 1
+
+    def neighbor_exposure_report(self, reset: bool = False) -> Dict[str, Any]:
+        """How often the neighbour cut-off hid flows -- and attacks -- from the latent.
+
+        `attack_hidden_from_latent_rate` is the share of attack host-windows in
+        which EVERY attack flow fell outside the latent's view, so only the
+        aggregate attributes could carry the attack. On benign traffic this is
+        a property of the data; under adversarial flooding it is the evasion
+        path, and it takes only `n_neighbors` benign flows after the attack.
+
+        `reset=True` zeroes the counters after reading, so one extractor can
+        report each split separately.
+        """
+        e = dict(self._exposure)
+        if reset:
+            self._exposure = dict.fromkeys(self._exposure, 0)
+        nan = float("nan")
+        e["n_neighbors"] = self.n_neighbors
+        e["sampling"] = "uniform" if self.neighbor_uniform else "most_recent"
+        e["counted"] = not self.neighbor_uniform
+        e["truncated_rate"] = (e["truncated_host_windows"] / e["host_windows"]
+                               if e["host_windows"] else nan)
+        e["flows_outside_latent_rate"] = (e["flows_outside_latent"] / e["flows"]
+                                          if e["flows"] else nan)
+        e["attack_hidden_from_latent_rate"] = (
+            e["attack_host_windows_all_attack_flows_outside_latent"] / e["attack_host_windows"]
+            if e["attack_host_windows"] else nan)
+        return e
 
     def compute_host_temporal_attributes(
         self,
@@ -480,7 +556,7 @@ class HostTrajectoryExtractor:
                 t = float(event_stream.timestamps[i])
                 adj_list[u].append((v, i, t))
                 adj_list[v].append((u, i, t))
-            windowed_nf = _WindowedNeighborFinder(NeighborFinder(adj_list, uniform=False))
+            windowed_nf = _WindowedNeighborFinder(NeighborFinder(adj_list, uniform=self.neighbor_uniform))
             self.tgn.neighbor_finder = windowed_nf
             self.tgn.embedding_module.neighbor_finder = windowed_nf
             edge_feats_t = torch.from_numpy(event_stream.edge_features).float().to(self.tgn.device)
@@ -548,7 +624,7 @@ class HostTrajectoryExtractor:
                 windowed_nf.lower_bound = win_start
             with torch.no_grad():
                 H_t = self.tgn.get_host_embeddings(
-                    active_host_ids, timestamp=win_end, n_neighbors=10
+                    active_host_ids, timestamp=win_end, n_neighbors=self.n_neighbors
                 ).cpu().numpy()
 
             # 3. Queue this window's interactions; they reach memory next time
@@ -587,6 +663,9 @@ class HostTrajectoryExtractor:
                     atk_recs = [r for r in host_recs if r.is_attack and r.src_ip == ip]
                 else:
                     atk_recs = [r for r in host_recs if r.is_attack]
+
+                if windowed_nf is not None:
+                    self._account_exposure(host_recs, atk_recs)
 
                 is_atk = len(atk_recs) > 0
                 if is_atk:
@@ -659,3 +738,17 @@ class HostTrajectoryExtractor:
         if sliding_buffer is not None:
             return sliding_buffer.get_all_trajectories()
         return builder.finalize() if owns_builder else builder
+
+
+def format_neighbor_exposure(report: Dict[str, Any], where: str = "") -> str:
+    """One line for a training log; see HostTrajectoryExtractor.neighbor_exposure_report."""
+    if not report.get("counted"):
+        return f"{where}: neighbour exposure not counted ({report.get('sampling')} sampling)"
+    return (
+        f"{where}: latent sees the last {report['n_neighbors']} flows per host-window -- "
+        f"{report['truncated_rate']:.1%} of {report['host_windows']} host-windows truncated, "
+        f"{report['flows_outside_latent_rate']:.1%} of flows outside the latent, "
+        f"{report['attack_host_windows_all_attack_flows_outside_latent']} of "
+        f"{report['attack_host_windows']} attack host-windows had EVERY attack flow outside it "
+        f"({report['attack_hidden_from_latent_rate']:.1%})"
+    )

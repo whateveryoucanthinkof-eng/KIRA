@@ -16,6 +16,12 @@ export interface SystemStatus {
   latency: number; // ms
   throughput: number; // Mbps
   activeConnections: number;
+  // Sensor blind spots (control_backend/capture_accounting.py). Cumulative
+  // since the sensor started; nonzero means some windows were scored on a
+  // partial capture or never scored at all.
+  sensorKernelDrops: number; // frames the kernel dropped before capture saw them
+  incompleteWindows: number; // windows built while the kernel was dropping
+  windowsMissed: number; // windows the sensor never delivered
   [key: string]: any; // Allow raw backend fields (network_online, ml_active, etc.)
 }
 

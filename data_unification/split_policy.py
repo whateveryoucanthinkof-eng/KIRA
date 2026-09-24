@@ -82,16 +82,35 @@ def load_lock() -> Dict[str, Dict[str, str]]:
 #               toolset and CICFlowMeter build: a generalisation test, not an
 #               in-distribution one. Expect lower numbers than "frozen", and
 #               read them as the honest ones.
-SCHEMES = ("frozen", "cross_year")
+#
+# "cross_year_ctu"  cross_year, plus CTU-13 as TRAINING data only. CTU-13's lock
+#               train scenarios -> train, its val AND test scenarios -> val
+#               (the same rule CIC-2018 gets), and nothing of it is ever
+#               tested. The test set is still all of CIC-2017, so the score
+#               keeps its meaning. Why: C2 is carried by ~10 hosts in CIC-2018
+#               (analysis 27), and CTU-13 is botnet C2 traffic -- the class
+#               CIC-2017's Bot days test. Kept as its own scheme rather than
+#               folded into cross_year so the pure 2018->2017 protocol
+#               (docs/CROSS_YEAR_PROTOCOL.md) stays reproducible.
+SCHEMES = ("frozen", "cross_year", "cross_year_ctu")
+
+#: Schemes that train on CIC-2018 and score once on CIC-2017.
+CROSS_YEAR_SCHEMES = ("cross_year", "cross_year_ctu")
+
+
+def is_cross_year(scheme: str) -> bool:
+    return scheme in CROSS_YEAR_SCHEMES
 
 
 def _scheme_split(dataset: str, locked: str, scheme: str) -> Optional[Split]:
     if scheme == "frozen":
         return locked  # type: ignore[return-value]
-    if scheme == "cross_year":
+    if is_cross_year(scheme):
         if dataset == "CIC2017":
             return "test"
         if dataset in ("CIC2018", "PCAP2018"):
+            return "train" if locked == "train" else "val"
+        if dataset == "CTU13" and scheme == "cross_year_ctu":
             return "train" if locked == "train" else "val"
         return None
     raise ValueError(f"unknown split scheme {scheme!r}; expected one of {SCHEMES}")

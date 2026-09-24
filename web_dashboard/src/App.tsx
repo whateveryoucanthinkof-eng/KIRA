@@ -223,13 +223,18 @@ export default function App() {
               p.forecast.map((f: Record<string, any>) => {
                 const risk = num(f.risk) * 100;
                 const conf = num(f.confidence, 0.5);
+                // The band is the backend's split-conformal interval for this
+                // step (control_backend/forecast_band.py). It used to be
+                // invented here as risk +/- 20 * DeepOP confidence, which
+                // measured nothing. No fitted band -> no band.
+                const banded = f.risk_lower != null && f.risk_upper != null;
                 return {
                   timestamp: new Date(Date.now() + num(f.horizon_seconds) * 1000).toISOString(),
                   horizonSeconds: num(f.horizon_seconds),
                   predictedStage: f.predicted_stage ?? null,
                   predicted: risk,
-                  lowerBound: Math.max(0, risk - conf * 20),
-                  upperBound: Math.min(100, risk + conf * 20),
+                  lowerBound: banded ? num(f.risk_lower) * 100 : risk,
+                  upperBound: banded ? num(f.risk_upper) * 100 : risk,
                   confidence: conf,
                 };
               })

@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Dict, Optional, Any
 
+from control_backend.capture_accounting import CaptureAccounting
 from control_backend.event_broker import broker
 from control_backend.lab_config import (
     MONOREPO_ROOT,
@@ -52,6 +53,8 @@ class LiveTelemetryService:
         self.current_active_connections: int = 0
         self.current_anomaly_score: float = 0.0
         self.current_threat_level: str = "low"
+        # Windows never delivered, or built while the kernel dropped frames.
+        self.capture = CaptureAccounting()
 
         self.isolated_hosts: set = set()
         self.blocked_ips: set = set()
@@ -133,6 +136,7 @@ class LiveTelemetryService:
         self.is_running = True
         self.is_ml_active = False
         self.windows_streamed = 0
+        self.capture.reset_sequence()
         self.last_window_at = 0.0
         self.adapter.reset_history()
         topology_service.reset()
@@ -317,6 +321,7 @@ class LiveTelemetryService:
                     continue
                 try:
                     record = json.loads(line)
+                    self.capture.observe(record)
                     raw_flows = record.get("flows") or []
                     flows = flows_from_span_dicts(raw_flows)
                     target = select_primary_target(flows)
@@ -438,6 +443,7 @@ class LiveTelemetryService:
                         "activeConnections": self.current_active_connections,
                         "anomalyScore": self.current_anomaly_score,
                         "threatLevel": self.current_threat_level,
+                        **self.capture.status(),
                         "timestamp": now_iso,
                     })
                 except Exception as e:

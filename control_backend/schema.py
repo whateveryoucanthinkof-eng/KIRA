@@ -44,6 +44,10 @@ class ForecastPoint(BaseModel):
     risk: float
     confidence: Optional[float] = None
     predicted_stage: Optional[str] = None
+    # Split-conformal band on `risk` for this step, fitted on validation
+    # (control_backend/forecast_band.py). None when the checkpoint has none.
+    risk_lower: Optional[float] = None
+    risk_upper: Optional[float] = None
 
 
 class ExplainabilityGroup(BaseModel):

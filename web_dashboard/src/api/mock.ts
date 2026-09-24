@@ -177,11 +177,16 @@ function windowState(step: number) {
     // Walk the forecast forward through the kill chain rather than repeating
     // the current stage — this is what the timeline's forecast cells render.
     const ahead = PHASES[Math.min(PHASES.length - 2, i + (k < 3 ? 0 : k < 6 ? 1 : 2))];
+    const risk = Math.max(0, Math.min(0.99, shown * drift + wobble(step + k, 7) * 0.015));
+    // Demo stand-in for the backend's per-step conformal band: wider further out.
+    const halfWidth = 0.04 + k * 0.02;
     return {
       horizon_seconds: (k + 1) * 30,
-      risk: Math.max(0, Math.min(0.99, shown * drift + wobble(step + k, 7) * 0.015)),
+      risk,
       confidence: Math.max(0.35, 0.92 - k * 0.07),
       predicted_stage: hot ? ahead.stage : "Benign",
+      risk_lower: Math.max(0, risk - halfWidth),
+      risk_upper: Math.min(1, risk + halfWidth),
     };
   });
 
@@ -258,6 +263,10 @@ function buildCampaign(step: number, now: number): Campaign {
 /* ── REST fixtures ─────────────────────────────────────────────────────── */
 
 const BASE_STATUS = {
+  // A healthy sensor: no frames dropped, every window delivered.
+  sensorKernelDrops: 0,
+  incompleteWindows: 0,
+  windowsMissed: 0,
   mode: "LIVE",
   site_id: "hq-core",
   lab_mode: true,

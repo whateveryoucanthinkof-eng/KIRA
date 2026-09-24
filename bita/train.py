@@ -417,7 +417,8 @@ def load_and_preprocess_unified_dataset(
                 return
 
     wanted = set(splits) if splits else None
-    if scheme == "cross_year" and cic2018_dir and not allow_cic2018_csv:
+    from data_unification.split_policy import is_cross_year
+    if is_cross_year(scheme) and cic2018_dir and not allow_cic2018_csv:
         raise ValueError(
             "cross_year trains on CIC-2018, and 9 of its 10 CSV days fabricate host IPs "
             "from the row number; an encoder is a model of the host graph, so train it on "
@@ -1334,6 +1335,13 @@ def train(args):
         "node_feat_dim": int(node_features.shape[1]),
         "feature_schema_version": SCHEMA_VERSION,
         "edge_feature_names": EDGE_FEATURE_NAMES,
+        # How each node's temporal neighbourhood was sampled. Serving must use
+        # the same count and rule: the graph-attention weights were fitted to
+        # this many neighbours, chosen this way. build_or_load_tgne_ta hands
+        # both to HostTrajectoryExtractor instead of a literal that happened
+        # to match.
+        "n_neighbors": args.n_degree,
+        "neighbor_sampling": "uniform" if args.uniform else "most_recent",
         # Which edge features were zeroed while training. The ablation is an
         # env var read at feature extraction, so serving must apply the SAME
         # mask; build_or_load_tgne_ta refuses a mismatch using this field.
@@ -1477,9 +1485,12 @@ if __name__ == '__main__':
                              'Use instead of --cic2018_dir, whose CSVs fabricate IPs on 9 of 10 days.')
     parser.add_argument('--pcap2018_label_dir', type=str, default=None,
                         help='CIC-2018 <day>_csv.csv files used only as labels for --pcap2018_root')
-    parser.add_argument('--split_scheme', type=str, default='frozen', choices=['frozen', 'cross_year'],
+    parser.add_argument('--split_scheme', type=str, default='frozen',
+                        choices=['frozen', 'cross_year', 'cross_year_ctu'],
                         help="'cross_year': the encoder reads only CIC-2018 train days; CIC-2017 is "
-                             "never loaded (it is the downstream test set). See split_policy.py.")
+                             "never loaded (it is the downstream test set). 'cross_year_ctu': the "
+                             "same, plus CTU-13's lock train scenarios (pass --ctu13_dir). "
+                             "See split_policy.py.")
     parser.add_argument('--allow_cic2018_csv', action='store_true', default=False)
     parser.add_argument('--init_from', type=str, default=None,
                         help='Start from this encoder checkpoint (e.g. a Warden-trained one) and '

@@ -431,6 +431,15 @@ export default function Overview({ status, history, forecast, prediction, envelo
     { label: "Packets", value: compact(n(last?.packets)), sub: "last window" },
     { label: "Pipeline", value: n(status.latency).toFixed(1), unit: "ms", sub: "telemetry + inference" },
     { label: "Packet loss", value: n(status.packetLoss).toFixed(2), unit: "%", sub: "unanswered flows" },
+    // Sensor blind spots: windows scored on a partial capture (kernel drops) or
+    // never scored (missed). Zero is the only healthy value, so any count is a warning.
+    {
+      label: "Sensor gaps",
+      value: compact(n(status.incompleteWindows) + n(status.windowsMissed)),
+      unit: "win",
+      level: n(status.incompleteWindows) + n(status.windowsMissed) > 0 ? "warning" : undefined,
+      sub: `${compact(n(status.sensorKernelDrops))} frames dropped · ${compact(n(status.windowsMissed))} missed`,
+    },
     { label: "Windows", value: String(history.length), sub: `of ${90} retained` },
   ];
 

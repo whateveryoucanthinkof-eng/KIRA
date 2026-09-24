@@ -61,7 +61,9 @@ def encoder_cmd(a, arm: str, ip: str):
         return common + ["--dataset_dir", str(a.warden_dir)] + shlex.split(a.encoder_args)
     cmd = common + ["--pcap2018_root", str(a.pcap_root),
                     "--pcap2018_label_dir", str(a.cic2018_csv_dir),
-                    "--split_scheme", "cross_year", "--train_splits", "train"]
+                    "--split_scheme", a.split_scheme, "--train_splits", "train"]
+    if a.split_scheme == "cross_year_ctu":
+        cmd += ["--ctu13_dir", str(a.ctu_dir)]
     if arm == "warden_ft":
         cmd += ["--init_from", str(encoder_path(a.out, "warden", ip))]
     return cmd + shlex.split(a.encoder_args)
@@ -73,9 +75,11 @@ def branch_a_paths(out: Path, arm: str, ip: str):
 
 def branch_a_cmd(a, arm: str, ip: str):
     ckpt, res = branch_a_paths(a.out, arm, ip)
+    ctu = ["--ctu-dir", str(a.ctu_dir)] if a.split_scheme == "cross_year_ctu" else []
     return [a.python, "scripts/retrain_branch_a_live.py",
             "--pcap-root", str(a.pcap_root), "--cic2018-csv-dir", str(a.cic2018_csv_dir),
-            "--cic2017-dir", str(a.cic2017_dir), "--split-scheme", "cross_year",
+            "--cic2017-dir", str(a.cic2017_dir), "--split-scheme", a.split_scheme,
+            *ctu,
             "--tgne", str(encoder_path(a.out, arm, ip)),
             "--output", str(ckpt), "--results-json", str(res),
             "--seed", str(a.seed)] + shlex.split(a.branch_a_args)
@@ -137,7 +141,11 @@ def summarise(a, arms, ips) -> dict:
                 auc if isinstance(auc, (int, float)) and auc == auc else -1.0)
 
     ranked = sorted([r for r in rows if r["status"] == "ok"], key=key, reverse=True)
-    return {"protocol": "encoder varies; Branch A trained+tuned on CIC-2018, scored once on CIC-2017",
+    scheme = getattr(a, "split_scheme", "cross_year")
+    trained_on = "CIC-2018 + CTU-13" if scheme == "cross_year_ctu" else "CIC-2018"
+    return {"protocol": f"encoder varies; Branch A trained+tuned on {trained_on} "
+                        f"({scheme}), scored once on CIC-2017",
+            "split_scheme": scheme, "seed": getattr(a, "seed", None),
             "rows": rows, "ranking": [f"{r['encoder']} / {r['ip_features']}" for r in ranked]}
 
 
@@ -181,6 +189,12 @@ def main() -> int:
     ap.add_argument("--arms", default=",".join(ARMS), help=f"subset of {ARMS}")
     ap.add_argument("--ip-ablation", action="store_true",
                     help="also run every arm with network-invariant IP features")
+    ap.add_argument("--ip-variants", default=None,
+                    help=f"comma list from {tuple(IP_VARIANTS)}; overrides --ip-ablation "
+                         f"(e.g. rerun only the winning variant with more seeds)")
+    ap.add_argument("--split-scheme", choices=("cross_year", "cross_year_ctu"), default="cross_year",
+                    help="cross_year_ctu adds CTU-13 to training/validation only (needs --ctu-dir)")
+    ap.add_argument("--ctu-dir", type=Path, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--encoder-args", default="", help="extra args for bita/train.py")
     ap.add_argument("--branch-a-args",
@@ -200,10 +214,17 @@ def main() -> int:
         # The fine-tune starts from the warden arm's encoder.
         arms = ["warden"] + arms
     ips = ["full", "cross_network"] if a.ip_ablation else ["full"]
+    if a.ip_variants:
+        ips = [x for x in a.ip_variants.split(",") if x]
+        bad = [x for x in ips if x not in IP_VARIANTS]
+        if bad:
+            ap.error(f"unknown IP variant(s) {bad}; choose from {tuple(IP_VARIANTS)}")
 
     if not a.summarise_only:
         need = {"--cic2017-dir": a.cic2017_dir, "--pcap-root": a.pcap_root,
                 "--cic2018-csv-dir": a.cic2018_csv_dir}
+        if a.split_scheme == "cross_year_ctu":
+            need["--ctu-dir"] = a.ctu_dir
         if "warden" in arms:
             need["--warden-dir"] = a.warden_dir
         missing = [k for k, v in need.items() if not v]

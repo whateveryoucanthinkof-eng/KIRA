@@ -7,7 +7,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -30,6 +30,7 @@ from branch_a_gnn_lstm.sequence_dataset import (
 from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.density import require_full_density
+from data_unification.split_policy import is_cross_year
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
@@ -1008,10 +1009,13 @@ def main():
     parser.add_argument("--pcap-window-stride", type=int, default=1)
     parser.add_argument("--allow-cic2018-csv", action="store_true",
                         help="Accept CIC-2018 CSVs under cross_year despite their synthetic IPs")
-    parser.add_argument("--split-scheme", choices=("frozen", "cross_year"), default="frozen",
+    parser.add_argument("--split-scheme", choices=("frozen", "cross_year", "cross_year_ctu"),
+                        default="frozen",
                         help="'frozen': splits.lock.json as is. 'cross_year': train on CIC-2018 "
                              "(its lock train days), tune on its other days, test ONCE on all "
-                             "of CIC-2017; CTU-13 unused. See data_unification/split_policy.py.")
+                             "of CIC-2017; CTU-13 unused. 'cross_year_ctu': the same, with CTU-13 "
+                             "added to train/val only (pass --ctu-dir). See "
+                             "data_unification/split_policy.py.")
     parser.add_argument("--tgne", type=Path, default=None,
                         help="Encoder checkpoint to extract host states with (default: the "
                              "served one). The encoder comparison passes each arm's encoder.")
@@ -1216,7 +1220,7 @@ def main():
                 f"split '{_name}' ({args.split_scheme}) matched no captures. "
                 f"Refusing to train on a split that does not exist.")
     print(f"{args.split_scheme} split -- {_describe_captures(partition)}", flush=True)
-    if args.split_scheme == "cross_year":
+    if is_cross_year(args.split_scheme):
         print("  every tuning decision (early stopping, threshold, temperature, conformal "
               "width) uses CIC-2018 validation days only; CIC-2017 is scored once, at the end",
               flush=True)
@@ -1233,6 +1237,7 @@ def main():
     # records are not needed until the train split has already been reduced to
     # samples.
     record_counts: Dict[str, int] = {}
+    neighbor_exposure: Dict[str, Dict[str, Any]] = {}
 
     def _store_per_capture(files, label):
         """Load -> extract -> free, one capture file at a time.
@@ -1274,6 +1279,11 @@ def main():
         print(format_unresolved_report(merge_unresolved_reports(coverage), where=label), flush=True)
         print(f"{label}: {total_recs} records -> {store.n_snapshots} snapshots "
               f"over {len(store)} hosts | {store.memory_report()}", flush=True)
+        # How much of each host's traffic its 12-D latent never saw, and how
+        # many attack windows it saw NONE of the attack in (flooding evasion).
+        from data_unification.multi_dataset_stream import format_neighbor_exposure
+        neighbor_exposure[label] = extractor.neighbor_exposure_report(reset=True)
+        print(format_neighbor_exposure(neighbor_exposure[label], where=label), flush=True)
         # The record count is returned, not just printed: the run summary below
         # used to reference `train_records`/`val_records`, which the
         # load -> extract -> free refactor had already deleted. Every
@@ -1595,6 +1605,16 @@ def main():
                 "technique": batch["technique"].to(device, non_blocking=_non_blocking),
                 "gradation": batch["gradation"].to(device, non_blocking=_non_blocking),
             }
+            if _nb == 0:
+                # Once per epoch, before the step: do the tasks fight over the
+                # shared LSTM? Measured instead of assumed (see
+                # MultiTaskLSTM.task_gradient_conflict); writes no .grad.
+                _conflict = model.task_gradient_conflict(x, targets)
+                _c3 = _conflict["cosine"]
+                print(f"  task gradients epoch={epoch}: cos(risk,tech)={_c3['risk_vs_tech']:+.3f} "
+                      f"cos(risk,grad)={_c3['risk_vs_grad']:+.3f} "
+                      f"cos(tech,grad)={_c3['tech_vs_grad']:+.3f} "
+                      f"dominant={_conflict['dominant_task']}", flush=True)
             optimizer.zero_grad(set_to_none=True)
             predictions = model(x)
             loss, _ = model.compute_loss(predictions, targets)
@@ -1619,6 +1639,7 @@ def main():
                             num_techniques=len(TECHNIQUE_VOCAB),
                             risk_positive_above=risk_positive_above)
         metrics["epoch"] = epoch
+        metrics["task_gradients"] = _conflict if _nb else None
         metrics["train_loss"] = float((_loss_sum / max(_nb, 1)).item())
         metrics["epoch_seconds"] = float(time.time() - _t_epoch)
         print(
@@ -1835,6 +1856,8 @@ def main():
     ckpt["credibility"] = credibility
     ckpt["split_scheme"] = args.split_scheme
     ckpt["encoder"] = str(args.tgne) if args.tgne else "served default"
+    # Per split: how much traffic the 12-D latent never saw (neighbour cut-off).
+    ckpt["neighbor_exposure"] = neighbor_exposure
     torch.save(ckpt, args.output)
     if args.results_json:
         import json as _json

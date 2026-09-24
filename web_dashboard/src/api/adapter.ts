@@ -52,6 +52,9 @@ function mapSystemStatus(backendStatus: any): SystemStatus {
     latency: backendStatus.latency || 0,
     throughput: backendStatus.throughput || 0,
     activeConnections: backendStatus.activeConnections || 0,
+    sensorKernelDrops: backendStatus.sensorKernelDrops || 0,
+    incompleteWindows: backendStatus.incompleteWindows || 0,
+    windowsMissed: backendStatus.windowsMissed || 0,
     // Keep raw backend fields for conditional logic
     ...backendStatus,
   };

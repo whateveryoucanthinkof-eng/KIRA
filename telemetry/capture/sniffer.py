@@ -13,12 +13,36 @@ import sys
 import time
 from typing import Callable, Optional, Dict, Any
 
+# <linux/if_packet.h>. Not exported by the socket module.
+SOL_PACKET = 263
+PACKET_STATISTICS = 6
+
+# Receive buffer to ask for. Linux clamps it to net.core.rmem_max, so the
+# effective size is read back and reported rather than assumed.
+REQUESTED_RCVBUF_BYTES = 32 * 1024 * 1024
+
+
 class StreamingPacketSniffer:
+    """Single-threaded AF_PACKET capture with per-packet parsing in Python.
+
+    That design has a throughput ceiling. Past it, the kernel's socket buffer
+    fills and the kernel drops frames before this process ever sees them --
+    and `packet_count` only counts what arrived, so a flood used to leave no
+    trace. `read_kernel_stats()` reads the kernel's own drop counter so a
+    window built from an incomplete capture is marked as such.
+    """
+
     def __init__(self, interface: str = "eth1"):
         self.interface = interface
         self.sock: Optional[socket.socket] = None
         self.running = False
         self.packet_count = 0
+        # Running totals of PACKET_STATISTICS; the kernel resets them per read.
+        self.kernel_packets_total = 0
+        self.kernel_drops_total = 0
+        # Exceptions swallowed by the capture loop (parse or callback).
+        self.loop_errors = 0
+        self.rcvbuf_bytes: Optional[int] = None
 
     def start(self):
         """Initializes the raw AF_PACKET socket in promiscuous mode."""
@@ -27,8 +51,16 @@ class StreamingPacketSniffer:
             self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
             self.sock.bind((self.interface, 0))
             self.sock.settimeout(0.5)
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, REQUESTED_RCVBUF_BYTES)
+                self.rcvbuf_bytes = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            except OSError:
+                self.rcvbuf_bytes = None
+            self.read_kernel_stats()  # discard anything counted before capture began
+            self.kernel_packets_total = self.kernel_drops_total = 0
             self.running = True
-            print(f"[*] StreamingPacketSniffer active on interface '{self.interface}' (promiscuous mode).")
+            print(f"[*] StreamingPacketSniffer active on interface '{self.interface}' "
+                  f"(promiscuous mode, rcvbuf={self.rcvbuf_bytes}).")
             sys.stdout.flush()
         except PermissionError:
             print(f"[!] Sniffer PermissionError: Raw packet capture requires CAP_NET_RAW / root on '{self.interface}'.", file=sys.stderr)
@@ -62,8 +94,36 @@ class StreamingPacketSniffer:
             except socket.timeout:
                 continue
             except Exception:
+                self.loop_errors += 1
                 if self.running:
                     time.sleep(0.01)
+
+    def read_kernel_stats(self) -> Dict[str, Any]:
+        """Frames the kernel saw and DROPPED for this socket since the last call.
+
+        Linux resets `struct tpacket_stats` on every PACKET_STATISTICS read and
+        folds the drops into `tp_packets`, so `packets` counts every frame that
+        reached the socket and `drops` the ones lost to a full buffer. Safe to
+        call from another thread than the capture loop. `available` is False
+        where the counter does not exist (no socket yet, non-Linux).
+        """
+        sock = self.sock
+        if sock is None or not hasattr(socket, "AF_PACKET"):
+            return {"available": False, "packets": 0, "drops": 0,
+                    "packets_total": self.kernel_packets_total,
+                    "drops_total": self.kernel_drops_total}
+        try:
+            raw = sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8)
+        except OSError:
+            return {"available": False, "packets": 0, "drops": 0,
+                    "packets_total": self.kernel_packets_total,
+                    "drops_total": self.kernel_drops_total}
+        packets, drops = struct.unpack("II", raw[:8])
+        self.kernel_packets_total += packets
+        self.kernel_drops_total += drops
+        return {"available": True, "packets": packets, "drops": drops,
+                "packets_total": self.kernel_packets_total,
+                "drops_total": self.kernel_drops_total}
 
     @staticmethod
     def parse_frame(data: bytes, ts: float) -> Optional[Dict[str, Any]]:
