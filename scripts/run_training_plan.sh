@@ -24,7 +24,8 @@
 #
 # Every heavy step runs under a memory cap (MemoryMax, no swap): an uncapped
 # job has frozen the training machine twice (analysis 27). Re-running a stage
-# skips any step whose output already exists.
+# skips any step whose output already exists, and a step that crashed resumes
+# after its last finished epoch (each trainer's --no-resume/--no_resume opts out).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,6 +39,9 @@ OUT="${OUT:-results/training_plan}"
 MEM_MAX="${MEM_MAX:-17G}"
 PYTHON="${PYTHON:-python}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+# Spill stores, per-epoch checkpoints and resume points all land under OUT.
+# A full disk kills a run mid-epoch, so preflight refuses to start below this.
+MIN_FREE_GB="${MIN_FREE_GB:-50}"
 
 SCHEME=cross_year_ctu
 CHOSEN_IP=cross_network            # decided in advance; see analysis 30, "winner"
@@ -86,6 +90,15 @@ preflight() {
     "$PYTHON" scripts/check_datasets.py --scheme "$SCHEME" \
         --pcap-root "$PCAP_ROOT" --cic2018-csv-dir "$CIC2018_CSV_DIR" \
         --cic2017-dir "$CIC2017_DIR" --ctu-dir "$CTU_DIR"
+    mkdir -p "$OUT"
+    local free_gb
+    free_gb=$(df -Pk "$OUT" | awk 'NR==2 {printf "%d", $4/1048576}')
+    echo "[plan] free disk under $OUT: ${free_gb} GiB (preflight needs ${MIN_FREE_GB})"
+    if [ "${free_gb:-0}" -lt "$MIN_FREE_GB" ]; then
+        echo "[plan] not enough free disk under $OUT: ${free_gb} GiB < ${MIN_FREE_GB} GiB." >&2
+        echo "[plan] Free space, point OUT elsewhere, or lower MIN_FREE_GB if you know the run needs less." >&2
+        exit 2
+    fi
     echo "[plan] out=$OUT mem_max=$MEM_MAX scheme=$SCHEME chosen_ip=$CHOSEN_IP"
     echo "[plan] preflight ok"
 }

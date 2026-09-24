@@ -34,7 +34,8 @@ from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.pcap_bridge import iter_day_records
 from data_unification.density import require_full_density
 from data_unification.split_policy import is_cross_year, partition_paths, split_of
-from cyberworld_v4.training_guard import IMPROVED, STOP, TrainingGuard, default_warmup_steps
+from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingGuard,
+                                          default_warmup_steps, run_fingerprint)
 
 
 def _pcap_day_split(day_dir) -> str:
@@ -218,7 +219,8 @@ def _loader_kwargs(device, num_workers: int):
 
 
 def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 3, risk_target: str = "severity",
-                        lr: float = 1e-3, step_back_after: int = 2, clip_norm: float = 1.0):
+                        lr: float = 1e-3, step_back_after: int = 2, clip_norm: float = 1.0,
+                        resume: "ResumePoint | None" = None):
     _c = get_contract()
     # Lazy: create_rollout_samples materialises h_history [15,12],
     # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
@@ -250,7 +252,15 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                           warmup_steps=default_warmup_steps(_nb_total),
                           clip_norm=clip_norm or None,
                           log=lambda m: print(m, flush=True))
-    for epoch in range(epochs):
+    first_epoch = 0
+    _rp = resume.load() if resume is not None else None
+    if _rp is not None:
+        wdt.load_state_dict(_rp["wdt"]); risk.load_state_dict(_rp["risk"])
+        optimizer.load_state_dict(_rp["optimizer"]); guard.load_state_dict(_rp["guard"])
+        best, best_epoch, best_state = _rp["best"], _rp["best_epoch"], _rp["best_state"]
+        _history[:] = _rp["history"]
+        first_epoch = epochs if guard.should_stop() else _rp["done_epochs"]
+    for epoch in range(first_epoch, epochs):
         wdt.train(); risk.train()
         # Accumulated on device and read once per epoch: a `.item()` per batch
         # forces a host-device sync that stalls the prefetch queue. The train
@@ -386,14 +396,18 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                       flush=True)
             torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
-        elif _action == STOP:
+        if resume is not None:
+            resume.save(epoch + 1, wdt=wdt.state_dict(), risk=risk.state_dict(),
+                        optimizer=optimizer.state_dict(), guard=guard.state_dict(), best=best,
+                        best_epoch=best_epoch, best_state=best_state, history=list(_history))
+        if _action == STOP:
             # The best weights are already saved, so stopping here cannot cost
             # quality -- it only stops spending hours on epochs that do not
             # improve validation. Run 1 went 6 epochs and its best was epoch 1.
             print(f"Branch B: early stop at epoch {epoch+1}; {guard.stop_reason} "
                   f"(best epoch {best_epoch}, val_loss {best:.4f})", flush=True)
             break
-    wdt.load_state_dict(best_state)
+    wdt.load_state_dict({k: v.to(next(wdt.parameters()).device) for k, v in best_state.items()})
     wdt.eval()
 
     # Stamp the verdict into the served checkpoint, where the adapter and the
@@ -587,7 +601,8 @@ def _drop_observed(obs, vocab, p: float):
 
 
 def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4, patience: int = 3,
-                      lr: float = 5e-4, step_back_after: int = 2, clip_norm: float = 1.0):
+                      lr: float = 5e-4, step_back_after: int = 2, clip_norm: float = 1.0,
+                      resume: "ResumePoint | None" = None):
     vocab=get_joint_vocab(network_observable_only=True)
     _c=get_contract()
     # T>0 makes samples carry h_history so we can condition on Branch B's own
@@ -645,7 +660,15 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                           warmup_steps=default_warmup_steps(_nb_total),
                           clip_norm=clip_norm or None,
                           log=lambda m: print(m, flush=True))
-    for epoch in range(epochs):
+    first_epoch = 0
+    _rp = resume.load() if resume is not None else None
+    if _rp is not None:
+        decoder.load_state_dict(_rp["decoder"]); optimizer.load_state_dict(_rp["optimizer"])
+        guard.load_state_dict(_rp["guard"])
+        best, best_epoch = _rp["best"], _rp["best_epoch"]
+        _history[:] = _rp["history"]
+        first_epoch = epochs if guard.should_stop() else _rp["done_epochs"]
+    for epoch in range(first_epoch, epochs):
         decoder.train()
         # On-device accumulation: `loss.item()` per batch synced the host to
         # the GPU on every step and defeated the worker prefetch queue.
@@ -809,7 +832,11 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         if _action == IMPROVED:
             best=_sel; best_epoch=epoch+1
             output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"d_state":d_state,"arch":decoder.arch_config(),"train_token_counts":_train_token_counts,"epoch_history":list(_history),"selection_metric":_sel_metric,"label_smoothing_support":_support.cpu().tolist(),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
-        elif _action == STOP:
+        if resume is not None:
+            resume.save(epoch + 1, decoder=decoder.state_dict(), optimizer=optimizer.state_dict(),
+                        guard=guard.state_dict(), best=best, best_epoch=best_epoch,
+                        history=list(_history))
+        if _action == STOP:
             # Best weights are already on disk; stopping cannot cost quality.
             print(f"DeepOP: early stop at epoch {epoch+1}; {guard.stop_reason} "
                   f"(best epoch {best_epoch}, selection score {best:.4f})", flush=True)
@@ -906,6 +933,8 @@ def main():
     parser.add_argument("--step-back-after",type=int,default=2,
                         help="After N flat epochs, restore the best weights and halve "
                              "the LR (cyberworld_v4/training_guard.py). Must be < --patience.")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore resume points left by a crashed run of the same command")
     parser.add_argument("--clip-norm",type=float,default=1.0,
                         help="Gradient-norm clip for Branch B and DeepOP; 0 disables")
     parser.add_argument("--lr-branch-b",type=float,default=1e-3)
@@ -1064,6 +1093,14 @@ def main():
     # being replaced.
     bb_out = args.out_dir / "branch_b" / "host_wdt.pt"
     dp_out = args.out_dir / "deepop" / "cwa_forecast_decoder.pt"
+    # Crash recovery. Kept until the whole run finishes, so a crash in DeepOP
+    # does not retrain a Branch B that had already finished.
+    _fp = run_fingerprint(args, ignore=("epochs", "num_workers"))
+    _log = lambda m: print(m, flush=True)
+    bb_resume = ResumePoint(bb_out.with_name(bb_out.stem + "_resume.pt"), {**_fp, "stage": "'branch_b'"},
+                            enabled=not args.no_resume, log=_log)
+    dp_resume = ResumePoint(dp_out.with_name(dp_out.stem + "_resume.pt"), {**_fp, "stage": "'deepop'"},
+                            enabled=not args.no_resume, log=_log)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     for _p in (bb_out, dp_out):
         _p.parent.mkdir(parents=True, exist_ok=True)
@@ -1108,7 +1145,7 @@ def main():
                                   num_workers=args.num_workers,patience=args.patience,
                                   risk_target=args.risk_target, lr=args.lr_branch_b,
                                   step_back_after=args.step_back_after,
-                                  clip_norm=args.clip_norm)
+                                  clip_norm=args.clip_norm, resume=bb_resume)
         print(f"served checkpoint updated: {bb_out}", flush=True)
 
     if args.stages in ("both", "deepop"):
@@ -1134,7 +1171,7 @@ def main():
         train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,
                           num_workers=args.num_workers,patience=args.patience,
                           lr=args.lr_deepop, step_back_after=args.step_back_after,
-                          clip_norm=args.clip_norm)
+                          clip_norm=args.clip_norm, resume=dp_resume)
         print(f"served checkpoint updated: {dp_out}", flush=True)
 
     if is_cross_year(args.split_scheme):
@@ -1198,6 +1235,8 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
         args.results_json.parent.mkdir(parents=True, exist_ok=True)
         args.results_json.write_text(json.dumps(out, indent=2, default=str))
         print(f"results written to {args.results_json}", flush=True)
+    bb_resume.clear()
+    dp_resume.clear()
 
 
 if __name__ == "__main__":

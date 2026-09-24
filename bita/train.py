@@ -31,7 +31,8 @@ from data_unification.tgne_features import (
     extract_canonical_edge_features,
 )
 from data_unification.density import require_full_density
-from cyberworld_v4.training_guard import STOP, TrainingGuard, default_warmup_steps
+from cyberworld_v4.training_guard import (STOP, ResumePoint, TrainingGuard, default_warmup_steps,
+                                          run_fingerprint)
 from data_unification.ip_features import ablated_node_features as _ablated_node_features
 
 
@@ -1113,6 +1114,28 @@ def train(args):
         warmup_steps=default_warmup_steps(math.ceil(num_batch / max(args.backprop_every or 1, 1))),
         clip_norm=args.clip_norm or None, log=logging.info)
 
+    # Crash recovery (cyberworld_v4/training_guard.ResumePoint): re-running the
+    # same command after a crash continues after the last finished epoch.
+    _curves = {"val_aps": val_aps, "new_nodes_val_aps": new_nodes_val_aps,
+               "val_aucs": val_aucs, "new_nodes_val_aucs": new_nodes_val_aucs,
+               "val_accuracies": val_accuracies, "new_nodes_val_accuracies": new_nodes_val_accuracies,
+               "val_mrrs": val_mrrs, "new_nodes_val_mrrs": new_nodes_val_mrrs,
+               "train_losses": train_losses, "epoch_times": epoch_times}
+    resume = ResumePoint(os.path.splitext(model_save_path)[0] + "_resume.pt",
+                         run_fingerprint(args, ignore=("n_epoch", "gpu", "num_workers")),
+                         enabled=not args.no_resume, log=logging.info)
+    first_epoch = 0
+    _rp = resume.load()
+    if _rp is not None:
+        tgn.load_state_dict(_rp["model"])
+        optimizer.load_state_dict(_rp["optimizer"])
+        guard.load_state_dict(_rp["guard"])
+        for _k, _v in _rp["curves"].items():
+            _curves[_k][:] = _v
+        first_epoch = _rp["done_epochs"]
+        if guard.should_stop():
+            first_epoch = args.n_epoch       # it had already stopped; just finish
+
     if args.shuffle_batches and args.use_memory:
         raise ValueError(
             "--shuffle_batches cannot be combined with --use_memory: TGN's memory "
@@ -1150,7 +1173,7 @@ def train(args):
     logging.info("Batch sampling: %s",
                  "SHUFFLED (memory off)" if args.shuffle_batches else "time-ordered")
     logging.info("Starting training loop...")
-    for epoch in range(args.n_epoch):
+    for epoch in range(first_epoch, args.n_epoch):
         start_epoch = time.time()
         tgn.train()
 
@@ -1371,6 +1394,15 @@ def train(args):
         if nn_val_ap == nn_val_ap and nn_val_ap < 0.55:
             _health.append(f"inductive link prediction AP {nn_val_ap:.3f}: near chance on unseen hosts")
         _action = guard.end_epoch(_sel, train_loss=mean_train_loss, health=_health)
+        resume.save(epoch + 1, model=tgn.state_dict(), optimizer=optimizer.state_dict(),
+                    guard=guard.state_dict(), curves={k: list(v) for k, v in _curves.items()})
+        # Only the best epoch's file is read again (below), and the current one
+        # may become the best; the rest are dead weight in --checkpoint_dir.
+        for _e in range(epoch):
+            if guard.best_epoch is None or _e != guard.best_epoch - 1:
+                _old = checkpoint_path_fn(_e)
+                if os.path.exists(_old):
+                    os.remove(_old)
         if _action == STOP:
             logging.info(f"Early stopping: {guard.stop_reason}")
             break
@@ -1390,6 +1422,7 @@ def train(args):
     with open(os.path.splitext(model_save_path)[0] + "_training_guard.json", "w") as _fh:
         _json.dump(guard.summary(), _fh, indent=2, default=str)
     logging.info(f"Best model successfully saved to: {model_save_path}")
+    resume.clear()
 
     # Serialize explicit architectural configuration
     import json
@@ -1617,6 +1650,9 @@ if __name__ == '__main__':
     # rescale every step.
     parser.add_argument('--clip_norm', type=float, default=100.0,
                         help='Gradient-norm clip for explosions; 0 disables (norms still logged)')
+    parser.add_argument('--no_resume', action='store_true',
+                        help='Ignore a resume point left by a crashed run of the same command '
+                             'and start from epoch 0')
     parser.add_argument('--learn_time_encoding', action='store_true',
                         help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
                              'Off by default: fixed encoding, see the note in train()')

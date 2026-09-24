@@ -31,7 +31,8 @@ from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.density import require_full_density
 from data_unification.split_policy import is_cross_year
-from cyberworld_v4.training_guard import IMPROVED, STOP, TrainingGuard, default_warmup_steps
+from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingGuard,
+                                          default_warmup_steps, run_fingerprint)
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
@@ -1209,6 +1210,9 @@ def main():
                              "weights and halve the LR before trying again "
                              "(cyberworld_v4/training_guard.py). Must be < --patience.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore a resume point left by a crashed run of the same "
+                             "command and start from epoch 1")
     parser.add_argument("--clip-norm", type=float, default=1.0,
                         help="Gradient-norm clip; 0 disables clipping (norms still logged)")
     parser.add_argument("--warmup-steps", type=int, default=None,
@@ -1704,7 +1708,24 @@ def main():
                   flush=True)
         return
 
-    for epoch in range(1, args.epochs + 1):
+    # Crash recovery (cyberworld_v4/training_guard.ResumePoint). Extraction
+    # re-runs on a restart; the finished epochs do not.
+    resume = ResumePoint(args.output.with_name(args.output.stem + "_resume.pt"),
+                         run_fingerprint(args, ignore=("epochs", "num_workers")),
+                         enabled=not args.no_resume, log=lambda m: print(m, flush=True))
+    first_epoch = 1
+    _rp = resume.load()
+    if _rp is not None:
+        model.load_state_dict(_rp["model"])
+        optimizer.load_state_dict(_rp["optimizer"])
+        guard.load_state_dict(_rp["guard"])
+        best_loss, best_metrics = _rp["best_loss"], _rp["best_metrics"]
+        _history[:] = _rp["history"]
+        first_epoch = _rp["done_epochs"] + 1
+        if guard.should_stop():
+            first_epoch = args.epochs + 1    # it had already stopped; just finish
+
+    for epoch in range(first_epoch, args.epochs + 1):
         model.train()
         # Loss is accumulated as a GPU tensor and read once at the end of the
         # epoch. `float(loss.item())` per batch forces a host-device sync on
@@ -1861,7 +1882,10 @@ def main():
                 },
                 args.output,
             )
-        elif _action == STOP:
+        resume.save(epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                    guard=guard.state_dict(), best_loss=best_loss,
+                    best_metrics=best_metrics, history=list(_history))
+        if _action == STOP:
             # The best weights are already written, so stopping here cannot
             # cost quality -- it only stops paying for epochs that do nothing.
             print(f"early stop at epoch {epoch}: {guard.stop_reason} (best epoch "
@@ -2009,6 +2033,7 @@ def main():
 
     print(f"saved={args.output} best_metrics={slim(best_metrics, True)} "
           f"test_metrics={slim(test_metrics, True)}")
+    resume.clear()
 
 
 if __name__ == "__main__":

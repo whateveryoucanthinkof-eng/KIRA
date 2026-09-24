@@ -283,6 +283,7 @@ def main() -> int:
         # DeepOP must run even though Branch B cannot beat persistence on
         # synthetic traffic, or its code path would go untested.
         "PLAN_DOWNSTREAM_EXTRA": f"--epochs {a.epochs} --allow-noncredible-branch-b",
+        "MIN_FREE_GB": "1",
     })
     if not shutil.which("systemd-run"):
         env["ALLOW_UNCAPPED"] = "1"

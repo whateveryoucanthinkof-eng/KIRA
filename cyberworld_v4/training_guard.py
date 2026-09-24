@@ -334,6 +334,20 @@ class TrainingGuard:
     def should_stop(self) -> bool:
         return bool(self.history) and self.history[-1]["action"] == STOP
 
+    # ------------------------------------------------------------- resume
+    _RESUME_KEYS = ("lr_scale", "global_step", "best", "best_epoch", "since_improve",
+                    "step_backs", "epoch", "stop_reason", "history", "_best_state")
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Everything the guard knows, including the best snapshot, for a resume point."""
+        return {k: getattr(self, k) for k in self._RESUME_KEYS}
+
+    def load_state_dict(self, sd: Dict[str, Any]) -> None:
+        for k in self._RESUME_KEYS:
+            setattr(self, k, sd[k])
+        self._reset_epoch_stats()
+        self._apply_lr()
+
     def summary(self) -> Dict[str, Any]:
         return {
             "best_epoch": self.best_epoch, "best_score": self.best,
@@ -346,3 +360,107 @@ class TrainingGuard:
 def default_warmup_steps(steps_per_epoch: int, cap: int = 500) -> int:
     """~5% of the first epoch, at most `cap` updates, at least 1."""
     return max(1, min(cap, steps_per_epoch // 20))
+
+
+# ---------------------------------------------------------------- crash resume
+def _rng_state() -> Dict[str, Any]:
+    import random
+    import numpy as np
+    st = {"python": random.getstate(), "numpy": np.random.get_state(),
+          "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        st["cuda"] = torch.cuda.get_rng_state_all()
+    return st
+
+
+def _set_rng_state(st: Dict[str, Any]) -> None:
+    import random
+    import numpy as np
+    random.setstate(st["python"])
+    np.random.set_state(st["numpy"])
+    torch.set_rng_state(st["torch"])
+    if "cuda" in st and torch.cuda.is_available() and len(st["cuda"]) == torch.cuda.device_count():
+        torch.cuda.set_rng_state_all(st["cuda"])
+
+
+def run_fingerprint(args, ignore: Iterable[str] = ()) -> Dict[str, str]:
+    """The arguments a resume point must match. Epoch ceilings, worker counts
+    and the device may change between attempts; anything else means a
+    different run, whose half-trained state must not be continued."""
+    skip = set(ignore) | {"resume", "no_resume"}
+    return {k: repr(v) for k, v in sorted(vars(args).items()) if k not in skip}
+
+
+class ResumePoint:
+    """Crash recovery: the state at the end of the last finished epoch.
+
+    A run killed at hour five -- power cut, OOM, a reboot -- restarted from
+    epoch 0 before this. Now each trainer writes one file per run (atomically:
+    temp file + os.replace, so a crash mid-write leaves the previous epoch's
+    file intact) holding the weights, the optimizer, the TrainingGuard (best
+    snapshot included) and the RNG states. Re-running the same command
+    continues after the last finished epoch; a successful run deletes it.
+
+    A file whose arguments differ from this run's is set aside (renamed
+    `.stale`), never loaded: continuing a different run's weights would be
+    silently wrong. An unreadable file is set aside as `.corrupt`.
+    """
+
+    def __init__(self, path, fingerprint: Dict[str, str], *, enabled: bool = True,
+                 log: Callable[[str], None] = print):
+        self.path = str(path)
+        self.fingerprint = dict(fingerprint)
+        self.enabled = enabled
+        self.log = log
+
+    def _set_aside(self, suffix: str) -> None:
+        import os
+        try:
+            os.replace(self.path, self.path + suffix)
+        except OSError:
+            pass
+
+    def load(self) -> Optional[Dict[str, Any]]:
+        import os
+        if not self.enabled or not os.path.exists(self.path):
+            return None
+        try:
+            payload = torch.load(self.path, map_location="cpu", weights_only=False)
+        except Exception as exc:  # truncated or foreign file
+            self.log(f"[resume] {self.path} unreadable ({exc}); set aside as .corrupt, starting fresh")
+            self._set_aside(".corrupt")
+            return None
+        theirs = payload.get("fingerprint") or {}
+        if theirs != self.fingerprint:
+            diff = sorted(k for k in set(theirs) | set(self.fingerprint)
+                          if theirs.get(k) != self.fingerprint.get(k))
+            self.log(f"[resume] {self.path} is from a run with different arguments "
+                     f"({', '.join(diff[:8])}); set aside as .stale, starting fresh")
+            self._set_aside(".stale")
+            return None
+        if payload.get("rng"):
+            _set_rng_state(payload["rng"])
+        self.log(f"[resume] continuing from {self.path}: {payload.get('done_epochs')} epoch(s) "
+                 f"already finished")
+        return payload
+
+    def save(self, done_epochs: int, **state: Any) -> None:
+        import os
+        if not self.enabled:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        tmp = self.path + ".tmp"
+        torch.save({"fingerprint": self.fingerprint, "done_epochs": int(done_epochs),
+                    "rng": _rng_state(), **state}, tmp)
+        os.replace(tmp, self.path)
+        # Test hook: die here, as a power cut would, so a test can prove the
+        # next run picks up from this file (tests/test_training_resume.py).
+        if os.environ.get("CYBERWORLD_TEST_CRASH_AFTER_EPOCH") == str(int(done_epochs)):
+            self.log(f"[resume] TEST CRASH after epoch {done_epochs}")
+            os._exit(99)
+
+    def clear(self) -> None:
+        import os
+        for p in (self.path, self.path + ".tmp"):
+            if os.path.exists(p):
+                os.remove(p)
