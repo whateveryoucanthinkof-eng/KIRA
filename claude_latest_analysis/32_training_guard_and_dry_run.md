@@ -50,6 +50,44 @@ Every checkpoint stores the guard's full history: `*_training_guard.json` for th
 
 Epoch counts are ceilings. The guard usually ends the run earlier.
 
+### Crash recovery (`ResumePoint`, same module)
+
+A crash, power cut or OOM used to send every trainer back to epoch 0. Each trainer now writes a
+resume point after every epoch. It holds:
+- the weights and the optimizer state;
+- the guard, including its best snapshot;
+- the RNG states.
+
+The write is atomic (temp file, then `os.replace`), so a crash during the write leaves the previous
+epoch's file intact. **Re-running the same command continues after the last finished epoch.** A
+successful run deletes its resume point.
+
+| Trainer | Resume file |
+|---|---|
+| Encoder | `<save_dir>/<prefix>-<data>_resume.pt` |
+| Branch A | `<output stem>_resume.pt` |
+| Branch B, DeepOP | `branch_b/host_wdt_resume.pt` and `deepop/cwa_forecast_decoder_resume.pt`, kept until the whole downstream run finishes, so a DeepOP crash does not retrain Branch B |
+
+Rules:
+- A resume point from a run with **different arguments** is set aside as `.stale` and never
+  loaded. The epoch ceiling and the worker count may change between attempts.
+- An unreadable file is set aside as `.corrupt`.
+- `--no_resume` (encoder) or `--no-resume` (the others) starts fresh.
+- Feature extraction re-runs on a restart; the finished epochs do not.
+
+Verified by killing each real trainer right after epoch 1 on the dry-run corpus
+(`CYBERWORLD_TEST_CRASH_AFTER_EPOCH=1`) and re-running it. All four resumed at epoch 2 and finished.
+That test found a bug in the downstream cleanup: a `NameError` on the last line of a successful
+run. In a unit test, a run resumed after epoch 2 ends with the same weights as an uninterrupted one
+(`tests/test_training_resume.py`).
+
+The encoder keeps only its best and current per-epoch checkpoints; it used to keep all 50.
+
+### Disk space
+
+Preflight refuses to start with less than `MIN_FREE_GB` (default 50) GiB free under `OUT`. That
+directory holds the spill stores, checkpoints and resume points.
+
 ## 2. The dry run (`scripts/dry_run_plan.py`, also the `dryrun` stage of the plan)
 
 The dry run writes a synthetic corpus in the exact on-disk formats the plan reads:
@@ -102,7 +140,7 @@ Considered and **kept**:
 
 ## 5. Status
 
-- Tests: the full suite passes except for the same 3 environmental failures as before, plus one
+- Tests: 1034 pass. The failures are the same 3 environmental ones as before, plus one
   collection error. `test_serving_replay_isolation` needs a retrained encoder, which this run
   produces.
 - Dry run: **passes** end to end, covering both IP arms and three seeds for the encoder and Branch A,
