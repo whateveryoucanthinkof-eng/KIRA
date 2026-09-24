@@ -188,3 +188,4 @@ is why `pcap_adapter.py` exists. Packet features are extracted but not yet in a 
 | [`29_external_review_assessed.md`](29_external_review_assessed.md) | An external critique checked claim by claim; label-conditional conformal, sensor drop accounting, neighbour cut-off exposure, task-gradient conflict |
 | [`30_training_decisions.md`](30_training_decisions.md) | **Before training:** every design decision for the next run and for the campaign model, and `scripts/run_training_plan.sh` |
 | [`31_merge_with_testing_prod.md`](31_merge_with_testing_prod.md) | How the 16 later testing-prod commits were merged into v5.5o, conflict by conflict |
+| [`32_training_guard_and_dry_run.md`](32_training_guard_and_dry_run.md) | **Before training:** the policy all four trainers follow (step back after 2 flat epochs, stop at 3), and the 7 defects the end-to-end dry run found |

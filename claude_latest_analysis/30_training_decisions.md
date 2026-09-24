@@ -4,6 +4,9 @@
 **How made:** every open choice was put to the project owner as a question, with the trade-offs.
 The answers below are theirs. Where a choice changes behaviour, the enforcing code is named.
 **Run it:** `scripts/run_training_plan.sh` (the plan in §1) implements every tactical decision here.
+**Training policy and dry run:** see [32](32_training_guard_and_dry_run.md). Every trainer steps back after
+2 flat epochs and stops at 3. The encoder's time encoding is fixed, and Branch A's discrete gradation
+is read off the technique head.
 
 ---
 
