@@ -81,7 +81,7 @@ class _Stub(torch.nn.Module):
         out[torch.arange(len(idx)), idx] = 6.0
         return out
 
-    def forward(self, x):
+    def forward(self, x, t_history=None):   # MultiTaskLSTM's time channel
         b = self.loader.batches[self._i]
         self._i += 1
         n = len(b["gradation"])

@@ -740,7 +740,8 @@ class DeepOPTokenScorer:
         return "\n".join(lines)
 
 
-def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=None):
+def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=None,
+                          support=None):
     """Both losses from one forward pass, because only one of them is comparable.
 
     `train_deepop_live` optimises `cross_entropy(..., label_smoothing=0.04)`
@@ -777,7 +778,30 @@ def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=
     """
     V = logits.shape[-1]
     flat, tgt = logits.reshape(-1, V), target.reshape(-1)
-    smoothed = F.cross_entropy(flat, tgt, weight=weight, label_smoothing=label_smoothing)
+    if support is None or weight is not None:
+        smoothed = F.cross_entropy(flat, tgt, weight=weight, label_smoothing=label_smoothing)
+    else:
+        # Smooth over the tokens that can actually occur, not the whole
+        # vocabulary.
+        #
+        # PyTorch spreads eps uniformly over all V classes. Six of the ten
+        # tokens here never occur as a target anywhere in the corpus --
+        # <PAD>, <BOS>, <EOS>, CredentialAccess.T1110, Exfiltration.T1005,
+        # Recon.T1595 -- so at eps=0.04 that is 6/10 * 0.04 = 2.4% of every
+        # target's probability mass deliberately pushed onto answers that
+        # are impossible. That is not regularisation, it is a loss floor.
+        #
+        # Same identity as PyTorch's, restricted to the support S:
+        #     L = (1 - eps) * NLL(target) + eps * mean_{k in S} NLL(k)
+        # With S = every class this is exactly F.cross_entropy(...,
+        # label_smoothing=eps) -- pinned by a test.
+        sup = torch.as_tensor(support, dtype=torch.bool, device=flat.device)
+        if not bool(sup.any()):
+            raise ValueError("label-smoothing support is empty")
+        logp = F.log_softmax(flat, dim=-1)
+        nll_t = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
+        nll_u = -logp[:, sup].mean(dim=1)
+        smoothed = ((1.0 - label_smoothing) * nll_t + label_smoothing * nll_u).mean()
     with torch.no_grad():
         plain = F.cross_entropy(flat, tgt, weight=weight)
     return smoothed, plain

@@ -12,12 +12,16 @@ there. No feature vector is built here.
 import time
 from typing import Dict, List, Optional, Any
 
+from cyberworld_v4.config import get_contract
 from telemetry.flow.flow_table import LiveFlowTable
 
 
 class LiveStateBuilder:
-    def __init__(self, window_sec: float = 2.0):
-        self.window_sec = window_sec
+    def __init__(self, window_sec: Optional[float] = None):
+        # Default to the authoritative temporal contract, not a hardcoded
+        # literal -- a caller that wants the served window size can simply
+        # omit window_sec instead of importing/duplicating the constant.
+        self.window_sec = window_sec if window_sec is not None else get_contract().window_seconds
 
         self.flow_table = LiveFlowTable()
 

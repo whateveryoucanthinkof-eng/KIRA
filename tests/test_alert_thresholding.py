@@ -86,3 +86,24 @@ def test_adapter_exposes_the_risk_objective():
     src = inspect.getsource(ma.AntigravityModelAdapter._adopt_risk_semantics)
     assert "risk_objective" in src
     assert "operating_point" in src, "must read a fitted threshold when present"
+
+
+# --- the rule layer must not make alerting arithmetically impossible -------
+#
+# testing-prod found that internal-only windows were displayed as
+# max(0.05, raw_risk * 0.4): capped at 0.40, below the 0.65 alert line, so no
+# internal-only window -- i.e. no lateral movement -- could ever alert, and it
+# added a startup warning for that combination. v5.5o removed the suppression
+# itself: the rule layer is advisory and never moves the verdict
+# (tests/test_verdict_is_the_model.py). The merge keeps the removal, and this
+# pins it so the ceiling cannot come back.
+
+def test_no_rule_can_cap_the_verdict_below_the_alert_line():
+    pytest.importorskip("torch")
+    import inspect
+    from control_backend import model_adapter as ma
+    A = ma.AntigravityModelAdapter
+    assert not hasattr(A, "INTERNAL_SUPPRESSION_FACTOR"), "the internal-traffic ceiling is back"
+    src = inspect.getsource(A.predict_window)
+    assert "raw_risk * 0.4" not in src and "raw_risk * self.INTERNAL" not in src
+    assert "obs_risk = ml_risk" in src, "the verdict must be the model output"

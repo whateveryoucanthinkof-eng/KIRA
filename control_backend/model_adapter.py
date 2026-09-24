@@ -6,7 +6,7 @@ Consumes UnifiedFlowRecord windows from Containerlab SPAN,
 runs TGNE-TA → Branch A / Branch B (WDT) / DeepOP CWA, and emits PredictionEvent.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 import time
@@ -135,6 +135,11 @@ class AntigravityModelAdapter:
         self.h_state_history: List[torch.Tensor] = []
         self.feature_history: List[torch.Tensor] = []
         self.h_state_history_by_target: Dict[str, List[torch.Tensor]] = {}
+        #: Window end time of each entry in h_state_history_by_target, kept in
+        #: lockstep with it. Branch B is trained on REAL elapsed times between
+        #: a host's steps (median 14 s, not the 2 s grid), so serving must pass
+        #: them too or it forecasts from a spacing the model never saw.
+        self.h_time_history_by_target: Dict[str, List[float]] = {}
         self.feature_history_by_target: Dict[str, List[torch.Tensor]] = {}
         # Branch A's technique token per window, per host: the "observed
         # attack sequence" DeepOP's encoder reads.
@@ -436,6 +441,7 @@ class AntigravityModelAdapter:
         self.h_state_history_by_target.clear()
         self.feature_history_by_target.clear()
         self.technique_history_by_target.clear()
+        self.h_time_history_by_target.clear()
         extractor = getattr(self, "extractor", None)
         if extractor is not None and hasattr(extractor, "reset_memory_state"):
             extractor.reset_memory_state()
@@ -455,7 +461,8 @@ class AntigravityModelAdapter:
 
         raise RuntimeError(f"TGNE produced no embedding for target host {target_ip}")
 
-    def _explain(self, x_tensor: torch.Tensor) -> ExplainabilityPayload:
+    def _explain(self, x_tensor: torch.Tensor,
+                 t_history: Optional[torch.Tensor] = None) -> ExplainabilityPayload:
         """Input x Gradient attribution for the prediction actually made.
 
         Two defects this fixes:
@@ -483,7 +490,9 @@ class AntigravityModelAdapter:
             # RNN backward needs cuDNN disabled in eval; this replaces the
             # train()-mode workaround without enabling dropout.
             with torch.backends.cudnn.flags(enabled=False):
-                out = self.branch_a(x)
+                # Same time input as the served forward, or the attribution
+                # would describe a computation that was never served.
+                out = self.branch_a(x, t_history=t_history)
                 risk = out["risk_score"]
                 if risk.ndim > 0:
                     risk = risk.reshape(-1)[0]
@@ -534,6 +543,19 @@ class AntigravityModelAdapter:
             top_features=top_features,
         )
 
+    def _relative_times(self, times):
+        """[1, history_steps] seconds relative to the latest window.
+
+        The convention both Branch A's time channel and Branch B's rollout are
+        trained with: <= 0, last entry exactly 0. Left-padded slots repeat the
+        earliest real time, matching the training datasets.
+        """
+        last = times[-1]
+        rel = [t - last for t in times]
+        while len(rel) < self.history_steps:
+            rel.insert(0, rel[0])
+        return torch.tensor([rel], dtype=torch.float32, device=self.device)
+
     def _alert_level(self, risk: float) -> str:
         """Band a risk score.
 
@@ -582,19 +604,40 @@ class AntigravityModelAdapter:
         """
         t0 = time.perf_counter()
 
-        host_flows = [
-            record
-            for record in flows
-            if record.src_ip == target_ip or record.dst_ip == target_ip
-        ]
-        if host_flows:
-            window_end = max(record.end_time for record in host_flows)
+        # One window, defined once, and used by BOTH halves of the feature
+        # vector. `flows` as handed over by the sensor is NOT one window: the
+        # live flow table retains a flow until it has been silent for 30 s
+        # (telemetry/flow/flow_table.py), so a snapshot routinely carries flows
+        # last seen many windows ago. Training builds a window's features from
+        # `win_recs` -- the records of that window, for every host -- and takes
+        # the attributes and the TGNE embedding from that same slice
+        # (data_unification/multi_dataset_stream.py:extract_trajectories).
+        #
+        # This used to clip only the host-scoped list, then hand the FULL,
+        # unclipped snapshot to TGNE. The 15 attributes were therefore computed
+        # over one time window and the 12 embedding dimensions over another,
+        # which training never does. Measured on a snapshot mixing flows aged
+        # 0.2-18 s: the embedding moved by up to 3.3e-2 per dimension between
+        # the two slices (mean 1.1e-2) -- the same magnitude as the
+        # full-graph-vs-subgraph mismatch this block already guards against.
+        #
+        # A recorded mitigation does not empty `flows`: the model scores the
+        # traffic it actually sees (see the docstring).
+        window_flows = flows
+        if flows:
+            window_end = max(record.end_time for record in flows)
             window_start = window_end - self.window_seconds
-            host_flows = [
+            window_flows = [
                 record
-                for record in host_flows
+                for record in flows
                 if record.end_time >= window_start or record.start_time >= window_start
             ]
+
+        host_flows = [
+            record
+            for record in window_flows
+            if record.src_ip == target_ip or record.dst_ip == target_ip
+        ]
 
         # Host-scoped flows are correct for the temporal ATTRIBUTES: those are
         # per-host aggregates (this host's byte counts, peers, ports).
@@ -614,10 +657,10 @@ class AntigravityModelAdapter:
         # cross-host traffic. That is a train/serve mismatch: the model was
         # fitted on full-graph embeddings and served subgraph ones.
         #
-        # The full window is passed here so live matches training. Verified by
-        # scripts/verify_offline_live_parity.py.
-        window_flows = flows if flows else host_flows
-        h_emb = self._build_embedding(target_ip, window_flows)
+        # The full window is passed here -- every host's flows, clipped to the
+        # same window the attributes were computed over -- so live matches
+        # training on both axes: the whole graph, one window.
+        h_emb = self._build_embedding(target_ip, window_flows or host_flows)
         
         import model_contract
         model_contract.assert_shape(h_emb, (model_contract.TGNE_LATENT_DIM,), "TGNE Embedding")
@@ -626,20 +669,31 @@ class AntigravityModelAdapter:
         model_contract.assert_shape(feature_vector, (model_contract.BRANCH_A_INPUT_DIM,), "Branch A Input Vector")
 
         feature_history = self.feature_history_by_target.setdefault(target_ip, [])
+        # One window time per history entry. Recorded HERE, alongside the
+        # feature vector, because Branch A runs before the Branch B state is
+        # appended below; recording it there left Branch A's forward one
+        # window short of times. Feature and state histories always hold the
+        # same windows (one append each per call, both capped at
+        # history_steps), so both models read this one list.
+        h_time_history = self.h_time_history_by_target.setdefault(target_ip, [])
         feature_history.append(
             torch.from_numpy(feature_vector).float().to(self.device)
         )
+        h_time_history.append(
+            float(max(r.end_time for r in flows)) if flows else float(time.time()))
         if len(feature_history) > self.history_steps:
             feature_history.pop(0)
+            h_time_history.pop(0)
         self.feature_history = feature_history
         feature_history = list(feature_history)
         while len(feature_history) < self.history_steps:
             feature_history.insert(0, torch.zeros_like(feature_history[0]))
         x_tensor = torch.stack(feature_history).unsqueeze(0)
+        t_history = self._relative_times(h_time_history)
 
         with torch.no_grad():
             logger.debug("[TGNE] -> [BRANCH_A] -> [BRANCH_B] -> [DEEPOP]")
-            branch_a_out = self.branch_a(x_tensor)
+            branch_a_out = self.branch_a(x_tensor, t_history=t_history)
             risk_pred = branch_a_out["risk_score"]
             obs_logits = branch_a_out["technique_logits"]
             obs_probs = torch.softmax(obs_logits, dim=-1)
@@ -686,21 +740,58 @@ class AntigravityModelAdapter:
         if len(h_state_history) > self.history_steps:
             h_state_history.pop(0)
         self.h_state_history = h_state_history
-        while len(h_state_history) < self.history_steps:
-            h_state_history.insert(0, torch.zeros_like(curr_h))
-        h_seq = torch.stack(h_state_history, dim=1)
+        # Pad a COPY. `h_state_history` is the list held in
+        # h_state_history_by_target, so padding it in place wrote the zero
+        # placeholders into the retained history -- which made
+        # `len(self.h_state_history)` equal history_steps from the very first
+        # window. `state.sequence_ready` and `state.buffer_length` are derived
+        # from that length, so the payload reported a full 15-step buffer while
+        # 14 of the 15 slots were padding. Measured on window 0 of a fresh
+        # adapter: sequence_ready=True, buffer_length=15, non-zero entries=1.
+        # The Branch A feature history two blocks above already takes a copy;
+        # this one did not, and that was the whole difference.
+        padded_h = list(h_state_history)
+        while len(padded_h) < self.history_steps:
+            padded_h.insert(0, torch.zeros_like(curr_h))
+        h_seq = torch.stack(padded_h, dim=1)
+
+        # Real elapsed seconds of each history step, relative to the latest
+        # (the convention HostWorldDynamicsTransformer._elapsed_times and both
+        # training datasets use: <= 0, last entry exactly 0). Padded slots
+        # repeat the earliest real time, as the DeepOP dataset does.
+        # t_history was built once above from the shared per-window times.
+        # t_future is the contract's question, asked explicitly: step k is
+        # (k+1) * step_seconds ahead -- the same horizons the forecast points
+        # are labelled with (5 x 30 s = 150 s under the current contract).
+        # Training teaches h(t + dt) over the REAL dt to each future active
+        # window; serving chooses which dt to ask about. Leaving it None would
+        # fall back to a window_seconds grid (+2 ... +10 s) and label those
+        # answers as +30 ... +150 s.
+        t_future = torch.tensor(
+            [[(k + 1) * self.step_seconds for k in range(self.forecast_steps)]],
+            dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
+            # delta_t_step is the served window, not the module default. The
+            # adapter takes its contract from the checkpoints
+            # (_adopt_contract), so passing nothing here would silently encode
+            # positions at LIVE_WINDOW_SIZE_SEC whenever a checkpoint is served
+            # under a different window -- exactly the case the
+            # CYBERWORLD_ALLOW_CONTRACT_MISMATCH escape hatch permits.
             if hasattr(self.wdt, "rollout_with_uncertainty"):
                 # _radii are LATENT-space radii (NaN unless calibrate_radii was
                 # run) and cannot be drawn on a risk chart. The served band is
                 # the risk-space conformal interval: forecast_band() below.
                 h_future, _radii = self.wdt.rollout_with_uncertainty(
-                    h_seq, K=self.forecast_steps, stabilize_horizon=True
+                    h_seq, K=self.forecast_steps,
+                    delta_t_step=self.window_seconds, stabilize_horizon=True,
+                    t_history=t_history, t_future=t_future,
                 )
             else:
                 h_future = self.wdt.rollout(
-                    h_seq, K=self.forecast_steps, stabilize_horizon=True
+                    h_seq, K=self.forecast_steps,
+                    delta_t_step=self.window_seconds, stabilize_horizon=True,
+                    t_history=t_history, t_future=t_future,
                 )
 
             step_risks, _ = self.risk_head.forward_trajectory(h_future)
@@ -756,13 +847,17 @@ class AntigravityModelAdapter:
         )
         alert = obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
 
-        # Early warning: how far ahead the FORECAST first crosses the threshold
-        # while the current window is still below it. This used to be the
-        # constant forecast_steps * window_seconds on every alert -- a config
-        # value shown as if it were a measured lead time.
+        # Early warning: how far ahead the FORECAST first crosses the threshold.
+        # This used to be the constant forecast_steps * window_seconds on every
+        # alert -- a config value shown as if it were a measured lead time. It
+        # is 0.0 when the current window already crosses (the attack is in
+        # progress; there is no warning to claim) and None when nothing does.
+        # Steps are FORECAST steps (step_seconds), not 2 s input windows.
         step_s = self.step_seconds
         lead_time: Optional[float] = None
-        if obs_risk < self.alert_threshold:
+        if obs_risk >= self.alert_threshold:
+            lead_time = 0.0
+        else:
             for k, r in enumerate(fut_risks):
                 if r >= self.alert_threshold:
                     lead_time = (k + 1) * step_s
@@ -775,7 +870,7 @@ class AntigravityModelAdapter:
         else:
             mitigation_status = "recorded_quiet"
 
-        explain = self._explain(x_tensor)
+        explain = self._explain(x_tensor, t_history)
         inf_ms = (time.perf_counter() - t0) * 1000.0
         now_ts = time.time()
 
@@ -806,7 +901,14 @@ class AntigravityModelAdapter:
         return PredictionEvent(
             type="prediction",
             mode="LIVE",
-            timestamp=datetime.fromtimestamp(now_ts).isoformat() + "Z",
+            # datetime.fromtimestamp() with no tz is LOCAL time; suffixing "Z"
+            # then asserts it is UTC. On an IST (+0530) host the payload read
+            # 2026-09-22T18:19:46Z when UTC was 12:49:46Z -- every alert
+            # timestamp 5h30m in the future, and disagreeing with every other
+            # event on the bus, which all use schema.utc_now_iso().
+            timestamp=datetime.fromtimestamp(now_ts, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
             wall_clock=time.strftime("%H:%M:%S", time.localtime(now_ts)),
             model=ModelMetadata(
                 name="Antigravity-DualBranch-DeepOP",
@@ -871,10 +973,15 @@ class AntigravityModelAdapter:
             early_warning=EarlyWarningData(
                 is_alert=alert,
                 alert_timestamp=now_ts if alert else None,
+                # Lead time is how far AHEAD the alert fires: the horizon of
+                # the first threshold crossing, 0.0 when the current window
+                # already crosses, None when nothing does. It used to report
+                # the full forecast horizon on every alert, overstating the
+                # warning on an attack already in progress.
                 lead_time_seconds=lead_time,
                 target_milestone_desc=(
                     forecast_techniques[int(round(lead_time / step_s)) - 1]
-                    if lead_time is not None else None
+                    if lead_time else (obs_technique if lead_time == 0.0 else None)
                 ),
             ),
             attack_active=attack_active,

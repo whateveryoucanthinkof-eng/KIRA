@@ -702,11 +702,30 @@ def _metrics_from_confusion(cm):
     total = int(support.sum())
     accuracy = float(tp.sum() / max(total, 1))
     baseline = float(support.max() / max(total, 1)) if total else 0.0
+
+    # The macro F1 a majority-class predictor would score, exactly from the
+    # support: it gets recall 1.0 and precision equal to that class's share on
+    # the majority class, and F1 = 0 on every other present class.
+    #
+    # Comparing macro F1 against the ACCURACY baseline is a category error,
+    # and it made this file's own warning misleading. On epoch 1 of the
+    # 2026-09-22 run the technique head scored accuracy 0.791 against a 0.900
+    # majority share, so the warning called it "adding almost nothing" --
+    # while its macro F1 of 0.397 beat the majority predictor's 0.316 by
+    # +0.081. Giving up majority-class accuracy to gain minority recall is
+    # exactly what focal loss is for, so judging these heads on accuracy
+    # punishes them for working as intended.
+    n_present = int(present.sum())
+    macro_f1 = float(f1[present].mean()) if present.any() else 0.0
+    macro_baseline = (float((2 * baseline / (baseline + 1.0)) / n_present)
+                      if n_present and total else 0.0)
     return {
         "accuracy": accuracy,
-        "macro_f1": float(f1[present].mean()) if present.any() else 0.0,
+        "macro_f1": macro_f1,
         "majority_baseline": baseline,
         "lift_over_baseline": accuracy - baseline,
+        "macro_f1_baseline": macro_baseline,
+        "macro_f1_lift": macro_f1 - macro_baseline,
         "classes_present": int(present.sum()),
         "classes_predicted": int((predicted > 0).sum()),
         "per_class": {
@@ -743,11 +762,13 @@ def _warn_if_gradation_collapsed(metrics, where):
         print(f"  WARNING [{where}]: gradation head predicts a SINGLE level for "
               f"every input ({present} levels present). Its accuracy {acc:.3f} "
               f"is the class prior, not a result.", flush=True)
-    elif lift < 0.01:
-        print(f"  WARNING [{where}]: gradation accuracy {acc:.3f} is within 1 "
-              f"point of the majority-level baseline "
-              f"{metrics.get('gradation_majority_baseline', 0):.3f} -- the head "
-              f"is adding almost nothing.", flush=True)
+    elif metrics.get("gradation_macro_f1_lift") is not None and \
+            metrics["gradation_macro_f1_lift"] <= 0.0:
+        # Macro F1, not accuracy -- see the technique warning for why.
+        print(f"  WARNING [{where}]: gradation macro F1 {f1:.3f} is at or below "
+              f"what a majority-level predictor scores "
+              f"({metrics.get('gradation_macro_f1_baseline', 0):.3f}) -- the head "
+              f"is adding nothing over a constant.", flush=True)
     elif f1 < 0.2 and present > 2:
         print(f"  WARNING [{where}]: gradation macro F1 {f1:.3f} over {present} "
               f"levels -- accuracy {acc:.3f} is carried by level 0 while the "
@@ -774,12 +795,17 @@ def _warn_if_head_collapsed(metrics, where):
               f"every input ({present} classes present in the data). Its "
               f"accuracy {metrics.get('tech_accuracy', 0):.3f} is the class "
               f"prior, not a result.", flush=True)
-    elif lift < 0.01 and present > 1:
-        print(f"  WARNING [{where}]: technique accuracy "
-              f"{metrics.get('tech_accuracy', 0):.3f} is within 1 point of the "
-              f"majority-class baseline "
-              f"{metrics.get('tech_majority_baseline', 0):.3f} -- the head is "
-              f"adding almost nothing.", flush=True)
+    elif metrics.get("tech_macro_f1_lift") is not None and \
+            metrics["tech_macro_f1_lift"] <= 0.0 and present > 1:
+        # Judged on macro F1, never on accuracy. A focal-loss head trades
+        # majority-class accuracy for minority recall by design, so accuracy
+        # below the majority share is expected and is not evidence of
+        # failure -- macro F1 at or below what a constant predictor scores is.
+        print(f"  WARNING [{where}]: technique macro F1 "
+              f"{metrics.get('tech_macro_f1', 0):.3f} is at or below what a "
+              f"majority-class predictor scores "
+              f"({metrics.get('tech_macro_f1_baseline', 0):.3f}) -- the head is "
+              f"adding nothing over a constant.", flush=True)
     elif f1 < 0.2 and present > 2:
         print(f"  WARNING [{where}]: macro F1 {f1:.3f} over {present} classes -- "
               f"accuracy {metrics.get('tech_accuracy', 0):.3f} is carried by the "
@@ -816,6 +842,7 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     abs_err_sum = torch.zeros((), device=device, dtype=torch.float64)
     n_risk = 0
+    conf_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.float64)
     pos_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     neg_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     brier_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -853,7 +880,11 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
                 "technique": batch["technique"].to(device, non_blocking=non_blocking),
                 "gradation": batch["gradation"].to(device, non_blocking=non_blocking),
             }
-            predictions = model(x)
+            # Real elapsed time between the history steps -- see
+            # MultiTaskLSTM.time_proj. Validation must see what training sees.
+            t_hist = (batch["t_history"].to(device, non_blocking=non_blocking)
+                      if "t_history" in batch else None)
+            predictions = model(x, t_history=t_hist)
             loss, parts = model.compute_loss(predictions, targets)
             loss_sum += loss.detach().double().sum()
             # Per-task losses and their learned weights. Without these the
@@ -891,6 +922,9 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
             pos_hist += torch.bincount(_b[_y], minlength=RISK_BINS)
             neg_hist += torch.bincount(_b[~_y], minlength=RISK_BINS)
+            # Sum of the predicted probabilities per bin, so ECE can use each
+            # bin's ACTUAL mean confidence rather than its nominal centre.
+            conf_hist += torch.bincount(_b, weights=_p.double(), minlength=RISK_BINS)
             prob_sum += _p.double().sum()
 
             pred_t = predictions["technique_logits"].argmax(dim=-1)
@@ -932,14 +966,28 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     # strictly lower bin is a win and every negative in the same bin is a tie.
     ph = pos_hist.double().cpu().numpy()
     nh = neg_hist.double().cpu().numpy()
+    ch = conf_hist.cpu().numpy()
     P, N = float(ph.sum()), float(nh.sum())
     if P > 0 and N > 0:
         neg_below = np.concatenate([[0.0], np.cumsum(nh)[:-1]])
         risk_auc = float((ph * (neg_below + 0.5 * nh)).sum() / (P * N))
-        conf = (np.arange(RISK_BINS) + 0.5) / RISK_BINS      # bin centre
+        # ECE with each bin's MEASURED mean confidence.
+        #
+        # This used the nominal bin centre `(i + 0.5) / RISK_BINS`, which
+        # disagreed with how scores are binned everywhere else in this file:
+        # a score lands in `floor(p * (RISK_BINS - 1))`, so bin i spans
+        # [i/(B-1), (i+1)/(B-1)) and its centre is (i+0.5)/(B-1), not
+        # (i+0.5)/B. The mismatch reached 5.0e-4 at the top of the range --
+        # negligible against an ECE of 0.07, but up to 25% of one at 0.002,
+        # and ECE at that scale is exactly where a calibration claim is made.
+        #
+        # Summing the probabilities per bin removes the approximation rather
+        # than correcting it: this is the textbook definition, and it is exact
+        # whatever the binning.
         cnt = ph + nh
         with np.errstate(divide="ignore", invalid="ignore"):
             acc_in_bin = np.where(cnt > 0, ph / np.maximum(cnt, 1), 0.0)
+            conf = np.where(cnt > 0, ch / np.maximum(cnt, 1), 0.0)
         risk_ece = float((cnt * np.abs(acc_in_bin - conf)).sum() / max(cnt.sum(), 1))
     else:
         # AUC and ECE need both classes; the BASE RATE does not, and reporting
@@ -964,6 +1012,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         **out_tasks,
         # -- the metrics that can tell a working head from a collapsed one --
         "tech_macro_f1": macro_f1,
+        "tech_macro_f1_baseline": tech["macro_f1_baseline"],
+        "tech_macro_f1_lift": tech["macro_f1_lift"],
         "tech_majority_baseline": baseline,
         "tech_lift_over_baseline": accuracy - baseline,
         "tech_classes_present": tech["classes_present"],
@@ -975,6 +1025,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         # -- the gradation head, judged the same way as the technique head --
         "gradation_accuracy": (float(grad_correct.item()) / grad_total) if grad_total else None,
         "gradation_macro_f1": grad["macro_f1"],
+        "gradation_macro_f1_baseline": grad["macro_f1_baseline"],
+        "gradation_macro_f1_lift": grad["macro_f1_lift"],
         "gradation_majority_baseline": grad["majority_baseline"],
         "gradation_lift_over_baseline": grad["lift_over_baseline"],
         "gradation_classes_present": grad["classes_present"],
@@ -1115,6 +1167,14 @@ def main():
                              "binary target a 95%% interval is wide by "
                              "construction; that is the honest answer, and the "
                              "reason the hardcoded +/-0.05 was not one.")
+    parser.add_argument("--max-gap-seconds", type=float, default=None,
+                        help="Cut each host's trajectory where consecutive active "
+                             "windows are further apart than this, so no sample's "
+                             "history or target crosses the gap. Off by default. "
+                             "Rows are ACTIVE windows, not clock ticks: a CTU-13 "
+                             "host's next window is a median 736 s away, against a "
+                             "10 s contract horizon. Enabling this drops samples -- "
+                             "see claude_latest_analysis/30_time_gaps.md.")
     parser.add_argument("--patience", type=int, default=3,
                         help="Stop after N epochs without improving --select-on. "
                              "The best checkpoint is already written, so this "
@@ -1253,7 +1313,7 @@ def main():
         networks, and a merged graph would make hosts from different captures
         each other's temporal neighbours, which they never were.
         """
-        from data_unification.trajectory_store import TrajectoryStoreBuilder
+        from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
         from data_unification.label_filter import (
             format_unresolved_report, merge_unresolved_reports)
         shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
@@ -1268,6 +1328,11 @@ def main():
                 pcap_max_windows=args.pcap_max_windows_per_day,
                 pcap_window_stride=args.pcap_window_stride, coverage=coverage)
             total_recs += len(recs)
+            # One trajectory per (host, capture): see TrajectoryStoreBuilder.
+            # set_namespace. Without it, the fabricated CIC-2018 days merged
+            # all 350 of their hosts across days, and 2018 rows preceded 2011
+            # rows in merged CTU-13 hosts.
+            shared.set_namespace(capture_namespace(f))
             extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
             if shared._window_idx.n:
                 widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
@@ -1340,7 +1405,8 @@ def main():
     _apply_risk_target(train_store, "train")
     _rep_train = {}
     train_ds = LazyHostSequenceDataset(train_store, seq_len=_c.history_steps, min_trajectory_len=1,
-        min_history_steps=args.min_history_steps, report=_rep_train)
+        min_history_steps=args.min_history_steps, report=_rep_train,
+        max_gap_seconds=args.max_gap_seconds)
     print(f"  [train] " + _fmt_history(_rep_train), flush=True)
     print(f"train done in {time.time()-t0:.1f}s ({len(train_ds)} samples)", flush=True)
     t0 = time.time()
@@ -1348,7 +1414,8 @@ def main():
     _apply_risk_target(val_store, "val")
     _rep_val = {}
     val_ds = LazyHostSequenceDataset(val_store, seq_len=_c.history_steps, min_trajectory_len=1,
-        min_history_steps=args.min_history_steps, report=_rep_val)
+        min_history_steps=args.min_history_steps, report=_rep_val,
+        max_gap_seconds=args.max_gap_seconds)
     print(f"  [val] " + _fmt_history(_rep_val), flush=True)
     print(f"val done in {time.time()-t0:.1f}s ({len(val_ds)} samples)", flush=True)
     t0 = time.time()
@@ -1356,8 +1423,16 @@ def main():
     _apply_risk_target(test_store, "test")
     _rep_test = {}
     test_ds = LazyHostSequenceDataset(test_store, seq_len=_c.history_steps, min_trajectory_len=1,
-        min_history_steps=args.min_history_steps, report=_rep_test)
+        min_history_steps=args.min_history_steps, report=_rep_test,
+        max_gap_seconds=args.max_gap_seconds)
     print(f"  [test] " + _fmt_history(_rep_test), flush=True)
+    if args.max_gap_seconds is not None:
+        for _n, _d in (("train", train_ds), ("val", val_ds), ("test", test_ds)):
+            _tot = len(_d) + _d.n_dropped_by_gap
+            print(f"gap segmentation [{_n}] at {args.max_gap_seconds}s: kept {len(_d):,} of "
+                  f"{_tot:,} samples, dropped {_d.n_dropped_by_gap:,} "
+                  f"({100.0 * _d.n_dropped_by_gap / max(_tot, 1):.1f}%) whose target lay beyond a gap",
+                  flush=True)
     print(f"test done in {time.time()-t0:.1f}s ({len(test_ds)} samples)", flush=True)
 
     # Pairing guard. `bce` binarises at risk > 0; under the hazard target that
@@ -1605,18 +1680,23 @@ def main():
                 "technique": batch["technique"].to(device, non_blocking=_non_blocking),
                 "gradation": batch["gradation"].to(device, non_blocking=_non_blocking),
             }
+            # Real elapsed time between history steps. The model was blind to
+            # it: none of the 15 temporal attributes spans windows, so fifteen
+            # steps 2 s apart and fifteen spread over hours looked identical.
+            t_hist = (batch["t_history"].to(device, non_blocking=_non_blocking)
+                      if "t_history" in batch else None)
             if _nb == 0:
                 # Once per epoch, before the step: do the tasks fight over the
                 # shared LSTM? Measured instead of assumed (see
                 # MultiTaskLSTM.task_gradient_conflict); writes no .grad.
-                _conflict = model.task_gradient_conflict(x, targets)
+                _conflict = model.task_gradient_conflict(x, targets, t_history=t_hist)
                 _c3 = _conflict["cosine"]
                 print(f"  task gradients epoch={epoch}: cos(risk,tech)={_c3['risk_vs_tech']:+.3f} "
                       f"cos(risk,grad)={_c3['risk_vs_grad']:+.3f} "
                       f"cos(tech,grad)={_c3['tech_vs_grad']:+.3f} "
                       f"dominant={_conflict['dominant_task']}", flush=True)
             optimizer.zero_grad(set_to_none=True)
-            predictions = model(x)
+            predictions = model(x, t_history=t_hist)
             loss, _ = model.compute_loss(predictions, targets)
             loss.backward()
             optimizer.step()
@@ -1647,7 +1727,8 @@ def main():
             f"val_loss={metrics['loss']:.4f} risk_mae={metrics['risk_mae']:.4f} "
             f"tech_accuracy={metrics['tech_accuracy']:.3f} "
             f"tech_macro_f1={metrics['tech_macro_f1']:.3f} "
-            f"lift={metrics['tech_lift_over_baseline']:+.3f} "
+            f"lift_acc={metrics['tech_lift_over_baseline']:+.3f} "
+            f"lift_f1={metrics['tech_macro_f1_lift']:+.3f} "
             f"classes_pred={metrics['tech_classes_predicted']}/{metrics['tech_classes_present']} "
             f"sel[{args.select_on}]={_selection_score(metrics, args.select_on):.4f} "
             f"| task_loss risk={metrics['loss_risk']:.4f} tech={metrics['loss_tech']:.4f} "

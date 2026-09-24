@@ -21,6 +21,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from cyberworld_v4.config import get_contract
 from telemetry.capture.sniffer import StreamingPacketSniffer
 from telemetry.state.state_builder import LiveStateBuilder
 
@@ -169,16 +170,18 @@ def main():
     )
     args = parser.parse_args()
 
+    window_sec = get_contract().window_seconds
+
     print("=" * 80)
     print("cyberworld LIVE SPAN TELEMETRY (CAPTURE ONLY)")
     print(f"  Interface:            {args.interface}")
-    print("  Window Resolution:    2.0 seconds")
+    print(f"  Window Resolution:    {window_sec:g} seconds")
     print("  Output:               5-tuple flows + window metadata → Dual-Branch/DeepOP")
     print("  Hot Path Storage:     Zero-Disk (Pure In-Memory)")
     print("=" * 80)
     sys.stdout.flush()
 
-    state_builder = LiveStateBuilder(window_sec=2.0)
+    state_builder = LiveStateBuilder(window_sec=window_sec)
 
     recorder = AsyncStateRecorder(args.record_state) if args.record_state else None
     pcap_recorder = AsyncPcapRecorder(args.record_pcap) if args.record_pcap else None

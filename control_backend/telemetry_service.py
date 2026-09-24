@@ -338,21 +338,40 @@ class LiveTelemetryService:
                         now=self.last_window_at,
                     )
 
-                    # Compute live reality metrics
-                    # Measured only. Throughput used to be floored at
-                    # 20 + 0.35 x flows, "packet loss" was synthesised from the
-                    # wall clock when it was zero, and latency had fake jitter
-                    # and an 8 ms floor added -- none of it observed.
+                    # Live reality metrics -- MEASURED, not synthesised.
+                    #
+                    # These three are labelled "Live operational reality
+                    # metrics" in schema.SystemStatusEvent and are read by an
+                    # operator as observations of their network. All three were
+                    # partly invented:
+                    #
+                    #   throughput  = max(real, len(flows)*0.35 + 20.0)
+                    #                 -> never below 20 Mbps, whatever the wire
+                    #                    was actually carrying; on a quiet
+                    #                    network the displayed figure was pure
+                    #                    flow-count arithmetic.
+                    #   packetLoss  = a measured 0.0 was OVERWRITTEN with
+                    #                 (int(time.time()) % 4) * 0.1 -- a 0.0-0.3%
+                    #                 loss figure derived from the wall clock.
+                    #                 A healthy link could not report healthy.
+                    #   latency     = real + min(120, len(flows)*0.25 + 8.0)
+                    #                 + a clock-derived "jitter" term, floored
+                    #                 at 4 ms. The pipeline's own measurement
+                    #                 was a minority of the number shown.
+                    #
+                    # The window divisor was also the literal 2.0 rather than
+                    # the served contract, so throughput would silently be
+                    # wrong by the ratio of the two if the window ever changed.
+                    window_s = float(getattr(self.adapter, "window_seconds", 2.0)) or 2.0
                     total_bytes = sum((getattr(f, "fwd_bytes", 0) + getattr(f, "bwd_bytes", 0)) for f in flows)
-                    window_s = float(getattr(self.adapter, "window_seconds", 2.0) or 2.0)
                     self.current_throughput = round((total_bytes * 8.0) / (window_s * 1_000_000.0), 2)
                     self.current_active_connections = len(flows)
 
                     # Share of flows with no reverse packets. Not true packet
                     # loss, but it is what the sensor can actually observe.
                     unanswered = sum(1 for f in flows if getattr(f, "bwd_packets", 0) == 0)
-                    self.current_packet_loss = round(
-                        min(100.0, (unanswered / max(1, len(flows))) * 100.0), 1)
+                    loss_pct = (unanswered / max(1, len(flows))) * 100.0
+                    self.current_packet_loss = round(min(100.0, loss_pct), 1)
 
                     self.current_latency = round(float(record.get("pipeline_latency_ms", 0.0)), 1)
 
@@ -430,7 +449,20 @@ class LiveTelemetryService:
                         "network": "running",
                         "sensor": "running" if self.is_running else "stopped",
                         "normal_traffic": "running" if len(flows) > 0 else "stopped",
-                        "attack": "running" if self.current_anomaly_score >= 65 else "stopped",
+                        # The alerting cut is the adapter's fitted operating
+                        # point, not a literal 65. `alert_threshold` is taken
+                        # from the checkpoint (_adopt_risk_semantics), and the
+                        # bce objective is expected to fit one well below 0.65
+                        # -- at a fitted 0.40, a risk of 0.55 raised
+                        # prediction.alert=True / alert_level=ELEVATED /
+                        # threatLevel="high" on the same bus while this field
+                        # still said "stopped".
+                        "attack": (
+                            "running"
+                            if self.current_anomaly_score
+                            >= float(getattr(self.adapter, "alert_threshold", 0.65)) * 100.0
+                            else "stopped"
+                        ),
                         "ml": "running" if self.is_ml_active else "stopped",
                         "network_online": True,
                         "sensor_active": self.is_running,

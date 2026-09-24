@@ -226,38 +226,78 @@ class LazyHostSequenceDataset(Dataset):
     """
 
     def __init__(self, store, seq_len: int = 5, min_trajectory_len: int = 2,
-                 min_history_steps=None, report=None):
+                 min_history_steps=None, report=None,
+                 max_gap_seconds: "float | None" = None):
         self.store = store
         self.seq_len = seq_len
-        # Kept in lockstep with create_host_sequence_samples: a window ending
-        # at `end` has min(end, seq_len) REAL steps, so requiring `need` real
-        # steps is exactly `end >= need`. None means the full window.
+        # Kept in lockstep with create_host_sequence_samples: a sample needs
+        # `need` REAL history steps. None means the full window.
         need = seq_len if min_history_steps is None else max(1, int(min_history_steps))
         self.min_history_steps = need
 
-        hosts, host_idx, pos = [], [], []
-        kept = dropped = 0
+        #: If set, a host's trajectory is cut wherever two consecutive active
+        #: windows are more than this many seconds apart, and no sample's
+        #: history or target crosses a cut.
+        #:
+        #: Rows are a host's ACTIVE windows, not its clock ticks, so "the next
+        #: window" is whenever the host next appears -- and that can be far
+        #: outside the contract's horizon. Measured on the train split with the
+        #: real adapters: consecutive active windows of a CTU-13 host are a
+        #: median 736 s apart and over an hour apart in 35% of pairs, against a
+        #: 2 s window and a 10 s forecast horizon. Uncapped, "15 steps of
+        #: history" can span hours and "the next step" can be an hour ahead.
+        #:
+        #: None (the default) keeps every sample, as the no-dilution rule asks.
+        #: Enabling it removes samples whose target lies beyond a gap, which
+        #: can be a large share -- see claude_latest_analysis/30_time_gaps.md.
+        self.max_gap_seconds = max_gap_seconds
+        self.n_dropped_by_gap = 0
+        from cyberworld_v4.config import get_contract as _gc
+        self._window_seconds = float(_gc().window_seconds)
+        ws_all = np.asarray(store.window_start) if max_gap_seconds is not None else None
+
+        hosts, host_idx, pos, lo = [], [], [], []
+        kept = dropped = padded = 0
         for h in store:
             rows = store._rows_by_host[h]
             n = len(rows)
             if n < min_trajectory_len:
                 continue
-            # end_idx from `need`..n-1. It used to start at 1, so a host with
-            # two windows produced a sample whose input was seq_len-1 zeros.
-            dropped += max(0, min(need, n) - 1)
-            if n <= need:
+            if max_gap_seconds is None:
+                ends = np.arange(1, n, dtype=np.int32)
+                seg_lo = np.zeros(n - 1, dtype=np.int32)
+            else:
+                ts = ws_all[np.asarray(rows)]
+                cut = np.diff(ts) > float(max_gap_seconds)   # cut[i]: gap between rows i and i+1
+                # segment start of every position = the latest cut at or before it
+                starts = np.zeros(n, dtype=np.int64)
+                starts[1:] = np.where(cut, np.arange(1, n), 0)
+                starts = np.maximum.accumulate(starts)
+                keep = starts[1:] < np.arange(1, n)          # a target may not open a segment
+                ends = np.arange(1, n, dtype=np.int32)[keep]
+                seg_lo = starts[1:][keep].astype(np.int32)
+                self.n_dropped_by_gap += int((~keep).sum())
+            # `need` real steps INSIDE the sample's segment. end_idx used to
+            # start at 1, so a host with two windows produced a sample whose
+            # input was seq_len-1 zeros.
+            real = ends - seg_lo
+            enough = real >= need
+            dropped += int((~enough).sum())
+            ends, seg_lo, real = ends[enough], seg_lo[enough], real[enough]
+            if len(ends) == 0:
                 continue
             hi = len(hosts)
             hosts.append(h)
-            k = n - need
-            kept += k
-            host_idx.append(np.full(k, hi, dtype=np.int32))
-            pos.append(np.arange(need, n, dtype=np.int32))
+            kept += len(ends)
+            padded += int((real < seq_len).sum())
+            host_idx.append(np.full(len(ends), hi, dtype=np.int32))
+            pos.append(ends)
+            lo.append(seg_lo)
 
         if report is not None:
             report.update({"kept": kept, "dropped_short_history": dropped,
-                           "padded": 0, "min_history_steps": need,
-                           "hosts": len(hosts)})
+                           "padded": padded, "min_history_steps": need,
+                           "hosts": len(hosts), "dropped_by_gap": self.n_dropped_by_gap})
 
         self.hosts = hosts
         # Row arrays already exist in the store; holding references to them
@@ -265,6 +305,8 @@ class LazyHostSequenceDataset(Dataset):
         self._rows = [store._rows_by_host[h] for h in hosts]
         self._host_idx = np.concatenate(host_idx) if host_idx else np.zeros(0, np.int32)
         self._pos = np.concatenate(pos) if pos else np.zeros(0, np.int32)
+        #: earliest row a sample's history may reach back to (its segment start)
+        self._lo = np.concatenate(lo) if lo else np.zeros(0, np.int32)
 
     def __len__(self) -> int:
         return int(len(self._pos))
@@ -274,7 +316,7 @@ class LazyHostSequenceDataset(Dataset):
         host = self.hosts[h]
         end = int(self._pos[idx])
         rows = self._rows[h]
-        start = max(0, end - self.seq_len)
+        start = max(int(self._lo[idx]), end - self.seq_len)
 
         feats = self.store.feats[rows[start:end]]          # (<=seq_len, 27)
         if len(feats) < self.seq_len:
@@ -283,7 +325,9 @@ class LazyHostSequenceDataset(Dataset):
 
         # Four scalars, read straight off the columns. `_materialize` would
         # build a whole HostWindowSnapshot -- including both feature slices --
-        # to have all but four of its fields discarded here, at 87x the cost.
+        # to have all but four of its fields discarded here. Measured with a
+        # warm cache: 3.12 us against 0.86 us, 3.6x. (An earlier figure of 87x
+        # came from a benchmark that timed a module import inside the loop.)
         risk, category, first_tech, window_idx = self.store.target_fields(int(rows[end]))
         tech = first_tech if first_tech is not None else "Benign"
         return {
@@ -295,4 +339,20 @@ class LazyHostSequenceDataset(Dataset):
                 GRADATION_LEVELS.get(category, 0), dtype=torch.long),
             "host_ip": host,
             "window_idx": window_idx,
+            "t_history": torch.from_numpy(self._t_history(rows, start, end)),
         }
+
+    def _t_history(self, rows, start, end):
+        """Seconds of each history step relative to the last OBSERVED one.
+
+        The convention MultiTaskLSTM and Branch B's rollout both use: <= 0,
+        last entry exactly 0. Left-padded slots repeat the earliest real
+        time, matching how the features are left-padded with zeros -- a
+        padded slot is not a step further into the past.
+        """
+        w = self.store.window_idx
+        w0 = float(w[int(rows[end - 1])])
+        t = (np.asarray(w[rows[start:end]], dtype=np.float64) - w0) * self._window_seconds
+        if len(t) < self.seq_len:
+            t = np.concatenate([np.full(self.seq_len - len(t), t[0] if len(t) else 0.0), t])
+        return np.ascontiguousarray(t, dtype=np.float32)

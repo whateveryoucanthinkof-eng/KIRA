@@ -187,3 +187,4 @@ is why `pcap_adapter.py` exists. Packet features are extracted but not yet in a 
 | [`14_remediation_session.md`](14_remediation_session.md) | Evidence log for the 2026-09-21 remediation: 17 defects fixed, each with a measurement |
 | [`29_external_review_assessed.md`](29_external_review_assessed.md) | An external critique checked claim by claim; label-conditional conformal, sensor drop accounting, neighbour cut-off exposure, task-gradient conflict |
 | [`30_training_decisions.md`](30_training_decisions.md) | **Before training:** every design decision for the next run and for the campaign model, and `scripts/run_training_plan.sh` |
+| [`31_merge_with_testing_prod.md`](31_merge_with_testing_prod.md) | How the 16 later testing-prod commits were merged into v5.5o, conflict by conflict |

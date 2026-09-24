@@ -42,7 +42,7 @@ class _BranchA(nn.Module):
         self.technique_idx = technique_idx
         self.n_classes = n_classes
 
-    def forward(self, x):
+    def forward(self, x, mask=None, t_history=None):
         z = (x[:, -1, :] * self.w).sum(-1) + self.logit
         logits = torch.full((x.shape[0], self.n_classes), -10.0)
         logits[:, self.technique_idx] = 10.0
@@ -57,6 +57,7 @@ def _adapter(risk: float, technique: str, future=(0.1,) * K, rules=False):
     a.h_state_history, a.feature_history = [], []
     a.h_state_history_by_target, a.feature_history_by_target = {}, {}
     a.technique_history_by_target = {}
+    a.h_time_history_by_target = {}
     a.world_state_dim = 27
     a.alert_threshold = 0.65
     a.rules_enabled = rules
@@ -73,7 +74,7 @@ def _adapter(risk: float, technique: str, future=(0.1,) * K, rules=False):
     )
     a.branch_a = _BranchA(risk, TECHNIQUE_VOCAB.index(technique), len(TECHNIQUE_VOCAB))
     a.wdt = types.SimpleNamespace(
-        rollout_with_uncertainty=lambda h, K, stabilize_horizon: (torch.zeros(1, K, h.shape[-1]), None))
+        rollout_with_uncertainty=lambda h, K, **kw: (torch.zeros(1, K, h.shape[-1]), None))
     a.risk_head = types.SimpleNamespace(
         forward_trajectory=lambda h: (torch.tensor([list(future)]), None))
     a.consolidate_network_technique = lambda tactic, tech: ("Benign", "")

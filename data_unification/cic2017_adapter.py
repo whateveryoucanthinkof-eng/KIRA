@@ -18,6 +18,7 @@ from data_unification.time_utils import (
     detect_12h_clock_in_group,
     repair_12h_clock,
     to_epoch_seconds,
+    warn_if_resolution_too_coarse,
 )
 
 
@@ -88,6 +89,7 @@ def _file_needs_clock_repair(filepath: str) -> bool:
     return verdict
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
+from cyberworld_v4.config import get_contract
 
 
 class CIC2017Adapter:
@@ -156,6 +158,15 @@ class CIC2017Adapter:
                     start_timestamps = repair_12h_clock(start_timestamps)
             except Exception:
                 start_timestamps = np.zeros(len(chunk), dtype=float)
+
+            # 7 of 8 CIC-2017 captures are written to the MINUTE; see
+            # time_utils.timestamp_resolution_seconds for the measurement and
+            # what it does to the window grid and the hazard target. Kept out
+            # of the try above so a bug here can never zero a timestamp column.
+            warn_if_resolution_too_coarse(
+                start_timestamps, get_contract().window_seconds,
+                source=os.path.basename(filepath),
+            )
 
             # Durations are in microseconds in CICFlowMeter
             dur_seconds = (pd.to_numeric(chunk[dur_col], errors="coerce").fillna(0.0) / 1e6).to_numpy()

@@ -346,7 +346,15 @@ def _resident_or_random_advised(feats, n_rows):
     if n_rows == 0 or not isinstance(feats, np.memmap):
         return feats
     if feats.nbytes <= RESIDENT_FEATS_MAX_BYTES:
-        resident = np.ascontiguousarray(feats)   # one sequential read
+        # np.ascontiguousarray on an ALREADY C-contiguous memmap returns a
+        # VIEW, not a copy, so this branch used to return something still
+        # backed by the spill file and the whole fix was inert -- the block
+        # got neither the resident copy NOR the MADV_RANDOM fallback below.
+        # Verified: the result had OWNDATA False and a .base chain of
+        # memmap -> mmap, and overwriting the backing file on disk changed
+        # the array's contents.
+        resident = np.empty(feats.shape, dtype=feats.dtype)
+        np.copyto(resident, feats)               # one sequential read
         del feats                                # drop the mapping
         return resident
     try:
@@ -357,12 +365,25 @@ def _resident_or_random_advised(feats, n_rows):
     return feats
 
 
+def capture_namespace(path) -> str:
+    """A stable, unique identity for one capture file: `<parent>/<stem>`.
+
+    The parent directory is part of it because CTU-13 disambiguates its
+    scenarios by directory (`1/`, `2/`, ...), and two captures must never share
+    a namespace or their hosts would merge again.
+    """
+    from pathlib import Path as _P
+    p = _P(path)
+    return f"{p.parent.name}/{p.stem}"
+
+
 class TrajectoryStoreBuilder:
     """Accumulates snapshots columnar-side, spilling the bulk array to disk."""
 
     def __init__(self, spill_dir: Optional[str] = None, feat_dim: int = FEAT_DIM):
         self.spill_dir = spill_dir
         self.feat_dim = int(feat_dim)
+        self._namespace: Optional[str] = None
         self._spill_path: Optional[str] = None
         self._spill_fh = None
         self._block = np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)
@@ -406,6 +427,33 @@ class TrajectoryStoreBuilder:
         self._spill_fh.write(self._block[: self._block_n].tobytes())
         self._block_n = 0
 
+    def set_namespace(self, namespace) -> None:
+        """Scope every host key appended from now on to `namespace`.
+
+        ## Why this exists
+
+        Hosts were keyed by the bare IP string, and the trainers feed one
+        shared builder capture after capture. So the same string in two
+        captures became ONE trajectory. Measured on the train split:
+
+          fri_16 & wed_14 (CIC-2018)     350 of 350 hosts shared
+          two CTU-13 scenarios           28,474 hosts shared
+          tue_20 (2018) & CTU-13 (2011)  59 hosts shared
+
+        Nine of the ten CIC-2018 days carry no IP columns and fabricate
+        `192.168.10.{i % 250 + 1}`, so every fabricated day's hosts merged with
+        every other's. And rows are appended in file order, which puts the
+        2018 captures before the 2011 ones: a merged host's "history" could
+        come from 2018 and its "next window" from 2011 -- predicting the past
+        from the future. The sequence, rollout and hazard targets all read
+        `_rows_by_host`, so all three were affected.
+
+        A host in capture A and a host in capture B are never the same
+        trajectory, even when they share an address. Call this once per
+        capture before extracting it; `None` restores bare-IP keys.
+        """
+        self._namespace = None if namespace is None else str(namespace)
+
     def append(self, *, host_ip, host_id, window_idx, window_start, window_end,
                embedding, temporal_attrs, is_attack, coarse_category,
                technique_ids, risk_score) -> None:
@@ -431,7 +479,8 @@ class TrajectoryStoreBuilder:
         self._block[row, EMB_DIM:] = temporal_attrs
         self._block_n += 1
 
-        self._host_name_id.append(self._intern(host_ip, self._host_index, self._host_names))
+        _key = host_ip if self._namespace is None else f"{host_ip}@{self._namespace}"
+        self._host_name_id.append(self._intern(_key, self._host_index, self._host_names))
         self._node_id.append(int(host_id))
         self._window_idx.append(window_idx)
         self._window_start.append(window_start)

@@ -108,5 +108,5 @@ def test_compute_loss_is_unchanged_by_the_split(model):
 
 def test_the_trainer_reports_it_every_epoch():
     src = (REPO / "scripts" / "retrain_branch_a_live.py").read_text(encoding="utf-8")
-    assert "model.task_gradient_conflict(x, targets)" in src
+    assert "model.task_gradient_conflict(x, targets, t_history=t_hist)" in src
     assert 'metrics["task_gradients"]' in src

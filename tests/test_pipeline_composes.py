@@ -68,6 +68,7 @@ def _adapter():
     a.h_state_history, a.feature_history = [], []
     a.h_state_history_by_target, a.feature_history_by_target = {}, {}
     a.technique_history_by_target = {}
+    a.h_time_history_by_target = {}
     a.alert_threshold, a.rules_enabled = 0.65, False
     a.window_seconds, a.history_steps, a.forecast_steps = 2.0, 15, 5
     a.forecast_step_seconds = 30.0

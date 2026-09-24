@@ -114,6 +114,51 @@ def _window_attack_label(atk_recs):
     return coarse, techs
 
 
+# ---------------------------------------------------------------------------
+# Heuristic label OVERRIDE -- off by default
+# ---------------------------------------------------------------------------
+#
+# Two blocks in extract_trajectories could set `is_attack = True`, rewrite
+# `coarse_category`, prepend a technique id and raise `risk_score` AFTER the
+# dataset's own label had been read:
+#
+#   auth:       is_brute_force_flag == 1.0  or  auth_failed_count >= 5
+#   behaviour:  is_shell_detected  == 1.0  or  port_mismatch_count >= 2
+#
+# They are not a small correction. Measured at full density, replaying the
+# exact label path of extract_trajectories on real captures with the
+# contract's 2 s window:
+#
+#   CIC-2017 Monday  (train, 529,601 flows, ZERO attack rows in the corpus)
+#       203,760 host-windows, 28,748 (14.11%) relabelled attack/Execution,
+#       every one of them a fabricated positive.
+#   CIC-2017 Wednesday (the held-out TEST split, 692,373 flows)
+#       ground truth 178 attack host-windows (0.19%); after the override
+#       9,659 (10.11%). 9,481 of 9,659 -- 98.2% of the split's positives --
+#       are the heuristic, not the data.
+#   CIC-2018 wed_29 (val, stride 4)   11.93% -> 17.45%
+#   CTU-13 scenario 11 (val, stride 4) 0.57% ->  9.47%
+#
+# The dominant driver is a bug in the detector itself: fingerprint_flow marks
+# `is_port_mismatch = dst_port not in STANDARD_WEB_PORTS` for its C2Beaconing
+# profile, and that profile is any flow with 1-3 packets each way, <=1200
+# bytes and a mean packet under 180 B -- i.e. essentially every DNS, NTP or
+# short service exchange. On Monday 166,598 of the mismatches came from that
+# one profile.
+#
+# A detector that labels 14% of a capture with no attacks in it is a source of
+# systematic label noise, and any metric computed over these labels is partly
+# measuring the heuristic rather than the model. The override is therefore
+# OFF unless explicitly requested; the dataset's own label stands.
+#
+# The auth block is additionally dead in every offline path: no caller in this
+# repository ever supplies auth_events, so `all_auth_events` is always empty.
+_LABEL_OVERRIDE_ENV = "CYBERWORLD_HEURISTIC_LABEL_OVERRIDE"
+
+
+def heuristic_label_override_enabled() -> bool:
+    """True when the auth/behavioural heuristics may overwrite a dataset label."""
+    return os.environ.get(_LABEL_OVERRIDE_ENV, "") in ("1", "true", "True", "yes")
 @dataclass(slots=True)
 class HostWindowSnapshot:
     """Per-host state snapshot for a single time window t.
@@ -287,6 +332,7 @@ class HostTrajectoryExtractor:
         chunks of chunked extraction (`emit_after` set), which carry on.
 
         `heuristic_label_augmentation` -- OFF by default, and the default changed.
+        CYBERWORLD_HEURISTIC_LABEL_OVERRIDE=1 turns it on as well (either switch).
 
         Two blocks below used to overwrite `is_attack` from heuristics rather
         than from the corpus label:
@@ -545,6 +591,8 @@ class HostTrajectoryExtractor:
         windowed_nf: Optional[_WindowedNeighborFinder] = None
 
         all_auth_events: List[AuthEventRecord] = self.auth_events + (list(auth_events) if auth_events else [])
+        # Read once, not once per host-window.
+        label_override = self.heuristic_label_augmentation or heuristic_label_override_enabled()
 
         if hasattr(self.tgn, "embedding_module") and len(event_stream.sources) > 0:
             from utils.utils import NeighborFinder
@@ -683,7 +731,7 @@ class HostTrajectoryExtractor:
                 # constructor docstring for why these two blocks are the reason
                 # the measured attack rate was 0.68 on corpora whose published
                 # rate is a few percent.
-                if self.heuristic_label_augmentation:
+                if label_override:
                     auth_metrics = {}
                     if all_auth_events:
                         auth_metrics = AuthLogAdapter.extract_window_auth_metrics(
