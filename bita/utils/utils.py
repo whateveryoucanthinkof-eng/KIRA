@@ -67,24 +67,78 @@ class EarlyStopMonitor(object):
 
 
 class RandEdgeSampler(object):
-  def __init__(self, src_list, dst_list, seed=None):
+  """Random negative destinations for link prediction.
+
+  `node_group` (optional, node id -> group id, e.g. the capture a node belongs
+  to) makes negatives come from the positive edge's OWN group when `sources`
+  is passed to sample(). Drawn from every capture at once, a negative could be
+  a 2011 CTU-13 host scored at a 2018 timestamp: its neighbour time deltas are
+  ~2e8 s, which (a) makes the negative trivially separable, inflating AP, and
+  (b) drove the time encoder's gradient to ~1e7 on every step of the dry run.
+  """
+
+  def __init__(self, src_list, dst_list, seed=None, node_group=None):
     self.seed = None
     self.src_list = np.unique(src_list)
     self.dst_list = np.unique(dst_list)
+    self.node_group = None
+    if node_group is not None:
+      self.node_group = np.asarray(node_group)
+      groups = self.node_group[self.dst_list]
+      self._dst_by_group = {g: self.dst_list[groups == g] for g in np.unique(groups)}
 
     if seed is not None:
       self.seed = seed
       self.random_state = np.random.RandomState(self.seed)
 
-  def sample(self, size):
-    if self.seed is None:
-      src_index = np.random.randint(0, len(self.src_list), size)
-      dst_index = np.random.randint(0, len(self.dst_list), size)
-    else:
+  def _rng(self):
+    return np.random if self.seed is None else self.random_state
 
-      src_index = self.random_state.randint(0, len(self.src_list), size)
-      dst_index = self.random_state.randint(0, len(self.dst_list), size)
-    return self.src_list[src_index], self.dst_list[dst_index]
+  def sample(self, size, sources=None, destinations=None):
+    """`destinations` (the positive edges' own) are never returned as their
+    negative. With per-capture pools, the inductive evaluation's pool is often
+    a single server: every negative WAS the positive destination, the two
+    scored identically, and inductive AUC/AP read exactly 0.5000 on every
+    epoch of the dry run -- half of the encoder's selection score was a
+    constant."""
+    rng = self._rng()
+    src_index = rng.randint(0, len(self.src_list), size)
+    avoid = None if destinations is None else np.asarray(destinations)
+    if self.node_group is None or sources is None:
+      return self.src_list[src_index], self._draw(rng, self.dst_list, avoid, size)
+    dst = np.empty(size, dtype=self.dst_list.dtype)
+    groups = self.node_group[np.asarray(sources)]
+    for g in np.unique(groups):
+      pos = np.nonzero(groups == g)[0]
+      pool = self._dst_by_group.get(g)
+      if pool is None or len(pool) == 0:
+        pool = self.dst_list          # no same-group destination: fall back
+      dst[pos] = self._draw(rng, pool, None if avoid is None else avoid[pos], len(pos))
+    return self.src_list[src_index], dst
+
+  def _draw(self, rng, pool, avoid, n):
+    """n uniform draws from the sorted-unique `pool`; row i excludes avoid[i].
+
+    Uniform over pool minus {avoid[i]}: draw from n-1 slots and skip the
+    excluded one. A pool that is only {avoid[i]} falls back to the whole
+    destination list, and only if that too is {avoid[i]} does the collision
+    stand (nothing else exists to sample).
+    """
+    if avoid is None:
+      return pool[rng.randint(0, len(pool), n)]
+    k = np.searchsorted(pool, avoid)
+    inside = (k < len(pool)) & (pool[np.minimum(k, len(pool) - 1)] == avoid)
+    out = np.empty(n, dtype=pool.dtype)
+    free = ~inside
+    if free.any():
+      out[free] = pool[rng.randint(0, len(pool), int(free.sum()))]
+    if inside.any() and len(pool) > 1:
+      idx = rng.randint(0, len(pool) - 1, int(inside.sum()))
+      idx += idx >= k[inside]
+      out[inside] = pool[idx]
+    elif inside.any():
+      out[inside] = self._draw(rng, self.dst_list, avoid[inside], int(inside.sum()))         if pool is not self.dst_list else pool[0]
+    return out
 
   def reset_random_state(self):
     self.random_state = np.random.RandomState(self.seed)
@@ -284,7 +338,7 @@ class NeighborFinder:
       rows = np.arange(B)[:, None]
       return (nb[rows, order].astype(np.int32),
               ei[rows, order].astype(np.int32),
-              et[rows, order].astype(np.float32))
+              et[rows, order].astype(np.float64))
 
     # Most-recent-n: take positions [stop - k, stop), right-aligned in the
     # output, which is what the reference's negative slicing produces.
@@ -294,7 +348,7 @@ class NeighborFinder:
     zero_i = np.zeros((), dtype=np.int32)
     neighbors = np.where(valid, flat_nbr[safe], zero_i).astype(np.int32)
     edge_idxs = np.where(valid, flat_eidx[safe], zero_i).astype(np.int32)
-    edge_times = np.where(valid, flat_ts[safe], 0.0).astype(np.float32)
+    edge_times = np.where(valid, flat_ts[safe], 0.0).astype(np.float64)
     return neighbors, edge_idxs, edge_times
 
   def _get_temporal_neighbor_reference(self, source_nodes, timestamps, n_neighbors=20):
@@ -314,7 +368,7 @@ class NeighborFinder:
     neighbors = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
       np.int32)  # each entry in position (i,j) represent the id of the item targeted by user src_idx_l[i] with an interaction happening before cut_time_l[i]
     edge_times = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
-      np.float32)  # each entry in position (i,j) represent the timestamp of an interaction between user src_idx_l[i] and item neighbors[i,j] happening before cut_time_l[i]
+      np.float64)  # each entry in position (i,j) represent the timestamp of an interaction between user src_idx_l[i] and item neighbors[i,j] happening before cut_time_l[i]
     edge_idxs = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
       np.int32)  # each entry in position (i,j) represent the interaction index of an interaction between user src_idx_l[i] and item neighbors[i,j] happening before cut_time_l[i]
 

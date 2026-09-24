@@ -157,10 +157,10 @@ class ExtendedTGN(TGN):
             memory = self.memory.get_memory(list(range(self.n_nodes)))
             last_update = self.memory.last_update
             time_diffs = (
-                torch.from_numpy(timestamps).float().to(self.device)
-                - last_update[node_ids].float()
+                torch.from_numpy(timestamps).double().to(self.device)
+                - last_update[node_ids].double()
             )
-            time_diffs = (time_diffs - self.mean_time_shift_src) / self.std_time_shift_src
+            time_diffs = ((time_diffs - self.mean_time_shift_src) / self.std_time_shift_src).float()
 
         node_embeddings = self.embedding_module.compute_embedding(
             memory=memory,

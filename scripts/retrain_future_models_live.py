@@ -34,6 +34,7 @@ from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.pcap_bridge import iter_day_records
 from data_unification.density import require_full_density
 from data_unification.split_policy import is_cross_year, partition_paths, split_of
+from cyberworld_v4.training_guard import IMPROVED, STOP, TrainingGuard, default_warmup_steps
 
 
 def _pcap_day_split(day_dir) -> str:
@@ -216,7 +217,8 @@ def _loader_kwargs(device, num_workers: int):
     return kw
 
 
-def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 2, risk_target: str = "severity"):
+def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 3, risk_target: str = "severity",
+                        lr: float = 1e-3, step_back_after: int = 2, clip_norm: float = 1.0):
     _c = get_contract()
     # Lazy: create_rollout_samples materialises h_history [15,12],
     # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
@@ -233,13 +235,21 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     d_state = int(train_traj.feats.shape[1])
     wdt = HostWorldDynamicsTransformer(d_latent=d_state, d_model=64, n_heads=4, n_layers=3).to(device)
     risk = InfiltrationRiskHead(d_latent=d_state, hidden_dim=32).to(device)
-    optimizer = torch.optim.Adam(list(wdt.parameters()) + list(risk.parameters()), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(list(wdt.parameters()) + list(risk.parameters()), lr=lr, weight_decay=1e-4)
     best = float("inf")
-    best_epoch, _since_improve = 0, 0
+    best_epoch = 0
     _history = []
     best_state = {k: v.detach().clone() for k, v in wdt.state_dict().items()}
     _nb_total = len(train_loader)
     _nblk = (str(device) == "cuda")
+    # Shared policy (cyberworld_v4/training_guard.py): warmup, clipping,
+    # non-finite steps skipped, step back to the best weights at half the LR
+    # after `step_back_after` flat epochs, stop at `patience`.
+    guard = TrainingGuard("branch_b", [wdt, risk], optimizer, mode="min",
+                          patience=patience, step_back_after=step_back_after,
+                          warmup_steps=default_warmup_steps(_nb_total),
+                          clip_norm=clip_norm or None,
+                          log=lambda m: print(m, flush=True))
     for epoch in range(epochs):
         wdt.train(); risk.train()
         # Accumulated on device and read once per epoch: a `.item()` per batch
@@ -278,7 +288,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             # Huber(beta=0.1) 0.216 against a zero baseline of 0.230 -- only
             # Huber beats it.
             loss = loss + risk.risk_loss(pred_risk, target_risk)
-            loss.backward(); optimizer.step()
+            if not guard.backward_step(loss):
+                continue
             _tr_sum += loss.detach().double().sum(); _nb += 1
             if _nb % 2000 == 0:
                 _el = time.time() - _t0; _r = _nb / max(_el, 1e-9)
@@ -353,8 +364,17 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                          "mse_model": _mm, "mse_persistence": _mp, "skill": _skill,
                          "bce_model": _bm, "bce_constant": _bce_base,
                          "risk_mae_model": _rmae, "risk_mae_zero": _rbar})
-        if score < best:
-            best=score; best_epoch=epoch+1; _since_improve=0
+        _bb_health = []
+        if not (_mp > 0 and _mm < _mp):
+            _bb_health.append(f"world model is not better than copying the last state "
+                              f"forward (skill {_skill:+.3f})")
+        if _rmae >= _rbar:
+            _bb_health.append(f"risk head MAE {_rmae:.4f} is not better than predicting "
+                              f"zero ({_rbar:.4f})")
+        _action = guard.end_epoch(score, train_loss=_trl, health=_bb_health)
+        _history[-1]["guard_action"] = _action
+        if _action == IMPROVED:
+            best=score; best_epoch=epoch+1
             output.parent.mkdir(parents=True,exist_ok=True)
             # Fitted from THIS epoch's validation residuals, so the band always
             # belongs to the weights saved beside it.
@@ -366,16 +386,13 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                       flush=True)
             torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
-        else:
-            _since_improve += 1
+        elif _action == STOP:
             # The best weights are already saved, so stopping here cannot cost
             # quality -- it only stops spending hours on epochs that do not
             # improve validation. Run 1 went 6 epochs and its best was epoch 1.
-            if patience and _since_improve >= patience:
-                print(f"Branch B: early stop at epoch {epoch+1}; no improvement "
-                      f"in {_since_improve} epochs, best was epoch {best_epoch} "
-                      f"(val_loss {best:.4f})", flush=True)
-                break
+            print(f"Branch B: early stop at epoch {epoch+1}; {guard.stop_reason} "
+                  f"(best epoch {best_epoch}, val_loss {best:.4f})", flush=True)
+            break
     wdt.load_state_dict(best_state)
     wdt.eval()
 
@@ -385,6 +402,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     if output.exists():
         _ck = torch.load(output, map_location="cpu", weights_only=False)
         _ck["credibility"] = cred
+        _ck["training_guard"] = guard.summary()
         torch.save(_ck, output)
     print(f"Branch B credibility: {'CREDIBLE' if cred['credible'] else 'NOT CREDIBLE'}"
           + (f" -- {'; '.join(cred['problems'])}" if cred["problems"] else ""), flush=True)
@@ -568,7 +586,8 @@ def _drop_observed(obs, vocab, p: float):
     return obs.masked_fill(drop, vocab.pad_idx)
 
 
-def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4, patience: int = 2):
+def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, num_workers: int = 4, patience: int = 3,
+                      lr: float = 5e-4, step_back_after: int = 2, clip_norm: float = 1.0):
     vocab=get_joint_vocab(network_observable_only=True)
     _c=get_contract()
     # T>0 makes samples carry h_history so we can condition on Branch B's own
@@ -609,8 +628,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
     # causal-window decoder (h=6, n_cw=3). Conditioned on the full world state.
     d_state=int(train_traj.feats.shape[1])
     decoder=DeepOPForecastDecoder(d_latent=d_state,d_model=72,vocab_size=vocab.vocab_size,n_heads=6,num_layers=2,window_sizes=[2,4,8],dim_feedforward=144).to(device)
-    optimizer=torch.optim.AdamW(decoder.parameters(),lr=5e-4,weight_decay=1e-4)
-    best=float("-inf"); best_epoch=0; _since_improve=0; _history=[]   # maximised: see selection below
+    optimizer=torch.optim.AdamW(decoder.parameters(),lr=lr,weight_decay=1e-4)
+    best=float("-inf"); best_epoch=0; _history=[]   # maximised: see selection below
     # Label smoothing only over tokens that occur as a target. Six of the ten
     # vocabulary tokens never do; smoothing over all ten pushed 2.4% of every
     # target's mass onto impossible answers. See smoothed_and_plain_ce.
@@ -621,6 +640,11 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
           f"tokens occur as a target", flush=True)
 
     _nb_total=len(train_loader); _nblk=(str(device)=="cuda")
+    guard = TrainingGuard("deepop", [decoder], optimizer, mode="max",
+                          patience=patience, step_back_after=step_back_after,
+                          warmup_steps=default_warmup_steps(_nb_total),
+                          clip_norm=clip_norm or None,
+                          log=lambda m: print(m, flush=True))
     for epoch in range(epochs):
         decoder.train()
         # On-device accumulation: `loss.item()` per batch synced the host to
@@ -654,7 +678,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             # against a printed 0.1404. Both are now reported.
             loss, _plain = smoothed_and_plain_ce(logits, tgt, label_smoothing=0.04,
                                                  support=_support)
-            loss.backward(); torch.nn.utils.clip_grad_norm_(decoder.parameters(),1.0); optimizer.step()
+            if not guard.backward_step(loss):
+                continue
             _tr_sum+=loss.detach().double().sum(); _tr_plain+=_plain.detach().double().sum(); _nb+=1
             if _nb % 2000 == 0:
                 _el=time.time()-_t0; _r=_nb/max(_el,1e-9)
@@ -774,17 +799,25 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             _sel = -score
         _history[-1]["selection_metric"] = _sel_metric
         _history[-1]["selection_score"] = float(_sel)
-        if _sel > best:
-            best=_sel; best_epoch=epoch+1; _since_improve=0
+        _dp_health = []
+        if acc - _best_base <= 0.0:
+            _dp_health.append(f"token accuracy {acc:.4f} is not better than repeating the last "
+                              f"token or the majority token ({_best_base:.4f})")
+        _action = guard.end_epoch(_sel, train_loss=float((_tr_sum/max(_nb,1)).item()),
+                                  health=_dp_health)
+        _history[-1]["guard_action"] = _action
+        if _action == IMPROVED:
+            best=_sel; best_epoch=epoch+1
             output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"d_state":d_state,"arch":decoder.arch_config(),"train_token_counts":_train_token_counts,"epoch_history":list(_history),"selection_metric":_sel_metric,"label_smoothing_support":_support.cpu().tolist(),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
-        else:
-            _since_improve += 1
+        elif _action == STOP:
             # Best weights are already on disk; stopping cannot cost quality.
-            if patience and _since_improve >= patience:
-                print(f"DeepOP: early stop at epoch {epoch+1}; no improvement in "
-                      f"{_since_improve} epochs, best was epoch {best_epoch} "
-                      f"(selection score {best:.4f})", flush=True)
-                break
+            print(f"DeepOP: early stop at epoch {epoch+1}; {guard.stop_reason} "
+                  f"(best epoch {best_epoch}, selection score {best:.4f})", flush=True)
+            break
+    if output.exists():
+        _ck = torch.load(output, map_location="cpu", weights_only=False)
+        _ck["training_guard"] = guard.summary()
+        torch.save(_ck, output)
 
 
 def _pcap_trajectories_per_day(args, extractor):
@@ -822,6 +855,7 @@ def _pcap_trajectories_per_day(args, extractor):
     # Branch B and DeepOP on a different corpus than Branch A and the encoder.
     if args.split_scheme == "cross_year_ctu":
         from data_unification.training_sources import discover_captures
+        from data_unification.trajectory_store import capture_namespace
         _cic, _ctu = CIC2018Adapter(), CTU13Adapter()
         ctu_caps = discover_captures(scheme=args.split_scheme, ctu13_dir=args.ctu_dir)
         assert not ctu_caps["test"], "cross_year_ctu must never test on CTU-13"
@@ -830,6 +864,7 @@ def _pcap_trajectories_per_day(args, extractor):
                 t = time.time()
                 recs = read_one_capture(Path(cap.path), _cic, _ctu, args.rows_per_file, args.stride)
                 b = builders[split]
+                b.set_namespace(capture_namespace(cap))   # one trajectory per (host, capture)
                 extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
                 if b._window_idx.n:
                     wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
@@ -865,7 +900,16 @@ def main():
                         help="Cap records kept per capture. Default None = FULL DENSITY.")
     parser.add_argument("--stride",type=int,default=1)
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
-    parser.add_argument("--epochs",type=int,default=3)
+    parser.add_argument("--epochs",type=int,default=12,
+                        help="Upper bound; the training guard stops each model once "
+                             "--patience epochs pass without improvement.")
+    parser.add_argument("--step-back-after",type=int,default=2,
+                        help="After N flat epochs, restore the best weights and halve "
+                             "the LR (cyberworld_v4/training_guard.py). Must be < --patience.")
+    parser.add_argument("--clip-norm",type=float,default=1.0,
+                        help="Gradient-norm clip for Branch B and DeepOP; 0 disables")
+    parser.add_argument("--lr-branch-b",type=float,default=1e-3)
+    parser.add_argument("--lr-deepop",type=float,default=5e-4)
     parser.add_argument("--risk-target",choices=("severity","hazard"),default="severity",
                         help="Which risk target to train against. 'severity' is "
                              "base_severity(tactic) for an attack window and 0.0 "
@@ -882,7 +926,7 @@ def main():
                              "'branch_b' lets you check Branch B against its "
                              "persistence baseline before committing hours to "
                              "DeepOP. 'deepop' loads the Branch B already on disk.")
-    parser.add_argument("--patience",type=int,default=2,
+    parser.add_argument("--patience",type=int,default=3,
                         help="Stop a model after N epochs without a validation "
                              "improvement. The best checkpoint is written every "
                              "time it improves, so this cannot cost quality -- it "
@@ -1062,7 +1106,9 @@ def main():
     if args.stages in ("both", "branch_b"):
         wdt = train_branch_b_live(train_traj,val_traj,bb_out,args.epochs,device,
                                   num_workers=args.num_workers,patience=args.patience,
-                                  risk_target=args.risk_target)
+                                  risk_target=args.risk_target, lr=args.lr_branch_b,
+                                  step_back_after=args.step_back_after,
+                                  clip_norm=args.clip_norm)
         print(f"served checkpoint updated: {bb_out}", flush=True)
 
     if args.stages in ("both", "deepop"):
@@ -1086,7 +1132,9 @@ def main():
             print(f"loaded Branch B from {bb_out} (epoch {_bb.get('epoch')}) for "
                   f"DeepOP conditioning", flush=True)
         train_deepop_live(train_traj,val_traj,dp_out,args.epochs,device,wdt=wdt,
-                          num_workers=args.num_workers,patience=args.patience)
+                          num_workers=args.num_workers,patience=args.patience,
+                          lr=args.lr_deepop, step_back_after=args.step_back_after,
+                          clip_norm=args.clip_norm)
         print(f"served checkpoint updated: {dp_out}", flush=True)
 
     if is_cross_year(args.split_scheme):

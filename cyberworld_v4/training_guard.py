@@ -1,0 +1,348 @@
+"""One training policy for all four models: learn every epoch, or say why not.
+
+The encoder, Branch A, Branch B and DeepOP each had their own loop, and none of
+them had a learning-rate schedule, a warmup, or any protection against a
+non-finite loss; only DeepOP clipped gradients, and patience ran from 2 to 5.
+A run could therefore spend hours on epochs that did nothing, or step once on a
+NaN and continue from garbage weights with nothing in the log to say so.
+
+TrainingGuard wraps the optimizer step and the end of each epoch:
+
+  per step    * linear LR warmup over the first `warmup_steps` updates, so the
+                first batches cannot throw the weights somewhere they never
+                recover from (the "collapsed at epoch 1" failure);
+              * gradient-norm clipping, with the pre-clip norm recorded;
+              * a non-finite loss or gradient is SKIPPED -- no optimizer step --
+                and counted.
+
+  per epoch   * improved   -> snapshot weights + optimizer state in memory;
+              * `step_back_after` epochs without improvement (default 2)
+                -> STEP BACK: restore the best snapshot, multiply the LR by
+                   `lr_factor` (default 0.5), print a diagnosis of what looks
+                   wrong, and carry on from the best point;
+              * `patience` epochs without improvement (default 3) -> STOP. The
+                best weights are already saved, so stopping costs nothing;
+              * an unstable epoch (non-finite score or > `max_nonfinite_frac`
+                of steps skipped) steps back immediately.
+
+The diagnosis is the "take a step back and think what's wrong" step, made
+concrete: it compares the train-loss trend with the validation trend, reads
+the gradient norms and clipping rate, and repeats the trainer's own health
+checks (a head predicting one class, a world model worse than persistence),
+then states which of the usual causes the numbers point to.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+
+import torch
+
+IMPROVED, WAIT, STEP_BACK, STOP = "improved", "wait", "step_back", "stop"
+
+
+def _finite(x) -> bool:
+    try:
+        return x is not None and math.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
+class TrainingGuard:
+    def __init__(
+        self,
+        name: str,
+        modules: Sequence[torch.nn.Module],
+        optimizer: torch.optim.Optimizer,
+        *,
+        mode: str = "max",
+        patience: int = 3,
+        step_back_after: int = 2,
+        lr_factor: float = 0.5,
+        min_lr: float = 1e-6,
+        max_step_backs: int = 2,
+        warmup_steps: int = 0,
+        clip_norm: Optional[float] = None,
+        max_nonfinite_frac: float = 0.01,
+        min_delta: float = 1e-4,
+        log: Callable[[str], None] = print,
+    ):
+        if mode not in ("max", "min"):
+            raise ValueError(f"mode must be 'max' or 'min', got {mode!r}")
+        if patience and step_back_after >= patience:
+            raise ValueError("step_back_after must be smaller than patience, or the "
+                             "run stops before it ever gets a second chance")
+        self.name = name
+        self.modules = list(modules)
+        self.optimizer = optimizer
+        self.mode = mode
+        self.patience = int(patience)
+        self.step_back_after = int(step_back_after)
+        self.lr_factor = float(lr_factor)
+        self.min_lr = float(min_lr)
+        self.max_step_backs = int(max_step_backs)
+        self.warmup_steps = int(warmup_steps)
+        self.clip_norm = clip_norm
+        self.max_nonfinite_frac = float(max_nonfinite_frac)
+        self.min_delta = float(min_delta)
+        self.log = log
+
+        self.base_lrs = [g["lr"] for g in optimizer.param_groups]
+        self.lr_scale = 1.0
+        self.global_step = 0
+
+        self.best: Optional[float] = None
+        self.best_epoch: Optional[int] = None
+        self.since_improve = 0
+        self.step_backs = 0
+        self.epoch = 0
+        self.stop_reason: Optional[str] = None
+        self.history: List[Dict[str, Any]] = []
+        self._best_state: Optional[Dict[str, Any]] = None
+        self._reset_epoch_stats()
+        self._apply_lr()
+
+    # ------------------------------------------------------------------ steps
+    def _params(self) -> Iterable[torch.nn.Parameter]:
+        for m in self.modules:
+            yield from (p for p in m.parameters() if p.requires_grad)
+
+    def current_lr(self) -> float:
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    def _apply_lr(self) -> None:
+        warm = 1.0
+        if self.warmup_steps and self.global_step < self.warmup_steps:
+            warm = 0.1 + 0.9 * (self.global_step / self.warmup_steps)
+        for g, base in zip(self.optimizer.param_groups, self.base_lrs):
+            g["lr"] = base * self.lr_scale * warm
+
+    def backward_step(self, loss: torch.Tensor) -> bool:
+        """backward + clip + step. Returns False (and skips the step) when the
+        loss or the gradient is not finite."""
+        self.n_steps += 1
+        if not bool(torch.isfinite(loss.detach()).all()):
+            self.optimizer.zero_grad(set_to_none=True)
+            self.n_nonfinite += 1
+            return False
+        loss.backward()
+        return self.step_after_backward()
+
+    def _record_top_grads(self) -> None:
+        """Which parameters carry the gradient, once per epoch (first step).
+
+        When every step hits the clip, the update direction is whatever the
+        largest-gradient tensor says, and the rest of the model barely moves.
+        Naming that tensor turns "gradients are large" into a cause.
+        """
+        norms = []
+        for mi, m in enumerate(self.modules):
+            for n, p in m.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    norms.append((float(p.grad.detach().float().norm()),
+                                  f"{type(m).__name__}.{n}" if len(self.modules) > 1 else n))
+        total = math.sqrt(sum(v * v for v, _ in norms)) or 1.0
+        norms.sort(reverse=True)
+        self.top_grads = [(name, v, (v / total) ** 2) for v, name in norms[:3]]
+
+    def step_after_backward(self) -> bool:
+        """For loops that call backward themselves (e.g. gradient accumulation)."""
+        if self.n_grad == 0:
+            self._record_top_grads()
+        params = list(self._params())
+        norm = torch.nn.utils.clip_grad_norm_(
+            params, self.clip_norm if self.clip_norm else float("inf"))
+        norm_f = float(norm)
+        if not math.isfinite(norm_f):
+            self.optimizer.zero_grad(set_to_none=True)
+            self.n_nonfinite += 1
+            return False
+        self.grad_norm_sum += norm_f
+        self.grad_norm_max = max(self.grad_norm_max, norm_f)
+        self.n_grad += 1
+        if self.clip_norm and norm_f > self.clip_norm:
+            self.n_clipped += 1
+        self._apply_lr()
+        self.optimizer.step()
+        self.global_step += 1
+        return True
+
+    def _reset_epoch_stats(self) -> None:
+        self.n_steps = 0
+        self.n_nonfinite = 0
+        self.n_grad = 0
+        self.n_clipped = 0
+        self.grad_norm_sum = 0.0
+        self.grad_norm_max = 0.0
+        self.top_grads = []
+
+    # --------------------------------------------------------------- epochs
+    def _improved(self, score: float) -> bool:
+        if self.best is None:
+            return True
+        tol = max(self.min_delta, self.min_delta * abs(self.best))
+        return score > self.best + tol if self.mode == "max" else score < self.best - tol
+
+    def _snapshot(self) -> None:
+        self._best_state = {
+            "modules": [{k: v.detach().clone() for k, v in m.state_dict().items()}
+                        for m in self.modules],
+            "optimizer": copy.deepcopy(self.optimizer.state_dict()),
+        }
+
+    def _restore(self) -> bool:
+        if self._best_state is None:
+            return False
+        for m, sd in zip(self.modules, self._best_state["modules"]):
+            m.load_state_dict(sd)
+        self.optimizer.load_state_dict(copy.deepcopy(self._best_state["optimizer"]))
+        self._apply_lr()   # load_state_dict restored the snapshot's LR; re-apply the scale
+        return True
+
+    def end_epoch(self, score: float, train_loss: Optional[float] = None,
+                  health: Optional[Sequence[str]] = None) -> str:
+        """Record one epoch and decide what happens next. Returns the action."""
+        self.epoch += 1
+        health = [h for h in (health or []) if h]
+        frac_bad = self.n_nonfinite / max(self.n_steps, 1)
+        unstable = (not _finite(score) or (train_loss is not None and not _finite(train_loss))
+                    or frac_bad > self.max_nonfinite_frac)
+        rec = {
+            "epoch": self.epoch, "score": float(score) if _finite(score) else None,
+            "train_loss": float(train_loss) if _finite(train_loss) else None,
+            "lr": self.current_lr(), "grad_norm_mean": self.grad_norm_sum / max(self.n_grad, 1),
+            "grad_norm_max": self.grad_norm_max,
+            "clipped_frac": self.n_clipped / max(self.n_grad, 1),
+            "nonfinite_steps": self.n_nonfinite, "steps": self.n_steps, "health": list(health),
+            "top_grads": [{"param": n, "norm": v, "share": s} for n, v, s in self.top_grads],
+        }
+
+        if not unstable and self._improved(float(score)):
+            self.best, self.best_epoch, self.since_improve = float(score), self.epoch, 0
+            self._snapshot()
+            action = IMPROVED
+        else:
+            self.since_improve += 1
+            if unstable:
+                action = STEP_BACK
+            elif self.patience and self.since_improve >= self.patience:
+                action = STOP
+            elif self.since_improve == self.step_back_after:
+                action = STEP_BACK
+            else:
+                action = WAIT
+
+        if action == STEP_BACK:
+            next_lr = max(b * self.lr_scale * self.lr_factor for b in self.base_lrs)
+            if self.step_backs >= self.max_step_backs or next_lr < self.min_lr:
+                action = STOP
+                self.stop_reason = (f"no improvement after {self.step_backs} step-back(s); "
+                                    f"the LR is already at {self.current_lr():.2e}")
+            else:
+                self.lr_scale *= self.lr_factor
+                self.step_backs += 1
+                restored = self._restore()
+                self._apply_lr()
+                rec["restored_epoch"] = self.best_epoch if restored else None
+        if action == STOP and self.stop_reason is None:
+            self.stop_reason = (f"{self.since_improve} epochs without improvement "
+                                f"(patience {self.patience}); best epoch {self.best_epoch}")
+
+        rec["action"] = action
+        rec["lr_after"] = self.current_lr()
+        self.history.append(rec)
+        self._log_epoch(rec, unstable, frac_bad)
+        if action in (STEP_BACK, STOP):
+            for line in self.diagnose(unstable=unstable, frac_bad=frac_bad):
+                self.log(f"  [{self.name} guard]   {line}")
+        self._reset_epoch_stats()
+        return action
+
+    # ------------------------------------------------------------ reporting
+    def _log_epoch(self, rec: Dict[str, Any], unstable: bool, frac_bad: float) -> None:
+        s = rec["score"]
+        score_txt = "nan" if s is None else f"{s:.4f}"
+        best_txt = "none" if self.best is None else f"{self.best:.4f}"
+        clip_txt = f" clipped {rec['clipped_frac']:.0%}" if self.clip_norm else ""
+        msg = (f"[{self.name} guard] epoch {rec['epoch']}: score={score_txt} best={best_txt} "
+               f"(epoch {self.best_epoch}) | lr {rec['lr']:.2e} | grad norm mean "
+               f"{rec['grad_norm_mean']:.3g} max {rec['grad_norm_max']:.3g}{clip_txt}"
+               f" | skipped {rec['nonfinite_steps']}/{rec['steps']} | -> {rec['action'].upper()}")
+        if rec["action"] == STEP_BACK:
+            msg += (f" (restored epoch {rec.get('restored_epoch')}, lr -> {rec['lr_after']:.2e})")
+        self.log(msg)
+        if self.clip_norm and rec["clipped_frac"] > 0.5 and rec["top_grads"]:
+            self.log(f"  [{self.name} guard] largest gradients: " + ", ".join(
+                f"{g['param']} {g['norm']:.3g} ({g['share']:.0%})" for g in rec["top_grads"]))
+        for h in rec["health"]:
+            self.log(f"  [{self.name} guard] health: {h}")
+
+    def diagnose(self, unstable: bool = False, frac_bad: float = 0.0) -> List[str]:
+        """What the recent epochs say is wrong, in plain words."""
+        out: List[str] = []
+        h = self.history
+        last = h[-1]
+        if unstable:
+            out.append(f"numerically unstable: {last['nonfinite_steps']} of {last['steps']} steps "
+                       f"had a non-finite loss/gradient ({frac_bad:.1%}) or the score was NaN. "
+                       f"Usual cause: learning rate too high. Weights restored, LR cut.")
+        losses = [r["train_loss"] for r in h[-3:] if r["train_loss"] is not None]
+        scores = [r["score"] for r in h[-3:] if r["score"] is not None]
+        if len(losses) >= 2:
+            rel = (losses[0] - losses[-1]) / max(abs(losses[0]), 1e-12)
+            if rel > 0.01 and not unstable:
+                out.append(f"train loss still falling ({losses[0]:.4g} -> {losses[-1]:.4g}) while "
+                           f"validation did not improve: over-fitting or a train/validation shift, "
+                           f"not a failure to learn. The best weights are the ones kept.")
+            elif abs(rel) <= 0.01:
+                out.append(f"train loss flat ({losses[0]:.4g} -> {losses[-1]:.4g}): the model has "
+                           f"stopped learning on the training data itself -- converged, under-capacity, "
+                           f"or an LR too small to move it (a lower LR follows).")
+            elif rel < -0.01:
+                out.append(f"train loss RISING ({losses[0]:.4g} -> {losses[-1]:.4g}): steps are too "
+                           f"large; the LR cut is the right response.")
+        if last["grad_norm_mean"] < 1e-7 and last["steps"]:
+            out.append("gradients are ~0: nothing reaches the weights (dead units or a detached "
+                       "graph). A lower LR will not fix this.")
+        if self.clip_norm and last["clipped_frac"] > 0.5:
+            top = last.get("top_grads") or []
+            dom = (f" Dominated by {top[0]['param']} ({top[0]['share']:.0%} of the squared norm): "
+                   f"that tensor sets every update's direction." if top and top[0]["share"] > 0.5 else "")
+            out.append(f"{last['clipped_frac']:.0%} of steps hit the clip norm {self.clip_norm}: "
+                       f"gradients are persistently large -- an LR that is too high, or an input "
+                       f"on the wrong scale.{dom}")
+        seen = set()
+        for r in h[-3:]:
+            for x in r["health"]:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(f"health check: {x}")
+        if scores and len(scores) >= 2 and max(scores) - min(scores) < self.min_delta * 10:
+            out.append("validation score has not moved at all: if a health check above says the "
+                       "head predicts one class, the model has collapsed onto the prior.")
+        action = last["action"]
+        if action == STEP_BACK:
+            out.append(f"action: rolled back to epoch {last.get('restored_epoch')} and continued at "
+                       f"lr {last['lr_after']:.2e} (step-back {self.step_backs}/{self.max_step_backs}).")
+        elif action == STOP:
+            out.append(f"action: stopped -- {self.stop_reason}. Best epoch {self.best_epoch} "
+                       f"(score {self.best}) is what is saved.")
+        return out
+
+    def should_stop(self) -> bool:
+        return bool(self.history) and self.history[-1]["action"] == STOP
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "best_epoch": self.best_epoch, "best_score": self.best,
+            "step_backs": self.step_backs, "stop_reason": self.stop_reason,
+            "final_lr": self.current_lr(), "patience": self.patience,
+            "step_back_after": self.step_back_after, "history": self.history,
+        }
+
+
+def default_warmup_steps(steps_per_epoch: int, cap: int = 500) -> int:
+    """~5% of the first epoch, at most `cap` updates, at least 1."""
+    return max(1, min(cap, steps_per_epoch // 20))

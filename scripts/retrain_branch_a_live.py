@@ -31,6 +31,7 @@ from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
 from data_unification.density import require_full_density
 from data_unification.split_policy import is_cross_year
+from cyberworld_v4.training_guard import IMPROVED, STOP, TrainingGuard, default_warmup_steps
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
@@ -658,6 +659,30 @@ def _print_per_class(per_class, where, names=None, label="technique"):
               f"{m['predicted']:>10,}", flush=True)
 
 
+def _branch_a_health(metrics):
+    """Problems the training guard repeats in its diagnosis (empty = healthy).
+
+    The same conditions the _warn_if_* helpers print, as short strings the
+    guard can carry into its step-back / stop report.
+    """
+    out = []
+    t_pred = metrics.get("tech_classes_predicted", 0)
+    t_present = metrics.get("tech_classes_present", 0)
+    if t_present > 1 and t_pred <= 1:
+        out.append(f"technique head predicts {t_pred} of {t_present} classes: "
+                   f"collapsed onto the majority class")
+    elif t_present > 1 and (metrics.get("tech_macro_f1_lift") or 0.0) <= 0.0:
+        out.append("technique macro-F1 is no better than always predicting the majority class")
+    auc = float(metrics.get("risk_auc", float("nan")))
+    if auc == auc and auc < 0.55:
+        out.append(f"risk head AUC {auc:.3f}: at or near chance")
+    g_pred = metrics.get("gradation_classes_predicted", 0)
+    g_present = metrics.get("gradation_classes_present", 0)
+    if g_present > 1 and g_pred <= 1:
+        out.append(f"gradation head predicts {g_pred} of {g_present} levels: collapsed")
+    return out
+
+
 def _warn_if_risk_head_useless(metrics, where):
     """Say so when the risk head is not beating its own base rate.
 
@@ -1178,7 +1203,16 @@ def main():
     parser.add_argument("--patience", type=int, default=3,
                         help="Stop after N epochs without improving --select-on. "
                              "The best checkpoint is already written, so this "
-                             "cannot cost quality. 0 disables.")
+                             "cannot cost quality.")
+    parser.add_argument("--step-back-after", type=int, default=2,
+                        help="After N epochs without improvement, restore the best "
+                             "weights and halve the LR before trying again "
+                             "(cyberworld_v4/training_guard.py). Must be < --patience.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
+    parser.add_argument("--clip-norm", type=float, default=1.0,
+                        help="Gradient-norm clip; 0 disables clipping (norms still logged)")
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="Linear LR warmup; default ~5%% of the first epoch, at most 500")
     parser.add_argument("--select-on", choices=("composite", "macro_f1", "val_loss"),
                         default="composite",
                         help="Which validation metric picks the kept checkpoint. "
@@ -1543,9 +1577,8 @@ def main():
     ).to(device)
     if focal_alpha is not None:
         model.tech_focal_loss.alpha = focal_alpha.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_loss = float("-inf")       # _selection_score is maximised
-    _since_improve = 0
     _history: List[Dict[str, float]] = []
     best_metrics: Dict[str, float] = {}
 
@@ -1555,6 +1588,16 @@ def main():
         f"train_samples={len(train_ds)} val_samples={len(val_ds)} device={device}"
     )
     _n_train_batches = len(train_loader)
+    # One policy for every trainer (cyberworld_v4/training_guard.py): warmup,
+    # clipping, non-finite steps skipped, step back to the best weights at
+    # half the LR after --step-back-after flat epochs, stop at --patience.
+    guard = TrainingGuard(
+        "branch_a", [model], optimizer, mode="max",
+        patience=args.patience, step_back_after=args.step_back_after,
+        warmup_steps=(args.warmup_steps if args.warmup_steps is not None
+                      else default_warmup_steps(_n_train_batches)),
+        clip_norm=args.clip_norm or None,
+        log=lambda m: print(m, flush=True))
     if args.eval_only:
         # Re-score an existing checkpoint without retraining.
         #
@@ -1698,8 +1741,10 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             predictions = model(x, t_history=t_hist)
             loss, _ = model.compute_loss(predictions, targets)
-            loss.backward()
-            optimizer.step()
+            # backward + clip + step. A non-finite loss is skipped and counted,
+            # never stepped on; the guard turns a run of them into a step back.
+            if not guard.backward_step(loss):
+                continue
             # Keep the log-variances in range in the saved weights too: a step
             # can leave one epsilon outside the bound, and that is the value a
             # checkpoint written this epoch would record.
@@ -1754,13 +1799,16 @@ def main():
         _score = _selection_score(metrics, args.select_on)
         metrics["selection_score"] = _score
         metrics["selection_metric"] = args.select_on
-        if _score > best_loss:
+        _action = guard.end_epoch(_score, train_loss=metrics["train_loss"],
+                                  health=_branch_a_health(metrics))
+        metrics["guard_action"] = _action
+        _history[-1]["guard_action"] = _action
+        if _action == IMPROVED:
             best_loss = _score
             # `slim` strips the score histograms and the collected logits.
             # They are working data for the post-hoc fits, not results, and a
             # checkpoint that carried them per epoch would be gigabytes.
             best_metrics = slim(metrics)
-            _since_improve = 0
             args.output.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
@@ -1813,16 +1861,13 @@ def main():
                 },
                 args.output,
             )
-        else:
-            _since_improve += 1
+        elif _action == STOP:
             # The best weights are already written, so stopping here cannot
             # cost quality -- it only stops paying for epochs that do nothing.
-            if args.patience and _since_improve >= args.patience:
-                print(f"early stop at epoch {epoch}: no improvement in "
-                      f"{_since_improve} epochs (best epoch "
-                      f"{best_metrics.get('epoch')}, "
-                      f"{args.select_on}={best_loss:.4f})", flush=True)
-                break
+            print(f"early stop at epoch {epoch}: {guard.stop_reason} (best epoch "
+                  f"{best_metrics.get('epoch')}, {args.select_on}={best_loss:.4f})",
+                  flush=True)
+            break
 
     # Held-out test: scored once, on the restored best checkpoint, after
     # training is finished. This is the only number that is a generalisation
@@ -1939,6 +1984,8 @@ def main():
     ckpt["encoder"] = str(args.tgne) if args.tgne else "served default"
     # Per split: how much traffic the 12-D latent never saw (neighbour cut-off).
     ckpt["neighbor_exposure"] = neighbor_exposure
+    # Every epoch's score, LR, gradient norms, skipped steps and guard action.
+    ckpt["training_guard"] = guard.summary()
     torch.save(ckpt, args.output)
     if args.results_json:
         import json as _json

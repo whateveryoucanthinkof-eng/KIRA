@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.extentedtgn import ExtendedTGN
+from model.time_encoding import TimeEncode
 from utils.utils import RandEdgeSampler, get_neighbor_finder, EarlyStopMonitor
 from evaluation.eval_edge_prediction_with_categories import eval_edge_prediction_with_categories
 from data_unification.tgne_features import (
@@ -30,6 +31,7 @@ from data_unification.tgne_features import (
     extract_canonical_edge_features,
 )
 from data_unification.density import require_full_density
+from cyberworld_v4.training_guard import STOP, TrainingGuard, default_warmup_steps
 from data_unification.ip_features import ablated_node_features as _ablated_node_features
 
 
@@ -510,20 +512,37 @@ def load_and_preprocess_unified_dataset(
     # cut fell at 13:13 and all 158,930 PortScan rows run 13:00-15:59.
     col_cap = _Growable(np.int16)
 
-    ip_to_id: dict = {}
+    # Nodes are keyed by (capture, address), not by address alone.
+    #
+    # A CIC-2018 capture day, another day, and a CTU-13 scenario are separate
+    # observations: keyed by address alone, the same 172.31.x host on 14 Feb
+    # and 28 Feb was ONE node, so each day's hosts became temporal neighbours
+    # of another day's (the defect testing-prod fixed for trajectories in
+    # 546d459). With TGN memory on it is also fatal: the split is taken per
+    # capture, so after training advances a shared host's memory to 28 Feb,
+    # validating its 14 Feb edges "updates memory to a time in the past" and
+    # the run dies on the first validation pass -- found by
+    # scripts/dry_run_plan.py. Per-capture nodes keep every node inside one
+    # capture, where train precedes validation precedes test.
+    #
+    # Node FEATURES are still a function of the address alone
+    # (build_node_feature_matrix_from_pairs), so nothing the model is given
+    # changes; only which edges count as one node's history.
+    node_to_id: dict = {}
     cat_to_id: dict = {}
     src_to_id: dict = {}
     cap_to_id: dict = {}
     _cur_cap = [0]
 
     def _consume(stream):
+        cap = _cur_cap[0]
         for r in stream:
-            su = ip_to_id.get(r.src_ip)
+            su = node_to_id.get((cap, r.src_ip))
             if su is None:
-                su = ip_to_id[r.src_ip] = len(ip_to_id) + 1   # 1-based; 0 is padding
-            di = ip_to_id.get(r.dst_ip)
+                su = node_to_id[(cap, r.src_ip)] = len(node_to_id) + 1   # 1-based; 0 is padding
+            di = node_to_id.get((cap, r.dst_ip))
             if di is None:
-                di = ip_to_id[r.dst_ip] = len(ip_to_id) + 1
+                di = node_to_id[(cap, r.dst_ip)] = len(node_to_id) + 1
             ci = cat_to_id.get(r.coarse_category)
             if ci is None:
                 ci = cat_to_id[r.coarse_category] = len(cat_to_id)
@@ -581,12 +600,13 @@ def load_and_preprocess_unified_dataset(
             captures, stride=stride, max_rows_per_file=max_rows_per_file,
             edge_dim=edge_dim, workers=parallel_workers,
         ):
-            # local ip id -> global node id, in this capture's own order
+            # local ip id -> global (capture, ip) node id, in this capture's order
+            _cid = cap_to_id.setdefault(res["path"], len(cap_to_id))
             ip_map = np.empty(len(res["ips"]), dtype=np.int64)
             for local, ip in enumerate(res["ips"]):
-                gid = ip_to_id.get(ip)
+                gid = node_to_id.get((_cid, ip))
                 if gid is None:
-                    gid = ip_to_id[ip] = len(ip_to_id) + 1
+                    gid = node_to_id[(_cid, ip)] = len(node_to_id) + 1
                 ip_map[local] = gid
             cat_map = np.empty(len(res["cats"]), dtype=np.int32)
             for local, c in enumerate(res["cats"]):
@@ -604,7 +624,6 @@ def load_and_preprocess_unified_dataset(
             col_lbl.extend(cat_map[res["lbl"]])
             col_edge.extend(res["edge"])
             col_src.extend(np.full(res["n"], si, dtype=np.int8))
-            _cid = cap_to_id.setdefault(res["path"], len(cap_to_id))
             col_cap.extend(np.full(res["n"], _cid, dtype=np.int16))
             logging.info("  %s: %d records", os.path.basename(res["path"]), res["n"])
         logging.info("Parallel ingest finished in %.1fs", _t.time() - _t0)
@@ -713,7 +732,9 @@ def load_and_preprocess_unified_dataset(
     # The octets are what buys inductive generalisation: an unseen host in a
     # /24 the model has already seen arrives close to its neighbours in feature
     # space. See data_unification/ip_features.py.
-    node_features = build_node_feature_matrix(ip_to_id)
+    from data_unification.ip_features import build_node_feature_matrix_from_pairs
+    node_features = build_node_feature_matrix_from_pairs(
+        (nid, ip) for (_cap, ip), nid in node_to_id.items())
     if node_features.shape[1] != edge_features.shape[1]:
         raise ValueError(
             f"node feature width {node_features.shape[1]} != edge feature width "
@@ -986,12 +1007,23 @@ def train(args):
     train_ngh_finder = get_neighbor_finder(train_data, uniform=args.uniform)
     full_ngh_finder = get_neighbor_finder(full_data, uniform=args.uniform)
 
-    # Samplers
-    train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations)
-    val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=0)
-    nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.sources, new_node_val_data.destinations, seed=1)
-    test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=2)
-    nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources, new_node_test_data.destinations, seed=3)
+    # Samplers. Negatives come from the positive edge's own capture: nodes are
+    # per capture (load_and_preprocess_unified_dataset), so each node has one.
+    _node_group = None
+    if "capture" in graph_df.columns:
+        _node_group = np.full(int(max(graph_df.u.max(), graph_df.i.max())) + 1, -1, dtype=np.int64)
+        _node_group[graph_df.u.values] = graph_df["capture"].values
+        _node_group[graph_df.i.values] = graph_df["capture"].values
+    train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations, node_group=_node_group)
+    val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=0, node_group=_node_group)
+    # Inductive negatives: with per-capture pools, the new-node edges' own
+    # destinations are often one server per capture, so the pool is the whole
+    # capture's destinations instead (the transductive samplers already use
+    # full_data). The sampler also never returns the positive destination.
+    _nn_pool = (lambda d: full_data) if _node_group is not None else (lambda d: d)
+    nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.sources, _nn_pool(new_node_val_data).destinations, seed=1, node_group=_node_group)
+    test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=2, node_group=_node_group)
+    nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources, _nn_pool(new_node_test_data).destinations, seed=3, node_group=_node_group)
 
     # Compute time statistics
     mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst = \
@@ -1032,6 +1064,23 @@ def train(args):
     if args.init_from:
         _init_from_checkpoint(tgn, args.init_from, device)
 
+    # Fixed time encoding (GraphMixer, Cong et al., ICLR 2023): the cos(w*dt+b)
+    # frequencies stay at their TGAT initialisation, 1 .. 1e-9 rad/s. d/dw of
+    # cos(w*dt) is -dt*sin(w*dt), so w's gradient scales with the elapsed time
+    # in seconds. Once timestamps were float64 and real deltas reached it, the
+    # training guard measured time_encoder.w at 91-97% of the encoder's squared
+    # gradient norm on the dry run -- with global-norm clipping, one 12-element
+    # vector then set the step size of the entire model, and real captures have
+    # deltas of hours, not the dry run's seconds.
+    if not args.learn_time_encoding:
+        _frozen = 0
+        for _m in tgn.modules():
+            if isinstance(_m, TimeEncode):
+                _m.requires_grad_(False)
+                _frozen += 1
+        logging.info(f"time encoding fixed (GraphMixer): {_frozen} TimeEncode module(s) frozen; "
+                     f"--learn_time_encoding to train them")
+
     # Loss Functions & Optimizer
     edge_criterion = nn.BCELoss()
     if args.focal_loss:
@@ -1041,7 +1090,8 @@ def train(args):
         category_criterion = FocalLoss(alpha=_alpha, gamma=2.0)
     else:
         category_criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(tgn.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam([p for p in tgn.parameters() if p.requires_grad],
+                                 lr=args.lr, weight_decay=args.weight_decay)
 
     num_instance = len(train_data.sources)
     num_batch = math.ceil(num_instance / args.batch_size)
@@ -1053,7 +1103,15 @@ def train(args):
     val_mrrs, new_nodes_val_mrrs = [], []
     train_losses, epoch_times = [], []
 
-    early_stopper = EarlyStopMonitor(max_round=args.patience, higher_better=True)
+    # Shared policy (cyberworld_v4/training_guard.py): warmup, clipping,
+    # non-finite steps skipped, step back to the best weights at half the LR
+    # after --step_back_after flat epochs, stop at --patience. Replaces
+    # EarlyStopMonitor, which had no LR response at all.
+    guard = TrainingGuard(
+        "encoder", [tgn], optimizer, mode="max",
+        patience=args.patience, step_back_after=args.step_back_after,
+        warmup_steps=default_warmup_steps(math.ceil(num_batch / max(args.backprop_every or 1, 1))),
+        clip_norm=args.clip_norm or None, log=logging.info)
 
     if args.shuffle_batches and args.use_memory:
         raise ValueError(
@@ -1148,7 +1206,7 @@ def train(args):
                 categories_batch = train_data.labels[sel]
 
                 size = len(sources_batch)
-                _, negatives_batch = train_rand_sampler.sample(size)
+                _, negatives_batch = train_rand_sampler.sample(size, sources=sources_batch, destinations=destinations_batch)
 
                 pos_prob, neg_prob, category_logits = tgn.compute_edge_probabilities_and_categories(
                     sources_batch, destinations_batch, negatives_batch,
@@ -1187,11 +1245,11 @@ def train(args):
             # capable (the same architecture reaches 0.998 on these features
             # standalone).
             total_loss = (loss + args.cat_loss_weight * category_loss_total) / args.backprop_every
-            total_loss.backward()
-            optimizer.step()
-            m_loss.append(total_loss.item())
-            m_edge_loss.append(float(loss.item()) / args.backprop_every)
-            m_cat_loss.append(float(category_loss_total.item()) / args.backprop_every)
+            # backward + clip + step; a non-finite loss is skipped, not stepped on.
+            if guard.backward_step(total_loss):
+                m_loss.append(total_loss.item())
+                m_edge_loss.append(float(loss.item()) / args.backprop_every)
+                m_cat_loss.append(float(category_loss_total.item()) / args.backprop_every)
 
             if k % 500 == 0:
                 elapsed = time.time() - start_epoch
@@ -1305,16 +1363,32 @@ def train(args):
             _sel, nn_val_ap, val_f1_macro,
         )
 
-        # Check early stopping
-        if early_stopper.early_stop_check(_sel):
-            logging.info(f"Early stopping triggered! No improvement over {early_stopper.max_round} epochs.")
-            logging.info(f"Best model was at Epoch {early_stopper.best_epoch} with selection score: {early_stopper.last_best:.4f}")
-            best_checkpoint = checkpoint_path_fn(early_stopper.best_epoch)
-            tgn.load_state_dict(torch.load(best_checkpoint, map_location=device))
+        _health = []
+        _dead = [_nm.get(i, i) for i, a in sorted(_per_class.items()) if float(a) == 0.0]
+        if _per_class and _dead:
+            _health.append(f"category head: {len(_dead)} of {len(_per_class)} classes at 0.0 "
+                           f"recall ({', '.join(map(str, _dead))})")
+        if nn_val_ap == nn_val_ap and nn_val_ap < 0.55:
+            _health.append(f"inductive link prediction AP {nn_val_ap:.3f}: near chance on unseen hosts")
+        _action = guard.end_epoch(_sel, train_loss=mean_train_loss, health=_health)
+        if _action == STOP:
+            logging.info(f"Early stopping: {guard.stop_reason}")
             break
+
+    # Serve the BEST epoch, always. This used to reload it only when early
+    # stopping fired; a run that used every epoch saved its LAST epoch as the
+    # "best model".
+    if guard.best_epoch is not None:
+        best_checkpoint = checkpoint_path_fn(guard.best_epoch - 1)   # guard epochs are 1-based
+        tgn.load_state_dict(torch.load(best_checkpoint, map_location=device))
+        logging.info(f"Best model: epoch {guard.best_epoch - 1} (selection {guard.best:.4f}), "
+                     f"{guard.step_backs} step-back(s)")
 
     # Save Best Model to final model path
     torch.save(tgn.state_dict(), model_save_path)
+    import json as _json
+    with open(os.path.splitext(model_save_path)[0] + "_training_guard.json", "w") as _fh:
+        _json.dump(guard.summary(), _fh, indent=2, default=str)
     logging.info(f"Best model successfully saved to: {model_save_path}")
 
     # Serialize explicit architectural configuration
@@ -1418,7 +1492,10 @@ def train(args):
         "inductive_val_accuracy": new_nodes_val_accuracies,
         "epoch_time": epoch_times
     })
-    metrics_csv_path = "results/training_metrics.csv"
+    # Beside the model it describes. Every run used to write the shared
+    # results/training_metrics.csv, so each comparison arm overwrote the last
+    # and results/README.md had to call the file unattributable.
+    metrics_csv_path = os.path.splitext(model_save_path)[0] + "_training_metrics.csv"
     df_metrics.to_csv(metrics_csv_path, index=False)
     logging.info(f"Training metrics saved to: {metrics_csv_path}")
 
@@ -1460,7 +1537,7 @@ def train(args):
     plt.legend()
 
     plt.tight_layout()
-    plot_path = "results/training_curves.png"
+    plot_path = os.path.splitext(model_save_path)[0] + "_training_curves.png"
     plt.savefig(plot_path, dpi=300)
     plt.close()
     logging.info(f"Training curves saved to: {plot_path}")
@@ -1530,7 +1607,19 @@ if __name__ == '__main__':
     parser.add_argument('--n_epoch', type=int, default=50, help='Maximum number of epochs (BiTA paper: 50)')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
-    parser.add_argument('--patience', type=int, default=5, help='Patience for early stopping')
+    parser.add_argument('--patience', type=int, default=3, help='Stop after N epochs without improvement')
+    parser.add_argument('--step_back_after', type=int, default=2,
+                        help='After N flat epochs restore the best weights and halve the LR '
+                             '(cyberworld_v4/training_guard.py); must be < --patience')
+    # 100, not the 1.0 used downstream: the objective is edge BCE + 15 x the
+    # category loss, so a healthy step's norm is ~60 (measured on the dry run).
+    # The clip is there for explosions -- it caught one at ~1e7 -- not to
+    # rescale every step.
+    parser.add_argument('--clip_norm', type=float, default=100.0,
+                        help='Gradient-norm clip for explosions; 0 disables (norms still logged)')
+    parser.add_argument('--learn_time_encoding', action='store_true',
+                        help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
+                             'Off by default: fixed encoding, see the note in train()')
     parser.add_argument('--n_layer', type=int, default=1, help='Number of GNN layers')
     parser.add_argument('--n_head', type=int, default=2, help='Number of attention heads')
     parser.add_argument('--n_degree', type=int, default=10, help='Number of sampled neighbors')

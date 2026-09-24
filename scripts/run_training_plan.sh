@@ -2,10 +2,13 @@
 # Runs the training plan agreed in claude_latest_analysis/30_training_decisions.md.
 #
 #   PCAP_ROOT=... CIC2018_CSV_DIR=... CIC2017_DIR=... CTU_DIR=... \
-#       scripts/run_training_plan.sh [preflight|compare|seeds|downstream|summary|all]
+#       scripts/run_training_plan.sh [preflight|dryrun|compare|seeds|downstream|summary|all]
 #
 # Stages, in order ("all" runs them in sequence and stops at the first failure):
 #
+#   preflight   every capture present and correctly named (scripts/check_datasets.py)
+#   dryrun      the whole plan on a tiny synthetic corpus (scripts/dry_run_plan.py);
+#               SKIP_DRY_RUN=1 to skip it
 #   compare     encoder (TGN memory on, 10 most-recent neighbours) + Branch A,
 #               with and without IP-identity features, seed 42, scheme
 #               cross_year_ctu: train on CIC-2018 PCAP + CTU-13, tune on
@@ -39,10 +42,19 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 SCHEME=cross_year_ctu
 CHOSEN_IP=cross_network            # decided in advance; see analysis 30, "winner"
 SEEDS_EXTRA=(123 2024)             # with 42 from `compare`: cyberworld_v4.config.SEEDS[:3]
-ENCODER_ARGS="--use_memory --n_degree 10"
+# Every model trains under cyberworld_v4/training_guard.py: LR warmup, gradient
+# clipping, non-finite steps skipped; after 2 epochs without improvement it
+# restores the best weights and halves the LR, after 3 it stops. The epoch
+# counts below are ceilings, not targets -- the guard ends each run once it
+# stops learning.
+#
+# PLAN_ENCODER_EXTRA / PLAN_BRANCH_A_EXTRA / PLAN_DOWNSTREAM_EXTRA are appended
+# to each stage's arguments (later flags win). scripts/dry_run_plan.py uses
+# them to run this exact plan on a tiny synthetic corpus.
+ENCODER_ARGS="--use_memory --n_degree 10 --n_epoch 50 --patience 3 --step_back_after 2 ${PLAN_ENCODER_EXTRA:-}"
 BRANCH_A_ARGS="--architecture paper --risk-objective soft_bce --risk-target hazard \
---epochs 8 --patience 3 --operating-point-criterion budgeted_f1 --alert-budget 2.0 \
---spill-dir $OUT/.spill --num-workers $NUM_WORKERS"
+--epochs 15 --patience 3 --step-back-after 2 --operating-point-criterion budgeted_f1 --alert-budget 2.0 \
+--spill-dir $OUT/.spill --num-workers $NUM_WORKERS ${PLAN_BRANCH_A_EXTRA:-}"
 
 compare_dir() { echo "$OUT/compare_seed$1"; }
 encoder_of() {  # seed ip -> encoder checkpoint written by run_encoder_comparison.py
@@ -114,8 +126,10 @@ downstream() {
         --pcap-root "$PCAP_ROOT" --cic2018-csv-dir "$CIC2018_CSV_DIR" \
         --ctu-dir "$CTU_DIR" --cic2017-dir "$CIC2017_DIR" \
         --split-scheme "$SCHEME" --risk-target hazard \
+        --epochs 12 --patience 3 --step-back-after 2 \
         --results-json "$OUT/downstream/cross_year.json" \
         --spill-dir "$OUT/.spill" --num-workers "$NUM_WORKERS" \
+        ${PLAN_DOWNSTREAM_EXTRA:-} \
         2>&1 | tee "$OUT/downstream/downstream.log"
 }
 
@@ -162,13 +176,26 @@ EOF
 EOF
 }
 
+dryrun() {
+    # The whole plan on a tiny synthetic corpus in the real formats, before the
+    # real run spends hours: a crash here costs minutes. It found the TGN-memory
+    # crash that would have ended the first real validation pass.
+    if [ "${SKIP_DRY_RUN:-0}" = 1 ]; then
+        echo "[plan] dry run skipped (SKIP_DRY_RUN=1)"
+        return
+    fi
+    echo "[plan] dry run: the whole plan on a tiny synthetic corpus first"
+    "$PYTHON" scripts/dry_run_plan.py
+}
+
 stage="${1:-all}"
 case "$stage" in
     preflight)  preflight ;;
+    dryrun)     dryrun ;;
     compare)    preflight; compare ;;
     seeds)      seeds ;;
     downstream) downstream ;;
     summary)    summary ;;
-    all)        preflight; compare; seeds; downstream; summary ;;
-    *) echo "usage: $0 [preflight|compare|seeds|downstream|summary|all]" >&2; exit 2 ;;
+    all)        preflight; dryrun; compare; seeds; downstream; summary ;;
+    *) echo "usage: $0 [preflight|dryrun|compare|seeds|downstream|summary|all]" >&2; exit 2 ;;
 esac

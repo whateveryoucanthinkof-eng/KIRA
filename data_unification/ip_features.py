@@ -219,10 +219,20 @@ def build_node_feature_matrix(ip_to_id: Dict[str, int], n_nodes: int = None) -> 
     slack rows for hosts that have not appeared yet). Unused rows stay zero,
     which is also what an unknown node should look like.
     """
-    needed = len(ip_to_id) + 1
+    return build_node_feature_matrix_from_pairs(
+        ((node_id, ip) for ip, node_id in ip_to_id.items()),
+        n_nodes=n_nodes if n_nodes is not None else len(ip_to_id) + 1)
+
+
+def build_node_feature_matrix_from_pairs(id_ip_pairs, n_nodes: int = None) -> np.ndarray:
+    """Same matrix from (node_id, ip) pairs, for when one address has SEVERAL
+    node ids -- the encoder keys nodes by (capture, host), so a host seen on
+    two capture days is two nodes with identical intrinsic features."""
+    pairs = list(id_ip_pairs)
+    needed = (max((nid for nid, _ in pairs), default=0) + 1)
     total_nodes = needed if n_nodes is None else max(int(n_nodes), needed)
     m = np.zeros((total_nodes, IP_FEATURE_DIM), dtype=np.float32)
-    for ip, node_id in ip_to_id.items():
+    for node_id, ip in pairs:
         if 0 <= node_id < total_nodes:
             m[node_id] = ip_node_features(ip)
     mask = node_ablation_mask()

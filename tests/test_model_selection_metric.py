@@ -24,8 +24,10 @@ from bita.utils.utils import EarlyStopMonitor
 def test_selection_uses_inductive_ap_and_macro_f1():
     src = open("bita/train.py").read()
     assert "_sel = 0.5 * float(nn_val_ap) + 0.5 * float(val_f1_macro)" in src
-    assert "early_stopper.early_stop_check(_sel)" in src, "the new metric is not used"
+    # The TrainingGuard (cyberworld_v4/training_guard.py) replaced EarlyStopMonitor.
+    assert "guard.end_epoch(_sel," in src, "the new metric is not used"
     assert "early_stop_check(val_ap)" not in src, "still selecting on val_ap alone"
+    assert "end_epoch(val_ap" not in src, "still selecting on val_ap alone"
 
 
 def test_the_selection_score_is_logged():

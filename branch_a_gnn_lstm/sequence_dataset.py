@@ -48,6 +48,21 @@ GRADATION_LEVELS = {
     "UNKNOWN": 1,
 }
 
+#: The gradation level of each technique class. Gradation is a function of
+#: the label, not an independent quantity: in every label map a row's primary
+#: technique (the one Branch A trains on) sits in coarse categories that all
+#: share one level -- T1071.001 is filed under C2 and under Impact, both level
+#: 3. tests/test_branch_a_gradation_from_technique.py re-derives this table
+#: from data_unification/label_maps/*.csv, so the two cannot drift apart.
+TECHNIQUE_GRADATION = {
+    "Benign": 0,
+    "T1046": 1, "T1595": 1,
+    "T1110": 2, "T1190": 2, "T1189": 2, "T1204": 2,
+    "T1071": 3, "T1071.001": 3, "T1568.001": 3, "T1005": 3,
+    "T1498": 3, "T1498.001": 3, "T1020": 3,
+}
+assert set(TECHNIQUE_GRADATION) == set(TECHNIQUE_VOCAB)
+
 
 class HostSequenceDataset(Dataset):
     """

@@ -373,7 +373,10 @@ def capture_namespace(path) -> str:
     a namespace or their hosts would merge again.
     """
     from pathlib import Path as _P
-    p = _P(path)
+    # Accept a training_sources.Capture too: Branch A's loader iterates those,
+    # and passing one here raised TypeError on the first capture of the run
+    # (found by scripts/dry_run_plan.py after the testing-prod merge).
+    p = _P(getattr(path, "path", path))
     return f"{p.parent.name}/{p.stem}"
 
 

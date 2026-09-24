@@ -189,10 +189,10 @@ class BiTAAggregator(MessageAggregator):
         raw_dim = edge_seqs[0][0][0].shape[-1]
         dev = edge_seqs[0][0][0].device
         raw = torch.zeros(n_edges, L, raw_dim, device=dev)
-        times = torch.zeros(n_edges, L, device=dev)
+        times = torch.zeros(n_edges, L, dtype=torch.float64, device=dev)
         for k, seq in enumerate(edge_seqs):
             raw[k, : len(seq)] = torch.stack([mm[0] for mm in seq])
-            times[k, : len(seq)] = torch.stack([mm[1].float().reshape(()) for mm in seq])
+            times[k, : len(seq)] = torch.stack([mm[1].double().reshape(()) for mm in seq])
 
         # Step 1 (Eq. 1): the message function.
         m = message_function.compute_message(raw) if message_function is not None else raw
@@ -209,7 +209,7 @@ class BiTAAggregator(MessageAggregator):
         lengths_d = lengths.to(dev)
         last_t = times.gather(1, (lengths_d - 1).clamp(min=0).unsqueeze(1))
         valid = torch.arange(L, device=dev).unsqueeze(0) < lengths_d.unsqueeze(1)
-        dt = (last_t - times).clamp(min=0.0) * valid
+        dt = ((last_t - times).clamp(min=0.0) * valid).float()
         x = m + self.time_encoder(dt)
 
         # Step 4.1 (Eq. 4-5): BiGRU, final hidden state of both directions.

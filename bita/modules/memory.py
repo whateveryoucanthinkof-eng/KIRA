@@ -27,7 +27,9 @@ class Memory(nn.Module):
     # Treat memory as parameter so that it is saved and loaded together with the model
     self.memory = nn.Parameter(torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
                                requires_grad=False)
-    self.last_update = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
+    # float64: at Unix-epoch scale (~1.5e9 s) float32 resolves only 128 s, so
+    # "time since last update" of anything under two minutes came out as 0.
+    self.last_update = nn.Parameter(torch.zeros(self.n_nodes, dtype=torch.float64).to(self.device),
                                     requires_grad=False)
 
     self.messages = defaultdict(list)
@@ -46,7 +48,7 @@ class Memory(nn.Module):
       torch.cat([self.memory.data, torch.zeros(extra, self.memory_dimension, device=dev)]),
       requires_grad=False)
     self.last_update = nn.Parameter(
-      torch.cat([self.last_update.data, torch.zeros(extra, device=dev)]),
+      torch.cat([self.last_update.data, torch.zeros(extra, dtype=self.last_update.dtype, device=dev)]),
       requires_grad=False)
     self.n_nodes = n_nodes
 

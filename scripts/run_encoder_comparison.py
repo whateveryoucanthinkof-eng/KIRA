@@ -214,6 +214,7 @@ def main() -> int:
         # The fine-tune starts from the warden arm's encoder.
         arms = ["warden"] + arms
     ips = ["full", "cross_network"] if a.ip_ablation else ["full"]
+    failed = []
     if a.ip_variants:
         ips = [x for x in a.ip_variants.split(",") if x]
         bad = [x for x in ips if x not in IP_VARIANTS]
@@ -241,6 +242,7 @@ def main() -> int:
                     ok = run(f"branch_a__{arm}__{ip}", branch_a_cmd(a, arm, ip),
                              branch_a_paths(a.out, arm, ip)[1], env, a)
                 if not ok:
+                    failed.append(f"{arm}/{ip}")
                     print(f"arm {arm}/{ip} stopped; the others continue", flush=True)
 
     if a.dry_run:
@@ -249,6 +251,11 @@ def main() -> int:
     (a.out / "comparison.json").write_text(json.dumps(summary, indent=2))
     (a.out / "comparison.md").write_text(to_markdown(summary))
     print(to_markdown(summary))
+    # A failed arm must fail the stage: the plan runs `seeds` and
+    # `downstream` next, and they need these encoders.
+    if failed:
+        print(f"FAILED arms: {failed}; see {a.out / 'logs'}", flush=True)
+        return 1
     return 0
 
 

@@ -213,24 +213,24 @@ class TGN(nn.Module):
             last_update = self.memory.last_update
 
             source_time_diffs = (
-                torch.from_numpy(edge_times).float().to(self.device)
-                - last_update[source_nodes].float()
+                torch.from_numpy(edge_times).double().to(self.device)
+                - last_update[source_nodes].double()
             )
             source_time_diffs = (
                 source_time_diffs - self.mean_time_shift_src
             ) / self.std_time_shift_src
 
             destination_time_diffs = (
-                torch.from_numpy(edge_times).float().to(self.device)
-                - last_update[destination_nodes].float()
+                torch.from_numpy(edge_times).double().to(self.device)
+                - last_update[destination_nodes].double()
             )
             destination_time_diffs = (
                 destination_time_diffs - self.mean_time_shift_dst
             ) / self.std_time_shift_dst
 
             negative_time_diffs = (
-                torch.from_numpy(edge_times).float().to(self.device)
-                - last_update[negative_nodes].float()
+                torch.from_numpy(edge_times).double().to(self.device)
+                - last_update[negative_nodes].double()
             )
             negative_time_diffs = (
                 negative_time_diffs - self.mean_time_shift_dst
@@ -238,7 +238,7 @@ class TGN(nn.Module):
 
             time_diffs = torch.cat(
                 [source_time_diffs, destination_time_diffs, negative_time_diffs], dim=0
-            )
+            ).float()
 
         node_embedding = self.embedding_module.compute_embedding(
             memory=memory,
@@ -333,7 +333,8 @@ class TGN(nn.Module):
         edge_times,
         edge_idxs,
     ):
-        edge_times = torch.from_numpy(edge_times).float().to(self.device)
+        # float64: absolute times; only the differences below go to float32.
+        edge_times = torch.from_numpy(np.asarray(edge_times, dtype=np.float64)).to(self.device)
         edge_features = (
             self.edge_raw_features[edge_idxs]
             if self.edge_raw_features is not None
@@ -343,8 +344,19 @@ class TGN(nn.Module):
         source_memory = self.memory.get_memory(source_nodes)
         destination_memory = self.memory.get_memory(destination_nodes)
 
-        source_time_delta = edge_times - self.memory.last_update[source_nodes]
-        source_time_delta_encoding = self.time_encoder(source_time_delta.unsqueeze(1)).view(
+        # "Time since this node's memory was last updated" -- which is undefined
+        # on first contact. Memory starts at last_update = 0, so a first message
+        # used to encode the ABSOLUTE Unix time (~1.5e9 s): cos(w * 1.5e9) is a
+        # random phase that flips on every optimiser step, i.e. noise written
+        # into memory, and d/dw of it scales with 1.5e9. Measured by the
+        # training guard on the dry run: time_encoder.w carried 100% of the
+        # gradient norm (4.7e7 against ~40 for everything else) and every step
+        # was clipped. The reference TGN never hit this because its datasets'
+        # clocks start at 0. A first contact now encodes a delta of 0.
+        last_update = self.memory.last_update[source_nodes]
+        source_time_delta = torch.where(
+            last_update > 0, edge_times - last_update, torch.zeros_like(edge_times))
+        source_time_delta_encoding = self.time_encoder(source_time_delta.float().unsqueeze(1)).view(
             len(source_nodes), -1
         )
 

@@ -41,7 +41,8 @@ def eval_edge_prediction_with_categories(
         categories_batch = data.labels[start_idx:end_idx]
 
         size = len(sources_batch)
-        _, negatives_batch = negative_edge_sampler.sample(size)
+        # Same-capture negatives where the sampler knows the captures (utils.RandEdgeSampler).
+        _, negatives_batch = negative_edge_sampler.sample(size, sources=sources_batch, destinations=destinations_batch)
 
         pos_score, neg_score, category_logits = model.compute_edge_probabilities_and_categories(
             sources_batch,

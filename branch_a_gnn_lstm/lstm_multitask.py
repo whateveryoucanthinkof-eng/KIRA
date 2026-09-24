@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from branch_a_gnn_lstm.attention import TemporalSelfAttention
-from branch_a_gnn_lstm.sequence_dataset import TECHNIQUE_VOCAB
+from branch_a_gnn_lstm.sequence_dataset import TECHNIQUE_GRADATION, TECHNIQUE_VOCAB
 
 
 class MultiClassFocalLoss(nn.Module):
@@ -392,6 +392,15 @@ class MultiTaskLSTM(nn.Module):
         self.num_layers = num_layers
         self.num_techniques = num_techniques
         self.num_gradations = num_gradations
+        # technique index -> gradation level, for the scalar mode's discrete
+        # output (see forward). A plain attribute, not a buffer, for the same
+        # state_dict reason as gradation_class_weights below. None when the
+        # head is not over TECHNIQUE_VOCAB and the mapping is unknown.
+        self._tech_level = None
+        if num_techniques == len(TECHNIQUE_VOCAB):
+            _lv = [TECHNIQUE_GRADATION[t] for t in TECHNIQUE_VOCAB]
+            if max(_lv) < num_gradations:
+                self._tech_level = torch.tensor(_lv, dtype=torch.long)
         # Plain attribute, not a buffer: see MultiClassFocalLoss's docstring --
         # anything registered here enters state_dict and an unexpected key
         # breaks the serving load. Training-time only.
@@ -570,12 +579,9 @@ class MultiTaskLSTM(nn.Module):
         tech_logits_raw = self.technique_head(h)
         gradation_score = None
         if self.gradation_mode == "scalar":
-            # G_t in [0, 1]. The evaluation code scores discrete levels, so the
-            # nearest of the num_gradations evenly spaced levels is also
-            # exposed as logits (argmax = nearest level).
+            # G_t in [0, 1]: the paper's continuous severity, trained by MSE.
             gradation_score = torch.sigmoid(self.gradation_head(h)).squeeze(-1)
-            levels = torch.linspace(0.0, 1.0, self.num_gradations, device=h.device, dtype=h.dtype)
-            grad_logits = -50.0 * (gradation_score.unsqueeze(-1) - levels) ** 2
+            grad_logits = None      # filled from the technique head below
         else:
             grad_logits = self.gradation_head(h)
 
@@ -591,6 +597,29 @@ class MultiTaskLSTM(nn.Module):
         # and the confusion matrix are all unchanged. Only the probabilities
         # move, which is the entire point.
         tech_logits = tech_logits_raw / self.effective_temperature
+
+        if grad_logits is None and self._tech_level is None:
+            # A non-standard label set: no technique->level table, so fall back
+            # to the nearest level of the scalar.
+            levels = torch.linspace(0.0, 1.0, self.num_gradations, device=h.device, dtype=h.dtype)
+            grad_logits = -50.0 * (gradation_score.unsqueeze(-1) - levels) ** 2
+        if grad_logits is None:
+            # The discrete level is read off the technique head, not the scalar.
+            #
+            # Decoding the MSE-trained scalar to its nearest level (the previous
+            # code) fails by construction: MSE predicts the conditional MEAN,
+            # and between Benign (0) and the attack levels (2/3, 1) the mean of
+            # an uncertain window lands on 1/3 -- "Recon/Unknown". The dry run
+            # (scripts/dry_run_plan.py) showed exactly that: the technique head
+            # reached 3/3 classes while the gradation read 100% Recon on the
+            # held-out test. A level is a fixed function of the technique
+            # (sequence_dataset.TECHNIQUE_GRADATION), so its probability is the
+            # sum of its techniques' probabilities -- consistent with the
+            # technique prediction by construction.
+            p = torch.softmax(tech_logits, dim=-1)
+            level_p = p.new_zeros(p.shape[0], self.num_gradations).index_add_(
+                1, self._tech_level.to(p.device), p)
+            grad_logits = torch.log(level_p.clamp_min(1e-12))
 
         return {
             "risk_score": risk_score.squeeze(-1),
