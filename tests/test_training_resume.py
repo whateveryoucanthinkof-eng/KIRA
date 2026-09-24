@@ -124,3 +124,17 @@ def test_every_trainer_is_wired():
         assert flag in src and "resume.load()" in src and "resume.save(" in src, f
     ds = (repo / "scripts/retrain_future_models_live.py").read_text(encoding="utf-8")
     assert ds.count("resume.save(") == 2 and "resume=bb_resume" in ds and "resume=dp_resume" in ds
+
+
+def test_downstream_clears_its_resume_points_inside_main():
+    """The first version cleared them in _score_cross_year, where they are not
+    defined: NameError at the very end of a successful run (found by the
+    end-to-end crash test)."""
+    import ast
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "scripts/retrain_future_models_live.py").read_text(encoding="utf-8")
+    for fn in ast.parse(src).body:
+        if isinstance(fn, ast.FunctionDef):
+            names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+            if "bb_resume" in names or "dp_resume" in names:
+                assert fn.name == "main", f"{fn.name} uses main's resume points"

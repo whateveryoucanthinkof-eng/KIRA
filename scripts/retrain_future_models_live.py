@@ -1176,6 +1176,9 @@ def main():
 
     if is_cross_year(args.split_scheme):
         _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device)
+    # The whole run finished: nothing left to resume.
+    bb_resume.clear()
+    dp_resume.clear()
 
 
 def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
@@ -1235,8 +1238,6 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
         args.results_json.parent.mkdir(parents=True, exist_ok=True)
         args.results_json.write_text(json.dumps(out, indent=2, default=str))
         print(f"results written to {args.results_json}", flush=True)
-    bb_resume.clear()
-    dp_resume.clear()
 
 
 if __name__ == "__main__":
