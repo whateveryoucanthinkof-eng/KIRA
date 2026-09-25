@@ -365,3 +365,48 @@ def test_append_batch_is_append(monkeypatch, tmp_path):
                          technique_ids=rows["technique_ids"][i],
                          risk_score=float(rows["risk_scores"][i]))
         assert_stores_equal(a.finalize(), b.finalize())
+
+
+def test_unresolved_labels_dropped_like_read_capture(tmp_path):
+    """read_capture drops UNKNOWN-category records and reports them; the
+    downstream readers keep them. One parse (one cache entry) serves both."""
+    from data_unification.label_filter import drop_unresolved
+    from data_unification.unified_schema import UnifiedFlowRecord
+    rng = np.random.default_rng(5)
+    recs = []
+    for i in range(3000):
+        bad = rng.random() < 0.2
+        atk = (not bad) and rng.random() < 0.3
+        t0 = 1.5e9 + float(rng.random() * 60)
+        recs.append(UnifiedFlowRecord(
+            src_ip=f"10.0.0.{int(rng.integers(1, 30))}", dst_ip=f"10.0.1.{int(rng.integers(1, 30))}",
+            src_port=1000, dst_port=int(rng.choice([22, 80, 443, 53])),
+            protocol=int(rng.choice([6, 17])), start_time=t0, end_time=t0 + float(rng.random()),
+            fwd_bytes=int(rng.integers(0, 5000)), bwd_bytes=int(rng.integers(0, 5000)),
+            fwd_packets=int(rng.integers(1, 9)), bwd_packets=int(rng.integers(0, 9)),
+            raw_label=("weird-%d" % (i % 3)) if bad else ("DoS" if atk else "BENIGN"),
+            raw_label_source="TEST", is_attack=atk,
+            coarse_category="UNKNOWN" if bad else ("Impact" if atk else "Benign"),
+            attck_technique_ids=["T1498"] if atk else []))
+    spec_a = cc.ColumnSpec("read_capture", "CTU13", "x", str(tmp_path / "x.binetflow"), WS)
+    spec_b = cc.ColumnSpec("one_capture", "CTU13", "x", str(tmp_path / "x.binetflow"), WS)
+    assert spec_a.source_key() == spec_b.source_key()
+    cc.build_columns(spec_a, tmp_path / "e", records=iter(recs))
+    kept, cov = drop_unresolved(recs)
+    assert 0 < len(kept) < len(recs)
+    cov = {**cov, "top_unresolved_labels": [tuple(x) for x in cov["top_unresolved_labels"]]}
+    for spec, want_recs, want_cov in ((spec_a, kept, cov), (spec_b, recs, None)):
+        cols = cc.CaptureColumns.load(tmp_path / "e", drop_unresolved=spec.drops_unresolved)
+        assert len(cols) == len(want_recs)
+        assert cols.coverage == want_cov
+        stores = []
+        for mode in ("records", "columns"):
+            ex = _extractor(True)
+            b = TrajectoryStoreBuilder()
+            if mode == "records":
+                ex.extract_trajectories(list(want_recs), builder=b)
+            else:
+                ex.extract_trajectories_columns(cols, builder=b)
+            stores.append(b.finalize())
+        assert stores[0].is_attack.any()
+        assert_stores_equal(*stores)
