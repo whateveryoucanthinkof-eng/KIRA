@@ -87,6 +87,11 @@ def build(args, device):
 def run(args):
     device = torch.device("cuda:0")
     torch.backends.cudnn.benchmark = False
+    if args.no_cudnn_tf32:
+        # PyTorch's default lets cuDNN run the BiGRU weight-gradient GEMMs in
+        # TF32; this makes the reference fp32 so level 2's Triton GRU can be
+        # compared at fp32 rounding.
+        torch.backends.cudnn.allow_tf32 = False
     if args.deterministic:
         # Makes the REFERENCE reproducible (its index_add_ uses atomics), so a
         # bit-identity claim is testable at all.
@@ -269,6 +274,7 @@ def main():
     ap.add_argument("--dump_outputs", type=int, default=64)
     ap.add_argument("--val", action="store_true")
     ap.add_argument("--deterministic", action="store_true")
+    ap.add_argument("--no_cudnn_tf32", action="store_true")
     ap.add_argument("--host_edges", help="path for a memmap copy of the edge features (HostEdgeFeatures path)")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--val_limit", type=int, default=0)
