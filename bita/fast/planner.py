@@ -40,6 +40,7 @@ bench.py --planner --compare.
 from __future__ import annotations
 
 import copy
+import math
 import mmap
 import multiprocessing as mp
 import os
@@ -64,12 +65,16 @@ def _r8(n):
     return (n + 7) & ~7
 
 
+_NPDT = {"i8": np.int64, "i4": np.int32, "f4": np.float32, "f8": np.float64, "b1": np.bool_}
+_ITEM = {"i8": 8, "i4": 4, "f4": 4, "f8": 8, "b1": 1}
+
+
 def _npdt(code):
-    return {"i8": np.int64, "i4": np.int32, "f4": np.float32, "f8": np.float64, "b1": np.bool_}[code]
+    return _NPDT[code]
 
 
 def layout(B, k, de_b, de_n, U, n_upd, E, L, variant, C, N_pad):
-    """name -> (offset, dtype code, shape), device bytes, total bytes.
+    """name -> (offset, dtype code, shape, count), device bytes, total bytes.
 
     Device groups (each as upload_many would lay it out, starting at a
     512-byte offset) then host-only arrays."""
@@ -80,9 +85,9 @@ def layout(B, k, de_b, de_n, U, n_upd, E, L, variant, C, N_pad):
         nonlocal off
         off = (off + _ALIGN_GROUP - 1) // _ALIGN_GROUP * _ALIGN_GROUP
         for name, code, shape in items:
-            nb = int(np.prod(shape)) * np.dtype(_npdt(code)).itemsize
-            out[name] = (off, code, shape)
-            off += _r8(nb)
+            count = math.prod(shape)
+            out[name] = (off, code, shape, count)
+            off += _r8(count * _ITEM[code])
 
     n = 3 * B
     g1 = [("b_ints", "i8", (6 * B,))]      # [nodes (3B) ; eidx (B) ; write order (2B)]
@@ -113,15 +118,35 @@ def layout(B, k, de_b, de_n, U, n_upd, E, L, variant, C, N_pad):
                  ("h_dt", "f4", (E, L)), ("h_last_t", "f8", (E,)), ("h_owner", "i8", (E,)),
                  ("h_counts", "f4", (n_upd,)), ("h_node_ts", "f8", (n_upd,))]
     for name, code, shape in host:
-        nb = int(np.prod(shape)) * np.dtype(_npdt(code)).itemsize
-        out[name] = (off, code, shape)
-        off += _r8(nb)
+        count = math.prod(shape)
+        out[name] = (off, code, shape, count)
+        off += _r8(count * _ITEM[code])
     return out, dev_nbytes, off
 
 
 def _views(buf, lay):
-    return {name: np.frombuffer(buf, dtype=_npdt(code), count=int(np.prod(shape)), offset=o).reshape(shape)
-            for name, (o, code, shape) in lay.items()}
+    return {name: np.frombuffer(buf, dtype=_NPDT[code], count=count, offset=o).reshape(shape)
+            for name, (o, code, shape, count) in lay.items()}
+
+
+class _HostViews(dict):
+    """numpy views of a plan's host copy, made on first access (the trainer
+    reads about half of them)."""
+
+    __slots__ = ("buf", "lay")
+
+    def __init__(self, buf, lay):
+        super().__init__()
+        self.buf, self.lay = buf, lay
+
+    def __missing__(self, name):
+        o, code, shape, count = self.lay[name]
+        v = np.frombuffer(self.buf, dtype=_NPDT[code], count=count, offset=o).reshape(shape)
+        self[name] = v
+        return v
+
+    def __contains__(self, name):
+        return name in self.lay
 
 
 # =================================================================== child
@@ -444,14 +469,12 @@ class BatchPlanner:
         p = Plan()
         p.batch, p.B, p.k, p.U, p.n_upd, p.E, p.L, p.variant, p.state = \
             b, B, cfg.n_degree, U, n_upd, E, L, variant, state
-        p.h = _views(host, lay)
+        p.h = _HostViews(host, lay)
         d = {}
-        for name, (o, code, shape) in lay.items():
+        for name, (o, code, shape, count) in lay.items():
             if o >= dev_nbytes:
                 continue
-            tdt = _TorchDT.get(code)
-            nb = int(np.prod(shape)) * np.dtype(_npdt(code)).itemsize
-            d[name] = dbuf[o: o + nb].view(tdt).view(shape)
+            d[name] = dbuf[o: o + count * _ITEM[code]].view(_TorchDT.get(code)).view(shape)
         p.d = d
         p._stage, p._dev = stage, dbuf
         self.n_plans += 1
