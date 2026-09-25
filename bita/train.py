@@ -23,6 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model.extentedtgn import ExtendedTGN
 from model.time_encoding import TimeEncode
 from utils.utils import RandEdgeSampler, get_neighbor_finder, EarlyStopMonitor
+from utils.utils import (CHUNK, DiskStore, count_unique, first_seen_order, mark_present,
+                         masked_copy, store_empty)
 from evaluation.eval_edge_prediction_with_categories import eval_edge_prediction_with_categories
 from data_unification.tgne_features import (
     EDGE_FEATURE_NAMES,
@@ -154,8 +156,20 @@ class Data:
         self.edge_idxs = edge_idxs
         self.labels = labels
         self.n_interactions = len(sources)
-        self.unique_nodes = set(sources) | set(destinations)
-        self.n_unique_nodes = len(self.unique_nodes)
+        self._n_unique = None
+
+    # Lazy. These were built eagerly for every split: a Python set of every
+    # node (~70 B per node as np.int64 objects), seven times over, when only a
+    # log line reads the count.
+    @property
+    def unique_nodes(self):
+        return set(np.asarray(self.sources).tolist()) | set(np.asarray(self.destinations).tolist())
+
+    @property
+    def n_unique_nodes(self):
+        if self._n_unique is None:
+            self._n_unique = count_unique(self.sources, self.destinations)
+        return self._n_unique
 
 
 def _contract_window_seconds() -> float:
@@ -190,7 +204,60 @@ def _init_from_checkpoint(tgn, path, device):
                  len(skipped), ", ".join(sorted({k.split(".")[0] for k in skipped})) or "none")
 
 
-def compute_time_statistics(sources, destinations, timestamps):
+def _time_since_last(nodes, timestamps, out):
+    """out[k] = timestamps[k] - (timestamp of `nodes[k]`'s previous edge, else 0).
+
+    The vectorised form of compute_time_statistics' dict loop, streamed in
+    chunks with one float64 per node carried between them. Same float64
+    subtraction, same operands, so the same bits."""
+    n_nodes = int(max(np.asarray(nodes).max(), 0)) + 1
+    last = np.zeros(n_nodes, dtype=np.float64)
+    for a in range(0, len(nodes), CHUNK):
+        nd = np.asarray(nodes[a:a + CHUNK]).astype(np.int64, copy=False)
+        t = np.asarray(timestamps[a:a + CHUNK], dtype=np.float64)
+        order = np.argsort(nd, kind="stable")
+        nd_s = nd[order]
+        t_s = t[order]
+        new_grp = np.r_[True, nd_s[1:] != nd_s[:-1]]
+        prev = np.empty_like(t_s)
+        prev[1:] = t_s[:-1]
+        prev[new_grp] = last[nd_s[new_grp]]
+        diff = np.empty_like(t)
+        diff[order] = t_s - prev
+        out[a:a + len(t)] = diff
+        ends = np.r_[np.flatnonzero(new_grp[1:]), len(nd_s) - 1]
+        last[nd_s[ends]] = t_s[ends]
+    return out
+
+
+def compute_time_statistics(sources, destinations, timestamps, store=None):
+    """Mean/std of each edge's time since its source's (destination's) previous edge.
+
+    The per-edge dict loop below built two Python lists of every difference
+    -- ~70 B per edge as float objects, ~19 GB at 133M edges. For non-negative
+    integer node ids the same differences are computed vectorised into float64
+    arrays (on disk with `store`), and np.mean/np.std then see the identical
+    array a list converts to, so the statistics are bit-identical.
+    """
+    src_a = np.asarray(sources)
+    dst_a = np.asarray(destinations)
+    # float64 times only: np.mean of an INTEGER array reduces through a
+    # buffered cast, which is not the same summation as over float64 values.
+    if (len(src_a) > 0 and src_a.dtype.kind in "iu" and dst_a.dtype.kind in "iu"
+            and np.asarray(timestamps).dtype == np.float64
+            and int(src_a.min()) >= 0 and int(dst_a.min()) >= 0):
+        n = len(src_a)
+        out = []
+        for name, nodes in (("dt_src", src_a), ("dt_dst", dst_a)):
+            d = _time_since_last(nodes, timestamps, store_empty(store, name, n, np.float64))
+            mean = float(np.mean(d))
+            std = float(np.std(d)) if np.std(d) > 0 else 1.0
+            out += [mean, std]
+            if store is not None:
+                store.remove(d)
+            del d
+        return tuple(out)
+
     last_timestamp_sources = dict()
     last_timestamp_dst = dict()
     all_timediffs_src = []
@@ -363,6 +430,7 @@ def load_and_preprocess_unified_dataset(
     window_seconds=2.0,
     ingest_scratch=None,
     ingest_cache=None,
+    store=None,
 ):
     """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
 
@@ -373,6 +441,12 @@ def load_and_preprocess_unified_dataset(
     host can be both. Edge features come from each record's real bidirectional
     bytes/packets/duration via extract_canonical_edge_features -- not the flow-count
     proxy Warden's loader uses, since these datasets carry real flow statistics.
+
+    `store` (a utils.utils.DiskStore) keeps every per-edge column in files
+    instead of anonymous memory: the growing columns, the sorted columns, the
+    returned graph_df's columns and the edge features (returned as np.memmap,
+    which ExtendedTGN then gathers per batch instead of copying to the GPU).
+    The values are identical either way.
 
     `splits` restricts which frozen captures are read. It defaults to
     ("train",) and that default is load-bearing.
@@ -464,20 +538,39 @@ def load_and_preprocess_unified_dataset(
     edge_dim = len(_probe)
 
     class _Growable:
-        """Append-only numpy column that doubles in place."""
+        """Append-only numpy column that doubles in place.
 
-        __slots__ = ("buf", "n")
+        With a store the column is a file: growing it extends the file and
+        re-maps it, so nothing is copied and nothing is anonymous memory."""
+
+        __slots__ = ("buf", "n", "path")
 
         def __init__(self, dtype, width=None, cap=1 << 20):
             shape = (cap,) if width is None else (cap, width)
-            self.buf = np.empty(shape, dtype=dtype)
             self.n = 0
+            self.path = None
+            if store is None:
+                self.buf = np.empty(shape, dtype=dtype)
+            else:
+                self.path = store._path("raw")
+                self.buf = np.memmap(self.path, dtype=dtype, mode="w+", shape=shape)
+
+        def _grow(self, cap):
+            shape = (cap,) + self.buf.shape[1:]
+            if self.path is not None:
+                dt = self.buf.dtype
+                self.buf.flush()
+                self.buf = None
+                # r+ with a larger shape extends the file; the data stays put.
+                self.buf = np.memmap(self.path, dtype=dt, mode="r+", shape=shape)
+                return
+            bigger = np.empty(shape, self.buf.dtype)
+            bigger[: self.n] = self.buf[: self.n]
+            self.buf = bigger
 
         def append(self, v):
             if self.n == len(self.buf):
-                bigger = np.empty((len(self.buf) * 2,) + self.buf.shape[1:], self.buf.dtype)
-                bigger[: self.n] = self.buf[: self.n]
-                self.buf = bigger
+                self._grow(len(self.buf) * 2)
             self.buf[self.n] = v
             self.n += 1
 
@@ -490,14 +583,20 @@ def load_and_preprocess_unified_dataset(
                 cap = len(self.buf)
                 while cap < need:
                     cap *= 2
-                bigger = np.empty((cap,) + self.buf.shape[1:], self.buf.dtype)
-                bigger[: self.n] = self.buf[: self.n]
-                self.buf = bigger
+                self._grow(cap)
             self.buf[self.n:need] = arr
             self.n = need
 
         def done(self):
             return self.buf[: self.n]
+
+        def free(self):
+            self.buf = None
+            if self.path is not None:
+                try:
+                    os.remove(self.path)
+                except OSError:
+                    pass
 
     col_u = _Growable(np.int64)
     col_i = _Growable(np.int64)
@@ -722,29 +821,56 @@ def load_and_preprocess_unified_dataset(
     # the widest one as a temporary: ~214 B/record at the peak, ~24.6 GB at
     # the ~115M records of the full PCAP corpus. This peaks at the live
     # columns + the order + one permuted column (~135 B/record).
+    #
+    # With a store, each permuted column is written into its own file in
+    # chunks of `order` (a gather is exact, so chunking changes nothing), and
+    # the unsorted file is deleted as soon as it has been read.
     order = np.argsort(col_ts.done(), kind="stable")
 
-    def _permuted(col):
-        out = col.done()[order]
-        col.buf = None
+    def _permuted(col, name):
+        if store is None:
+            out = col.done()[order]
+        else:
+            src_col = col.done()
+            out = store.empty(name, n, src_col.dtype)
+            for a in range(0, n, CHUNK):
+                np.take(src_col, order[a:a + CHUNK], out=out[a:a + CHUNK])
+            del src_col
+        col.free()
         return out
 
-    u_list = _permuted(col_u)
-    i_list = _permuted(col_i)
-    ts_list = _permuted(col_ts)
-    label_list = _permuted(col_lbl)
-    source_list = _permuted(col_src)
-    capture_list = _permuted(col_cap)
+    u_list = _permuted(col_u, "u")
+    i_list = _permuted(col_i, "i")
+    ts_list = _permuted(col_ts, "ts")
+    label_list = _permuted(col_lbl, "label")
+    source_list = _permuted(col_src, "source")
+    capture_list = _permuted(col_cap, "capture")
 
     # Row 0 stays zero: it is the padding edge, which is why no vstack is needed.
     # np.take with out= writes straight into place: no temporary copy.
-    edge_features = np.empty((n + 1, edge_dim), dtype=np.float32)
-    edge_features[0] = 0.0
-    np.take(col_edge.done(), order, axis=0, out=edge_features[1:])
-    col_edge.buf = None
+    if store is None:
+        edge_features = np.empty((n + 1, edge_dim), dtype=np.float32)
+        edge_features[0] = 0.0
+        np.take(col_edge.done(), order, axis=0, out=edge_features[1:])
+    else:
+        edge_features = store.memmap("edge_features", (n + 1, edge_dim), np.float32)
+        edge_features[0] = 0.0
+        _raw = col_edge.done()
+        for a in range(0, n, CHUNK):
+            b = min(n, a + CHUNK)
+            np.take(_raw, order[a:b], axis=0, out=edge_features[1 + a:1 + b])
+        del _raw
+        edge_features.flush()
+    col_edge.free()
     del col_u, col_i, col_ts, col_lbl, col_edge, col_src, col_cap, order
 
-    idx_list = np.arange(1, n + 1)
+    if store is None:
+        idx_list = np.arange(1, n + 1)
+    else:
+        idx_list = store.empty("idx", n, np.int64)
+        for a in range(0, n, CHUNK):
+            b = min(n, a + CHUNK)
+            idx_list[a:b] = np.arange(a + 1, b + 1)
 
     # Category ids must match LabelEncoder's semantics -- ALPHABETICAL order,
     # not first-seen. cat_to_id above is assigned in encounter order for speed,
@@ -755,18 +881,29 @@ def load_and_preprocess_unified_dataset(
     remap = np.empty(len(ordered), dtype=np.int32)
     for name, encounter_id in cat_to_id.items():
         remap[encounter_id] = ordered.index(name)
-    label_list = remap[label_list]
+    if store is None:
+        label_list = remap[label_list]
+    else:
+        # In place, in chunks: the same int32 gather.
+        for a in range(0, n, CHUNK):
+            label_list[a:a + CHUNK] = remap[label_list[a:a + CHUNK]]
     category_mapping = {i: name for i, name in enumerate(ordered)}
     logging.info("Loaded %d unified flow records from CIC-2017/CIC-2018/CTU-13", n)
     logging.info("Detected coarse categories: %s", category_mapping)
 
+    # copy=False: the frame wraps the columns (pandas' default copies and
+    # consolidates them -- a second full copy of u/i/idx and of everything else).
     graph_df = pd.DataFrame({'u': u_list, 'i': i_list, 'ts': ts_list,
                              'label': label_list, 'idx': idx_list,
-                             'source': source_list, 'capture': capture_list})
+                             'source': source_list, 'capture': capture_list}, copy=False)
     _src_names = {v: k for k, v in src_to_id.items()}
+    _per_src = np.zeros(max(len(_src_names), 1), dtype=np.int64)
+    for a in range(0, n, CHUNK):
+        _per_src += np.bincount(np.asarray(source_list[a:a + CHUNK], dtype=np.int64),
+                                minlength=len(_per_src))[:len(_per_src)]
     logging.info(
         "Edges per corpus: %s",
-        {_src_names[v]: int((source_list == v).sum()) for v in sorted(_src_names)},
+        {_src_names[v]: int(_per_src[v]) for v in sorted(_src_names)},
     )
 
     # Node features were np.zeros(...). Every one of them. In TGN a node's
@@ -798,7 +935,18 @@ def load_and_preprocess_unified_dataset(
     return graph_df, edge_features, node_features, category_mapping
 
 
-def split_data(graph_df, edge_features, node_features, different_new_nodes=True, randomize_features=False):
+def split_data(graph_df, edge_features, node_features, different_new_nodes=True, randomize_features=False,
+               store=None):
+    """The 70/15/15 per-capture temporal split plus the inductive node draw.
+
+    Every set operation that used to iterate edges in Python (set(sources),
+    Series.map(lambda x: x in S), list comprehensions over zip) is a bitmap
+    over node ids now, with identical results; the one place a Python set's
+    ITERATION ORDER matters -- np.random.choice over list(test_node_set) -- is
+    rebuilt from the same values in the same insertion order (see
+    utils.first_seen_order), so the draw is the same. With `store` the
+    train/val/test columns are written to files instead of RAM copies.
+    """
     if randomize_features:
         node_features = np.random.rand(node_features.shape[0], node_features.shape[1]).astype(np.float32)
 
@@ -884,20 +1032,51 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     full_data = Data(sources, destinations, timestamps, edge_idxs, labels)
 
     np.random.seed(2020)
-    node_set = set(sources) | set(destinations)
-    n_total_unique_nodes = len(node_set)
+    _ids_ok = (len(sources) > 0 and sources.dtype.kind in "iu" and destinations.dtype.kind in "iu"
+               and int(min(sources.min(), destinations.min())) >= 0)
+    if _ids_ok:
+        _max_id = int(max(sources.max(), destinations.max()))
+        n_total_unique_nodes = count_unique(sources, destinations)
+        full_data._n_unique = n_total_unique_nodes
+    else:
+        node_set = set(sources) | set(destinations)
+        n_total_unique_nodes = len(node_set)
 
     _held_out = val_mask_t | test_mask_t
-    test_node_set = set(sources[_held_out]).union(set(destinations[_held_out]))
+    if _ids_ok:
+        # Same values, same insertion order as set(sources[_held_out]) etc.,
+        # hence the same set layout and the same list(test_node_set) order.
+        _held_src = masked_copy(sources, _held_out)
+        _a = first_seen_order(_held_src, _max_id).tolist()
+        del _held_src
+        _held_dst = masked_copy(destinations, _held_out)
+        _b = first_seen_order(_held_dst, _max_id).tolist()
+        del _held_dst
+        test_node_set = set(_a).union(set(_b))
+        del _a, _b
+    else:
+        test_node_set = set(sources[_held_out]).union(set(destinations[_held_out]))
     requested_new_nodes = max(1, int(0.1 * n_total_unique_nodes))
     requested_new_nodes = min(requested_new_nodes, len(test_node_set))
     new_test_node_set = set(
         np.random.choice(list(test_node_set), requested_new_nodes, replace=False)
     )
 
-    new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
-    new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
-    observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
+    def _edge_touches(node_set_):
+        """Per edge: source or destination in node_set_ (a bitmap lookup)."""
+        if not _ids_ok:
+            return (graph_df.u.map(lambda x: x in node_set_).values
+                    | graph_df.i.map(lambda x: x in node_set_).values)
+        flag = np.zeros(_max_id + 1, dtype=bool)
+        if node_set_:
+            flag[np.fromiter(node_set_, dtype=np.int64, count=len(node_set_))] = True
+        out = np.empty(len(sources), dtype=bool)
+        for a in range(0, len(sources), CHUNK):
+            out[a:a + CHUNK] = flag[sources[a:a + CHUNK]] | flag[destinations[a:a + CHUNK]]
+        return out
+
+    # ~(src in S) & ~(dst in S)  ==  ~(src in S | dst in S)
+    observed_edges_mask = ~_edge_touches(new_test_node_set)
 
     # A class must not be annihilated by the inductive node draw.
     #
@@ -929,9 +1108,7 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
             sorted(lost), len(new_test_node_set) - len(kept),
         )
         new_test_node_set = kept
-        new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
-        new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
-        observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
+        observed_edges_mask = ~_edge_touches(new_test_node_set)
         still = _classes_lost(observed_edges_mask)
         if still:
             logging.error("Class(es) %s STILL absent from training after re-draw.", sorted(still))
@@ -940,7 +1117,14 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     # as a behaviour -- a model that scores well on it has memorised that host
     # -- so its metrics must never be reported as detection performance.
     for c in np.unique(labels):
-        srcs = np.unique(sources[labels == c])
+        if _ids_ok:
+            _seen = np.zeros(_max_id + 1, dtype=bool)
+            for a in range(0, len(sources), CHUNK):
+                _seen[sources[a:a + CHUNK][labels[a:a + CHUNK] == c]] = True
+            srcs = np.flatnonzero(_seen)
+            del _seen
+        else:
+            srcs = np.unique(sources[labels == c])
         if len(srcs) <= 2 and c != 0:
             logging.warning(
                 "Class %s is carried by only %d source host(s). Its metrics "
@@ -950,11 +1134,15 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
                 len(srcs),
             )
 
-    train_mask = np.logical_and(train_mask_t, observed_edges_mask)
-    train_data = Data(sources[train_mask], destinations[train_mask], timestamps[train_mask], edge_idxs[train_mask], labels[train_mask])
+    def _subset(mask, name):
+        k = int(np.count_nonzero(mask))
+        return Data(*(masked_copy(col, mask, store, f"{name}_{cn}", count=k) for col, cn in (
+            (sources, "src"), (destinations, "dst"), (timestamps, "ts"),
+            (edge_idxs, "idx"), (labels, "label"))))
 
-    train_node_set = set(train_data.sources).union(train_data.destinations)
-    new_node_set = node_set - train_node_set
+    train_mask = np.logical_and(train_mask_t, observed_edges_mask)
+    del observed_edges_mask
+    train_data = _subset(train_mask, "train")
 
     val_mask = val_mask_t
     test_mask = test_mask_t
@@ -964,20 +1152,33 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
         val_new_node_set = set(list(new_test_node_set)[:n_new_nodes])
         test_new_node_set = set(list(new_test_node_set)[n_new_nodes:])
 
-        edge_contains_new_val_node_mask = np.array([(a in val_new_node_set or b in val_new_node_set) for a, b in zip(sources, destinations)])
-        edge_contains_new_test_node_mask = np.array([(a in test_new_node_set or b in test_new_node_set) for a, b in zip(sources, destinations)])
+        edge_contains_new_val_node_mask = _edge_touches(val_new_node_set)
         new_node_val_mask = np.logical_and(val_mask, edge_contains_new_val_node_mask)
+        del edge_contains_new_val_node_mask
+        edge_contains_new_test_node_mask = _edge_touches(test_new_node_set)
         new_node_test_mask = np.logical_and(test_mask, edge_contains_new_test_node_mask)
+        del edge_contains_new_test_node_mask
     else:
-        edge_contains_new_node_mask = np.array([(a in new_node_set or b in new_node_set) for a, b in zip(sources, destinations)])
+        if _ids_ok:
+            # node_set - train_node_set, as a bitmap
+            _new = mark_present(mark_present(np.zeros(_max_id + 1, dtype=bool), sources), destinations)
+            _tr = mark_present(mark_present(np.zeros(_max_id + 1, dtype=bool),
+                                            train_data.sources), train_data.destinations)
+            _new &= ~_tr
+            new_node_set = set(np.flatnonzero(_new).tolist())
+            del _new, _tr
+        else:
+            train_node_set = set(train_data.sources).union(train_data.destinations)
+            new_node_set = node_set - train_node_set
+        edge_contains_new_node_mask = _edge_touches(new_node_set)
         new_node_val_mask = np.logical_and(val_mask, edge_contains_new_node_mask)
         new_node_test_mask = np.logical_and(test_mask, edge_contains_new_node_mask)
 
-    val_data = Data(sources[val_mask], destinations[val_mask], timestamps[val_mask], edge_idxs[val_mask], labels[val_mask])
-    test_data = Data(sources[test_mask], destinations[test_mask], timestamps[test_mask], edge_idxs[test_mask], labels[test_mask])
+    val_data = _subset(val_mask, "val")
+    test_data = _subset(test_mask, "test")
 
-    new_node_val_data = Data(sources[new_node_val_mask], destinations[new_node_val_mask], timestamps[new_node_val_mask], edge_idxs[new_node_val_mask], labels[new_node_val_mask])
-    new_node_test_data = Data(sources[new_node_test_mask], destinations[new_node_test_mask], timestamps[new_node_test_mask], edge_idxs[new_node_test_mask], labels[new_node_test_mask])
+    new_node_val_data = _subset(new_node_val_mask, "nnval")
+    new_node_test_data = _subset(new_node_test_mask, "nntest")
 
     logging.info(f"Dataset split: Full={full_data.n_interactions} ({full_data.n_unique_nodes} nodes), "
                  f"Train={train_data.n_interactions}, Val={val_data.n_interactions}, Test={test_data.n_interactions}, "
@@ -1017,6 +1218,21 @@ def train(args):
     logging.info(f"Training on device: {device}")
 
     # Load and Preprocess Data
+    #
+    # Out-of-core store for the unified corpus: every per-edge array (loaded
+    # columns, split subsets, neighbour-finder CSR, edge features) lives in
+    # files under the checkpoint dir -- on disk, never the tmpfs temp dir --
+    # and is paged in as batches touch it. ~133M edges no longer need ~38 GB
+    # of anonymous memory, and the edge features no longer sit on the GPU.
+    # Nothing it computes changes. Removed when the run ends; a crashed run's
+    # store is wiped (not reused) by the next run's DiskStore().
+    store = None
+    if (args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root) \
+            and not args.in_memory:
+        import atexit
+        store = DiskStore(os.path.join(args.checkpoint_dir, "store"))
+        atexit.register(store.cleanup)
+        logging.info("Out-of-core store: %s", store.root)
     if args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root:
         if args.data_name == 'warden_alerts':  # still the default; unified run wasn't given its own name
             args.data_name = 'unified_cic_ctu13'
@@ -1041,6 +1257,7 @@ def train(args):
             # On disk beside the epoch checkpoints: never the tmpfs temp dir.
             ingest_scratch=os.path.join(args.checkpoint_dir, "ingest") if args.ingest_workers else None,
             ingest_cache=args.ingest_cache if args.ingest_workers else None,
+            store=store,
         )
     else:
         graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
@@ -1052,11 +1269,11 @@ def train(args):
 
     node_features, edge_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
         split_data(graph_df, edge_features, node_features, different_new_nodes=args.different_new_nodes,
-                   randomize_features=args.randomize_features)
+                   randomize_features=args.randomize_features, store=store)
 
     # Neighbor finders
-    train_ngh_finder = get_neighbor_finder(train_data, uniform=args.uniform)
-    full_ngh_finder = get_neighbor_finder(full_data, uniform=args.uniform)
+    train_ngh_finder = get_neighbor_finder(train_data, uniform=args.uniform, store=store)
+    full_ngh_finder = get_neighbor_finder(full_data, uniform=args.uniform, store=store)
 
     # Samplers. Negatives come from the positive edge's own capture: nodes are
     # per capture (load_and_preprocess_unified_dataset), so each node has one.
@@ -1078,7 +1295,8 @@ def train(args):
 
     # Compute time statistics
     mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst = \
-        compute_time_statistics(full_data.sources, full_data.destinations, full_data.timestamps)
+        compute_time_statistics(full_data.sources, full_data.destinations, full_data.timestamps,
+                                store=store)
 
     model_save_path = os.path.join(args.save_dir, f"{args.prefix}-{args.data_name}.pth")
     checkpoint_path_fn = lambda epoch: os.path.join(args.checkpoint_dir, f"{args.prefix}-{args.data_name}-{epoch}.pth")
@@ -1172,7 +1390,7 @@ def train(args):
                "val_mrrs": val_mrrs, "new_nodes_val_mrrs": new_nodes_val_mrrs,
                "train_losses": train_losses, "epoch_times": epoch_times}
     resume = ResumePoint(os.path.splitext(model_save_path)[0] + "_resume.pt",
-                         run_fingerprint(args, ignore=("n_epoch", "gpu", "num_workers")),
+                         run_fingerprint(args, ignore=("n_epoch", "gpu", "num_workers", "in_memory")),
                          enabled=not args.no_resume, log=logging.info)
     first_epoch = 0
     _rp = resume.load()
@@ -1625,6 +1843,9 @@ def train(args):
     plt.close()
     logging.info(f"Training curves saved to: {plot_path}")
 
+    if store is not None:
+        store.cleanup()
+
     return {
         "test_auc": test_res[1],
         "test_ap": test_res[0],
@@ -1758,6 +1979,10 @@ if __name__ == '__main__':
     # Promote a winner with scripts/select_best_encoder.py --copy.
     parser.add_argument('--checkpoint_dir', type=str, default='.spill/encoder_epochs')
     parser.add_argument('--log_dir', type=str, default='logs')
+    parser.add_argument('--in_memory', action='store_true', default=False,
+                        help='Keep every per-edge array in RAM and the edge features on the '
+                             'GPU (the pre-out-of-core behaviour). Default: file-backed under '
+                             '<checkpoint_dir>/store, identical results.')
 
     args = parser.parse_args()
     if args.shuffle_batches is None:
