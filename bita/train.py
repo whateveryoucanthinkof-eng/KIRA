@@ -1374,6 +1374,13 @@ def train(args):
         logging.info(f"time encoding fixed (GraphMixer): {_frozen} TimeEncode module(s) frozen; "
                      f"--learn_time_encoding to train them")
 
+    # --- fast TGN step (opt-in; bita/fast/) -------------------------------
+    from fast import enable_fast_tgn, fast_tgn_requested
+    if fast_tgn_requested(args.fast_step):
+        enable_fast_tgn(tgn, level=args.fast_step_level)
+        logging.info(f"fast TGN step enabled (level {args.fast_step_level})")
+    # ----------------------------------------------------------------------
+
     # Loss Functions & Optimizer
     edge_criterion = nn.BCELoss()
     if args.focal_loss:
@@ -1414,7 +1421,8 @@ def train(args):
                "val_mrrs": val_mrrs, "new_nodes_val_mrrs": new_nodes_val_mrrs,
                "train_losses": train_losses, "epoch_times": epoch_times}
     resume = ResumePoint(os.path.splitext(model_save_path)[0] + "_resume.pt",
-                         run_fingerprint(args, ignore=("n_epoch", "gpu", "num_workers", "in_memory")),
+                         run_fingerprint(args, ignore=("n_epoch", "gpu", "num_workers", "in_memory",
+                                                 "fast_step", "fast_step_level")),
                          enabled=not args.no_resume, log=logging.info)
     first_epoch = 0
     _rp = resume.load()
@@ -1952,6 +1960,12 @@ if __name__ == '__main__':
     parser.add_argument('--no_resume', action='store_true',
                         help='Ignore a resume point left by a crashed run of the same command '
                              'and start from epoch 0')
+    # --- fast TGN step (opt-in; bita/fast/) ---
+    parser.add_argument('--fast_step', action='store_true',
+                        help='Same model/data/batch, re-expressed without per-message Python work or '
+                             'device syncs (also CYBERWORLD_FAST_TGN=1). See bita/fast/__init__.py')
+    parser.add_argument('--fast_step_level', type=int, default=2,
+                        help='1: forward bit-identical to the reference; 2: + Triton BiGRU (fp32 rounding)')
     parser.add_argument('--learn_time_encoding', action='store_true',
                         help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
                              'Off by default: fixed encoding, see the note in train()')
