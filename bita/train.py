@@ -1289,6 +1289,7 @@ def train(args):
     # Neighbor finders
     train_ngh_finder = get_neighbor_finder(train_data, uniform=args.uniform, store=store)
     full_ngh_finder = get_neighbor_finder(full_data, uniform=args.uniform, store=store)
+    logging.info("Setup: neighbour finders built")
 
     # Samplers. Negatives come from the positive edge's own capture: nodes are
     # per capture (load_and_preprocess_unified_dataset), so each node has one.
@@ -1313,11 +1314,13 @@ def train(args):
     nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.sources, _nn_pool(new_node_val_data).destinations, seed=1, node_group=_node_group)
     test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=2, node_group=_node_group)
     nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources, _nn_pool(new_node_test_data).destinations, seed=3, node_group=_node_group)
+    logging.info("Setup: negative samplers built")
 
     # Compute time statistics
     mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst = \
         compute_time_statistics(full_data.sources, full_data.destinations, full_data.timestamps,
                                 store=store)
+    logging.info("Setup: time statistics computed")
 
     model_save_path = os.path.join(args.save_dir, f"{args.prefix}-{args.data_name}.pth")
     checkpoint_path_fn = lambda epoch: os.path.join(args.checkpoint_dir, f"{args.prefix}-{args.data_name}-{epoch}.pth")
