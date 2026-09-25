@@ -328,7 +328,9 @@ class MemoryOverlay:
         for t in self.touched:
             self.ptr[t] = -1
         if self.touched_g:
-            self.ptr_g[torch.cat(self.touched_g)] = -1
+            # index_fill_, not `ptr_g[idx] = -1`: the latter copies the scalar
+            # through a synchronising host->device transfer.
+            self.ptr_g.index_fill_(0, torch.cat(self.touched_g), -1)
         self.touched = []
         self.touched_g = []
         self.overlay.clear()

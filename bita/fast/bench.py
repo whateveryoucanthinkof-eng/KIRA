@@ -81,7 +81,7 @@ def build(args, device):
     alpha = T.FocalLoss.inverse_frequency_alpha(train_data.labels, num_categories)
     return dict(tgn=tgn, train_data=train_data, val_data=val_data, full_ngh=full_ngh,
                 train_ngh=train_ngh, train_sampler=train_sampler, val_sampler=val_sampler,
-                edge_criterion=nn.BCELoss(), category_criterion=T.FocalLoss(alpha=alpha, gamma=2.0))
+                edge_criterion=nn.BCELoss(), category_criterion=T.FocalLoss(alpha=alpha, gamma=2.0).to(device))
 
 
 def run(args):
@@ -115,6 +115,7 @@ def run(args):
     tgn.memory.__init_memory__()
     tgn.set_neighbor_finder(B["train_ngh"])
     rec = dict(total=[], edge=[], cat=[], outputs=[], grads_first=None, norms=[])
+    losslog = T.StepLossLog(args.backprop_every)
     prof = None
     if args.profile:
         from torch.profiler import profile, ProfilerActivity, schedule
@@ -143,7 +144,7 @@ def run(args):
                 src, dst, neg, ts, eidx, n_neighbors=args.n_degree)
             bel = ec(pos_prob.squeeze(-1), torch.ones(size, device=device)) + \
                 ec(neg_prob.squeeze(-1), torch.zeros(size, device=device))
-            bcl = cc(logits, torch.tensor(cat, dtype=torch.long, device=device))
+            bcl = cc(logits, T.upload(np.asarray(cat), device, torch.long))
             loss = loss + bel
             cat_total = cat_total + bcl
             if args.dump and bi < args.dump_outputs:
@@ -156,10 +157,8 @@ def run(args):
             ok = guard.step_after_backward()
         else:
             ok = guard.backward_step(total)
-        if args.dump and ok:
-            rec["total"].append(float(total.item()))
-            rec["edge"].append(float(loss.item()) / args.backprop_every)
-            rec["cat"].append(float(cat_total.item()) / args.backprop_every)
+        if ok:
+            losslog.append_step(total, loss, cat_total)     # as bita/train.py
         tgn.memory.detach_memory()
         if prof is not None:
             prof.step()
@@ -190,6 +189,7 @@ def run(args):
         if args.trace:
             prof.export_chrome_trace(args.trace)
 
+    rec["total"], rec["edge"], rec["cat"] = losslog.total, losslog.edge, losslog.cat
     if args.dump:
         val = None
         if args.val:

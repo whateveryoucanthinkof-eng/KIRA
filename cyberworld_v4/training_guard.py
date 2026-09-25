@@ -121,14 +121,30 @@ class TrainingGuard:
 
     def backward_step(self, loss: torch.Tensor) -> bool:
         """backward + clip + step. Returns False (and skips the step) when the
-        loss or the gradient is not finite."""
+        loss or the gradient is not finite.
+
+        ONE device->host synchronisation per step. The loss-finite check and
+        the gradient norm are read together after backward, instead of one
+        sync before backward (isfinite) and one after it (the norm). The
+        outcome is the same: for a non-finite loss the reference skips
+        backward and sets the grads to None; here backward runs, and the
+        grads (non-finite, possibly clipped) are then set to None -- no
+        optimizer step, no counter or diagnostic touched but n_nonfinite.
+        The first step of an epoch (n_grad == 0) records the per-parameter
+        gradient norms, which the reference records only for a finite loss;
+        that step keeps the reference's order exactly.
+        """
         self.n_steps += 1
-        if not bool(torch.isfinite(loss.detach()).all()):
-            self.optimizer.zero_grad(set_to_none=True)
-            self.n_nonfinite += 1
-            return False
+        if self.n_grad == 0 or not torch.is_tensor(loss) or loss.device.type == "cpu":
+            if not bool(torch.isfinite(loss.detach()).all()):
+                self.optimizer.zero_grad(set_to_none=True)
+                self.n_nonfinite += 1
+                return False
+            loss.backward()
+            return self.step_after_backward()
+        loss_ok = torch.isfinite(loss.detach()).all()
         loss.backward()
-        return self.step_after_backward()
+        return self.step_after_backward(loss_ok=loss_ok)
 
     def _record_top_grads(self) -> None:
         """Which parameters carry the gradient, once per epoch (first step).
@@ -147,14 +163,29 @@ class TrainingGuard:
         norms.sort(reverse=True)
         self.top_grads = [(name, v, (v / total) ** 2) for v, name in norms[:3]]
 
-    def step_after_backward(self) -> bool:
-        """For loops that call backward themselves (e.g. gradient accumulation)."""
+    def step_after_backward(self, loss_ok: Optional[torch.Tensor] = None) -> bool:
+        """For loops that call backward themselves (e.g. gradient accumulation).
+
+        `loss_ok` (a device bool, from backward_step) is read in the same
+        synchronisation as the gradient norm; a False skips the step exactly
+        as a non-finite loss does in backward_step."""
         if self.n_grad == 0:
             self._record_top_grads()
         params = list(self._params())
         norm = torch.nn.utils.clip_grad_norm_(
             params, self.clip_norm if self.clip_norm else float("inf"))
-        norm_f = float(norm)
+        if loss_ok is not None and norm.device == loss_ok.device:
+            ok_f, norm_f = torch.stack([loss_ok.to(norm.dtype), norm]).tolist()   # the one sync
+            if not ok_f:
+                self.optimizer.zero_grad(set_to_none=True)
+                self.n_nonfinite += 1
+                return False
+        else:
+            if loss_ok is not None and not bool(loss_ok):
+                self.optimizer.zero_grad(set_to_none=True)
+                self.n_nonfinite += 1
+                return False
+            norm_f = float(norm)
         if not math.isfinite(norm_f):
             self.optimizer.zero_grad(set_to_none=True)
             self.n_nonfinite += 1
