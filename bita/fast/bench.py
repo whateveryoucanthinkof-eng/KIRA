@@ -49,6 +49,13 @@ def build(args, device):
     num_categories = len(d["category_mapping"])
     node_features, edge_features, full_data, train_data, val_data, test_data, nn_val, nn_test = \
         T.split_data(graph_df, edge_features, node_features, different_new_nodes=True)
+    if args.host_edges:
+        # Out-of-core edge features (v5.5o): a np.memmap makes TGN keep them on
+        # the host as HostEdgeFeatures, exactly as full-scale training does.
+        mm = np.memmap(args.host_edges, dtype=np.float32, mode="w+", shape=edge_features.shape)
+        mm[:] = edge_features
+        mm.flush()
+        edge_features = np.memmap(args.host_edges, dtype=np.float32, mode="r", shape=edge_features.shape)
     train_ngh = get_neighbor_finder(train_data, uniform=False)
     full_ngh = get_neighbor_finder(full_data, uniform=False)
     node_group = None
@@ -262,6 +269,7 @@ def main():
     ap.add_argument("--dump_outputs", type=int, default=64)
     ap.add_argument("--val", action="store_true")
     ap.add_argument("--deterministic", action="store_true")
+    ap.add_argument("--host_edges", help="path for a memmap copy of the edge features (HostEdgeFeatures path)")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--val_limit", type=int, default=0)
     ap.add_argument("--profile", action="store_true")

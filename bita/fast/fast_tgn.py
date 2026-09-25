@@ -92,6 +92,12 @@ class _MemView:
         return out.reshape(*nodes_np.shape, out.shape[-1])
 
 
+def _host_edge_array(table):
+    """The host array behind a HostEdgeFeatures (out-of-core edge features),
+    or None when the features are a device tensor (or absent)."""
+    return getattr(table, "array", None) if table is not None and not torch.is_tensor(table) else None
+
+
 class _Batch:
     """Per-batch host arrays, device copies and memory-independent tensors,
     shared by the two compute_temporal_embeddings calls of one batch."""
@@ -111,14 +117,20 @@ class _Batch:
         self.ts2 = self.ts3[: 2 * B]
         # Row order of this batch's messages in the pool (stable by owner).
         self.write_order = np.argsort(self.pos, kind="stable")
-        ints, = upload_many(dev, np.concatenate([self.nodes, self.eidx, self.write_order]))
+        host_edges = _host_edge_array(model.edge_raw_features)
+        extra = () if host_edges is None else (np.take(host_edges, self.eidx, axis=0),)
+        ints, *ef = upload_many(dev, np.concatenate([self.nodes, self.eidx, self.write_order]), *extra)
         self.nodes_g = ints[: 3 * B]
         self.pos_g = ints[: 2 * B]
         self.src_g, self.dst_g = ints[:B], ints[B: 2 * B]
         self.eidx_g = ints[3 * B: 4 * B]
         self.write_order_g = ints[4 * B:]
-        self.ef = model.edge_raw_features[self.eidx_g] if model.edge_raw_features is not None \
-            else torch.zeros((B, model.n_edge_features), device=dev)
+        if ef:                        # HostEdgeFeatures: rows gathered on the host, same values
+            self.ef = ef[0]
+        elif model.edge_raw_features is not None:
+            self.ef = model.edge_raw_features[self.eidx_g]
+        else:
+            self.ef = torch.zeros((B, model.n_edge_features), device=dev)
         self.cache = {}
 
 
@@ -308,9 +320,12 @@ class FastTGNMixin:
             nbr = neighbors.reshape(-1).astype(np.int64)
             n = len(bt.nodes)
             all_nodes = np.concatenate([bt.nodes, nbr])
-            ints, deltas_g, mask_g, invalid_g = upload_many(
+            host_edges = _host_edge_array(em.edge_features)
+            extra = () if host_edges is None else (
+                np.take(host_edges, edge_idxs.astype(np.int64), axis=0),)
+            ints, deltas_g, mask_g, invalid_g, *ef_n = upload_many(
                 dev, np.concatenate([all_nodes, edge_idxs.reshape(-1).astype(np.int64)]),
-                deltas, mask_fixed, invalid)
+                deltas, mask_fixed, invalid, *extra)
             c.update(n_neighbors=n_neighbors, nbr=nbr, all_nodes=all_nodes,
                      all_g=ints[: all_nodes.size], nbr_g=ints[n: all_nodes.size],
                      eidx_n_g=ints[all_nodes.size:].view(n, -1),
@@ -319,8 +334,12 @@ class FastTGNMixin:
                 else torch.zeros((n, self.n_node_features), device=dev)
             c["nf_nbr"] = em.node_features[c["nbr_g"], :] if em.node_features is not None \
                 else torch.zeros((nbr.size, self.n_node_features), device=dev)
-            c["ef_n"] = em.edge_features[c["eidx_n_g"], :] if em.edge_features is not None \
-                else torch.zeros((n, n_neighbors, self.n_edge_features), device=dev)
+            if ef_n:
+                c["ef_n"] = ef_n[0]
+            elif em.edge_features is not None:
+                c["ef_n"] = em.edge_features[c["eidx_n_g"], :]
+            else:
+                c["ef_n"] = torch.zeros((n, n_neighbors, self.n_edge_features), device=dev)
         n = len(bt.nodes)
         if te_frozen and "src_time" in c:
             src_time, edge_time_emb = c["src_time"], c["edge_time_emb"]
