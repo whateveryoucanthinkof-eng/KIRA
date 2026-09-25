@@ -299,3 +299,63 @@ def test_planned_training_host_edges_cpu(tmp_path):
     ref = _train(False, 1, "cpu", host_edges=str(tmp_path / "a.mm"), epochs=1)
     got = _train(True, 1, "cpu", host_edges=str(tmp_path / "b.mm"), epochs=1)
     _assert_identical(ref, got)
+
+
+def _cuda():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+@pytest.fixture
+def deterministic_cuda():
+    import torch
+    prev = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    yield
+    torch.use_deterministic_algorithms(prev)
+
+
+@pytest.mark.skipif(not _cuda(), reason="needs CUDA")
+@pytest.mark.parametrize("level,host", [(2, False), (3, False), (3, True), (4, False)])
+def test_planned_training_bit_identical_cuda(level, host, deterministic_cuda, monkeypatch, tmp_path):
+    """Levels 2-4 on the GPU (level 3: CUDA-graphed region; level 4: BiTA
+    graphs on padded layouts written by the planner), with and without host
+    edge features, a pool that grows and compacts: identical with the planner."""
+    import fast.store as store
+    monkeypatch.setattr(store, "MIN_ROWS", 300)
+    he = (lambda name: str(tmp_path / name)) if host else (lambda name: None)
+    ref = _train(False, level, "cuda", host_edges=he("a.mm"))
+    got = _train(True, level, "cuda", host_edges=he("b.mm"))
+    _assert_identical(ref, got)
+
+
+def test_planner_refuses_out_of_order_batches():
+    import torch
+    from fast.planner import BatchPlanner
+    from utils.utils import get_neighbor_finder, RandEdgeSampler
+    from fast import enable_fast_tgn
+    from model.extentedtgn import ExtendedTGN
+    src, dst, ts, eidx, labels, ef, nf, group = _corpus(n_edges=600)
+    data = _Data(src, dst, ts, eidx, labels)
+    finder = get_neighbor_finder(data, uniform=False, max_node_idx=len(nf) - 1)
+    tgn = ExtendedTGN(neighbor_finder=finder, node_features=nf, edge_features=ef, device=torch.device("cpu"),
+                      n_layers=1, n_heads=2, dropout=0.1, use_memory=True, message_dimension=100,
+                      memory_dimension=12, embedding_module_type="graph_attention", message_function="identity",
+                      aggregator_type="bigru_transformer", memory_updater_type="gru", n_neighbors=10,
+                      num_categories=2)
+    enable_fast_tgn(tgn, level=1)
+    planner = BatchPlanner(tgn, data, finder, RandEdgeSampler(src, dst), batch_size=64, backprop_every=4,
+                           n_degree=10)
+    try:
+        plans = planner.epoch(10)
+        plans.next(0)
+        with pytest.raises(RuntimeError, match="strictly in batch order"):
+            plans.next(2)
+        with pytest.raises(RuntimeError, match="ended after"):
+            plans.finish()
+    finally:
+        planner.close()
+    assert planner.proc is None
