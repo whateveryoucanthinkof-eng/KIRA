@@ -87,7 +87,7 @@ def main(day_dir, label_dir):
     scratch.mkdir(parents=True, exist_ok=True)
     t = time.perf_counter()
     r = _parse_one(("PCAP2018", str(day_dir), str(scratch), 1, None, 12, str(label_dir),
-                    2.0, 500_000))
+                    2.0, 500_000, "python"))
     w = time.perf_counter() - t - t_csv
     for _ in iter_parts(r):
         pass

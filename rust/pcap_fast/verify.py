@@ -5,7 +5,7 @@
 Stage 1: iter_merged_day_windows (bucket, host, every flow-dict field, the 30
 packet features), compared window by window in lockstep with floats compared
 by their bit pattern (float.hex), types included.
-Stage 2: _parse_one's columns (u, i, ts, lbl, edge) + vocabularies, compared
+Stage 2: _parse_one's columns on the Python parser (u, i, ts, lbl, edge) + vocabularies, compared
 with np.array_equal on the raw bit patterns and exact dtype equality.
 """
 
@@ -85,7 +85,7 @@ def _ref_columns(day_dir, label_dir, scratch, window_seconds=2.0):
         shutil.rmtree(out)
     out.mkdir(parents=True)
     res = _parse_one(("PCAP2018", str(day_dir), str(out), 1, None, 12, str(label_dir),
-                      window_seconds, 500_000))
+                      window_seconds, 500_000, "python"))
     if res.get("error"):
         raise RuntimeError(res["error"])
     if not res.get("n"):

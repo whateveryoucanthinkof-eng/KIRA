@@ -1,4 +1,5 @@
-"""Python side of the pcap_fast experiment. NOT wired into training.
+"""Python side of pcap_fast. data_unification.parallel_ingest uses it by default
+for PCAP2018 days (CYBERWORLD_PCAP_PARSER=python opts out).
 
 Two entry points, each a drop-in for one stage of the reference path:
 
@@ -29,9 +30,9 @@ from typing import Dict, Iterator, List, Optional
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_BIN = os.environ.get(
-    "PCAP_FAST_BIN",
-    "/var/home/samito/Documents/SIH/rust_parser_experiment/target/release/pcap_fast")
+#: Built by `cargo build --release` in this directory (scripts/run_training_plan.sh
+#: preflight does it). PCAP_FAST_BIN overrides.
+DEFAULT_BIN = os.environ.get("PCAP_FAST_BIN", str(HERE / "target" / "release" / "pcap_fast"))
 
 FEATURE_COLUMNS = [
     'ttl_mean', 'ttl_std', 'ttl_unique_count', 'tcp_window_mean', 'tcp_window_std',
@@ -171,66 +172,66 @@ def _edge_features(fb, bb, fp, bp, start, end, proto, dport) -> np.ndarray:
     return feat
 
 
-def parse_pcap_day_columns_fast(day_dir, label_dir, window_seconds: float = 2.0,
-                                binary: str = DEFAULT_BIN, stats: Optional[dict] = None,
-                                keep_columns: bool = True) -> Optional[dict]:
-    """_parse_one("PCAP2018", day_dir, ...) columns, concatenated (not split in parts)."""
-    from data_unification.attack_windows import derive_windows
-    from data_unification.label_resolver import get_default_resolver
-    from data_unification.training_sources import (_PCAP_DAY, _pcap_label_csv,
-                                                   check_label_day)
-    from data_unification.unified_schema import LabelSource
+class DayColumnBuilder:
+    """Turns the Rust chunk stream of one day into _parse_one's columns.
 
-    day_dir = Path(day_dir)
-    csv_path = _pcap_label_csv(day_dir, label_dir)
-    if csv_path is None:
-        return None
-    dw = derive_windows(str(csv_path))
-    if not dw.ok:
-        return None
-    day = _PCAP_DAY.match(day_dir.name).group("day")
-    check_label_day(day, dw.intervals)
-    resolver = get_default_resolver()
+    Holds the day's LOCAL vocabularies (ips, cats) across chunks, so chunks
+    can be written out as they arrive. Every choice mirrors the reference
+    record loop in parallel_ingest._parse_one: ips in src-then-dst encounter
+    order, cats in record encounter order, resolver.resolve called exactly
+    once per merged window (so the coverage counters move identically).
+    """
 
-    files, hosts = _captures(day_dir)
-    remap = np.full(0, -1, dtype=np.int64)     # rust string id -> local id
-    n_local = 0
-    ips_local: List[str] = []
-    cat_local: Dict[str, int] = {}
-    member_cache: Dict[int, np.ndarray] = {}   # id(interval) -> bool per rust string id
-    cols = {"u": [], "i": [], "ts": [], "lbl": [], "edge": []}
-    kept = 0
+    def __init__(self, dw, hosts: List[str], window_seconds: float, resolver):
+        from data_unification.unified_schema import LabelSource
+        self.dw, self.hosts, self.w = dw, hosts, float(window_seconds)
+        self.resolver, self._src = resolver, LabelSource.CIC2018
+        self.remap = np.full(0, -1, dtype=np.int64)   # rust string id -> local id
+        self.ips: List[str] = []
+        self.cat_local: Dict[str, int] = {}
+        self._member: Dict[int, np.ndarray] = {}      # id(interval) -> bool per rust string id
+        self.source = LabelSource.CIC2018.value
+        self.n = 0
 
-    for strings, wins, hws, flows in iter_chunks(files, hosts, window_seconds, None, binary, stats):
-        if len(remap) < len(strings):
-            remap = np.concatenate([remap, np.full(len(strings) - len(remap), -1, np.int64)])
+    @property
+    def cats(self) -> List[str]:
+        return list(self.cat_local)
+
+    def chunk(self, strings, wins, hws, flows):
+        """(u, i, ts, lbl, edge) for one Rust chunk; None if it has no flows."""
+        if len(self.remap) < len(strings):
+            self.remap = np.concatenate(
+                [self.remap, np.full(len(strings) - len(self.remap), -1, np.int64)])
         nf = len(flows)
-        if nf == 0:
-            continue
         src = flows["src"].astype(np.int64)
         dst = flows["dst"].astype(np.int64)
+        cat_local, hosts, w = self.cat_local, self.hosts, self.w
 
-        # ---- labels, one window at a time (iter_day_records)
+        # ---- labels, one window at a time (iter_day_records). resolve() runs
+        # for EVERY window, flows or not, exactly as the reference does.
         lbl = np.empty(nf, dtype=np.int32)
         hw_flow_start = np.concatenate([[0], np.cumsum(hws["n_flows"].astype(np.int64))])
         hw_host = hws["host"].tolist()
         h = 0
         for bucket, n_hw in wins.tolist():
             a, b = int(hw_flow_start[h]), int(hw_flow_start[h + n_hw])
-            window_start = bucket * window_seconds
-            window_end = window_start + window_seconds
+            window_start = bucket * w
+            window_end = window_start + w
             mid_ts = (window_start + window_end) / 2.0
-            interval = dw.interval_at(mid_ts)
+            interval = self.dw.interval_at(mid_ts)
             raw_label = interval.label if interval else "BENIGN"
-            coarse, _tids, is_attack = resolver.resolve(raw_label, source=LabelSource.CIC2018)
+            coarse, _tids, is_attack = self.resolver.resolve(raw_label, source=self._src)
+            if b == a:                      # a window whose host-windows hold no flows
+                h += n_hw
+                continue
             scoped = bool(interval and interval.scoped)
             if is_attack and scoped:
                 key = id(interval)
-                mem = member_cache.get(key)
+                mem = self._member.get(key)
                 if mem is None or len(mem) < len(strings):
                     mem = np.fromiter((s in interval.participants for s in strings),
                                       dtype=bool, count=len(strings))
-                    member_cache[key] = mem
+                    self._member[key] = mem
                 hit = mem[src[a:b]] | mem[dst[a:b]]
                 for k in range(n_hw):
                     if hosts[hw_host[h + k]] in interval.participants:
@@ -251,18 +252,20 @@ def parse_pcap_day_columns_fast(day_dir, label_dir, window_seconds: float = 2.0,
             else:
                 lbl[a:b] = cat_local[first]
             h += n_hw
+        if nf == 0:
+            return None
 
         # ---- local ip ids in encounter order: src then dst, record by record
+        remap = self.remap
         seq = np.empty(2 * nf, dtype=np.int64)
         seq[0::2] = src
         seq[1::2] = dst
         new = seq[remap[seq] < 0]
         if len(new):
-            uniq, first = np.unique(new, return_index=True)
-            order = uniq[np.argsort(first, kind="stable")]
-            remap[order] = np.arange(n_local, n_local + len(order))
-            n_local += len(order)
-            ips_local.extend(strings[k] for k in order.tolist())
+            uniq, first_at = np.unique(new, return_index=True)
+            order = uniq[np.argsort(first_at, kind="stable")]
+            remap[order] = np.arange(len(self.ips), len(self.ips) + len(order))
+            self.ips.extend(strings[k] for k in order.tolist())
         u = remap[src].astype(np.int32)
         i = remap[dst].astype(np.int32)
 
@@ -270,16 +273,63 @@ def parse_pcap_day_columns_fast(day_dir, label_dir, window_seconds: float = 2.0,
                               flows["fwd_pkts"].astype(np.int64), flows["bwd_pkts"].astype(np.int64),
                               flows["start"], flows["end"], flows["proto"].astype(np.int64),
                               flows["dport"])
-        kept += nf
-        if keep_columns:
-            cols["u"].append(u); cols["i"].append(i); cols["ts"].append(flows["start"].copy())
-            cols["lbl"].append(lbl); cols["edge"].append(edge)
+        self.n += nf
+        return u, i, flows["start"].astype(np.float64), lbl, edge
 
-    if not kept:
+
+def load_day_labels(day_dir, label_dir):
+    """(dw, day) exactly as iter_pcap_day_windows derives them, or None where
+    it would skip the day (no label CSV, implausible windows)."""
+    from data_unification.attack_windows import derive_windows
+    from data_unification.training_sources import (_PCAP_DAY, _pcap_label_csv,
+                                                   check_label_day)
+    day_dir = Path(day_dir)
+    csv_path = _pcap_label_csv(day_dir, label_dir)
+    if csv_path is None:
+        print(f"skipping {day_dir.name}: no label CSV under {label_dir}", flush=True)
+        return None
+    dw = derive_windows(str(csv_path))
+    if not dw.ok:
+        print(f"skipping {day_dir.name}: implausible attack windows ({dw.evidence})", flush=True)
+        return None
+    day = _PCAP_DAY.match(day_dir.name).group("day")
+    check_label_day(day, dw.intervals)
+    return dw, day
+
+
+def iter_day_column_chunks(day_dir, dw, window_seconds: float = 2.0,
+                           binary: str = DEFAULT_BIN, stats: Optional[dict] = None):
+    """(builder, chunk-iterator) for one day; the builder's ips/cats/n are
+    final once the iterator is exhausted."""
+    from data_unification.label_resolver import get_default_resolver
+    files, hosts = _captures(day_dir)
+    b = DayColumnBuilder(dw, hosts, window_seconds, get_default_resolver())
+
+    def gen():
+        for strings, wins, hws, flows in iter_chunks(files, hosts, window_seconds, None,
+                                                     binary, stats):
+            cols = b.chunk(strings, wins, hws, flows)
+            if cols is not None:
+                yield cols
+    return b, gen()
+
+
+def parse_pcap_day_columns_fast(day_dir, label_dir, window_seconds: float = 2.0,
+                                binary: str = DEFAULT_BIN, stats: Optional[dict] = None,
+                                keep_columns: bool = True) -> Optional[dict]:
+    """_parse_one("PCAP2018", day_dir, ...) columns, concatenated (not split in parts)."""
+    got = load_day_labels(day_dir, label_dir)
+    if got is None:
+        return None
+    b, it = iter_day_column_chunks(day_dir, got[0], window_seconds, binary, stats)
+    cols = {"u": [], "i": [], "ts": [], "lbl": [], "edge": []}
+    for chunk in it:
+        if keep_columns:
+            for k, v in zip(("u", "i", "ts", "lbl", "edge"), chunk):
+                cols[k].append(v)
+    if not b.n:
         return {"n": 0}
-    out = {"n": kept, "source": LabelSource.CIC2018.value, "ips": ips_local,
-           "cats": list(cat_local)}
+    out = {"n": b.n, "source": b.source, "ips": b.ips, "cats": b.cats}
     if keep_columns:
         out.update({k: np.concatenate(v) for k, v in cols.items()})
-        out["u"] = out["u"].astype(np.int32)
     return out

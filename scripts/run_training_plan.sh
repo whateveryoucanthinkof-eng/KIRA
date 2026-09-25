@@ -90,6 +90,23 @@ preflight() {
     "$PYTHON" scripts/check_datasets.py --scheme "$SCHEME" \
         --pcap-root "$PCAP_ROOT" --cic2018-csv-dir "$CIC2018_CSV_DIR" \
         --cic2017-dir "$CIC2017_DIR" --ctu-dir "$CTU_DIR"
+    # PCAP days are parsed by the Rust port (rust/pcap_fast) unless
+    # CYBERWORLD_PCAP_PARSER=python. Build it here (a no-op when current); a
+    # missing binary would silently make ingest ~12x slower.
+    if [ "${CYBERWORLD_PCAP_PARSER:-rust}" != python ]; then
+        if command -v cargo >/dev/null 2>&1; then
+            (cd rust/pcap_fast && nice cargo build --release -q -j4) || {
+                echo "[plan] cargo build of rust/pcap_fast failed" >&2; exit 2; }
+        elif [ ! -x rust/pcap_fast/target/release/pcap_fast ]; then
+            echo "[plan] rust/pcap_fast is not built and cargo is not available." >&2
+            echo "[plan] Build it (cd rust/pcap_fast && cargo build --release), or set CYBERWORLD_PCAP_PARSER=python." >&2
+            exit 2
+        fi
+        # Fails loudly if numpy is not the version Rust parity was verified on.
+        "$PYTHON" -c "from data_unification.parallel_ingest import pcap_parser_choice as c; p = c(); print('[plan] PCAP parser:', p); raise SystemExit(p != 'rust')" || {
+            echo "[plan] the Rust PCAP parser is not usable (see above); set CYBERWORLD_PCAP_PARSER=python to run on the reference parser." >&2
+            exit 2; }
+    fi
     mkdir -p "$OUT"
     local free_gb
     free_gb=$(df -Pk "$OUT" | awk 'NR==2 {printf "%d", $4/1048576}')

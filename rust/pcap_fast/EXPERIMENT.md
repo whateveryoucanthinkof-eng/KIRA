@@ -3,7 +3,20 @@
 **Result:** on every input tested, the Rust port gives output bit-identical to
 the Python reference, from the packet-level features through to the encoder
 columns. The ingest cost drops by roughly 12x in wall time and 12-21x in CPU.
-This is a feasibility study. It is **not** wired into training.
+
+**Status (integrated):** this is now the DEFAULT parser for PCAP2018 days in
+`data_unification/parallel_ingest._parse_one` (the parallel/cached loader).
+`CYBERWORLD_PCAP_PARSER=python` forces the reference. The binary lives at
+`rust/pcap_fast/target/release/pcap_fast` (`PCAP_FAST_BIN` overrides); the
+plan's preflight builds it. If it is missing or older than its sources the
+loader warns and falls back to Python. Every Rust-parsed day is re-parsed on
+its first 2 host files (`CYBERWORLD_PCAP_PARITY_FILES`) by the Python
+reference, on a mini-day of symlinks, and any bit difference raises
+`PcapParityError` and stops the run. The ingest cache key includes the parser
+and hashes `src/*.rs`, `Cargo.toml`, `Cargo.lock` and `pcap_fast_py.py`. The
+Rust path refuses to run unless numpy is 1.26.4 with bufsize 8192.
+`tests/test_pcap_rust_parser.py` runs the equivalence and `verify.py` checks
+on the synthetic corpus. The sections below are the original study.
 
 ## What was ported
 
@@ -145,7 +158,7 @@ Risks:
 To reproduce:
 
 ```
-CARGO_TARGET_DIR=~/Documents/SIH/rust_parser_experiment/target cargo build --release -j4
+(cd rust/pcap_fast && cargo build --release -j4)
 python3 rust/pcap_fast/build_testdata.py
 bash rust/pcap_fast/run_verify.sh ~/Documents/SIH/DATA/CSV ~/Documents/SIH/rust_parser_experiment/days/*_pcap
 ```
