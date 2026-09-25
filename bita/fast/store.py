@@ -110,6 +110,17 @@ class Overlay:
         return bool(self.chunks)
 
 
+#: Smallest pool (rows). Tests lower it to force compaction and growth.
+MIN_ROWS = 1 << 16
+
+
+def _capacity_for(n_live: int) -> int:
+    """Pool rows to allocate for n_live live rows: 1.5x headroom (+32k), not
+    a power-of-two jump. At full scale (~10-18M pending rows of 192 B) a 4x
+    or doubling policy alone would cost several GB of GPU memory."""
+    return max(MIN_ROWS, int(n_live * 1.5) + min(1 << 15, MIN_ROWS))
+
+
 class MessagePool:
     """Pending raw messages: a device row pool plus host metadata.
 
@@ -118,13 +129,14 @@ class MessagePool:
     [start[v], start[v] + cnt[v]) in the reference's insertion order.
     """
 
-    def __init__(self, n_nodes: int, width: int, device, capacity: int = 1 << 16):
+    def __init__(self, n_nodes: int, width: int, device, capacity: int = None):
         self.width = width
         self.device = device
         self.n_nodes = n_nodes
         self.cnt = np.zeros(n_nodes, dtype=np.int64)
+        self.n_live = 0                  # == cnt.sum(), maintained incrementally
         self.start = np.zeros(n_nodes, dtype=np.int64)
-        self._alloc(capacity)
+        self._alloc(capacity or MIN_ROWS)
         self.overlay = Overlay()
         self.live_row0 = self.cur        # rows >= live_row0 are in the overlay
 
@@ -146,7 +158,7 @@ class MessagePool:
     def _grow(self, need):
         cap = self.capacity
         while cap - self.cur < need:
-            cap *= 2
+            cap = int(cap * 1.5) + need
         pool = torch.zeros(cap, self.width, device=self.device)
         pool[: self.cur] = self.pool[: self.cur]
         self.pool = pool
@@ -162,7 +174,7 @@ class MessagePool:
         n_live = int(cnts.sum())
         old_rows = np.repeat(self.start[nodes], cnts) + (
             np.arange(n_live) - np.repeat(np.cumsum(cnts) - cnts, cnts))
-        cap = max(1 << 16, 1 << int(np.ceil(np.log2(max(4 * (n_live + 1), 2)))))
+        cap = _capacity_for(n_live)
         pool = torch.zeros(cap, self.width, device=self.device)
         if n_live:
             pool[1: 1 + n_live] = self.pool.index_select(0, upload(old_rows, self.device, torch.int64))
@@ -174,6 +186,7 @@ class MessagePool:
         self.pool, self.row_t, self.row_peer, self.capacity = pool, row_t, row_peer, cap
         self.cur = 1 + n_live
         self.live_row0 = self.cur
+        self.n_live = n_live
 
     # --------------------------------------------------------------- write
     def write_order(self, owners: np.ndarray) -> np.ndarray:
@@ -205,6 +218,7 @@ class MessagePool:
         self.row_peer[rows] = peers[order]
         uniq, first, counts = np.unique(o_sorted, return_index=True, return_counts=True)
         self.start[uniq] = base + first
+        self.n_live += int(counts.sum()) - int(self.cnt[uniq].sum())
         self.cnt[uniq] = counts
         sorted_raw = raw.index_select(0, order_g)
         with torch.no_grad():
@@ -215,14 +229,20 @@ class MessagePool:
         self.cur = base + n
 
     def clear(self, nodes: np.ndarray):
-        self.cnt[nodes] = 0
+        u = np.unique(nodes)
+        self.n_live -= int(self.cnt[u].sum())
+        self.cnt[u] = 0
 
     def detach(self):
         self.overlay.clear()
         self.live_row0 = self.cur
         # Dead rows (consumed or superseded lists) are reclaimed here, at a
-        # group boundary, where no overlay row is referenced by position.
-        if self.cur > (self.capacity * 3) // 4:
+        # group boundary, where no overlay row is referenced by position. Once
+        # dead rows outnumber half the live ones: O(live) work per ~live/2
+        # rows written, i.e. amortised O(1) per row, and the pool stays within
+        # ~1.5-2x the live rows instead of growing with every row ever written.
+        dead = self.cur - 1 - self.n_live
+        if dead > max(self.n_live // 2, MIN_ROWS // 2):
             self.compact()
 
     # ---------------------------------------------------------------- read
@@ -253,7 +273,7 @@ class MessagePool:
         self.overlay.clear()
         self.cnt[:] = 0
         n_live = len(snap["t"])
-        cap = max(1 << 16, 1 << int(np.ceil(np.log2(max(4 * (n_live + 1), 2)))))
+        cap = _capacity_for(n_live)
         self._alloc(cap)
         if n_live:
             self.pool[1: 1 + n_live] = snap["data"]
@@ -261,6 +281,7 @@ class MessagePool:
         self.row_peer[1: 1 + n_live] = snap["peer"]
         cnts = snap["cnts"]
         self.cnt[snap["nodes"]] = cnts
+        self.n_live = n_live
         self.start[snap["nodes"]] = 1 + np.cumsum(cnts) - cnts
         self.cur = 1 + n_live
         self.live_row0 = self.cur

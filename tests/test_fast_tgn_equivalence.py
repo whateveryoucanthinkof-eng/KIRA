@@ -116,6 +116,7 @@ def _run(level, n_batches=24, bs=64, backprop_every=4):
 
 def _assert_same_pending(ref_mem, fast_mem):
     pool = fast_mem._pool
+    assert pool.n_live == int(pool.cnt.sum())
     nodes = [k for k, v in ref_mem.messages.items() if len(v)]
     assert sorted(nodes) == sorted(np.flatnonzero(pool.cnt > 0).tolist())
     for k in nodes:
@@ -141,6 +142,24 @@ def test_level1_forward_bit_identical_grads_rounding(deterministic):
     worst = _run(level=1)
     assert worst["out"] == 0.0
     assert worst["grad"] < 1e-5, worst
+
+
+def test_level1_with_pool_compaction_and_growth(deterministic, monkeypatch):
+    """A 300-row minimum pool: every group grows it mid-group (overlay live)
+    and compacts it at the group boundary; results stay bit-identical."""
+    import fast.store as store
+    monkeypatch.setattr(store, "MIN_ROWS", 300)
+    calls = {"compact": 0, "_grow": 0}
+    for name in calls:
+        orig = getattr(store.MessagePool, name)
+
+        def counted(self, *a, _orig=orig, _name=name, **k):
+            calls[_name] += 1
+            return _orig(self, *a, **k)
+        monkeypatch.setattr(store.MessagePool, name, counted)
+    worst = _run(level=1)
+    assert worst["out"] == 0.0
+    assert calls["compact"] >= 2 and calls["_grow"] >= 1, calls
 
 
 def test_level2_within_fp32_rounding(deterministic):
