@@ -362,6 +362,7 @@ def load_and_preprocess_unified_dataset(
     allow_cic2018_csv=False,
     window_seconds=2.0,
     ingest_scratch=None,
+    ingest_cache=None,
 ):
     """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
 
@@ -600,9 +601,9 @@ def load_and_preprocess_unified_dataset(
         import time as _t
         _t0 = _t.time()
         _pcap = any(k == "PCAP2018" for k, _f in captures)
-        if _pcap and ingest_scratch is None:
-            raise ValueError("parallel PCAP ingest needs an on-disk ingest_scratch: its parts "
-                             "total GBs and the default temp dir is tmpfs (RAM)")
+        if _pcap and ingest_scratch is None and ingest_cache is None:
+            raise ValueError("parallel PCAP ingest needs an on-disk ingest_scratch or ingest_cache: "
+                             "its parts total GBs and the default temp dir is tmpfs (RAM)")
         if ingest_scratch is not None:
             # A crashed earlier run can leave parts behind; they are never reused.
             import shutil as _sh
@@ -611,6 +612,7 @@ def load_and_preprocess_unified_dataset(
             captures, stride=stride, max_rows_per_file=max_rows_per_file,
             edge_dim=edge_dim, workers=parallel_workers, scratch=ingest_scratch,
             pcap_label_dir=pcap2018_label_dir, window_seconds=window_seconds,
+            cache_dir=ingest_cache,
             on_capture=lambda r: worker_coverage.append(r.get("coverage")),
         ):
             # local ip id -> global (capture, ip) node id, in this capture's order
@@ -642,8 +644,8 @@ def load_and_preprocess_unified_dataset(
                 col_src.extend(np.full(m, si, dtype=np.int8))
                 col_cap.extend(np.full(m, _cid, dtype=np.int16))
                 del part
-            logging.info("  %s: %d records (%.0fs elapsed)", os.path.basename(res["path"]),
-                         res["n"], _t.time() - _t0)
+            logging.info("  %s: %d records (%.0fs elapsed%s)", os.path.basename(res["path"]),
+                         res["n"], _t.time() - _t0, ", cached" if res.get("cached") else "")
         logging.info("Parallel ingest finished in %.1fs", _t.time() - _t0)
         if ingest_scratch is not None:
             import shutil as _sh
@@ -1038,6 +1040,7 @@ def train(args):
             window_seconds=_contract_window_seconds(),
             # On disk beside the epoch checkpoints: never the tmpfs temp dir.
             ingest_scratch=os.path.join(args.checkpoint_dir, "ingest") if args.ingest_workers else None,
+            ingest_cache=args.ingest_cache if args.ingest_workers else None,
         )
     else:
         graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
@@ -1681,6 +1684,10 @@ if __name__ == '__main__':
                         help='Parse captures across N worker processes. 0 = serial. '
                              'Results are identical either way: workers return local '
                              'vocabularies and the parent merges in fixed capture order.')
+    parser.add_argument('--ingest_cache', type=str, default=None,
+                        help='Directory for the parsed-capture cache (with --ingest_workers). '
+                             'Keyed by every input file (name/size/mtime), the parse parameters '
+                             'and a hash of the parsing code, so a stale entry is never read.')
     parser.add_argument('--train_splits', type=str, default='train', help="Frozen-lock splits to read (comma separated). Default 'train' keeps val/test captures unseen by the encoder; pass '' to read everything (leaks labels downstream).")
     parser.add_argument('--prefix', type=str, default='bita_bigru_transformer', help='Prefix for saved artifacts')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')

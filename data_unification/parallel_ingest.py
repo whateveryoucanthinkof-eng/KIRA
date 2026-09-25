@@ -24,6 +24,7 @@ parsing it saves.
 
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing
 import os
@@ -155,6 +156,127 @@ def _parse_one(args) -> Optional[dict]:
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
+# ------------------------------------------------------------------ cache
+#
+# Every encoder run re-parsed the same ~482 GB of PCAPs (~1 h even in
+# parallel): two IP variants x three seeds re-read identical bytes. A parsed
+# capture is a pure function of (its input files, the parsing code, the
+# parse parameters), so it is cached on disk under a key built from all three.
+# Any change to a capture file (name, size, mtime), its label CSV, a
+# parameter, or ANY repo module the parse imports gives a new key: a stale
+# entry is never read, only left behind.
+
+#: Entry points of the parse. Modules imported lazily inside functions are
+#: listed explicitly so the code hash sees them too.
+_PARSE_ENTRY_MODULES = (
+    "data_unification.parallel_ingest",
+    "data_unification.cic2017_adapter",
+    "data_unification.cic2018_adapter",
+    "data_unification.ctu13_adapter",
+    "data_unification.tgne_features",
+    "data_unification.label_resolver",
+    "data_unification.training_sources",
+    "data_unification.attack_windows",
+    "data_unification.pcap_bridge",
+    "data_unification.pcap_adapter",
+    "telemetry.capture.sniffer",
+    "telemetry.flow.flow_table",
+    "telemetry.packet.pcap_engine",
+)
+
+#: Bump to invalidate every entry when the cache FORMAT changes.
+_CACHE_FORMAT = 1
+
+
+def _code_hash_worker(repo: str) -> Tuple[str, List[str]]:
+    """Runs in a FRESH interpreter: import the parse chain, hash every repo
+    module that ended up loaded (transitively), by content."""
+    import hashlib
+    import importlib
+    import sys
+    for m in _PARSE_ENTRY_MODULES:
+        importlib.import_module(m)
+    files = sorted({os.path.realpath(mod.__file__) for mod in list(sys.modules.values())
+                    if getattr(mod, "__file__", None)
+                    and os.path.realpath(mod.__file__).startswith(repo + os.sep)})
+    h = hashlib.sha256()
+    for f in files:
+        h.update(os.path.relpath(f, repo).encode())
+        with open(f, "rb") as fh:
+            h.update(hashlib.sha256(fh.read()).digest())
+    return h.hexdigest(), [os.path.relpath(f, repo) for f in files]
+
+
+def parse_code_hash() -> Tuple[str, List[str]]:
+    """(hash, files) of the parsing code, measured in a clean spawn process so
+    whatever the caller happens to have imported does not leak in."""
+    repo = os.path.realpath(str(Path(__file__).resolve().parents[1]))
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as ex:
+        return ex.submit(_code_hash_worker, repo).result()
+
+
+def _input_fingerprint(kind: str, path: str, pcap_label_dir: Optional[str]) -> list:
+    """(relative name, size, mtime_ns) of every file the capture's parse reads."""
+    def stat(f: Path, rel: str):
+        st = f.stat()
+        return [rel, st.st_size, st.st_mtime_ns]
+    p = Path(path)
+    if kind == "PCAP2018":
+        out = [stat(f, str(f.relative_to(p))) for f in sorted(p.rglob("*")) if f.is_file()]
+        from data_unification.training_sources import _pcap_label_csv
+        csv_path = _pcap_label_csv(p, Path(pcap_label_dir)) if pcap_label_dir else None
+        out.append(stat(csv_path, "LABELS:" + csv_path.name) if csv_path else ["LABELS:", None, None])
+        return out
+    return [stat(p, p.name)]
+
+
+def cache_key(kind, path, *, stride, max_rows, edge_dim, pcap_label_dir, window_seconds,
+              code_hash) -> str:
+    import hashlib
+    blob = json.dumps({
+        "format": _CACHE_FORMAT, "kind": kind, "name": Path(path).name,
+        "inputs": _input_fingerprint(kind, path, pcap_label_dir),
+        "stride": stride, "max_rows": max_rows, "edge_dim": edge_dim,
+        "window_seconds": float(window_seconds), "code": code_hash,
+    }, sort_keys=True)
+    return f"{Path(path).name}-{hashlib.sha256(blob.encode()).hexdigest()[:24]}"
+
+
+def _cache_read(entry: Path, path: str) -> Optional[dict]:
+    """A committed entry's result dict, or None. meta.json is written last,
+    so its presence is the commit marker."""
+    try:
+        with open(entry / "meta.json") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for stem in meta.get("parts", ()):
+        if not all((entry / f"{stem}.{c}.npy").exists() for c in _COLS):
+            return None
+    meta["path"] = path              # the caller's spelling, not the cached one
+    meta["parts"] = [str(entry / stem) for stem in meta.get("parts", ())]
+    meta["cached"] = True
+    return meta
+
+
+def _cache_commit(res: dict, tmpdir: Path, entry: Path) -> dict:
+    """Move a finished parse into the cache atomically (rename on one fs)."""
+    meta = {k: v for k, v in res.items() if k not in ("parts", "path", "cached")}
+    meta["parts"] = [Path(s).name for s in res.get("parts", ())]
+    with open(tmpdir / "meta.json", "w") as f:
+        json.dump(meta, f)
+    if entry.exists() and _cache_read(entry, res["path"]) is not None:
+        shutil.rmtree(tmpdir, ignore_errors=True)    # another run committed it first
+    else:
+        # Absent, or a damaged leftover (no meta.json, a part missing): replace it.
+        shutil.rmtree(entry, ignore_errors=True)
+        os.rename(tmpdir, entry)
+    out = _cache_read(entry, res["path"])
+    if out is None:
+        raise RuntimeError(f"ingest cache entry {entry} failed to read back")
+    return out
+
+
 def parse_captures_parallel(
     captures: List[Tuple[str, str]],
     *,
@@ -166,6 +288,7 @@ def parse_captures_parallel(
     on_capture: Optional[Callable[[dict], None]] = None,
     pcap_label_dir: Optional[str] = None,
     window_seconds: float = 2.0,
+    cache_dir: Optional[str] = None,
 ):
     """Parse `captures` = [(kind, path)] in parallel; yield results in INPUT order.
 
@@ -176,6 +299,9 @@ def parse_captures_parallel(
 
     `scratch` should be on disk for PCAP days (their parts total GBs); the
     default is the system temp dir, which is tmpfs -- i.e. RAM -- on Fedora.
+
+    With `cache_dir`, captures already parsed with identical inputs, code and
+    parameters are served from disk, and newly parsed ones are committed there.
     """
     if workers is None:
         # Leave headroom: each worker holds one capture's columns, and the
@@ -184,17 +310,56 @@ def parse_captures_parallel(
 
     tmp = scratch or tempfile.mkdtemp(prefix="tgne_ingest_")
     Path(tmp).mkdir(parents=True, exist_ok=True)
-    args = [(k, p, tmp, stride, max_rows_per_file, edge_dim, pcap_label_dir, window_seconds,
-             _PART_RECORDS) for k, p in captures]
 
-    logger.info("Parsing %d captures across %d worker processes", len(args), workers)
+    entries: List[Optional[Path]] = [None] * len(captures)
+    hits: Dict[int, dict] = {}
+    if cache_dir is not None:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        code_hash, code_files = parse_code_hash()
+        logger.info("Ingest cache %s: parse code hash %s over %d module(s)",
+                    cache_dir, code_hash[:12], len(code_files))
+        for n, (k, p) in enumerate(captures):
+            entries[n] = Path(cache_dir) / cache_key(
+                k, p, stride=stride, max_rows=max_rows_per_file, edge_dim=edge_dim,
+                pcap_label_dir=pcap_label_dir, window_seconds=window_seconds,
+                code_hash=code_hash)
+            got = _cache_read(entries[n], p)
+            if got is not None:
+                hits[n] = got
+        logger.info("Ingest cache: %d of %d capture(s) cached", len(hits), len(captures))
+
+    def _outdir(n):
+        if entries[n] is None:
+            return tmp
+        d = Path(cache_dir) / f".tmp-{entries[n].name}-{os.getpid()}"
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        return str(d)
+
+    misses = [n for n in range(len(captures)) if n not in hits]
+    if misses:
+        logger.info("Parsing %d captures across %d worker processes", len(misses), workers)
     try:
         # spawn, not fork: the trainer has torch (and its thread pools) live
         # by now, and forking a multi-threaded process can deadlock the child.
-        with ProcessPoolExecutor(max_workers=workers,
+        with ProcessPoolExecutor(max_workers=max(1, min(workers, len(misses) or 1)),
                                  mp_context=multiprocessing.get_context("spawn")) as ex:
-            # map() preserves input order, which is what keeps ids deterministic.
-            for res in ex.map(_parse_one, args):
+            futs = {n: ex.submit(_parse_one, (captures[n][0], captures[n][1], _outdir(n),
+                                              stride, max_rows_per_file, edge_dim,
+                                              pcap_label_dir, window_seconds, _PART_RECORDS))
+                    for n in misses}
+            # Consumed in INPUT order, which is what keeps ids deterministic.
+            for n in range(len(captures)):
+                if n in hits:
+                    res = hits[n]
+                else:
+                    res = futs.pop(n).result()
+                    if entries[n] is not None:
+                        tmpdir = Path(cache_dir) / f".tmp-{entries[n].name}-{os.getpid()}"
+                        if res.get("error"):
+                            shutil.rmtree(tmpdir, ignore_errors=True)
+                        else:
+                            res = _cache_commit(res, tmpdir, entries[n])
                 if res.get("error"):
                     # Surfaced in the PARENT's log; a worker's own handlers
                     # are not connected to it.
@@ -203,25 +368,28 @@ def parse_captures_parallel(
                 elif res.get("n", 0) == 0:
                     logger.warning("parallel parse produced 0 records for %s",
                                    res["path"])
-                if res.get("n", 0) == 0:
-                    if on_capture:
-                        on_capture(res)
-                    continue
                 if on_capture:
                     on_capture(res)
+                if res.get("n", 0) == 0:
+                    continue
                 yield res
     finally:
         if scratch is None:
             shutil.rmtree(tmp, ignore_errors=True)
+        if cache_dir is not None:
+            for d in Path(cache_dir).glob(f".tmp-*-{os.getpid()}"):
+                shutil.rmtree(d, ignore_errors=True)
 
 
 def iter_parts(res: dict):
-    """Yield one capture's columns part by part, deleting each part once loaded."""
+    """Yield one capture's columns part by part. Scratch parts are deleted once
+    loaded; cached parts are left in place for the next run."""
     for stem in res.get("parts", ()):
         part = {col: np.load(f"{stem}.{col}.npy") for col in _COLS}
-        for col in _COLS:
-            try:
-                os.unlink(f"{stem}.{col}.npy")
-            except OSError:
-                pass
+        if not res.get("cached"):
+            for col in _COLS:
+                try:
+                    os.unlink(f"{stem}.{col}.npy")
+                except OSError:
+                    pass
         yield part

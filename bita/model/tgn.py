@@ -58,8 +58,11 @@ class TGN(nn.Module):
             if node_features is not None
             else None
         )
+        # np.asarray, not .astype: astype copies even when the array is already
+        # float32, and at full PCAP density the edge block is ~6 GB -- the copy
+        # existed only to be moved to the GPU and discarded.
         self.edge_raw_features = (
-            torch.from_numpy(edge_features.astype(np.float32)).to(device)
+            torch.from_numpy(np.ascontiguousarray(edge_features, dtype=np.float32)).to(device)
             if edge_features is not None
             else None
         )
