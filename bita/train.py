@@ -1618,6 +1618,7 @@ def train(args):
         # Per-step losses stay on the device and are read (one sync) only
         # when printed; see StepLossLog.
         m_loss = StepLossLog(args.backprop_every)
+        fast_batch_losses = getattr(tgn, "fast_batch_losses", None)
 
         # Sample order for this epoch.
         #
@@ -1666,21 +1667,29 @@ def train(args):
                 size = len(sources_batch)
                 _, negatives_batch = train_rand_sampler.sample(size, sources=sources_batch, destinations=destinations_batch)
 
-                pos_prob, neg_prob, category_logits = tgn.compute_edge_probabilities_and_categories(
-                    sources_batch, destinations_batch, negatives_batch,
-                    timestamps_batch, edge_idxs_batch, n_neighbors=args.n_degree
-                )
+                if fast_batch_losses is not None:
+                    # The fast path computes the same two losses itself, the
+                    # fixed-shape part as a CUDA graph at --fast_step_level 3.
+                    batch_edge_loss, batch_cat_loss, _ = fast_batch_losses(
+                        sources_batch, destinations_batch, negatives_batch, timestamps_batch,
+                        edge_idxs_batch, categories_batch, edge_criterion, category_criterion,
+                        n_neighbors=args.n_degree)
+                else:
+                    pos_prob, neg_prob, category_logits = tgn.compute_edge_probabilities_and_categories(
+                        sources_batch, destinations_batch, negatives_batch,
+                        timestamps_batch, edge_idxs_batch, n_neighbors=args.n_degree
+                    )
 
-                pos_label = torch.ones(size, dtype=torch.float, device=device)
-                neg_label = torch.zeros(size, dtype=torch.float, device=device)
+                    pos_label = torch.ones(size, dtype=torch.float, device=device)
+                    neg_label = torch.zeros(size, dtype=torch.float, device=device)
 
-                batch_edge_loss = edge_criterion(pos_prob.squeeze(-1), pos_label) + \
-                                  edge_criterion(neg_prob.squeeze(-1), neg_label)
+                    batch_edge_loss = edge_criterion(pos_prob.squeeze(-1), pos_label) + \
+                                      edge_criterion(neg_prob.squeeze(-1), neg_label)
 
-                # Pinned, asynchronous upload (torch.tensor(..., device=cuda)
-                # from pageable memory synchronises the stream every batch).
-                categories_batch_tensor = upload(np.asarray(categories_batch), device, torch.long)
-                batch_cat_loss = category_criterion(category_logits, categories_batch_tensor)
+                    # Pinned, asynchronous upload (torch.tensor(..., device=cuda)
+                    # from pageable memory synchronises the stream every batch).
+                    categories_batch_tensor = upload(np.asarray(categories_batch), device, torch.long)
+                    batch_cat_loss = category_criterion(category_logits, categories_batch_tensor)
 
                 loss += batch_edge_loss
                 category_loss_total += batch_cat_loss
@@ -2100,7 +2109,8 @@ if __name__ == '__main__':
                         help='Same model/data/batch, re-expressed without per-message Python work or '
                              'device syncs (also CYBERWORLD_FAST_TGN=1). See bita/fast/__init__.py')
     parser.add_argument('--fast_step_level', type=int, default=2,
-                        help='1: forward bit-identical to the reference; 2: + Triton BiGRU (fp32 rounding)')
+                        help='1: forward bit-identical to the reference; 2: + Triton BiGRU (fp32 rounding); '
+                             '3: + the embedding/heads/losses as replayed CUDA graphs (bit-identical to 2)')
     parser.add_argument('--learn_time_encoding', action='store_true',
                         help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
                              'Off by default: fixed encoding, see the note in train()')

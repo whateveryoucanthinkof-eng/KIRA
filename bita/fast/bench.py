@@ -140,11 +140,15 @@ def run(args):
             eidx, ts, cat = train_data.edge_idxs[s:e], train_data.timestamps[s:e], train_data.labels[s:e]
             size = len(src)
             _, neg = B["train_sampler"].sample(size, sources=src, destinations=dst)
-            pos_prob, neg_prob, logits = tgn.compute_edge_probabilities_and_categories(
-                src, dst, neg, ts, eidx, n_neighbors=args.n_degree)
-            bel = ec(pos_prob.squeeze(-1), torch.ones(size, device=device)) + \
-                ec(neg_prob.squeeze(-1), torch.zeros(size, device=device))
-            bcl = cc(logits, T.upload(np.asarray(cat), device, torch.long))
+            if hasattr(tgn, "fast_batch_losses"):                # as bita/train.py
+                bel, bcl, (pos_prob, neg_prob, logits) = tgn.fast_batch_losses(
+                    src, dst, neg, ts, eidx, cat, ec, cc, n_neighbors=args.n_degree)
+            else:
+                pos_prob, neg_prob, logits = tgn.compute_edge_probabilities_and_categories(
+                    src, dst, neg, ts, eidx, n_neighbors=args.n_degree)
+                bel = ec(pos_prob.squeeze(-1), torch.ones(size, device=device)) + \
+                    ec(neg_prob.squeeze(-1), torch.zeros(size, device=device))
+                bcl = cc(logits, T.upload(np.asarray(cat), device, torch.long))
             loss = loss + bel
             cat_total = cat_total + bcl
             if args.dump and bi < args.dump_outputs:

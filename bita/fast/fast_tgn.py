@@ -50,6 +50,7 @@ class FastMemory(Memory):
         # The tables hold detached values already; only the overlays hold history.
         self._pool.detach()
         self._mo.detach()
+        self._graph_slot_next = 0        # level 3: graph slots are free again (bita/fast/graphs.py)
 
     def backup_memory(self):
         self.detach_memory()
@@ -307,9 +308,41 @@ class FastTGNMixin:
             return em.compute_embedding(memory=_MemView(mem), source_nodes=bt.nodes, timestamps=bt.ts3,
                                         n_layers=self.n_layers, n_neighbors=n_neighbors, time_diffs=None)
         dev = self.device
-        c = bt.cache
+        c = self._fast_nbr(bt, n_neighbors)
+        n = len(bt.nodes)
+        if "nf_src" not in c:
+            c["nf_src"] = em.node_features[bt.nodes_g, :] if em.node_features is not None \
+                else torch.zeros((n, self.n_node_features), device=dev)
+            c["nf_nbr"] = em.node_features[c["nbr_g"], :] if em.node_features is not None \
+                else torch.zeros((c["nbr"].size, self.n_node_features), device=dev)
+            if "ef_n_host" in c:
+                c["ef_n"] = c["ef_n_host"]
+            elif em.edge_features is not None:
+                c["ef_n"] = em.edge_features[c["eidx_n_g"], :]
+            else:
+                c["ef_n"] = torch.zeros((n, n_neighbors, self.n_edge_features), device=dev)
         te_frozen = not any(p.requires_grad for p in em.time_encoder.parameters())
+        if te_frozen and "src_time" in c:
+            src_time, edge_time_emb = c["src_time"], c["edge_time_emb"]
+        else:
+            src_time = em.time_encoder(torch.zeros((n, 1), device=dev))
+            edge_time_emb = em.time_encoder(c["deltas_g"])
+            if te_frozen:
+                c["src_time"], c["edge_time_emb"] = src_time, edge_time_emb
+
+        rows = mem.fast_read(c["all_nodes"], c["all_g"])            # sources and neighbours, one gather
+        return self._fast_fn("attention", _attention_core)(
+            em.attention_models[0], rows[:n], c["nf_src"], rows[n:], c["nf_nbr"], src_time, c["ef_n"],
+            edge_time_emb, c["mask_g"], c["invalid_g"])
+
+    def _fast_nbr(self, bt: _Batch, n_neighbors):
+        """Neighbour lookup and its one upload (memory-independent, cached per batch)."""
+        em = self.embedding_module
+        dev = self.device
+        c = bt.cache
         if "nbr" not in c or c["n_neighbors"] != n_neighbors:
+            for key in ("nf_src", "src_time", "ef_n_host"):
+                c.pop(key, None)
             neighbors, edge_idxs, edge_times = em.neighbor_finder.get_temporal_neighbor(
                 bt.nodes, bt.ts3, n_neighbors=n_neighbors)
             deltas = (bt.ts3[:, None] - edge_times).astype(np.float32)
@@ -330,29 +363,9 @@ class FastTGNMixin:
                      all_g=ints[: all_nodes.size], nbr_g=ints[n: all_nodes.size],
                      eidx_n_g=ints[all_nodes.size:].view(n, -1),
                      deltas_g=deltas_g, mask_g=mask_g, invalid_g=invalid_g)
-            c["nf_src"] = em.node_features[bt.nodes_g, :] if em.node_features is not None \
-                else torch.zeros((n, self.n_node_features), device=dev)
-            c["nf_nbr"] = em.node_features[c["nbr_g"], :] if em.node_features is not None \
-                else torch.zeros((nbr.size, self.n_node_features), device=dev)
             if ef_n:
-                c["ef_n"] = ef_n[0]
-            elif em.edge_features is not None:
-                c["ef_n"] = em.edge_features[c["eidx_n_g"], :]
-            else:
-                c["ef_n"] = torch.zeros((n, n_neighbors, self.n_edge_features), device=dev)
-        n = len(bt.nodes)
-        if te_frozen and "src_time" in c:
-            src_time, edge_time_emb = c["src_time"], c["edge_time_emb"]
-        else:
-            src_time = em.time_encoder(torch.zeros((n, 1), device=dev))
-            edge_time_emb = em.time_encoder(c["deltas_g"])
-            if te_frozen:
-                c["src_time"], c["edge_time_emb"] = src_time, edge_time_emb
-
-        rows = mem.fast_read(c["all_nodes"], c["all_g"])            # sources and neighbours, one gather
-        return self._fast_fn("attention", _attention_core)(
-            em.attention_models[0], rows[:n], c["nf_src"], rows[n:], c["nf_nbr"], src_time, c["ef_n"],
-            edge_time_emb, c["mask_g"], c["invalid_g"])
+                c["ef_n_host"] = ef_n[0]
+        return c
 
     def _fast_fn(self, name, fn):
         """`fn`, or with CYBERWORLD_FAST_TGN_COMPILE=1 a torch.compile'd copy.
@@ -417,6 +430,136 @@ class FastTGNMixin:
             s1, d1, _ = self._fast_cte(bt, n_neighbors)
         combined = torch.cat([s1, d1, bt.ef.float()], dim=1)
         return pos, neg, self.category_predictor(combined)
+
+    # ------------------------------------------------- training losses
+    def fast_batch_losses(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs,
+                          labels, edge_criterion, category_criterion, n_neighbors=20):
+        """One training batch's (edge loss, category loss, (pos_prob, neg_prob,
+        category_logits)), computed exactly as bita/train.py computes them from
+        compute_edge_probabilities_and_categories:
+
+            edge = BCE(pos, 1) + BCE(neg, 0)      category = criterion(logits, labels)
+
+        Level 3 runs the fixed-shape part (graph-attention embedding, both
+        heads, both losses) as a replayed CUDA graph (bita/fast/graphs.py);
+        every other case runs it eagerly. The returned probabilities/logits
+        are read-only and valid until the next batch in the same slot."""
+        bt = _Batch(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs)
+        dev = self.device
+        B = bt.B
+        region = self._graph_region_ok(bt, edge_criterion, category_criterion)
+        if region is None:
+            s1, d1, n1 = self._fast_cte(bt, n_neighbors)
+            pos, neg = self._fast_scores(s1, d1, n1)
+            from model.extentedtgn import legacy_category_pass
+            if legacy_category_pass():
+                if getattr(self.embedding_module.neighbor_finder, "uniform", False):
+                    bt.cache = {}
+                s1, d1, _ = self._fast_cte(bt, n_neighbors)
+            logits = self.category_predictor(torch.cat([s1, d1, bt.ef.float()], dim=1))
+            pos_label = torch.ones(B, dtype=torch.float, device=dev)
+            neg_label = torch.zeros(B, dtype=torch.float, device=dev)
+            edge_loss = edge_criterion(pos.squeeze(-1), pos_label) + edge_criterion(neg.squeeze(-1), neg_label)
+            cat_loss = category_criterion(logits, upload(np.asarray(labels), dev, torch.long))
+            return edge_loss, cat_loss, (pos, neg, logits)
+        # memory update + message store exactly as _fast_cte, then the region
+        self._fast_update_memory(bt.pos)
+        self.memory.clear_messages(bt.pos)
+        self.memory._pool.write(bt.pos, bt.peers, bt.ts2, self._fast_raw_messages(bt),
+                                order=bt.write_order, order_g=bt.write_order_g)
+        c = self._fast_nbr(bt, n_neighbors)
+        rows = self.memory.fast_read(c["all_nodes"], c["all_g"])
+        host = "ef_n_host" in c
+        inputs = (rows, bt.nodes_g, c["nbr_g"], c["deltas_g"], c["mask_g"], c["invalid_g"],
+                  upload(np.asarray(labels), dev, torch.long),
+                  bt.ef if host else bt.eidx_g, c["ef_n_host"] if host else c["eidx_n_g"])
+        slot = self._graph_slot((B, n_neighbors, host), region, inputs)
+        pos, neg, logits, edge_loss, cat_loss = slot(*inputs)
+        return edge_loss, cat_loss, (pos, neg, logits)
+
+    def _graph_region_ok(self, bt, edge_criterion, category_criterion):
+        """The region function when this batch can replay a graph, else None."""
+        from model.extentedtgn import legacy_category_pass
+        if self._fast_level < 3 or not self.training or not torch.is_grad_enabled() or not self._fast_ga1:
+            return None
+        if self.device.type != "cuda" or legacy_category_pass():
+            return None
+        em = self.embedding_module
+        if any(p.requires_grad for p in em.time_encoder.parameters()):
+            return None                 # a learned time encoding would be a region parameter; not handled
+        if getattr(self, "_graph_batch", None) is None:
+            self._graph_batch = bt.B    # the batch size of the run; the short last batch stays eager
+        if bt.B != self._graph_batch:
+            return None
+        alpha = getattr(category_criterion, "alpha", None)
+        if torch.is_tensor(alpha) and alpha.device.type != "cuda":
+            return None                 # would be a host->device copy inside the graph
+        key = (id(edge_criterion), id(category_criterion))
+        fns = self.__dict__.setdefault("_graph_fns", {})
+        if key not in fns:
+            fns[key] = self._make_region(edge_criterion, category_criterion)
+        return fns[key]
+
+    def _make_region(self, edge_criterion, category_criterion):
+        model = self
+
+        def region(rows, nodes_g, nbr_g, deltas, mask, invalid, labels, ef_in, efn_in):
+            """The eager step's ops from the memory read to both losses, in
+            the eager order (see _fast_embedding, _fast_scores,
+            compute_edge_probabilities_and_categories, bita/train.py)."""
+            em = model.embedding_module
+            dev = rows.device
+            n = nodes_g.shape[0]
+            B = n // 3
+            host = efn_in.is_floating_point()
+            nf_src = em.node_features[nodes_g, :] if em.node_features is not None \
+                else torch.zeros((n, model.n_node_features), device=dev)
+            nf_nbr = em.node_features[nbr_g, :] if em.node_features is not None \
+                else torch.zeros((nbr_g.shape[0], model.n_node_features), device=dev)
+            if host:
+                ef_n = efn_in
+            elif em.edge_features is not None:
+                ef_n = em.edge_features[efn_in, :]
+            else:
+                ef_n = torch.zeros((n, mask.shape[1], model.n_edge_features), device=dev)
+            src_time = em.time_encoder(torch.zeros((n, 1), device=dev))
+            edge_time_emb = em.time_encoder(deltas)
+            emb = _attention_core(em.attention_models[0], rows[:n], nf_src, rows[n:], nf_nbr, src_time, ef_n,
+                                  edge_time_emb, mask, invalid)
+            s, d, ng = emb[:B], emb[B: 2 * B], emb[2 * B:]
+            pos, neg = model._fast_scores(s, d, ng)
+            if host:
+                ef = ef_in
+            elif model.edge_raw_features is not None:
+                ef = model.edge_raw_features[ef_in]
+            else:
+                ef = torch.zeros((B, model.n_edge_features), device=dev)
+            logits = model.category_predictor(torch.cat([s, d, ef.float()], dim=1))
+            pos_label = torch.ones(B, dtype=torch.float, device=dev)
+            neg_label = torch.zeros(B, dtype=torch.float, device=dev)
+            edge_loss = edge_criterion(pos.squeeze(-1), pos_label) + edge_criterion(neg.squeeze(-1), neg_label)
+            cat_loss = category_criterion(logits, labels)
+            return pos, neg, logits, edge_loss, cat_loss
+
+        return region
+
+    def _graph_slot(self, key, region, inputs):
+        """The slot for the next batch since the last detach_memory()."""
+        from fast.graphs import GraphSlot
+        mem = self.memory
+        i = getattr(mem, "_graph_slot_next", 0)
+        mem._graph_slot_next = i + 1
+        slots = self.__dict__.setdefault("_graph_slots", {}).setdefault(key + (id(region),), [])
+        while len(slots) <= i:
+            em = self.embedding_module
+            params, seen = [], set()
+            for m in (em, self.affinity_score, self.category_predictor):
+                for p in m.parameters():
+                    if p.requires_grad and id(p) not in seen:
+                        seen.add(id(p))
+                        params.append(p)
+            slots.append(GraphSlot(region, inputs, params, diff_inputs=[0], diff_outputs=[3, 4]))
+        return slots[i]
 
     # ---------------------------------------------- streaming (serving)
     @torch.no_grad()
