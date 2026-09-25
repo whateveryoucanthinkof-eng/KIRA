@@ -2,10 +2,15 @@
 
 Built with `cargo build --release` in rust/tgn_host (no dependencies; the
 library is `rust/tgn_host/target/release/libtgn_host.so`, TGN_HOST_LIB
-overrides). Every function here returns None when the library is missing,
-older than its sources, disabled (CYBERWORLD_HOST_RUST=0) or given arrays it
-does not handle; callers then run their numpy version, which computes the same
-thing bit for bit (tests/test_tgn_host_rust.py).
+overrides). Every function here returns None (nbr_plan: False) when the
+library is missing, older than its sources, disabled (CYBERWORLD_HOST_RUST=0)
+or given arrays it does not handle; callers then run their numpy version,
+which computes the same thing bit for bit (tests/test_tgn_host_rust.py,
+tests/test_batch_planner.py).
+
+  recent_neighbors   NeighborFinder.get_temporal_neighbor, most-recent-n
+  bita_plan          BiTA grouping of a batch's pending messages (plan.rs)
+  nbr_plan           the neighbour block of the fast step (plan.rs)
 """
 from __future__ import annotations
 
