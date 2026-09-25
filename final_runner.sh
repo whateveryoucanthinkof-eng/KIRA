@@ -26,7 +26,9 @@ if systemctl --user is-active -q train-plan; then
     exit 1
 fi
 # A stopped plan can leave its per-job scopes behind; never run two copies.
-if pgrep -f "bita/train.py|scripts/retrain_" >/dev/null; then
+# Anchored to the interpreter so a shell whose command line merely MENTIONS
+# these scripts (an editor, another terminal) is not mistaken for a trainer.
+if pgrep -f '^[^ ]*python[0-9.]* (-u )?(bita/train\.py|scripts/retrain_)' >/dev/null; then
     echo "training processes are still running (pgrep -af 'bita/train.py|scripts/retrain_'); stop them first" >&2
     exit 1
 fi
