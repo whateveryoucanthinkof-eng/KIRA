@@ -361,6 +361,7 @@ def load_and_preprocess_unified_dataset(
     scheme="frozen",
     allow_cic2018_csv=False,
     window_seconds=2.0,
+    ingest_scratch=None,
 ):
     """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
 
@@ -587,19 +588,30 @@ def load_and_preprocess_unified_dataset(
     captures = [(k, f) for k, f in captures if _in_split(f)]
     n_read = len(captures)
 
-    if parallel_workers and any(k == "PCAP2018" for k, _f in captures):
-        logging.info("PCAP captures are read serially (the parallel parser handles CSVs only)")
-        parallel_workers = 0
+    worker_coverage = []
     if parallel_workers and len(captures) > 1:
         # Parallel path. Workers return LOCAL vocabularies; the merge below
         # assigns global ids in capture order, so the result is identical to
         # the serial path. See data_unification/parallel_ingest.py.
-        from data_unification.parallel_ingest import parse_captures_parallel
+        #
+        # PCAP days go through it too, one day per worker: serially, the
+        # encoder read ~480 GB of captures on one core at ~21 MB/s (~6.5 h).
+        from data_unification.parallel_ingest import iter_parts, parse_captures_parallel
         import time as _t
         _t0 = _t.time()
+        _pcap = any(k == "PCAP2018" for k, _f in captures)
+        if _pcap and ingest_scratch is None:
+            raise ValueError("parallel PCAP ingest needs an on-disk ingest_scratch: its parts "
+                             "total GBs and the default temp dir is tmpfs (RAM)")
+        if ingest_scratch is not None:
+            # A crashed earlier run can leave parts behind; they are never reused.
+            import shutil as _sh
+            _sh.rmtree(ingest_scratch, ignore_errors=True)
         for res in parse_captures_parallel(
             captures, stride=stride, max_rows_per_file=max_rows_per_file,
-            edge_dim=edge_dim, workers=parallel_workers,
+            edge_dim=edge_dim, workers=parallel_workers, scratch=ingest_scratch,
+            pcap_label_dir=pcap2018_label_dir, window_seconds=window_seconds,
+            on_capture=lambda r: worker_coverage.append(r.get("coverage")),
         ):
             # local ip id -> global (capture, ip) node id, in this capture's order
             _cid = cap_to_id.setdefault(res["path"], len(cap_to_id))
@@ -615,19 +627,27 @@ def load_and_preprocess_unified_dataset(
                 if cid is None:
                     cid = cat_to_id[c] = len(cat_to_id)
                 cat_map[local] = cid
-            si = src_to_id.get(res["kind"])
+            # Keyed by the records' own raw_label_source, as the serial path is.
+            si = src_to_id.get(res["source"])
             if si is None:
-                si = src_to_id[res["kind"]] = len(src_to_id)
+                si = src_to_id[res["source"]] = len(src_to_id)
 
-            col_u.extend(ip_map[res["u"]])
-            col_i.extend(ip_map[res["i"]])
-            col_ts.extend(res["ts"])
-            col_lbl.extend(cat_map[res["lbl"]])
-            col_edge.extend(res["edge"])
-            col_src.extend(np.full(res["n"], si, dtype=np.int8))
-            col_cap.extend(np.full(res["n"], _cid, dtype=np.int16))
-            logging.info("  %s: %d records", os.path.basename(res["path"]), res["n"])
+            for part in iter_parts(res):
+                m = len(part["ts"])
+                col_u.extend(ip_map[part["u"]])
+                col_i.extend(ip_map[part["i"]])
+                col_ts.extend(part["ts"])
+                col_lbl.extend(cat_map[part["lbl"]])
+                col_edge.extend(part["edge"])
+                col_src.extend(np.full(m, si, dtype=np.int8))
+                col_cap.extend(np.full(m, _cid, dtype=np.int16))
+                del part
+            logging.info("  %s: %d records (%.0fs elapsed)", os.path.basename(res["path"]),
+                         res["n"], _t.time() - _t0)
         logging.info("Parallel ingest finished in %.1fs", _t.time() - _t0)
+        if ingest_scratch is not None:
+            import shutil as _sh
+            _sh.rmtree(ingest_scratch, ignore_errors=True)
     else:
         for kind, f in captures:
             _cur_cap[0] = cap_to_id.setdefault(f, len(cap_to_id))
@@ -655,7 +675,16 @@ def load_and_preprocess_unified_dataset(
     # label strings the maps have not seen.
     try:
         from data_unification.label_resolver import get_default_resolver
-        _cov = get_default_resolver().unresolved_report()
+        _cov = dict(get_default_resolver().unresolved_report())
+        # Parallel workers resolve labels in their own processes; add theirs.
+        _labels = set(_cov["distinct_unresolved_labels"])
+        for wc in worker_coverage:
+            if wc:
+                _cov["resolve_calls"] += wc["resolve_calls"]
+                _cov["unresolved_calls"] += wc["unresolved_calls"]
+                _labels.update(wc["labels"])
+        _cov["distinct_unresolved_labels"] = sorted(_labels)
+        _cov["unresolved_rate"] = _cov["unresolved_calls"] / max(_cov["resolve_calls"], 1)
         if _cov["unresolved_calls"]:
             logging.warning(
                 "Label coverage: %.4f%% UNRESOLVED (%d of %d). Unmapped labels "
@@ -684,17 +713,33 @@ def load_and_preprocess_unified_dataset(
         )
 
     # Chronological order, by permuting the columns rather than sorting objects.
+    #
+    # One column at a time, freeing each source as soon as it is permuted.
+    # Permuting all of them before freeing any held two full copies of every
+    # column, and `edge_features[1:] = col_edge[order]` built a THIRD copy of
+    # the widest one as a temporary: ~214 B/record at the peak, ~24.6 GB at
+    # the ~115M records of the full PCAP corpus. This peaks at the live
+    # columns + the order + one permuted column (~135 B/record).
     order = np.argsort(col_ts.done(), kind="stable")
-    u_list = col_u.done()[order]
-    i_list = col_i.done()[order]
-    ts_list = col_ts.done()[order]
-    label_list = col_lbl.done()[order]
-    source_list = col_src.done()[order]
-    capture_list = col_cap.done()[order]
+
+    def _permuted(col):
+        out = col.done()[order]
+        col.buf = None
+        return out
+
+    u_list = _permuted(col_u)
+    i_list = _permuted(col_i)
+    ts_list = _permuted(col_ts)
+    label_list = _permuted(col_lbl)
+    source_list = _permuted(col_src)
+    capture_list = _permuted(col_cap)
 
     # Row 0 stays zero: it is the padding edge, which is why no vstack is needed.
-    edge_features = np.zeros((n + 1, edge_dim), dtype=np.float32)
-    edge_features[1:] = col_edge.done()[order]
+    # np.take with out= writes straight into place: no temporary copy.
+    edge_features = np.empty((n + 1, edge_dim), dtype=np.float32)
+    edge_features[0] = 0.0
+    np.take(col_edge.done(), order, axis=0, out=edge_features[1:])
+    col_edge.buf = None
     del col_u, col_i, col_ts, col_lbl, col_edge, col_src, col_cap, order
 
     idx_list = np.arange(1, n + 1)
@@ -991,6 +1036,8 @@ def train(args):
             scheme=args.split_scheme,
             allow_cic2018_csv=args.allow_cic2018_csv,
             window_seconds=_contract_window_seconds(),
+            # On disk beside the epoch checkpoints: never the tmpfs temp dir.
+            ingest_scratch=os.path.join(args.checkpoint_dir, "ingest") if args.ingest_workers else None,
         )
     else:
         graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(

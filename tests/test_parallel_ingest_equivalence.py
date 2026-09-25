@@ -103,3 +103,60 @@ def test_a_worker_failure_is_reported_not_swallowed(corpus, caplog):
              ("CIC2018", "/nonexistent/fri_23_csv.csv")], workers=2))
     assert out == []
     assert any("parallel parse failed" in r.message for r in caplog.records)
+
+
+# ------------------------------------------------------------------ PCAP days
+#
+# The encoder's real corpus is CTU-13 plus CIC-2018 PCAP days. Serially that
+# read ~480 GB on one core (~6.5 h). PCAP days now go through the parallel
+# parser one day per worker, and must stay bit-identical to serial.
+
+@pytest.fixture(scope="module")
+def pcap_corpus(tmp_path_factory):
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "dry_run_plan", Path(__file__).resolve().parents[1] / "scripts" / "dry_run_plan.py")
+    drp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(drp)
+    return drp.build_corpus(tmp_path_factory.mktemp("synthetic"), seed=3)
+
+
+def _load_pcap(paths, workers, scratch):
+    return bt.load_and_preprocess_unified_dataset(
+        ctu13_dir=str(paths["ctu13"]), pcap2018_root=str(paths["pcap"]),
+        pcap2018_label_dir=str(paths["csv"]), scheme="cross_year_ctu",
+        splits=("train",), parallel_workers=workers, window_seconds=2.0,
+        ingest_scratch=scratch)
+
+
+@pytest.mark.parametrize("workers", [3, 8])
+def test_parallel_pcap_ingest_is_bit_identical_to_serial(pcap_corpus, tmp_path, workers):
+    gs, es, ns, cs = _load_pcap(pcap_corpus, 0, None)
+    gp, ep, np_, cp = _load_pcap(pcap_corpus, workers, str(tmp_path / "ingest"))
+
+    assert (gs.source.nunique() == 2), "fixture must mix CTU-13 and PCAP records"
+    for col in ("u", "i", "ts", "label", "idx", "source", "capture"):
+        np.testing.assert_array_equal(
+            gs[col].values, gp[col].values, err_msg=f"graph_df.{col} differs")
+    np.testing.assert_array_equal(es, ep, err_msg="edge_features differ")
+    np.testing.assert_array_equal(ns, np_, err_msg="node_features differ")
+    assert cs == cp, "category mapping differs"
+    assert not (tmp_path / "ingest").exists(), "scratch parts must be cleaned up"
+
+
+def test_parallel_pcap_ingest_refuses_tmpfs_default(pcap_corpus):
+    """Without an on-disk scratch the parts would land in /tmp, i.e. RAM."""
+    with pytest.raises(ValueError, match="ingest_scratch"):
+        _load_pcap(pcap_corpus, 4, None)
+
+
+def test_multi_part_captures_merge_identically(pcap_corpus, tmp_path, monkeypatch):
+    """A capture larger than one on-disk part must reassemble in order."""
+    import data_unification.parallel_ingest as pi
+    gs, es, _ns, _cs = _load_pcap(pcap_corpus, 0, None)
+    monkeypatch.setattr(pi, "_PART_RECORDS", 7)
+    gp, ep, _np, _cp = _load_pcap(pcap_corpus, 4, str(tmp_path / "ingest"))
+    np.testing.assert_array_equal(gs.u.values, gp.u.values)
+    np.testing.assert_array_equal(gs.ts.values, gp.ts.values)
+    np.testing.assert_array_equal(es, ep)
