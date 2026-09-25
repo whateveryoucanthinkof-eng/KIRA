@@ -1565,7 +1565,7 @@ def train(args):
                "train_losses": train_losses, "epoch_times": epoch_times}
     resume = ResumePoint(os.path.splitext(model_save_path)[0] + "_resume.pt",
                          run_fingerprint(args, ignore=("n_epoch", "gpu", "num_workers", "in_memory",
-                                                 "fast_step", "fast_step_level")),
+                                                 "fast_step", "fast_step_level", "batch_planner")),
                          enabled=not args.no_resume, log=logging.info)
     first_epoch = 0
     _rp = resume.load()
@@ -1615,6 +1615,25 @@ def train(args):
         )
     logging.info("Batch sampling: %s",
                  "SHUFFLED (memory off)" if args.shuffle_batches else "time-ordered")
+    # Batch planner (opt-in; bita/fast/planner.py): each training batch's
+    # value-independent host work -- the batch slices, the negative draws
+    # (the planner continues this process's numpy RNG stream and hands the
+    # end state back), the message pool's row bookkeeping, BiTA grouping,
+    # neighbour lookup, host edge-feature rows -- is computed ahead in a
+    # forked process and consumed here in batch order. Same values bit for
+    # bit (tests/test_batch_planner.py); validation and test run unplanned.
+    planner = None
+    if args.batch_planner:
+        if args.shuffle_batches:
+            raise ValueError("--batch_planner plans time-ordered batches; drop --shuffle_batches")
+        from fast.planner import BatchPlanner
+        planner = BatchPlanner(tgn, train_data, train_ngh_finder, train_rand_sampler,
+                               batch_size=args.batch_size, backprop_every=args.backprop_every,
+                               n_degree=args.n_degree)
+        import atexit
+        atexit.register(planner.close)
+        logging.info("batch planner enabled (pid %d)", planner.proc.pid)
+
     logging.info("Starting training loop...")
     for epoch in range(first_epoch, args.n_epoch):
         start_epoch = time.time()
@@ -1653,6 +1672,7 @@ def train(args):
             perm = np.random.permutation(num_instance)
         else:
             perm = np.arange(num_instance)
+        plans = planner.epoch(num_batch, edge_criterion, category_criterion) if planner is not None else None
 
         for k in range(0, num_batch, args.backprop_every):
             loss = 0.0
@@ -1662,6 +1682,15 @@ def train(args):
             for j in range(args.backprop_every):
                 batch_idx = k + j
                 if batch_idx >= num_batch:
+                    continue
+
+                if plans is not None:
+                    # The plan carries this batch's arrays, negatives and labels.
+                    batch_edge_loss, batch_cat_loss, _ = fast_batch_losses(
+                        None, None, None, None, None, None, edge_criterion, category_criterion,
+                        n_neighbors=args.n_degree, plan=plans.next(batch_idx))
+                    loss += batch_edge_loss
+                    category_loss_total += batch_cat_loss
                     continue
 
                 start_idx = batch_idx * args.batch_size
@@ -1743,6 +1772,10 @@ def train(args):
             if args.use_memory:
                 tgn.memory.detach_memory()
 
+        if plans is not None:
+            plans.finish()            # installs the numpy RNG state after this epoch's negative draws
+            logging.info("batch planner: trainer waited %.1fs for plans this epoch", planner.wait_s)
+            planner.wait_s = 0.0
         guard.flush()
         epoch_time = time.time() - start_epoch
         epoch_times.append(epoch_time)
@@ -1863,6 +1896,9 @@ def train(args):
         if _action == STOP:
             logging.info(f"Early stopping: {guard.stop_reason}")
             break
+
+    if planner is not None:
+        planner.close()
 
     # Serve the BEST epoch, always. This used to reload it only when early
     # stopping fired; a run that used every epoch saved its LAST epoch as the
@@ -2125,6 +2161,10 @@ if __name__ == '__main__':
                         help='1: forward bit-identical to the reference; 2: + Triton BiGRU (fp32 rounding); '
                              '3: + the embedding/heads/losses as replayed CUDA graphs (bit-identical to 2); '
                              '4: + BiTA and the memory updater as graphs on padded shapes (fp32 rounding)')
+    parser.add_argument('--batch_planner', action='store_true',
+                        help='With --fast_step: compute each training batch\'s value-independent host work '
+                             '(negatives, pool row bookkeeping, BiTA grouping, neighbours) ahead in a separate '
+                             'process (bita/fast/planner.py). Bit-identical results.')
     parser.add_argument('--learn_time_encoding', action='store_true',
                         help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
                              'Off by default: fixed encoding, see the note in train()')
