@@ -14,8 +14,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "bita"))
 
 from control_backend.site_config import (
+    env,
     load_site_config,
     reload_site_config,
+    resolve_site_config_path,
     select_primary_target_ip,
     get_site_config,
 )
@@ -40,6 +42,34 @@ def lab_site(monkeypatch):
     yield get_site_config()
     monkeypatch.delenv("CYBERWORLD_SITE_CONFIG", raising=False)
     reload_site_config()
+
+
+def test_env_prefers_uppercase_and_accepts_legacy(monkeypatch):
+    """CYBERWORLD_* wins; the lowercase spelling still resolves for existing shells."""
+    monkeypatch.delenv("CYBERWORLD_SITE", raising=False)
+    monkeypatch.delenv("cyberworld_SITE", raising=False)
+    assert env("SITE") is None
+    assert env("SITE", "fallback") == "fallback"
+
+    monkeypatch.setenv("cyberworld_SITE", "legacy-site")
+    assert env("SITE") == "legacy-site"
+
+    monkeypatch.setenv("CYBERWORLD_SITE", "modern-site")
+    assert env("SITE") == "modern-site"
+
+
+def test_legacy_site_config_env_still_resolves(monkeypatch):
+    """A lowercase-only environment must still select the site YAML."""
+    path = os.path.join(PROJECT_ROOT, "config", "sites", "local-default.yaml")
+    monkeypatch.delenv("CYBERWORLD_SITE_CONFIG", raising=False)
+    monkeypatch.setenv("cyberworld_SITE_CONFIG", path)
+    reload_site_config()
+    try:
+        assert resolve_site_config_path() == os.path.abspath(path)
+        assert get_site_config().site_id == "local-default"
+    finally:
+        monkeypatch.delenv("cyberworld_SITE_CONFIG", raising=False)
+        reload_site_config()
 
 
 def test_load_containerlab_site():

@@ -1,14 +1,33 @@
 import type { SystemStatus } from "../../api/types";
-import { StatusDot } from "../shared/StatusBadge";
+import { Micro, Square, Rule } from "../../design/primitives";
 
-type Page = "overview" | "network" | "predictions" | "events" | "controls";
+type Page =
+  | "overview"
+  | "network"
+  | "predictions"
+  | "campaign"
+  | "attck"
+  | "replay"
+  | "incidents"
+  | "events"
+  | "model"
+  | "controls";
 
-const navItems: { id: Page; label: string; icon: string }[] = [
-  { id: "overview",    label: "Overview",    icon: "▦" },
-  { id: "network",     label: "Network",     icon: "⬡" },
-  { id: "predictions", label: "Predictions", icon: "◈" },
-  { id: "events",      label: "Events",      icon: "≡" },
-  { id: "controls",    label: "Controls",    icon: "⊙" },
+/**
+ * Navigation carries no icons. An index and the label are enough, and the
+ * active state is a full inversion — unmistakable without a glow or a rail.
+ */
+const NAV: { id: Page; label: string }[] = [
+  { id: "overview", label: "Overview" },
+  { id: "network", label: "Network" },
+  { id: "predictions", label: "Predictions" },
+  { id: "campaign", label: "Campaign" },
+  { id: "attck", label: "ATT&CK" },
+  { id: "replay", label: "Replay" },
+  { id: "incidents", label: "Incidents" },
+  { id: "events", label: "Events" },
+  { id: "model", label: "Model" },
+  { id: "controls", label: "Controls" },
 ];
 
 interface SidebarProps {
@@ -17,130 +36,124 @@ interface SidebarProps {
   status: SystemStatus | null;
 }
 
-function formatUptime(seconds: number): string {
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return `${d}d ${h}h ${m}m`;
+function fmtUptime(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d > 0) return `${d}d ${String(h).padStart(2, "0")}h ${String(m).padStart(2, "0")}m`;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
 export default function Sidebar({ activePage, onNavigate, status }: SidebarProps) {
+  const services: { label: string; val: string }[] = [
+    { label: "Network", val: status?.networkStatus ?? "unknown" },
+    { label: "Sensor", val: status?.telemetryStatus ?? "unknown" },
+    { label: "Inference", val: status?.predictionStatus ?? "unknown" },
+  ];
+
   return (
     <aside
       style={{
-        width: 200,
+        width: "var(--rail-w)",
         flexShrink: 0,
-        background: "var(--color-surface)",
-        borderRight: "1px solid var(--color-border)",
+        background: "var(--ink-050)",
+        borderRight: "var(--hard)",
         display: "flex",
         flexDirection: "column",
         height: "100%",
       }}
     >
-      {/* Brand */}
-      <div
-        style={{
-          padding: "16px 16px 14px",
-          borderBottom: "1px solid var(--color-border)",
-        }}
-      >
-        <div
-          style={{
-            fontSize: 13,
-            fontWeight: 700,
-            letterSpacing: "-0.01em",
-            color: "var(--color-text-primary)",
-          }}
-        >
-          Cyber Network
+      {/* ── Masthead ─────────────────────────────────────────────── */}
+      <div style={{ padding: "var(--s-4)", borderBottom: "var(--hard)" }}>
+        <div className="t-display-m" style={{ color: "var(--paper-000)", lineHeight: 1 }}>
+          cyberworld
         </div>
-        <div
-          style={{
-            fontSize: 11,
-            color: "var(--color-text-muted)",
-            marginTop: 1,
-            fontWeight: 500,
-          }}
-        >
-          Predictor
-        </div>
+        <Micro style={{ marginTop: 6, color: "var(--paper-600)", letterSpacing: "0.1em" }}>
+          Attack Forecasting
+        </Micro>
       </div>
 
-      {/* Nav */}
-      <nav style={{ padding: "8px 8px", flex: 1 }}>
-        {navItems.map((item) => {
-          const isActive = item.id === activePage;
+      {/* ── Navigation ───────────────────────────────────────────── */}
+      <nav style={{ flex: 1, padding: "var(--s-2) 0", minHeight: 0, overflowY: "auto" }}>
+        {NAV.map((item, i) => {
+          const active = item.id === activePage;
           return (
             <button
               key={item.id}
               onClick={() => onNavigate(item.id)}
+              aria-current={active ? "page" : undefined}
               style={{
                 display: "flex",
-                alignItems: "center",
-                gap: 9,
+                alignItems: "baseline",
+                gap: "var(--s-3)",
                 width: "100%",
-                padding: "7px 8px",
-                borderRadius: 6,
-                border: "none",
-                cursor: "pointer",
-                fontSize: 13,
-                fontWeight: isActive ? 600 : 400,
-                color: isActive ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                background: isActive ? "var(--color-base)" : "transparent",
+                padding: "9px var(--s-4)",
                 textAlign: "left",
-                transition: "background 0.1s, color 0.1s",
-                marginBottom: 1,
+                background: active ? "var(--paper-000)" : "transparent",
+                color: active ? "var(--ink-000)" : "var(--paper-400)",
+                transition: "background 90ms steps(2,end), color 90ms steps(2,end)",
               }}
               onMouseEnter={(e) => {
-                if (!isActive) {
-                  (e.currentTarget as HTMLButtonElement).style.background = "var(--color-base)";
-                }
+                if (active) return;
+                e.currentTarget.style.background = "var(--ink-200)";
+                e.currentTarget.style.color = "var(--paper-000)";
               }}
               onMouseLeave={(e) => {
-                if (!isActive) {
-                  (e.currentTarget as HTMLButtonElement).style.background = "transparent";
-                }
+                if (active) return;
+                e.currentTarget.style.background = "transparent";
+                e.currentTarget.style.color = "var(--paper-400)";
               }}
             >
-              <span style={{ fontSize: 14, opacity: isActive ? 1 : 0.6 }}>{item.icon}</span>
-              {item.label}
+              <span className="t-data-s" style={{ opacity: active ? 0.55 : 0.5, flexShrink: 0 }}>
+                {String(i + 1).padStart(2, "0")}
+              </span>
+              <span className="t-label" style={{ letterSpacing: "0.02em" }}>
+                {item.label}
+              </span>
             </button>
           );
         })}
       </nav>
 
-      {/* System status footer */}
-      {status && (
-        <div
-          style={{
-            padding: "12px 14px",
-            borderTop: "1px solid var(--color-border)",
-            display: "flex",
-            flexDirection: "column",
-            gap: 5,
-          }}
-        >
-          <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--color-text-muted)", marginBottom: 2 }}>
-            Services
+      {/* ── Service health ───────────────────────────────────────── */}
+      <div style={{ padding: "var(--s-3) var(--s-4) var(--s-4)", borderTop: "var(--hard)" }}>
+        <Micro style={{ marginBottom: "var(--s-2)" }}>Services</Micro>
+
+        {services.map(({ label, val }) => (
+          <div
+            key={label}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "var(--s-2)",
+              padding: "5px 0",
+              borderBottom: "var(--hair)",
+            }}
+          >
+            <span className="t-label" style={{ color: "var(--paper-400)" }}>
+              {label}
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: "var(--s-2)" }}>
+              <span className="t-data-s" style={{ color: "var(--paper-600)" }}>
+                {val}
+              </span>
+              <Square status={val} live={val === "running"} />
+            </span>
           </div>
-          {[
-            { label: "Network",    val: status.networkStatus },
-            { label: "Telemetry",  val: status.telemetryStatus },
-            { label: "Prediction", val: status.predictionStatus },
-          ].map(({ label, val }) => (
-            <div key={label} style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>{label}</span>
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <StatusDot status={val} pulse />
-                <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>{val}</span>
-              </div>
-            </div>
-          ))}
-          <div style={{ marginTop: 4, fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-            uptime {formatUptime(status.uptime)}
-          </div>
+        ))}
+
+        <Rule style={{ margin: "var(--s-3) 0 var(--s-2)" }} />
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <Micro>Uptime</Micro>
+          <span className="t-data-s" style={{ color: "var(--paper-400)", fontVariantNumeric: "tabular-nums" }}>
+            {fmtUptime(status?.uptime ?? 0)}
+          </span>
         </div>
-      )}
+      </div>
     </aside>
   );
 }

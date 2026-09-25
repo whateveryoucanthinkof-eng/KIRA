@@ -6,9 +6,10 @@ All adapters (CIC-IDS2017, CIC-IDS2018, CTU-13, Warden) project their heterogene
 into this unified format.
 """
 
+import sys as _sys
 from dataclasses import dataclass, asdict, field
 from enum import Enum
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, ClassVar
 import pandas as pd
 import numpy as np
 
@@ -33,8 +34,33 @@ class CoarseCategory(str, Enum):
     UNKNOWN = "Unknown"
 
 
-@dataclass
+def _interned(v):
+    """Intern any string-like value, including numpy.str_.
+
+    `sys.intern` requires an exact `str`. numpy string scalars are str
+    subclasses, so they must be coerced before interning -- otherwise the call
+    is skipped and every row keeps its own copy.
+    """
+    if type(v) is str:
+        return _sys.intern(v)
+    if isinstance(v, str):          # numpy.str_ and other str subclasses
+        return _sys.intern(str(v))
+    return v
+
+
+@dataclass(slots=True)
 class UnifiedFlowRecord:
+    """One normalized flow.
+
+    slots=True and the string interning in __post_init__ are load-bearing at
+    corpus scale, not style. Measured on real CTU-13 data: 643 B/record, of
+    which ~420 B was duplicated strings and the per-instance __dict__ --
+    src_ip/dst_ip repeat across ~22k unique values per 120k references, and
+    raw_label_source/coarse_category have 1-2 unique values across the whole
+    file. At 37M records (full corpus density) that overhead alone is ~15 GB
+    on a 22 GiB machine, which is what made full-density training impossible.
+    Interning makes equal strings share one object; slots drops the __dict__.
+    """
     src_ip: str
     dst_ip: str
     src_port: int
@@ -51,9 +77,33 @@ class UnifiedFlowRecord:
     is_attack: bool  # Derived from mapping
     coarse_category: str  # Standard coarse taxonomy
     attck_technique_ids: List[str] = field(default_factory=list)  # MITRE ATT&CK technique IDs (e.g. ['T1046'])
-    metadata: Dict[str, Any] = field(default_factory=dict)  # Additional attributes (e.g. scenario_id, flow_count)
+    # None rather than {} : every record allocating an empty dict costs 64 B,
+    # and 100% of CSV/netflow-path records never populate it (2.4 GB at 37M).
+    # Read through the `meta` property, which always returns a mapping.
+    metadata: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
+        # Share one object per distinct string. These fields are drawn from
+        # small vocabularies (hosts, labels, sources, categories) but are
+        # created fresh per row by the pandas-based adapters.
+        #
+        # This used to guard on `type(x) is str`, which is False for
+        # numpy.str_ -- and numpy.str_ is exactly what the pandas adapters hand
+        # over for src_ip and dst_ip. So interning silently skipped the two
+        # highest-cardinality, highest-volume fields in the record while
+        # appearing to work: measured on wed_29, raw_label collapsed to ONE
+        # object across 5,000 records while src_ip kept 5,000 distinct objects
+        # for 250 unique values.
+        #
+        # _interned() accepts any str subclass and coerces it to an exact str
+        # first, which both enables interning and drops the heavier numpy
+        # scalar wrapper.
+        self.src_ip = _interned(self.src_ip)
+        self.dst_ip = _interned(self.dst_ip)
+        self.raw_label = _interned(self.raw_label)
+        self.raw_label_source = _interned(self.raw_label_source)
+        self.coarse_category = _interned(self.coarse_category)
+
         # Validate critical numerical invariants
         if self.start_time > self.end_time:
             # If duration is 0 or end_time < start_time due to precision, align end_time
@@ -71,16 +121,35 @@ class UnifiedFlowRecord:
             else:
                 self.attck_technique_ids = []
 
+    _EMPTY_META: ClassVar[Dict[str, Any]] = {}
+
+    @property
+    def meta(self) -> Dict[str, Any]:
+        """metadata, never None -- read through this instead of .metadata."""
+        return self.metadata if self.metadata is not None else self._EMPTY_META
+
     @property
     def src_host_key(self) -> str:
-        """Returns scoped global host identifier preventing IP collision across datasets."""
-        scenario = self.metadata.get("scenario_id", "default")
+        """Scoped host identifier. NOT the mechanism the trainers use -- see below.
+
+        Do not wire this in as the fix for cross-capture host merging. It
+        scopes by `scenario_id`, falling back to "default", and the CIC-2018
+        adapter never sets scenario_id -- so every one of its days would map
+        `192.168.10.5` to the same `CIC2018::default::192.168.10.5` and the
+        nine fabricated days would still merge into one trajectory, which is
+        the defect it was written to prevent.
+
+        The wired mechanism is TrajectoryStoreBuilder.set_namespace with
+        trajectory_store.capture_namespace(path), which scopes by the actual
+        capture file and so cannot collide.
+        """
+        scenario = self.meta.get("scenario_id", "default")
         return f"{self.raw_label_source}::{scenario}::{self.src_ip}"
 
     @property
     def dst_host_key(self) -> str:
         """Returns scoped global host identifier preventing IP collision across datasets."""
-        scenario = self.metadata.get("scenario_id", "default")
+        scenario = self.meta.get("scenario_id", "default")
         return f"{self.raw_label_source}::{scenario}::{self.dst_ip}"
 
     @property

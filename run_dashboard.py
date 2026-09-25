@@ -1,16 +1,23 @@
 """
 run_dashboard.py
-Launcher for the CyberWorld SOC console (local SPAN or Containerlab Lab Mode).
+Launcher for the cyberworld SOC console (local SPAN or Containerlab Lab Mode).
 
   python run_dashboard.py --site local-default --interface eth1
   python run_dashboard.py --site containerlab-enterprise
 
 Env:
   CYBERWORLD_SITE, CYBERWORLD_SITE_CONFIG, CYBERWORLD_SENSOR_IFACE
+  CYBERWORLD_API_TOKEN   require this token on every request (auto-generated
+                         when --host is not a loopback address)
+
+Binds 127.0.0.1 by default. The console shows the internal host map and can
+record mitigations, so exposing it on a shared network needs a token.
 """
 
 import argparse
+import ipaddress
 import os
+import secrets
 import sys
 from pathlib import Path
 import threading
@@ -20,6 +27,14 @@ import webbrowser
 REPO_ROOT = Path(__file__).resolve().parent
 bita_path = str(REPO_ROOT / "bita")
 
+# Why this path juggling exists: the vendored TGNE-TA code under bita/ imports its own
+# submodules by bare top-level names -- `from model.tgn import TGN`, `from modules.memory
+# import Memory`, `from utils.utils import ...`. That only resolves with bita/ itself on
+# sys.path, which puts a generic `model` package into the global namespace. Any other
+# `model.py` on PYTHONPATH (or a `model` already imported by something else) shadows it and
+# breaks checkpoint loading, so entries owning a model.py are dropped and a stale `model`
+# module is evicted below. Repackaging bita/ into a proper namespace would remove all of
+# this; it is left alone deliberately because the checkpoints are keyed to that layout.
 os.chdir(str(REPO_ROOT))
 clean_path = [str(REPO_ROOT), bita_path]
 for p in (os.environ.get("PYTHONPATH") or "").split(os.pathsep):
@@ -34,9 +49,21 @@ for k in list(sys.modules):
         del sys.modules[k]
 
 
+def _is_loopback(host: str) -> bool:
+    if host in ("localhost",):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def open_browser(port: int):
     time.sleep(1.8)
     url = f"http://localhost:{port}"
+    token = os.environ.get("CYBERWORLD_API_TOKEN", "")
+    if token:
+        url += f"/?token={token}"
     print(f"\n[+] Opening SOC Console: {url}\n")
     try:
         webbrowser.open(url)
@@ -45,12 +72,14 @@ def open_browser(port: int):
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="CyberWorld SOC dashboard")
+    p = argparse.ArgumentParser(description="cyberworld SOC dashboard")
     p.add_argument("--site", default=None, help="Site id under config/sites/")
     p.add_argument("--site-config", default=None, help="Path to a site YAML file")
     p.add_argument("--interface", default=None, help="Override SPAN capture interface")
     p.add_argument("--replay", default=None, help="Replay PCAP file (demo mode)")
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="Bind address. Default loopback only; any other address "
+                        "requires an access token (generated if not set).")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--no-browser", action="store_true")
     return p.parse_args()
@@ -73,7 +102,7 @@ if __name__ == "__main__":
     site = get_site_config()
 
     print("=" * 70)
-    print("  CYBERWORLD SOC — SPAN DISCOVERY + DUAL-BRANCH / DEEPOP")
+    print("  cyberworld SOC — SPAN DISCOVERY + DUAL-BRANCH / DEEPOP")
     print("=" * 70)
     print(f"[+] Repo root:     {REPO_ROOT}")
     print(f"[+] Site:          {site.site_id} (lab_mode={site.lab_mode})")
@@ -85,6 +114,14 @@ if __name__ == "__main__":
         print("[+] Mode:          Local SPAN (no Containerlab required)")
         print("[!] Capture needs CAP_NET_RAW / root on the mirror NIC.")
     print("=" * 70)
+
+    if not _is_loopback(args.host) and not os.environ.get("CYBERWORLD_API_TOKEN"):
+        os.environ["CYBERWORLD_API_TOKEN"] = secrets.token_urlsafe(24)
+    token = os.environ.get("CYBERWORLD_API_TOKEN", "")
+    if token:
+        print(f"[+] Access token required. Open: http://localhost:{args.port}/?token={token}")
+    if not _is_loopback(args.host):
+        print(f"[!] Binding {args.host}: reachable from other machines on this network.")
 
     dist_path = REPO_ROOT / "web_dashboard" / "dist" / "index.html"
     if not dist_path.exists():

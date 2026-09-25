@@ -1,0 +1,305 @@
+{
+ "policy_version": "1.0.0",
+ "frozen_utc": "2026-09-21T04:55:11.591795+00:00",
+ "rationale": "see data_unification/split_policy.py",
+ "stratified_by": "attack_fraction, round-robin 4:1:1",
+ "inventory": [
+  {
+   "dataset": "CIC2018",
+   "capture": "fri_16_csv.csv",
+   "rows": 1048575,
+   "attack_fraction": 0.573925
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "fri_23_csv.csv",
+   "rows": 1048575,
+   "attack_fraction": 0.00054
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "fri_2_csv.csv",
+   "rows": 1048575,
+   "attack_fraction": 0.272933
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "thu_15_csv.csv",
+   "rows": 1048575,
+   "attack_fraction": 0.050066
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "thu_1_csv.csv",
+   "rows": 331125,
+   "attack_fraction": 0.281126
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "thu_22_csv.csv",
+   "rows": 1048575,
+   "attack_fraction": 0.000345
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "tue_20_csv.csv",
+   "rows": 7948748,
+   "attack_fraction": 0.072488
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "wed_14_csv.csv",
+   "rows": 1048575,
+   "attack_fraction": 0.363302
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "wed_21_csv.csv",
+   "rows": 1048575,
+   "attack_fraction": 0.655883
+  },
+  {
+   "dataset": "CIC2018",
+   "capture": "wed_29_csv.csv",
+   "rows": 613104,
+   "attack_fraction": 0.112386
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
+   "rows": 225745,
+   "attack_fraction": 0.567131
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv",
+   "rows": 286467,
+   "attack_fraction": 0.554793
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Friday-WorkingHours-Morning.pcap_ISCX.csv",
+   "rows": 191033,
+   "attack_fraction": 0.010291
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Monday-WorkingHours.pcap_ISCX.csv",
+   "rows": 529918,
+   "attack_fraction": 0.0
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv",
+   "rows": 288602,
+   "attack_fraction": 0.000125
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
+   "rows": 458968,
+   "attack_fraction": 0.00475
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Tuesday-WorkingHours.pcap_ISCX.csv",
+   "rows": 445909,
+   "attack_fraction": 0.031027
+  },
+  {
+   "dataset": "CIC2017",
+   "capture": "Wednesday-workingHours.pcap_ISCX.csv",
+   "rows": 692703,
+   "attack_fraction": 0.364762
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "1/capture20110810.binetflow",
+   "rows": 2824636,
+   "attack_fraction": 0.014501
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "10/capture20110818.binetflow",
+   "rows": 1309791,
+   "attack_fraction": 0.081198
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "11/capture20110818-2.binetflow",
+   "rows": 107251,
+   "attack_fraction": 0.076121
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "12/capture20110819.binetflow",
+   "rows": 325471,
+   "attack_fraction": 0.006661
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "13/capture20110815-3.binetflow",
+   "rows": 1925149,
+   "attack_fraction": 0.020779
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "2/capture20110811.binetflow",
+   "rows": 1808122,
+   "attack_fraction": 0.011582
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "3/capture20110812.binetflow",
+   "rows": 4710638,
+   "attack_fraction": 0.005694
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "4/capture20110815.binetflow",
+   "rows": 1121076,
+   "attack_fraction": 0.002301
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "5/capture20110815-2.binetflow",
+   "rows": 129832,
+   "attack_fraction": 0.00694
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "6/capture20110816.binetflow",
+   "rows": 558919,
+   "attack_fraction": 0.008284
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "7/capture20110816-2.binetflow",
+   "rows": 114077,
+   "attack_fraction": 0.000552
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "8/capture20110816-3.binetflow",
+   "rows": 2954230,
+   "attack_fraction": 0.002074
+  },
+  {
+   "dataset": "CTU13",
+   "capture": "9/capture20110817.binetflow",
+   "rows": 2087508,
+   "attack_fraction": 0.088616
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "fri_16_pcap",
+   "rows": 0,
+   "attack_fraction": 0.573925
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "fri_23_pacap",
+   "rows": 0,
+   "attack_fraction": 0.00054
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "fri_2_pcap",
+   "rows": 0,
+   "attack_fraction": 0.272933
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "thu_15_pacap",
+   "rows": 0,
+   "attack_fraction": 0.050066
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "thu_1_pcap",
+   "rows": 0,
+   "attack_fraction": 0.281126
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "thu_22_pcap",
+   "rows": 0,
+   "attack_fraction": 0.000345
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "tue_20_pcap",
+   "rows": 0,
+   "attack_fraction": 0.072488
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "wed_14_pcap",
+   "rows": 0,
+   "attack_fraction": 0.363302
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "wed_21_pcap",
+   "rows": 0,
+   "attack_fraction": 0.655883
+  },
+  {
+   "dataset": "PCAP2018",
+   "capture": "wed_28_pcap",
+   "rows": 0,
+   "attack_fraction": 0.363302
+  }
+ ],
+ "assignment": {
+  "CIC2017": {
+   "Monday-WorkingHours.pcap_ISCX.csv": "train",
+   "Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv": "train",
+   "Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv": "train",
+   "Friday-WorkingHours-Morning.pcap_ISCX.csv": "train",
+   "Tuesday-WorkingHours.pcap_ISCX.csv": "val",
+   "Wednesday-workingHours.pcap_ISCX.csv": "test",
+   "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv": "train",
+   "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv": "train"
+  },
+  "CIC2018": {
+   "thu_22_csv.csv": "train",
+   "fri_23_csv.csv": "train",
+   "thu_15_csv.csv": "train",
+   "tue_20_csv.csv": "train",
+   "wed_29_csv.csv": "val",
+   "fri_2_csv.csv": "test",
+   "thu_1_csv.csv": "train",
+   "wed_14_csv.csv": "train",
+   "fri_16_csv.csv": "train",
+   "wed_21_csv.csv": "train"
+  },
+  "CTU13": {
+   "7/capture20110816-2.binetflow": "train",
+   "8/capture20110816-3.binetflow": "train",
+   "4/capture20110815.binetflow": "train",
+   "3/capture20110812.binetflow": "train",
+   "12/capture20110819.binetflow": "val",
+   "5/capture20110815-2.binetflow": "test",
+   "6/capture20110816.binetflow": "train",
+   "2/capture20110811.binetflow": "train",
+   "1/capture20110810.binetflow": "train",
+   "13/capture20110815-3.binetflow": "train",
+   "11/capture20110818-2.binetflow": "val",
+   "10/capture20110818.binetflow": "test",
+   "9/capture20110817.binetflow": "train"
+  },
+  "PCAP2018": {
+   "thu_22_pcap": "train",
+   "fri_23_pacap": "train",
+   "thu_15_pacap": "train",
+   "tue_20_pcap": "train",
+   "fri_2_pcap": "val",
+   "thu_1_pcap": "test",
+   "wed_14_pcap": "train",
+   "wed_28_pcap": "train",
+   "fri_16_pcap": "train",
+   "wed_21_pcap": "train"
+  }
+ }
+}

@@ -1,8 +1,10 @@
 {
-  "manifest_version": "1.0.0",
+  "manifest_version": "2.0.0",
+  "generated_by": "scripts/write_model_manifests.py",
+  "generated_utc": "2026-09-24T07:16:46.864018Z",
   "model_name": "branch_b_host_wdt",
-  "model_version": "1.0.0",
   "checkpoint_file": "host_wdt.pt",
+  "checkpoint_sha256": "26d06278fa8d0c077a53ee6b64ddd4f1231558f0de3a8333ca1f40e5e8663bf3",
   "architecture": {
     "model_type": "HostWorldDynamicsTransformer",
     "d_latent": 12,
@@ -17,24 +19,54 @@
       "aggregation": "peak_severity_max"
     }
   },
-  "feature_schema": {
-    "version": "1.0.0",
-    "tgne_latent_dim": 12,
-    "observable_only": true,
-    "zero_label_leakage": true
-  },
   "temporal_contract": {
-    "mode": "live_micro",
-    "delta_t_sec": 2.0,
-    "history_steps": 5,
-    "forecast_horizon_steps": 8,
-    "stabilize_horizon": true
+    "window_seconds": 2.0,
+    "history_steps": 15,
+    "forecast_steps": 5,
+    "forecast_step_seconds": 2.0,
+    "history_seconds": 30.0,
+    "forecast_seconds": 10.0,
+    "matches_authoritative_contract": false,
+    "authoritative_contract": {
+      "window_seconds": 2.0,
+      "history_steps": 15,
+      "forecast_steps": 5,
+      "forecast_window_seconds": 30.0,
+      "history_seconds": 30.0,
+      "forecast_seconds": 150.0,
+      "forecast_stride": 15
+    }
   },
-  "training_metadata": {
-    "dataset": "unified_telemetry_v3",
-    "split_policy": "ScientificSplitManager_disjoint_scenarios",
-    "random_seed": 42,
-    "optimizer": "AdamW",
-    "lr": 0.0005
-  }
+  "metrics": {
+    "selected_epoch": 1,
+    "validation": null,
+    "test": null,
+    "baselines": null,
+    "operating_point": null,
+    "not_recorded": [
+      "skill",
+      "mse_model",
+      "mse_persistence",
+      "risk_mae_model",
+      "risk_mae_zero"
+    ]
+  },
+  "credibility": {
+    "checked": false
+  },
+  "risk_target": null,
+  "provenance": {
+    "git": null,
+    "created_utc": null,
+    "command": null,
+    "dataset_sources": null,
+    "dependencies": null,
+    "fingerprint": null
+  },
+  "warnings": [
+    "Temporal contract differs from cyberworld_v4/config.py; the serving adapter refuses this checkpoint unless CYBERWORLD_ALLOW_CONTRACT_MISMATCH=1.",
+    "No credibility verdict recorded; metrics are unvalidated.",
+    "Legacy world state: models the 12-D TGNE latent only, not the 27-D state s(t) Branch A reads. Retrain for the current pipeline.",
+    "No per-epoch history: whether this world model beats persistence (copying the last embedding) was never measured for these weights."
+  ]
 }

@@ -1,5 +1,5 @@
 # ==============================================================================
-# CyberWorld — .gitignore
+# cyberworld — .gitignore
 # Excludes datasets, PCAPs, caches, secrets, node_modules, and local planning docs
 # ==============================================================================
 
@@ -43,6 +43,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
+# Demo-mode flag for the dashboard. Carries no secret — only
+# VITE_DEMO_MODE=true — and npm run demo does nothing without it.
+!web_dashboard/.env.demo
 .venv/
 venv/
 ENV/
@@ -103,10 +106,13 @@ checkpoints/*
 *.safetensors
 *.pkl
 *.pickle
-# Keep live Dual-Branch / DeepOP / TGNE checkpoints
-!saved_models/**/*.pt
+# Keep only the checkpoints the live app loads (see control_backend/model_adapter.py).
+# Listed explicitly so retrain/backup artifacts cannot silently reappear in the tree.
+!saved_models/branch_a/branch_a_lstm.pt
+!saved_models/branch_b/host_wdt.pt
+!saved_models/deepop/cwa_forecast_decoder.pt
+!bita/saved_models/bita_bigru_transformer-warden_alerts.pth
 !saved_models/**/*.manifest.json
-!bita/saved_models/**/*.pth
 
 # --- Logs, Temp & Scratch Directories ---
 logs/
@@ -150,3 +156,30 @@ Desktop.ini
 *.webm
 *.mov
 *.mkv
+
+# Transient training spill: memmapped feature blocks, 500MB+ each,
+# rewritten continuously by a live run. Never an artefact worth versioning.
+.spill/
+
+# Regenerable from scripts/make_parity_fixture.py; 21MB of replayed capture.
+captures/parity_states.jsonl
+.claude/worktrees/
+
+# --- Training outputs (results/) ---
+# results/ keeps what a run CONCLUDES: comparison.json/.md, per-run results
+# JSON, curve CSV/PNG, and the summary. Everything below is bulk, regenerable
+# or per-run state, and must never be committed:
+#   .ingest_cache/  parsed captures (~8.4 GB), rebuilt by `run_training_plan.sh warm`
+#   ingest/, store/ an encoder run's ingest scratch and out-of-core arrays
+#   .warm-scratch/  the warm stage's scratch
+#   *.npy/*.npz     column parts and memmapped stores
+# Checkpoints (*.pt/*.pth), logs (*.log, logs/) and .spill/ are ignored above.
+.ingest_cache/
+.shared_setup/
+.warm-scratch/
+results/**/ingest/
+results/**/store/
+*.npy
+*.npz
+*.memmap
+results/**/*.tmp-*

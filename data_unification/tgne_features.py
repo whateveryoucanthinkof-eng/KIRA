@@ -17,12 +17,24 @@ ground-truth labels (`is_attack`, `coarse_category`, `attck_technique_ids`).
 """
 
 from dataclasses import dataclass, field
+import os
 from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 
 from data_unification.host_attributes import HOST_ATTRIBUTES
 
-SCHEMA_VERSION: str = "1.0.0"
+#: Bump this whenever the VALUE at any index changes, not only when the width
+#: does. A checkpoint trained under one schema and served under another sees an
+#: input distribution it never learned, with no shape error to catch it --
+#: which is the failure mode `build_or_load_tgne_ta` refuses on.
+#:
+#: 2.0.0  dst_port is log-scaled instead of divided by 65535, and the host
+#:        attributes unique_peers / unique_dst_ports no longer saturate at 147
+#:        (data_unification/host_attributes.py). Both change every stored
+#:        feature value, so every checkpoint built under 1.0.0 must be
+#:        retrained; none can be loaded under this schema.
+#: 1.0.0  original canonical schema.
+SCHEMA_VERSION: str = "2.0.0"
 
 # Authoritative 12-D Edge Feature Names
 EDGE_FEATURE_NAMES: List[str] = [
@@ -36,7 +48,7 @@ EDGE_FEATURE_NAMES: List[str] = [
     "is_tcp",
     "is_udp",
     "is_icmp",
-    "dst_port_norm_65535",
+    "dst_port_log_norm",
     "directional_flow_asymmetry",
 ]
 
@@ -65,6 +77,72 @@ class TGNEFeatureSchema:
 SCHEMA: TGNEFeatureSchema = TGNEFeatureSchema()
 
 
+#: Edge features to zero out, by name, for ablation studies. Set via
+#: CYBERWORLD_ABLATE_EDGE_FEATURES as a comma-separated list of names from
+#: EDGE_FEATURE_NAMES. Empty (the default) changes nothing.
+#:
+#: ## Why this exists
+#:
+#: A reviewer asked how these twelve features were chosen and what makes them
+#: the right ones. The honest answer was that nothing in the repository
+#: justified them -- they are conventional NetFlow summaries, with no ablation
+#: and no importance analysis behind them.
+#:
+#: `dst_port_norm_65535` is the sharp end of that question. Several CIC-2018
+#: attack classes sit on fixed destination ports, so a model can learn
+#: "port => class" and score well without learning behaviour at all -- and
+#: that collapses the moment an attacker changes port. Zeroing one feature and
+#: re-measuring inductive AUC turns the question into a number.
+#:
+#: Zeroing rather than removing keeps the 12-D contract intact, so an ablated
+#: encoder still loads everywhere a normal one does and the comparison is not
+#: confounded by an architecture change.
+def _ablation_mask() -> "np.ndarray | None":
+    raw = os.environ.get("CYBERWORLD_ABLATE_EDGE_FEATURES", "").strip()
+    if not raw:
+        return None
+    wanted = [n.strip() for n in raw.split(",") if n.strip()]
+    unknown = [n for n in wanted if n not in EDGE_FEATURE_NAMES]
+    if unknown:
+        raise ValueError(
+            f"unknown edge feature(s) to ablate: {unknown}. "
+            f"Valid names: {EDGE_FEATURE_NAMES}")
+    mask = np.ones(len(EDGE_FEATURE_NAMES), dtype=np.float32)
+    for n in wanted:
+        mask[EDGE_FEATURE_NAMES.index(n)] = 0.0
+    return mask
+
+
+_ABLATION_MASK = None
+_ABLATION_READ = False
+
+
+def ablated_edge_features() -> list:
+    """Names of the edge features this process zeroes. [] when none."""
+    mask = ablation_mask()
+    if mask is None:
+        return []
+    return [n for n, m in zip(EDGE_FEATURE_NAMES, mask) if m == 0.0]
+
+
+def ablation_mask():
+    """Cached so the env var is read once, not once per flow record."""
+    global _ABLATION_MASK, _ABLATION_READ
+    if not _ABLATION_READ:
+        _ABLATION_MASK = _ablation_mask()
+        _ABLATION_READ = True
+        if _ABLATION_MASK is not None:
+            dropped = [n for n, m in zip(EDGE_FEATURE_NAMES, _ABLATION_MASK) if m == 0.0]
+            print(f"EDGE FEATURE ABLATION ACTIVE: zeroing {dropped}", flush=True)
+    return _ABLATION_MASK
+
+
+def reset_ablation_cache():
+    """For tests, which change the env var between cases."""
+    global _ABLATION_MASK, _ABLATION_READ
+    _ABLATION_MASK, _ABLATION_READ = None, False
+
+
 def extract_canonical_edge_features(
     fwd_bytes: float,
     bwd_bytes: float,
@@ -91,11 +169,32 @@ def extract_canonical_edge_features(
     feat[7] = 1.0 if int(protocol) == 6 else 0.0
     feat[8] = 1.0 if int(protocol) == 17 else 0.0
     feat[9] = 1.0 if int(protocol) == 1 else 0.0
-    feat[10] = np.float32(min(65535, max(0, int(dst_port))) / 65535.0)
+    # Log-scaled, not dst_port/65535.
+    #
+    # The linear form put every service anyone cares about in the bottom 1% of
+    # the range: 22 -> 0.00034, 53 -> 0.00081, 80 -> 0.00122, 443 -> 0.00676,
+    # 3389 -> 0.05. The three most informative destinations in the corpus were
+    # separated by less than a thousandth of the feature's range, while two
+    # meaningless ephemeral ports 40000 apart were separated by 0.6 -- so the
+    # single most discriminative attribute of a flow arrived at the encoder as
+    # near-constant noise.
+    #
+    # A port is really categorical and the honest encoding is an embedding or a
+    # set of indicator features, which needs slots this 12-D contract does not
+    # have. Log scaling is the best available use of ONE slot: it spreads the
+    # well-known range (22 -> 0.28, 53 -> 0.36, 80 -> 0.41, 443 -> 0.56,
+    # 3389 -> 0.73) while still compressing the ephemeral range, and it is
+    # monotone, so nothing downstream that assumed ordering breaks.
+    feat[10] = np.float32(
+        np.log1p(min(65535, max(0, int(dst_port)))) / np.log1p(65535.0))
 
     # Feature 11: Directional flow asymmetry in [-1.0, 1.0]
     tot_bytes = max(0.0, float(fwd_bytes)) + max(0.0, float(bwd_bytes))
     feat[11] = np.float32((float(fwd_bytes) - float(bwd_bytes)) / (tot_bytes + 1e-5))
+
+    _m = ablation_mask()
+    if _m is not None:
+        feat *= _m
     return feat
 
 
@@ -135,8 +234,13 @@ def build_scoped_host_id(
     capture_id: Optional[str] = None,
 ) -> str:
     """
-    Builds a globally unique, scoped host identifier to prevent IP collisions across datasets.
-    Example: 'cicids2017:Friday_DDoS:192.168.10.50'
+    Builds a scoped host identifier, e.g. 'cicids2017:Friday_DDoS:192.168.10.50'.
+
+    Unused. The trainers scope hosts with TrajectoryStoreBuilder.set_namespace
+    and trajectory_store.capture_namespace(path) instead, which is keyed by the
+    capture file itself. If this is ever wired in, `scenario_id` must be unique
+    per capture: the CIC-2018 adapter does not set one, and a shared value
+    would merge the same address across days again.
     """
     clean_src = str(dataset_source).strip().lower()
     clean_scen = str(scenario_id).strip()

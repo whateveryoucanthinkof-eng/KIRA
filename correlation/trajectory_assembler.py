@@ -12,7 +12,12 @@ from enum import Enum
 import numpy as np
 import torch
 import torch.nn.functional as F
-from data_unification.temporal_config import MACRO_WINDOW_SIZE_SEC, DEFAULT_ROLLOUT_HORIZON_MACRO
+# The assembler feeds the real Branch A / Branch B / DeepOP checkpoints, so its
+# defaults must be the contract's, not the unsupported 60s MACRO granularity it
+# used to default to (K=4, 60s windows, 10/5 history -- all four wrong).
+from cyberworld_v4.config import get_contract
+
+_CONTRACT = get_contract()
 
 
 class Provenance(str, Enum):
@@ -71,12 +76,21 @@ class AttackTrajectoryAssembler:
         risk_head,
         deepop_decoder,
         device: str = "cpu",
+        risk_target: str = "severity",
     ):
         self.branch_a = branch_a_model.to(device)
         self.wdt = wdt_model.to(device)
         self.risk_head = risk_head.to(device)
         self.deepop = deepop_decoder.to(device)
         self.device = device
+        #: Which target Branch B's risk head was trained against. Decides how
+        #: per-step risks are reduced to one number -- see the comment at the
+        #: reduction site. Defaults to "severity", the current training
+        #: default, so behaviour is unchanged unless a hazard-trained
+        #: checkpoint says otherwise.
+        if risk_target not in ("severity", "hazard"):
+            raise ValueError(f"risk_target must be 'severity' or 'hazard', got {risk_target!r}")
+        self.risk_target = risk_target
 
         self.branch_a.eval()
         self.wdt.eval()
@@ -87,10 +101,10 @@ class AttackTrajectoryAssembler:
         self,
         host_trajectories: Dict[str, list],
         batch_size: int = 128,
-        K: int = DEFAULT_ROLLOUT_HORIZON_MACRO,
-        window_size_sec: float = MACRO_WINDOW_SIZE_SEC,
-        max_seq_len_a: int = 10,
-        max_seq_len_wdt: int = 5,
+        K: int = None,
+        window_size_sec: float = None,
+        max_seq_len_a: int = None,
+        max_seq_len_wdt: int = None,
         lateral_pairs: Optional[List[Tuple[str, str]]] = None,
     ) -> Dict[str, HostAttackTrajectory]:
         """
@@ -99,6 +113,14 @@ class AttackTrajectoryAssembler:
         achieving up to ~89x throughput acceleration.
         """
         from branch_a_gnn_lstm.sequence_dataset import TECHNIQUE_VOCAB
+
+        # Resolve against the contract. Branch A is trained with
+        # seq_len=history_steps (15) and Branch B with the same history, so the
+        # previous literals silently truncated both at serving time.
+        K = _CONTRACT.forecast_steps if K is None else K
+        window_size_sec = _CONTRACT.window_seconds if window_size_sec is None else window_size_sec
+        max_seq_len_a = _CONTRACT.history_steps if max_seq_len_a is None else max_seq_len_a
+        max_seq_len_wdt = _CONTRACT.history_steps if max_seq_len_wdt is None else max_seq_len_wdt
 
         results: Dict[str, HostAttackTrajectory] = {}
         items = list(host_trajectories.items())
@@ -127,27 +149,63 @@ class AttackTrajectoryAssembler:
 
             # Pre-allocate numpy batch buffers
             x_batch = np.zeros((B, max_la, 27), dtype=np.float32)
-            mask_batch = np.ones((B, max_la), dtype=bool)  # True = padded
             h_hist_batch = np.zeros((B, max_lw, 12), dtype=np.float32)
+            t_hist_batch = np.zeros((B, max_lw), dtype=np.float32)
+            t_a_batch = np.zeros((B, max_la), dtype=np.float32)   # Branch A history times
 
+            # LEFT-pad, because that is what training does.
+            #
+            # branch_a_gnn_lstm/sequence_dataset.py builds every training window
+            # as `padding + feature_vectors` (and LazyHostSequenceDataset as
+            # `concatenate([pad, feats])`) -- zeros FIRST, the host's most
+            # recent step LAST -- and passes no mask, so attention pools over
+            # the pad positions too. This wrote `x_batch[i, j]` from j=0 and
+            # left the tail zero, i.e. right-padding, then masked the tail out.
+            # Both halves of that differ from training.
+            #
+            # It mattered most for Branch B. h_hist was right-padded as well,
+            # so for any host with fewer snapshots than the longest host in its
+            # minibatch the LAST history step -- the state the autoregressive,
+            # residual-delta rollout starts from -- was the zero vector.
+            # Measured with a 3-snapshot host batched against a 15-snapshot
+            # host: |h[short, -1]| = 0.0 against |h[long, -1]| = 18.0. That host
+            # was forecast from the origin rather than from where it actually
+            # was, and nothing reported it.
             for i, (_, snaps) in enumerate(chunk):
                 recent_a = snaps[-max_seq_len_a:]
                 recent_w = snaps[-max_seq_len_wdt:]
-                la = len(recent_a)
-                lw = len(recent_w)
+                off_a = max_la - len(recent_a)
+                off_w = max_lw - len(recent_w)
                 for j, s in enumerate(recent_a):
-                    x_batch[i, j] = np.concatenate([s.embedding, s.temporal_attrs])
-                    mask_batch[i, j] = False
+                    x_batch[i, off_a + j] = np.concatenate([s.embedding, s.temporal_attrs])
+                if recent_a:
+                    _a0 = float(recent_a[-1].window_start)
+                    _ta = [float(s.window_start) - _a0 for s in recent_a]
+                    t_a_batch[i, off_a:] = _ta
+                    t_a_batch[i, :off_a] = _ta[0]
                 for j, s in enumerate(recent_w):
-                    h_hist_batch[i, j] = s.embedding
+                    h_hist_batch[i, off_w + j] = s.embedding
+                # Real elapsed seconds relative to the latest snapshot, in the
+                # convention Branch B is trained with (<= 0, last entry 0).
+                # Left-padded slots repeat the earliest real time.
+                if recent_w:
+                    _t0 = float(recent_w[-1].window_start)
+                    _ts = [float(s.window_start) - _t0 for s in recent_w]
+                    t_hist_batch[i, off_w:] = _ts
+                    t_hist_batch[i, :off_w] = _ts[0]
 
             x_tensor = torch.from_numpy(x_batch).to(self.device)
-            mask_tensor = torch.from_numpy(mask_batch).to(self.device)
             h_hist_tensor = torch.from_numpy(h_hist_batch).to(self.device)
+            t_hist_tensor = torch.from_numpy(t_hist_batch).to(self.device)
 
             with torch.no_grad():
-                # 1. Branch A: Batched forward pass
-                branch_a_out = self.branch_a(x_tensor, mask=mask_tensor)
+                # 1. Branch A: Batched forward pass.
+                #    No mask: training passes none (train_branch_a.py never
+                #    builds one), so the weights were fitted with attention
+                #    over the zero-pad positions. Masking them at serving time
+                #    is a different function from the one that was trained.
+                branch_a_out = self.branch_a(
+                    x_tensor, t_history=torch.from_numpy(t_a_batch).to(self.device))
                 obs_risks = branch_a_out["risk_score"].cpu().numpy()  # [B]
                 obs_tech_probs = F.softmax(branch_a_out["technique_logits"], dim=-1)
                 obs_tech_indices = obs_tech_probs.argmax(dim=-1).cpu().numpy()  # [B]
@@ -166,13 +224,39 @@ class AttackTrajectoryAssembler:
                 ]
                 obs_t_tensor = torch.tensor(obs_token_ids, dtype=torch.long, device=self.device)
 
-                h_future = self.wdt.rollout(h_hist_tensor, K=K, delta_t_step=window_size_sec)  # [B, K, d_latent]
+                # Real history spacing -- Branch B is trained on it (median gap
+                # 14 s, not the 2 s grid). t_future stays None: the uniform grid
+                # IS the question being asked, "+2, +4, ... +10 s from now".
+                h_future = self.wdt.rollout(h_hist_tensor, K=K, delta_t_step=window_size_sec,
+                                            t_history=t_hist_tensor)  # [B, K, d_latent]
                 step_risks, cumul_risks = self.risk_head.forward_trajectory(h_future)  # [B, K], [B]
                 step_risks_np = step_risks.cpu().numpy()  # [B, K]
-                cumul_risks_np = cumul_risks.cpu().numpy()  # [B]
+                # Which aggregation is correct depends on what the head was
+                # trained against, so it is read from the checkpoint rather
+                # than assumed.
+                #
+                # `1 - prod(1-r)` is the discrete-survival identity, exact
+                # when each step is an INDEPENDENT conditional hazard -- true
+                # of the severity target. Under the hazard target it is wrong:
+                # exp(-dt/tau) at k=1..K are K correlated restatements of one
+                # event's proximity, not K independent draws, so the product
+                # compounds the same evidence K times. Measured with exact
+                # ground-truth hazards and a perfect predictor: an attack four
+                # windows PAST the horizon yields cumulative 0.854 when the
+                # truth is 0. peak() is the right reduction there.
+                if getattr(self, "risk_target", "severity") == "hazard":
+                    cumul_risks_np = step_risks_np.max(axis=1)  # [B]
+                else:
+                    cumul_risks_np = cumul_risks.cpu().numpy()  # [B]
 
-                pred_tokens, decoded_names = self.deepop.forecast_sequence(
-                    h_future, max_steps=K, observed_token=obs_t_tensor
+                # Ask for the decoder's own per-step probabilities. Without
+                # them the forecast confidence below was a hardcoded decay that
+                # never looked at the model.
+                pred_tokens, decoded_names, _attack_p, step_token_probs = (
+                    self.deepop.forecast_sequence(
+                        h_future, max_steps=K, observed_token=obs_t_tensor,
+                        return_probs=True,
+                    )
                 )
 
             # Unpack batch results into HostAttackTrajectory instances
@@ -196,6 +280,7 @@ class AttackTrajectoryAssembler:
                 last_t = snaps[-1].window_start
                 last_win = snaps[-1].window_idx
 
+                host_token_probs = step_token_probs[i] if step_token_probs else []
                 for k in range(K):
                     coarse, tech = decoded_names[i][k]
                     step_r = float(step_risks_np[i, k])
@@ -206,8 +291,23 @@ class AttackTrajectoryAssembler:
                             timestamp=last_t + (k + 1) * window_size_sec,
                             provenance=Provenance.FORECAST.value,
                             coarse_category=coarse,
-                            technique_id=tech if tech else "T1071",
-                            confidence=max(0.4, 0.9 - 0.1 * k),
+                            # An empty technique means the decoder emitted a
+                            # category with no technique. Calling that "T1071"
+                            # (Application Layer Protocol, i.e. C2) labelled an
+                            # unknown forecast as command-and-control, which is
+                            # a specific and alarming claim to invent.
+                            technique_id=tech if tech else "",
+                            # The decoder's own probability for the token it
+                            # emitted. This was `max(0.4, 0.9 - 0.1 * k)` -- a
+                            # fixed decay from 0.9 that never consulted the
+                            # model, so step 0 of every forecast for every host
+                            # was reported at 90% confidence. (The untrained MLP
+                            # edge scorer that read it as a feature was removed.)
+                            confidence=(
+                                float(host_token_probs[k])
+                                if k < len(host_token_probs)
+                                else 0.0
+                            ),
                             risk_score=step_r,
                         )
                     )
@@ -225,12 +325,24 @@ class AttackTrajectoryAssembler:
         self,
         host_ip: str,
         observed_snapshots: list,  # List[HostWindowSnapshot]
-        K: int = 4,
-        window_size_sec: float = 60.0,
+        K: int = None,
+        window_size_sec: float = None,
     ) -> HostAttackTrajectory:
         """
         Assembles trajectory for a single host (backward-compatible convenience wrapper).
+
+        The defaults are the contract's. They were `K=4, window_size_sec=60.0`
+        -- the unsupported MACRO granularity that the batch entry point above
+        was already fixed to stop defaulting to. No model in this repository is
+        trained at 60 s, so this wrapper produced a 4-step forecast with its
+        steps timestamped 60 s apart from weights fitted for 5 steps at 2 s:
+        the returned timeline claimed to reach 240 s ahead when the models can
+        see 10 s.
         """
+        K = _CONTRACT.forecast_steps if K is None else K
+        window_size_sec = (
+            _CONTRACT.window_seconds if window_size_sec is None else window_size_sec
+        )
         batch_res = self.assemble_trajectories_batch(
             {host_ip: observed_snapshots},
             batch_size=1,

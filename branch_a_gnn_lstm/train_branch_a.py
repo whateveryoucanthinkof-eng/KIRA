@@ -28,6 +28,8 @@ from branch_a_gnn_lstm.sequence_dataset import (
     TECHNIQUE_VOCAB,
 )
 from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
+from cyberworld_v4.config import get_contract
+from data_unification.tgne_features import SCHEMA_VERSION
 
 
 def load_sample_multi_dataset_records(max_per_source: int = 500):
@@ -58,6 +60,25 @@ def load_sample_multi_dataset_records(max_per_source: int = 500):
     return records
 
 
+class StaleEncoderArchitecture(RuntimeError):
+    """A TGNE checkpoint whose architecture predates the current model.
+
+    Distinct from a contract mismatch (right shapes, wrong temporal
+    granularity): here the weights cannot be loaded at all.
+    """
+
+
+# The encoder retrained 2026-09-21 on CIC-2017 + CIC-2018 + CTU-13 at full
+# density: inductive test AUC 0.9626, transductive 0.9972, macro F1 0.8405.
+# Paths are resolved relative to the repo root so a different cwd still finds
+# them.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CANONICAL_TGNE_CHECKPOINT = os.path.join(
+    _REPO_ROOT, "saved_models", "bita_bigru_transformer-unified_final.pth")
+LEGACY_TGNE_CHECKPOINT = os.path.join(
+    _REPO_ROOT, "bita", "saved_models", "bita_bigru_transformer-warden_alerts.pth")
+
+
 def build_or_load_tgne_ta(
     config_path: str = "bita/saved_models/bita_config.json",
     checkpoint_path: Optional[str] = None,
@@ -67,7 +88,27 @@ def build_or_load_tgne_ta(
     Fails loudly if checkpoint or configuration differs.
     """
     checkpoint_path = checkpoint_path or os.environ.get("TGNE_CHECKPOINT_PATH")
-    ckpt_path = checkpoint_path or "bita/saved_models/bita_bigru_transformer-warden_alerts.pth"
+    if not checkpoint_path:
+        # Resolution order: explicit argument, then TGNE_CHECKPOINT_PATH, then
+        # the canonical retrained encoder, then the legacy Warden checkpoint.
+        #
+        # The canonical entry is not cosmetic. Six call sites -- including
+        # control_backend/model_adapter.py, the live serving path -- call this
+        # with no argument, and every one of them used to land on the Warden
+        # checkpoint. That checkpoint predates the edge-aware category head:
+        # its head was a single Linear over summed node embeddings, so it could
+        # not see the flow it was classifying and collapsed to one class. Branch
+        # A is trained against the retrained encoder, so leaving the default on
+        # Warden means training and serving disagree about the encoder.
+        #
+        # The legacy path is kept last so an install without the retrained file
+        # still reports the familiar StaleEncoderArchitecture rather than a
+        # bare FileNotFoundError.
+        for _cand in (CANONICAL_TGNE_CHECKPOINT, LEGACY_TGNE_CHECKPOINT):
+            if os.path.exists(_cand):
+                checkpoint_path = _cand
+                break
+    ckpt_path = checkpoint_path or LEGACY_TGNE_CHECKPOINT
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"TGNE-TA checkpoint not found at: {ckpt_path}")
 
@@ -85,6 +126,10 @@ def build_or_load_tgne_ta(
         "num_categories": 4,
         "edge_feat_dim": 12,
         "node_feat_dim": 12,
+        # bita/train.py defaults, which every encoder predating these config
+        # keys was trained with.
+        "n_neighbors": 10,
+        "neighbor_sampling": "most_recent",
     }
     if checkpoint_path:
         config_path = os.path.splitext(checkpoint_path)[0] + "_config.json"
@@ -93,15 +138,62 @@ def build_or_load_tgne_ta(
         with open(config_path, "r") as f:
             loaded_cfg = json.load(f)
             config.update({k: v for k, v in loaded_cfg.items() if k in config})
-            if loaded_cfg.get("feature_schema_version") != "1.0.0":
-                raise ValueError("TGNE checkpoint has no supported canonical feature schema")
+            _want = SCHEMA_VERSION
+            _got = loaded_cfg.get("feature_schema_version")
+            if _got != _want:
+                # Not cosmetic. A schema bump means the VALUES changed, so the
+                # encoder would receive an input distribution it never saw --
+                # with matching shapes and no error anywhere. Refusing here is
+                # the only place that can catch it.
+                raise ValueError(
+                    f"TGNE checkpoint {ckpt_path} was trained under feature "
+                    f"schema {_got!r}; this tree is {_want!r}.\n\n"
+                    f"What changed in 2.0.0: dst_port is log-scaled instead of "
+                    f"divided by 65535, and the unique_peers / unique_dst_ports "
+                    f"host attributes no longer saturate at 147. Every stored "
+                    f"feature value is different, so the encoder must be "
+                    f"retrained -- there is no conversion.\n\n"
+                    f"Retrain:  see claude_latest_analysis/16_downstream_retrain_runbook.md"
+                )
             if loaded_cfg.get("edge_feat_dim") != 12 or loaded_cfg.get("node_feat_dim") != 12:
                 raise ValueError("TGNE checkpoint dimensions do not match the canonical 12-D contract")
+            # Edge-feature ablation (CYBERWORLD_ABLATE_EDGE_FEATURES) zeroes
+            # features at extraction time, for training AND serving. An encoder
+            # trained with dst_port zeroed and served with it present (or the
+            # reverse) sees an input distribution it never saw, with matching
+            # shapes and no error. Configs that predate the field were trained
+            # with nothing ablated.
+            from data_unification.tgne_features import ablated_edge_features
+            _trained = sorted(loaded_cfg.get("ablated_edge_features") or [])
+            _serving = sorted(ablated_edge_features())
+            if _trained != _serving:
+                raise ValueError(
+                    f"TGNE checkpoint {ckpt_path} was trained with edge features "
+                    f"{_trained or 'none'} ablated, but this process ablates "
+                    f"{_serving or 'none'} (CYBERWORLD_ABLATE_EDGE_FEATURES). "
+                    f"Set the variable to match the checkpoint.")
+            # And the IP node features (CYBERWORLD_ABLATE_NODE_FEATURES).
+            from data_unification.ip_features import ablated_node_features
+            _trained_n = sorted(loaded_cfg.get("ablated_node_features") or [])
+            _serving_n = sorted(ablated_node_features())
+            if _trained_n != _serving_n:
+                raise ValueError(
+                    f"TGNE checkpoint {ckpt_path} was trained with node features "
+                    f"{_trained_n or 'none'} ablated, but this process ablates "
+                    f"{_serving_n or 'none'} (CYBERWORLD_ABLATE_NODE_FEATURES). "
+                    f"Set the variable to match the checkpoint.")
 
     n_nodes = 5000
     adj_list = [[] for _ in range(n_nodes)]
     ngh_finder = NeighborFinder(adj_list, uniform=True)
 
+    # Placeholder only: HostTrajectoryExtractor.extract_trajectories replaces
+    # node_raw_features with real intrinsic IP features for the hosts actually
+    # present (data_unification/ip_features.py). Left zero here because no IP
+    # map exists yet at construction time -- but if a caller ever runs the
+    # encoder WITHOUT going through the extractor, it would be feeding zeros to
+    # a model trained on IP features, so this stays a documented placeholder
+    # rather than a silent default.
     node_feats = np.zeros((n_nodes, config["node_feat_dim"]), dtype=np.float32)
     edge_feats = np.zeros((10000, config["edge_feat_dim"]), dtype=np.float32)
 
@@ -124,9 +216,85 @@ def build_or_load_tgne_ta(
     )
 
     state_dict = torch.load(ckpt_path, map_location="cpu")
-    tgn.load_state_dict(state_dict, strict=True)
+    # A memory-enabled encoder saves its per-node memory rows, sized to the
+    # training graph's node count. They are runtime state, not weights:
+    # extraction and serving reset memory per capture/session and grow the
+    # table as hosts appear. Keep this model's own (empty) rows so the strict
+    # load checks every real weight.
+    _own = tgn.state_dict()
+    for _k in list(state_dict):
+        if _k.endswith("memory.memory") or _k.endswith("memory.last_update"):
+            state_dict[_k] = _own[_k]
+    try:
+        tgn.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        # The category head changed shape: it used to be a single Linear over
+        # `src_emb + dst_emb` (12-D, direction-blind, edge-blind) and is now an
+        # MLP over [src ; dst ; edge_features]. The old head could not see the
+        # flow at all, so it collapsed to predicting one class for everything.
+        #
+        # Say that plainly instead of surfacing a raw state_dict diff.
+        msg = str(exc)
+
+        # Distinguish two very different failures that both mention
+        # category_predictor:
+        #
+        #   a) SHAPE of the final layer differs -> num_categories mismatch,
+        #      which means the config JSON is missing or wrong. The fix is to
+        #      write one (scripts/write_encoder_config.py), NOT to retrain.
+        #   b) the layer NAMES differ (category_predictor.weight vs
+        #      category_predictor.0.weight) -> the checkpoint predates the
+        #      edge-aware head and genuinely needs a retrain.
+        #
+        # The original message said "predates the edge-aware category head"
+        # for both, which sends someone to retrain an encoder that only needed
+        # a 400-byte JSON file beside it.
+        if "size mismatch for category_predictor" in msg:
+            import re as _re
+            want = _re.search(r"shape torch\.Size\(\[(\d+)\]\) from checkpoint", msg)
+            got = _re.search(r"current model is torch\.Size\(\[(\d+)\]\)", msg)
+            raise StaleEncoderArchitecture(
+                f"TGNE checkpoint {ckpt_path} was trained with "
+                f"{want.group(1) if want else '?'} categories but this loader built "
+                f"{got.group(1) if got else '?'}.\n\n"
+                f"The architecture is fine -- the config JSON is missing or stale. "
+                f"build_or_load_tgne_ta reads '<checkpoint>_config.json' and falls "
+                f"back to num_categories=4 when it is absent.\n\n"
+                f"Fix:  python scripts/write_encoder_config.py {ckpt_path}\n\n"
+                f"Underlying: {exc}"
+            ) from exc
+
+        if "category_predictor" in msg:
+            raise StaleEncoderArchitecture(
+                f"TGNE checkpoint {ckpt_path} predates the edge-aware category "
+                f"head. The old head was a single Linear on summed node "
+                f"embeddings, which could not distinguish two flows between the "
+                f"same pair of hosts and collapsed to a constant prediction. "
+                f"Retrain the encoder (see claude_latest_analysis/"
+                f"16_downstream_retrain_runbook.md).\n\nUnderlying: {exc}"
+            ) from exc
+        raise
     tgn.eval()
+    _attach_neighbor_sampling(tgn, config)
     return tgn
+
+
+def _attach_neighbor_sampling(tgn, config: Dict[str, Any]) -> None:
+    """Carry the training-time neighbour sampling onto the model for serving.
+
+    HostTrajectoryExtractor used a literal n_neighbors=10 with most-recent
+    sampling, which matched bita/train.py's defaults by coincidence rather than
+    by construction. It now reads these attributes, so an encoder trained with
+    another --n_degree or --uniform is served the way it was trained.
+    """
+    sampling = config.get("neighbor_sampling", "most_recent")
+    if sampling not in ("most_recent", "uniform"):
+        raise ValueError(f"unknown neighbor_sampling {sampling!r} in the encoder config")
+    n = int(config.get("n_neighbors", 10))
+    if n < 1:
+        raise ValueError(f"n_neighbors must be >= 1, got {n}")
+    tgn.serving_n_neighbors = n
+    tgn.serving_neighbor_uniform = sampling == "uniform"
 
 
 
@@ -147,12 +315,17 @@ def train_branch_a(
 
     # Extract dynamic graph & host trajectories for train partition
     tgn = build_or_load_tgne_ta()
-    extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=60.0)
+    # Contract-bound. This was hardcoded to 60.0 while the shipped checkpoints
+    # and live inference ran at 2.0s, so this trainer could not reproduce them.
+    # The window now comes from the single source of truth.
+    extractor = HostTrajectoryExtractor(
+        tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds
+    )
     print("Extracting per-host trajectories with TGNE-TA embeddings for train partition...")
     train_trajectories = extractor.extract_trajectories(train_records)
     print(f"Active train hosts tracked: {len(train_trajectories)}")
 
-    train_samples = create_host_sequence_samples(train_trajectories, seq_len=5, min_trajectory_len=1)
+    train_samples = create_host_sequence_samples(train_trajectories, seq_len=get_contract().history_steps, min_trajectory_len=1)
     print(f"Total train sequence samples: {len(train_samples)}")
     if len(train_samples) < 10:
         print("Warning: Few train samples created. Duplicating for robust mini-batch training.")
@@ -163,13 +336,13 @@ def train_branch_a(
     val_trajectories = extractor.extract_trajectories(val_records)
     print(f"Active val hosts tracked: {len(val_trajectories)}")
 
-    val_samples = create_host_sequence_samples(val_trajectories, seq_len=5, min_trajectory_len=1)
+    val_samples = create_host_sequence_samples(val_trajectories, seq_len=get_contract().history_steps, min_trajectory_len=1)
     print(f"Total val sequence samples: {len(val_samples)}")
     if len(val_samples) < 5:
         val_samples = val_samples * 5
 
-    train_set = HostSequenceDataset(train_samples, seq_len=5)
-    val_set = HostSequenceDataset(val_samples, seq_len=5)
+    train_set = HostSequenceDataset(train_samples, seq_len=get_contract().history_steps)
+    val_set = HostSequenceDataset(val_samples, seq_len=get_contract().history_steps)
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)

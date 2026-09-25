@@ -4,7 +4,6 @@ Allowlisted executor driving the real Containerlab cyber-range in the monorepo r
 Attacks are external: ARM marks that an outside campaign is expected; no simulated flows.
 """
 
-from datetime import datetime
 import logging
 import subprocess
 import threading
@@ -18,7 +17,7 @@ from control_backend.lab_config import (
     WORKSTATION_CONTAINERS,
 )
 from control_backend.site_config import get_site_config
-from control_backend.schema import CommandEvent, AttackEvent
+from control_backend.schema import CommandEvent, AttackEvent, utc_now_iso
 from control_backend.telemetry_service import telemetry_service
 from control_backend.topology_service import topology_service
 
@@ -26,7 +25,7 @@ logger = logging.getLogger("antigravity.commands")
 
 ALLOWED_COMMANDS = {
     "build_environment": {
-        "description": "Build CyberWorld node container image",
+        "description": "Build cyberworld node container image",
         "cmd": ["./scripts/build.sh"],
     },
     "start_network": {
@@ -173,7 +172,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_started",
                     command=cmd_name,
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     line=f"[*] Executing {cmd_name}...",
                 )
             )
@@ -182,7 +181,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_completed",
                     command=cmd_name,
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     exit_code=0,
                     success=True,
                     line=f"[✓] {cmd_name} completed successfully.",
@@ -194,7 +193,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_completed",
                     command=cmd_name,
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     exit_code=1,
                     success=False,
                     line=f"[✗] Error: {e}",
@@ -211,7 +210,7 @@ class CommandExecutor:
             CommandEvent(
                 type="command_started",
                 command=cmd_name,
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line=f"Executing operation: {cfg['description']}...",
             )
         )
@@ -237,7 +236,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_output",
                     command=cmd_name,
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     line=f"[ERROR] {e}",
                 )
             )
@@ -249,7 +248,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_completed",
                     command=cmd_name,
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     exit_code=exit_code,
                     success=success,
                     line=f"Operation '{cmd_name}' finished with exit code {exit_code}.",
@@ -275,7 +274,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_output",
                     command=cmd_name,
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     line=line,
                 )
             )
@@ -306,7 +305,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_output",
                     command="start_normal_traffic",
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     line=f"[+] Started workload on {container}: {' '.join(profile_args)}",
                 )
             )
@@ -323,7 +322,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_output",
                     command="stop_normal_traffic",
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     line=f"[-] Terminated workloads in {container}",
                 )
             )
@@ -347,7 +346,7 @@ class CommandExecutor:
             CommandEvent(
                 type="command_output",
                 command="start_attack",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line=(
                     "[⚔️ EXTERNAL MODE] Dashboard armed for outside traffic. "
                     f"{hint} No simulated campaign is launched."
@@ -359,7 +358,7 @@ class CommandExecutor:
                 CommandEvent(
                     type="command_output",
                     command="start_attack",
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                    timestamp=utc_now_iso(),
                     line="[!] Tip: start sensor + ML so SPAN traffic is observed.",
                 )
             )
@@ -379,7 +378,7 @@ class CommandExecutor:
             CommandEvent(
                 type="command_output",
                 command="stop_attack",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line="[-] External attack monitoring disarmed.",
             )
         )
@@ -417,7 +416,7 @@ class CommandExecutor:
             CommandEvent(
                 type="command_output",
                 command="reset_environment",
-                timestamp=datetime.utcnow().isoformat() + "Z",
+                timestamp=utc_now_iso(),
                 line="[✓] Environment reset: external armed cleared, topology cleared, ML standby.",
             )
         )

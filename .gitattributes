@@ -1,0 +1,7 @@
+# Keep the repository LF. A Windows copy of this tree once flipped 45 files to
+# CRLF, which breaks the shell scripts on the Linux training machine
+# ($'': command not found) and turns every line of a file into a diff.
+* text=auto eol=lf
+*.pt binary
+*.pth binary
+*.pcap binary

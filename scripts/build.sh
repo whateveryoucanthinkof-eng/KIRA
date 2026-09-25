@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 echo "================================================================="
-echo "BUILDING CYBERWORLD CONTAINER IMAGE (localhost/cyberworld-node:latest)"
+echo "BUILDING cyberworld CONTAINER IMAGE (localhost/cyberworld-node:latest)"
 echo "================================================================="
 
 cd "${ROOT_DIR}"

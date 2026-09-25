@@ -1,38 +1,146 @@
 {
-  "manifest_version": "1.0.0",
+  "manifest_version": "2.0.0",
+  "generated_by": "scripts/write_model_manifests.py",
+  "generated_utc": "2026-09-24T07:16:46.854503Z",
   "model_name": "branch_a_multitask_lstm",
-  "model_version": "1.1.0-live-retrained",
   "checkpoint_file": "branch_a_lstm.pt",
+  "checkpoint_sha256": "04e1e01fb98b46636646e70a2a5f3c5f650dda0516017caf5ae847aea926c4c7",
   "architecture": {
     "model_type": "MultiTaskLSTM",
     "input_dim": 27,
     "hidden_dim": 64,
     "num_layers": 2,
     "heads": {
-      "risk_head": {"type": "Linear", "out_dim": 1, "activation": "Sigmoid"},
-      "technique_head": {"type": "Linear", "out_dim": 14, "activation": "Logits"},
-      "stage_head": {"type": "Linear", "out_dim": 4, "activation": "Logits"}
+      "risk_head": {
+        "type": "Linear",
+        "out_dim": 1,
+        "activation": "Sigmoid"
+      },
+      "technique_head": {
+        "type": "Linear",
+        "out_dim": 14,
+        "activation": "Logits"
+      },
+      "stage_head": {
+        "type": "Linear",
+        "out_dim": 4,
+        "activation": "Logits"
+      }
     }
   },
-  "feature_schema": {
-    "version": "1.0.0",
-    "tgne_latent_dim": 12,
-    "host_temporal_attr_dim": 15,
-    "total_input_dim": 27
-  },
   "temporal_contract": {
-    "mode": "live_micro",
-    "window_size_sec": 2.0,
-    "history_steps": 5
+    "window_seconds": 2.0,
+    "history_steps": 15,
+    "forecast_steps": 5,
+    "forecast_step_seconds": 2.0,
+    "history_seconds": 30.0,
+    "forecast_seconds": 10.0,
+    "matches_authoritative_contract": false,
+    "authoritative_contract": {
+      "window_seconds": 2.0,
+      "history_steps": 15,
+      "forecast_steps": 5,
+      "forecast_window_seconds": 30.0,
+      "history_seconds": 30.0,
+      "forecast_seconds": 150.0,
+      "forecast_stride": 15
+    }
   },
-  "training_metadata": {
-    "dataset": "SIH_CIC2018_CTU13_live_micro",
-    "split_policy": "file_disjoint_80_20",
-    "train_hosts": 4007,
-    "train_samples": 35993,
-    "validation_samples": 3400,
-    "random_seed": 42,
-    "optimizer": "AdamW",
-    "lr": 0.001
-  }
+  "metrics": {
+    "selected_epoch": 6,
+    "validation": {
+      "loss": 0.6601448128175861,
+      "risk_mae": 0.22683174908161163,
+      "tech_accuracy": 0.8818243749908105,
+      "epoch": 6,
+      "train_loss": -4.336485667705418
+    },
+    "test": {
+      "loss": 26.361831673909055,
+      "risk_mae": 0.3381083905696869,
+      "tech_accuracy": 0.7807440677061734
+    },
+    "baselines": null,
+    "operating_point": null,
+    "not_recorded": [
+      "risk_auc",
+      "risk_brier",
+      "tech_macro_f1"
+    ]
+  },
+  "credibility": {
+    "checked": true,
+    "credible": true,
+    "problems": [],
+    "stats": {
+      "train_n": 22836532.0,
+      "train_hosts": 2172277.0,
+      "train_positive_rate": 0.22626636128462937,
+      "train_technique_classes": 7.0,
+      "train_categories": "['Execution', 'Benign', 'Impact', 'InitialAccess', 'C2']",
+      "train_risk_mean": 0.1940527856349945,
+      "val_n": 2366662.0,
+      "val_hosts": 230136.0,
+      "val_positive_rate": 0.34621969677123304,
+      "val_technique_classes": 2.0,
+      "val_categories": "['Benign', 'Execution', 'C2']",
+      "val_risk_mean": 0.3025653064250946,
+      "val_hosts_with_label_change": 19775.0,
+      "val_label_churn": 0.08592745159384016,
+      "val_traj_len_median": 1.0,
+      "val_traj_len_max": 9726.0,
+      "val_hosts_with_16plus": 2868.0,
+      "val_persistence_accuracy": 0.653780303228767,
+      "model_minus_persistence": 0.12696376447740643,
+      "train_val_ratio": 9.649257899945155
+    }
+  },
+  "risk_target": null,
+  "provenance": {
+    "git": {
+      "commit": "4c2828e590db416bd191915de7720099746c51e4",
+      "branch": "testing-prod",
+      "dirty": false,
+      "dirty_files": []
+    },
+    "created_utc": "2026-09-21T14:59:59.208061Z",
+    "command": [
+      "scripts/retrain_branch_a_live.py",
+      "--cic-dir",
+      "/var/home/samito/Documents/SIH/DATA/CSV",
+      "--ctu-dir",
+      "/var/home/samito/Documents/SIH/CTU-13-Dataset",
+      "--output",
+      "/var/home/samito/Documents/cyber_network_predictor-2f6ff8a69d8845ddb9bf9f3d72366af6dd5b5875/saved_models/branch_a/branch_a_lstm.pt",
+      "--epochs",
+      "8",
+      "--batch-size",
+      "128",
+      "--spill-dir",
+      "/var/home/samito/Documents/cyber_network_predictor-2f6ff8a69d8845ddb9bf9f3d72366af6dd5b5875/.spill"
+    ],
+    "dataset_sources": [
+      "/var/home/samito/Documents/SIH/DATA/CSV",
+      "/var/home/samito/Documents/SIH/CTU-13-Dataset"
+    ],
+    "dependencies": {
+      "python": "3.12.14",
+      "platform": "Linux-7.1.13-200.fc44.x86_64-x86_64-with-glibc2.43",
+      "numpy": "1.26.4",
+      "torch": "2.13.0+cu130",
+      "sklearn": "1.9.0",
+      "pandas": "3.0.5",
+      "pyarrow": "25.0.1",
+      "scipy": "1.17.1",
+      "cuda": "13.0",
+      "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU"
+    },
+    "fingerprint": "1109ecf8b8f23c68"
+  },
+  "warnings": [
+    "Temporal contract differs from cyberworld_v4/config.py; the serving adapter refuses this checkpoint unless CYBERWORLD_ALLOW_CONTRACT_MISMATCH=1.",
+    "Validation split has 2 technique classes vs 7 in training; per-class metrics cannot be measured for the missing classes.",
+    "Only technique ACCURACY is recorded. The corpus is ~82.5% Benign, so accuracy cannot visibly fail; quote macro F1 once a retrain records it.",
+    "Legacy architecture: trained before this model was aligned with its paper (see docs/PAPER_CONFORMANCE.md). Loads via from_checkpoint; retrain for the paper model."
+  ]
 }

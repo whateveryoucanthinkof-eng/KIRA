@@ -1,79 +1,90 @@
 """
-Centralized Temporal Granularity Configuration.
-Unifies timescale contracts across data unification, GNN dynamic graph snapshots,
-Branch B World Dynamics Transformer rollouts, and SOC dashboard operations.
+Temporal granularity constants, DERIVED from the one authoritative contract.
+
+This module used to declare a *second, conflicting* contract. It hardcoded
+`DEFAULT_ROLLOUT_HORIZON_LIVE = 8` and `DEFAULT_HISTORY_STEPS = 5` while
+`cyberworld_v4/config.py` -- the contract every trainer and checkpoint
+validator uses -- says `forecast_steps = 5` and `history_steps = 15`.
+
+That mattered because `control_backend/model_adapter.py` imports its serving
+defaults from *here*, not from the contract. So the live path requested an
+8-step rollout with 5 steps of history from models trained for a 5-step rollout
+with 15 steps of history. Nothing raised: the shapes are permissive enough to
+run, they are just wrong.
+
+Everything below is now computed from `cyberworld_v4.config.get_contract()`.
+There is exactly one contract. To change the temporal granularity, change it
+there; this module follows.
+
+`cyberworld_v4.config` imports only the standard library, so importing it here
+introduces no cycle.
 """
 
 from enum import Enum
 from typing import Union
+
 import torch
+
+from cyberworld_v4.config import get_contract
+
+_CONTRACT = get_contract()
 
 
 class TimescaleMode(str, Enum):
+    """Operating timescales for the predictive cybersecurity platform.
+
+    Only LIVE_MICRO is supported. MACRO_BATCH is retained so that existing
+    imports keep resolving, but **no model in this repository is trained at
+    60-second granularity**, so selecting it is an error rather than a mode.
     """
-    Operating timescales for the predictive cybersecurity platform.
-    """
-    LIVE_MICRO = "live_micro"    # Real-time streaming: 2.0s windows, K=8 steps (16s forward horizon)
-    MACRO_BATCH = "macro_batch"  # Offline PCAP batching: 60.0s windows, K=4 steps (240s forward horizon)
+
+    LIVE_MICRO = "live_micro"    # the contract: 2.0s windows, 15 history, 5 forecast
+    MACRO_BATCH = "macro_batch"  # unsupported; see _unsupported_macro()
 
 
-# Authoritative Temporal Constants
-LIVE_WINDOW_SIZE_SEC: float = 2.0
+# ---------------------------------------------------------------------------
+# Authoritative temporal constants -- all derived, none declared.
+# ---------------------------------------------------------------------------
+
+LIVE_WINDOW_SIZE_SEC: float = _CONTRACT.window_seconds          # 2.0
+DEFAULT_ROLLOUT_HORIZON_LIVE: int = _CONTRACT.forecast_steps    # 5  (was hardcoded 8)
+DEFAULT_HISTORY_STEPS: int = _CONTRACT.history_steps            # 15 (was hardcoded 5)
+
+# Kept only so that `from ... import MACRO_WINDOW_SIZE_SEC` does not break.
+# Any code that *uses* these is requesting a granularity no trained model has.
 MACRO_WINDOW_SIZE_SEC: float = 60.0
+DEFAULT_ROLLOUT_HORIZON_MACRO: int = 4
 
-DEFAULT_ROLLOUT_HORIZON_LIVE: int = 8    # 8 * 2.0s = 16.0s
-DEFAULT_ROLLOUT_HORIZON_MACRO: int = 4   # 4 * 60.0s = 240.0s
-DEFAULT_HISTORY_STEPS: int = 5           # History steps L = 5 across both live & macro
+
+def _unsupported_macro(what: str):
+    raise ValueError(
+        f"MACRO_BATCH {what} is not supported: no model in this repository is trained "
+        f"at {MACRO_WINDOW_SIZE_SEC}s granularity. The contract is "
+        f"{_CONTRACT.describe()}. Use TimescaleMode.LIVE_MICRO."
+    )
 
 
 def get_default_window_size(mode: Union[TimescaleMode, str] = TimescaleMode.LIVE_MICRO) -> float:
-    """Returns the default temporal step size in seconds for the given mode."""
+    """The contract's window size. MACRO_BATCH raises rather than silently diverging."""
     if isinstance(mode, str):
         mode = TimescaleMode(mode)
-    if mode == TimescaleMode.LIVE_MICRO:
-        return LIVE_WINDOW_SIZE_SEC
-    elif mode == TimescaleMode.MACRO_BATCH:
-        return MACRO_WINDOW_SIZE_SEC
+    if mode == TimescaleMode.MACRO_BATCH:
+        _unsupported_macro("window size")
     return LIVE_WINDOW_SIZE_SEC
 
 
 def get_default_horizon_steps(mode: Union[TimescaleMode, str] = TimescaleMode.LIVE_MICRO) -> int:
-    """Returns the default forecast horizon step count K for the given mode."""
+    """The contract's forecast horizon. MACRO_BATCH raises rather than silently diverging."""
     if isinstance(mode, str):
         mode = TimescaleMode(mode)
-    if mode == TimescaleMode.LIVE_MICRO:
-        return DEFAULT_ROLLOUT_HORIZON_LIVE
-    elif mode == TimescaleMode.MACRO_BATCH:
-        return DEFAULT_ROLLOUT_HORIZON_MACRO
+    if mode == TimescaleMode.MACRO_BATCH:
+        _unsupported_macro("rollout horizon")
     return DEFAULT_ROLLOUT_HORIZON_LIVE
 
 
-def validate_temporal_contract(
-    runtime_window_size: float,
-    model_window_size: float,
-    requested_horizon: int,
-    model_horizon: int,
-    requested_history: int = DEFAULT_HISTORY_STEPS,
-    model_history: int = DEFAULT_HISTORY_STEPS,
-) -> None:
-    """
-    Validates that runtime execution respects the temporal contract of the model.
-    Fails loudly with ValueError if there is an irreconcilable temporal mismatch.
-    """
-    if abs(runtime_window_size - model_window_size) > 1e-3:
-        raise ValueError(
-            f"Temporal mismatch: runtime window ({runtime_window_size}s) != model window ({model_window_size}s). "
-            f"A model trained on {model_window_size}s transitions cannot be deployed with {runtime_window_size}s windows."
-        )
-    if requested_horizon > model_horizon:
-        raise ValueError(
-            f"Horizon mismatch: requested horizon ({requested_horizon}) exceeds model capability ({model_horizon})."
-        )
-    if requested_history != model_history:
-        raise ValueError(
-            f"History mismatch: requested history ({requested_history}) != model history ({model_history})."
-        )
-
+def get_default_history_steps() -> int:
+    """The contract's history length (15). Present so callers stop hardcoding 5."""
+    return DEFAULT_HISTORY_STEPS
 
 
 def normalize_time_delta(
@@ -81,8 +92,8 @@ def normalize_time_delta(
     reference_dt: float = LIVE_WINDOW_SIZE_SEC,
 ) -> Union[float, torch.Tensor]:
     """
-    Normalizes time delta relative to reference timescale to maintain consistent
-    ContinuousTimeEncoding frequency responses across differing temporal contracts.
+    Normalizes time delta relative to the reference timescale so that
+    ContinuousTimeEncoding frequency responses stay consistent across contexts.
     """
     if isinstance(delta_t, torch.Tensor):
         return torch.clamp(delta_t / max(0.1, reference_dt), 0.0, 300.0)

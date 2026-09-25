@@ -1,0 +1,417 @@
+/* ════════════════════════════════════════════════════════════════════════════
+   CYBERWORLD SOC — "FIELD MANUAL" DESIGN TOKENS
+   ────────────────────────────────────────────────────────────────────────────
+   The console is a ruled technical document, not a deck of floating cards.
+   Depth comes from surface value and rule weight. Never from shadow.
+
+   HARD RULES — these are enforced, not suggestions:
+     · border-radius is 0. Everywhere. Without exception.
+     · No box-shadow, no backdrop-filter, no blur, no glow.
+     · No gradient except a flat-to-transparent chart area fill at <= 14%.
+     · Colour is data-ink. If it does not encode risk, it is monochrome.
+     · Machine output is mono. Human language is Space Grotesk.
+       Only Instrument Serif is permitted to be large.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {
+  /* ── Type faces ───────────────────────────────────────────────────────── */
+  --face-display: 'Instrument Serif', 'Times New Roman', serif;
+  --face-ui: 'Space Grotesk', 'Helvetica Neue', Arial, sans-serif;
+  --face-data: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* ── Structure ────────────────────────────────────────────────────────── */
+  --radius: 0;
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-12: 48px;
+
+  --panel-pad: 16px;
+  --panel-head-h: 32px;
+  --rail-w: 216px;
+  --header-h: 56px;
+
+  /* ── INK — the default theme. Warm graphite, for night operations. ────── */
+  --ink-000: #0a0a09;
+  --ink-050: #121211;
+  --ink-100: #191918;
+  --ink-200: #232322;
+  --ink-300: #2b2b29;
+
+  --rule-hair: #2c2c2a;
+  --rule-hard: #46453f;
+
+  --paper-000: #f2efe6;
+  --paper-400: #a8a49a;
+  --paper-600: #6e6b63;
+
+  /* ── Severity — data-ink only. Maps 1:1 to PredictionData.alert_level. ── */
+  --sev-nominal: #4f9d69;
+  --sev-warning: #c89331;
+  --sev-elevated: #c4643a;
+  --sev-critical: #c4362f;
+
+  /* Observed data is WARM. Forecast data is COOL. The temperature split
+     carries the provenance, so no third accent hue is needed — and the
+     distinction survives greyscale, which a hue pair would not. */
+  --signal-observed: #d8cfae;
+  --signal-forecast: #7d8ca1;
+
+  /* Chart area fills. The one sanctioned gradient use. */
+  --fill-observed: rgba(216, 207, 174, 0.1);
+  --fill-forecast: rgba(125, 140, 161, 0.12);
+
+  /* ── Composite rules ──────────────────────────────────────────────────── */
+  --hair: 1px solid var(--rule-hair);
+  --hard: 1px solid var(--rule-hard);
+
+  color-scheme: dark;
+}
+
+/* ── PAPER — bone and ink. Same structure, inverted value. ──────────────── */
+:root[data-theme='paper'] {
+  --ink-000: #f4f1e8;
+  --ink-050: #fbf9f4;
+  --ink-100: #ffffff;
+  --ink-200: #eae6db;
+  --ink-300: #e0dbcc;
+
+  --rule-hair: #ddd8ca;
+  --rule-hard: #a8a192;
+
+  --paper-000: #17161a;
+  --paper-400: #57544c;
+  --paper-600: #86827a;
+
+  --sev-nominal: #2f7346;
+  --sev-warning: #96690f;
+  --sev-elevated: #9c4520;
+  --sev-critical: #9c2019;
+
+  --signal-observed: #5c5138;
+  --signal-forecast: #4a5a70;
+
+  --fill-observed: rgba(92, 81, 56, 0.12);
+  --fill-forecast: rgba(74, 90, 112, 0.12);
+
+  color-scheme: light;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   RESET
+   ════════════════════════════════════════════════════════════════════════ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  border-radius: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background: var(--ink-000);
+  color: var(--paper-000);
+  font-family: var(--face-ui);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-synthesis-weight: none;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  border-radius: 0;
+}
+
+table {
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+
+/* One focus treatment, used everywhere. A hard offset outline — no glow. */
+:focus-visible {
+  outline: 2px solid var(--paper-000);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--paper-000);
+  color: var(--ink-000);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   TYPE SCALE
+   Eight steps. If a size is not here, it does not exist.
+   ════════════════════════════════════════════════════════════════════════ */
+
+.t-display-xl {
+  font-family: var(--face-display);
+  font-weight: 400;
+  font-size: 56px;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-feature-settings: 'tnum' 1;
+}
+
+.t-display-l {
+  font-family: var(--face-display);
+  font-weight: 400;
+  font-size: 32px;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+}
+
+.t-display-m {
+  font-family: var(--face-display);
+  font-weight: 400;
+  font-size: 22px;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+}
+
+.t-micro {
+  font-family: var(--face-ui);
+  font-weight: 500;
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.t-label {
+  font-family: var(--face-ui);
+  font-weight: 500;
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.t-body {
+  font-family: var(--face-ui);
+  font-weight: 400;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.t-data-l {
+  font-family: var(--face-data);
+  font-weight: 500;
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.t-data {
+  font-family: var(--face-data);
+  font-weight: 400;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.t-data-s {
+  font-family: var(--face-data);
+  font-weight: 400;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   MOTION
+
+   Two registers, and the split is deliberate:
+
+   STEPPED — the design's identity. Indicators TICK, controls SNAP. Anything
+   reporting machine state is discrete because the state is discrete.
+   EASED — added only where continuous quantities change: a risk value, a
+   meter, a chart series, a stage filling. These are interpolations of real
+   numbers, so interpolating them is honest as well as smoother.
+
+   Nothing breathes, pulses or glows in either register.
+   ════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1); /* ease-out, no overshoot */
+  --dur-snap: 90ms;
+  --dur-quick: 160ms;
+  --dur-value: 280ms;
+  --dur-fill: 400ms;
+}
+
+/* ── Stepped register ─────────────────────────────────────────────────── */
+
+@keyframes tick {
+  0%,
+  49.9% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0.22;
+  }
+}
+
+.is-ticking {
+  animation: tick 2s steps(1, end) infinite;
+}
+
+/* Log console + streaming rows: a single hard wipe, no fade-slide. */
+@keyframes stamp {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.is-stamping {
+  animation: stamp 120ms steps(2, end);
+}
+
+/* ── Eased register ───────────────────────────────────────────────────── */
+
+/* Page transition. One short wipe with a 4px rise — no stagger, no scale. */
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.is-entering {
+  animation: enter var(--dur-quick) var(--ease) both;
+}
+
+/* Traveling dash for an active attack path. Duration is set inline from the
+   current risk, so the path visibly accelerates as the intrusion escalates. */
+@keyframes travel {
+  to {
+    stroke-dashoffset: -32;
+  }
+}
+
+.is-traveling {
+  animation: travel 1s linear infinite;
+}
+
+/* A band arriving on an alert edge — used by the early-warning hero. */
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.is-revealing {
+  animation: reveal var(--dur-fill) var(--ease) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .is-ticking,
+  .is-stamping,
+  .is-entering,
+  .is-traveling,
+  .is-revealing {
+    animation: none;
+  }
+
+  *,
+  *::before,
+  *::after {
+    transition-duration: 1ms !important;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SCROLLBARS — square, hairline, no thumb radius
+   ════════════════════════════════════════════════════════════════════════ */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-hard) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--rule-hard);
+  border: 2px solid var(--ink-000);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--paper-600);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   RECHARTS OVERRIDES
+   ════════════════════════════════════════════════════════════════════════ */
+
+.recharts-cartesian-axis-tick-value {
+  font-family: var(--face-data) !important;
+  font-size: 10px !important;
+  fill: var(--paper-600) !important;
+}
+
+.recharts-tooltip-wrapper {
+  outline: none !important;
+}
+
+.recharts-reference-line-line {
+  shape-rendering: crispEdges;
+}
+
+/* Recharts SVG defaults to overflow:visible, which bleeds paths over adjacent
+   panels. The tooltip is a sibling div, so clipping the surface is safe. */
+svg.recharts-surface {
+  overflow: hidden;
+}

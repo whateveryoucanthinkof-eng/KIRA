@@ -1,4 +1,4 @@
-# Local SPAN bring-up (CyberWorld)
+# Local SPAN bring-up (cyberworld)
 
 ## Lab (Containerlab)
 

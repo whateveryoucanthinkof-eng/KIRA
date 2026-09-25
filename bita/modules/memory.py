@@ -27,10 +27,30 @@ class Memory(nn.Module):
     # Treat memory as parameter so that it is saved and loaded together with the model
     self.memory = nn.Parameter(torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
                                requires_grad=False)
-    self.last_update = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
+    # float64: at Unix-epoch scale (~1.5e9 s) float32 resolves only 128 s, so
+    # "time since last update" of anything under two minutes came out as 0.
+    self.last_update = nn.Parameter(torch.zeros(self.n_nodes, dtype=torch.float64).to(self.device),
                                     requires_grad=False)
 
     self.messages = defaultdict(list)
+
+  def ensure_capacity(self, n_nodes):
+    """Grow the memory table to hold node ids < n_nodes. New rows start at zero.
+
+    Serving and trajectory extraction assign node ids as hosts appear, so the
+    table cannot be sized once at construction the way it is in batch training.
+    """
+    if n_nodes <= self.n_nodes:
+      return
+    extra = n_nodes - self.n_nodes
+    dev = self.memory.device
+    self.memory = nn.Parameter(
+      torch.cat([self.memory.data, torch.zeros(extra, self.memory_dimension, device=dev)]),
+      requires_grad=False)
+    self.last_update = nn.Parameter(
+      torch.cat([self.last_update.data, torch.zeros(extra, dtype=self.last_update.dtype, device=dev)]),
+      requires_grad=False)
+    self.n_nodes = n_nodes
 
   def store_raw_messages(self, nodes, node_id_to_messages):
     for node in nodes:
@@ -46,9 +66,10 @@ class Memory(nn.Module):
     return self.last_update[node_idxs]
 
   def backup_memory(self):
+    # Messages are (raw, t) or (raw, t, peer); keep any trailing fields.
     messages_clone = {}
     for k, v in self.messages.items():
-      messages_clone[k] = [(x[0].clone(), x[1].clone()) for x in v]
+      messages_clone[k] = [(x[0].clone(), x[1].clone()) + tuple(x[2:]) for x in v]
 
     return self.memory.data.clone(), self.last_update.data.clone(), messages_clone
 
@@ -57,7 +78,7 @@ class Memory(nn.Module):
 
     self.messages = defaultdict(list)
     for k, v in memory_backup[2].items():
-      self.messages[k] = [(x[0].clone(), x[1].clone()) for x in v]
+      self.messages[k] = [(x[0].clone(), x[1].clone()) + tuple(x[2:]) for x in v]
 
   def detach_memory(self):
     self.memory.detach_()
@@ -66,7 +87,7 @@ class Memory(nn.Module):
     for k, v in self.messages.items():
       new_node_messages = []
       for message in v:
-        new_node_messages.append((message[0].detach(), message[1]))
+        new_node_messages.append((message[0].detach(), message[1]) + tuple(message[2:]))
 
       self.messages[k] = new_node_messages
 

@@ -5,6 +5,9 @@ Load per-deployment site profiles (CIDRs, sensor, lab_mode, assets of interest).
 Override with env:
   CYBERWORLD_SITE=containerlab-enterprise|local-default|<name>
   CYBERWORLD_SITE_CONFIG=/absolute/or/relative/path/to/site.yaml
+
+The legacy lowercase spellings (cyberworld_SITE, ...) are still honored, with a
+one-time warning per variable.
 """
 
 from __future__ import annotations
@@ -24,6 +27,34 @@ logger = logging.getLogger("antigravity.site_config")
 
 SITES_DIR = os.path.join(REPO_ROOT, "config", "sites")
 DEFAULT_SITE_ID = "containerlab-enterprise"
+
+_ENV_PREFIX = "CYBERWORLD_"
+_LEGACY_ENV_PREFIX = "cyberworld_"
+_legacy_env_warned: set = set()
+
+
+def env(suffix: str, default: Optional[str] = None) -> Optional[str]:
+    """Read CYBERWORLD_<suffix>, falling back to the legacy lowercase spelling."""
+    value = os.environ.get(_ENV_PREFIX + suffix)
+    if value is not None:
+        return value
+
+    legacy_name = _LEGACY_ENV_PREFIX + suffix
+    value = os.environ.get(legacy_name)
+    if value is not None:
+        if legacy_name not in _legacy_env_warned:
+            _legacy_env_warned.add(legacy_name)
+            logger.warning(
+                "%s is deprecated; use %s instead.", legacy_name, _ENV_PREFIX + suffix
+            )
+        return value
+
+    return default
+
+
+def env_is_set(suffix: str) -> bool:
+    """True when either spelling of CYBERWORLD_<suffix> is present."""
+    return env(suffix) is not None
 
 
 @dataclass(frozen=True)
@@ -139,12 +170,12 @@ def _parse_assets(raw: Any) -> Tuple[AssetOfInterest, ...]:
 
 
 def resolve_site_config_path() -> str:
-    explicit = os.environ.get("CYBERWORLD_SITE_CONFIG")
+    explicit = env("SITE_CONFIG")
     if explicit:
         path = explicit if os.path.isabs(explicit) else os.path.join(REPO_ROOT, explicit)
         return os.path.abspath(path)
 
-    site_id = os.environ.get("CYBERWORLD_SITE", DEFAULT_SITE_ID).strip() or DEFAULT_SITE_ID
+    site_id = (env("SITE") or DEFAULT_SITE_ID).strip() or DEFAULT_SITE_ID
     return os.path.abspath(os.path.join(SITES_DIR, f"{site_id}.yaml"))
 
 
@@ -170,7 +201,7 @@ def load_site_config(path: Optional[str] = None) -> SiteConfig:
         assets_of_interest=_parse_assets(raw.get("assets_of_interest")),
         sensor_mode=str(sensor.get("mode") or "local"),
         sensor_interface=str(
-            os.environ.get("CYBERWORLD_SENSOR_IFACE")
+            env("SENSOR_IFACE")
             or sensor.get("interface")
             or "eth1"
         ),
@@ -200,7 +231,10 @@ def reload_site_config() -> SiteConfig:
     return get_site_config()
 
 
-def flow_endpoint_activity(flows: Sequence[Any]) -> Dict[str, float]:
+def flow_endpoint_activity(
+    flows: Sequence[Any],
+    site: Optional["SiteConfig"] = None,
+) -> Dict[str, float]:
     """
     Score IPs by approximate activity (bytes + packets) across a flow window.
     Accepts UnifiedFlowRecord-like objects or dicts.
@@ -228,9 +262,13 @@ def flow_endpoint_activity(flows: Sequence[Any]) -> Dict[str, float]:
             fwd_p = float(getattr(f, "fwd_packets", 0) or 0)
             bwd_p = float(getattr(f, "bwd_packets", 0) or 0)
 
-        # Weight: bytes dominate, packets break ties; +1 ensures presence counts.
-        _add(src, fwd_b + bwd_b * 0.25 + fwd_p + 1.0)
-        _add(dst, bwd_b + fwd_b * 0.25 + bwd_p + 1.0)
+        conn_w = 25.0
+        ext_mult = 1.0
+        if site and site.classify_ip(src) == "external" and site.classify_ip(dst) == "internal":
+            ext_mult = 50.0
+
+        _add(src, fwd_b + bwd_b * 0.25 + fwd_p + conn_w)
+        _add(dst, (bwd_b + fwd_b * 0.25 + bwd_p + conn_w) * ext_mult)
 
     return scores
 
@@ -244,14 +282,36 @@ def select_primary_target_ip(
     Choose which host to score for a window — site-aware, not lab-hardcoded.
 
     Priority:
-      1) assets_of_interest present in the window (highest activity among them)
-      2) most active internal (enterprise) IP
-      3) most active IP overall
-      4) first configured asset_of_interest
-      5) explicit fallback or empty string
+      1) Internal host receiving traffic from external/untrusted sources (potential victim under attack)
+      2) assets_of_interest present in the window (highest activity among them)
+      3) most active internal (enterprise) IP
+      4) most active IP overall
+      5) first configured asset_of_interest
+      6) explicit fallback or empty string
     """
     site = site or get_site_config()
-    scores = flow_endpoint_activity(flows)
+
+    # Step 1: Detect any internal destination host receiving external/untrusted inbound flows
+    ext_inbound_counts: Dict[str, int] = {}
+    for f in flows or []:
+        if isinstance(f, dict):
+            src = str(f.get("src_ip") or "")
+            dst = str(f.get("dst_ip") or "")
+        else:
+            src = str(getattr(f, "src_ip", "") or "")
+            dst = str(getattr(f, "dst_ip", "") or "")
+        if site.classify_ip(src) == "external" and site.classify_ip(dst) == "internal":
+            ext_inbound_counts[dst] = ext_inbound_counts.get(dst, 0) + 1
+
+    if ext_inbound_counts:
+        # Prioritize asset_of_interest if among external targets, else highest count
+        asset_set = set(site.asset_ips())
+        ext_assets = {ip: c for ip, c in ext_inbound_counts.items() if ip in asset_set}
+        if ext_assets:
+            return max(ext_assets.items(), key=lambda kv: kv[1])[0]
+        return max(ext_inbound_counts.items(), key=lambda kv: kv[1])[0]
+
+    scores = flow_endpoint_activity(flows, site=site)
     if not scores:
         assets = site.asset_ips()
         if assets:

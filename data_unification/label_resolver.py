@@ -11,6 +11,14 @@ from typing import Dict, List, Tuple, Optional
 import pandas as pd
 
 
+UNKNOWN_CATEGORY = "UNKNOWN"
+
+
+def is_unresolved(coarse_category: str) -> bool:
+    """True when the label could not be mapped. Exclude these from benchmarks."""
+    return coarse_category == UNKNOWN_CATEGORY
+
+
 class LabelResolver:
     """Thread-safe, cached resolver for dataset-specific label mappings."""
 
@@ -18,6 +26,10 @@ class LabelResolver:
         if label_maps_dir is None:
             label_maps_dir = os.path.join(os.path.dirname(__file__), "label_maps")
         self.label_maps_dir = label_maps_dir
+        # Labels the maps could not resolve, for the unresolved_rate report.
+        self._unresolved: set = set()
+        self._resolve_calls: int = 0
+        self._unresolved_calls: int = 0
 
         self.maps: Dict[str, Dict[str, Tuple[str, List[str], bool]]] = {
             "CIC": self._load_map("cic_label_map.csv"),
@@ -60,6 +72,7 @@ class LabelResolver:
         Resolves raw_label under the given source ('CIC2017', 'CIC2018', 'CTU13', 'WARDEN').
         Returns: (coarse_category, attck_technique_ids, is_attack)
         """
+        self._resolve_calls += 1
         norm_source = source.upper()
         if "CIC" in norm_source:
             lut = self.maps.get("CIC", {})
@@ -97,8 +110,33 @@ class LabelResolver:
         if "infilt" in norm_key:
             return ("InitialAccess", ["T1190"], True)
 
-        # Default fallback
-        return ("Unknown", [], True if norm_key else False)
+        # Default fallback.
+        #
+        # v3 returned `True if norm_key else False` here: any label string the
+        # maps did not recognise silently became a positive attack example. That
+        # converts ontology uncertainty into supervised truth and injects
+        # systematic label noise — a new attack name, a typo or a renamed
+        # category all become confident positives.
+        #
+        # UNKNOWN is now a third state (spec 15). is_attack is False so nothing
+        # is asserted, and callers building a benchmark must exclude these rows
+        # rather than treat them as benign. `unresolved_rate` reports how much
+        # was dropped, which belongs beside any headline metric.
+        if norm_key:
+            self._unresolved.add(norm_key)
+            self._unresolved_calls += 1
+        return (UNKNOWN_CATEGORY, [], False)
+
+    def unresolved_report(self) -> Dict[str, object]:
+        """Publish mapping coverage (spec 15): report it, do not absorb it."""
+        total = max(self._resolve_calls, 1)
+        return {
+            "resolve_calls": self._resolve_calls,
+            "unresolved_calls": self._unresolved_calls,
+            "unresolved_rate": self._unresolved_calls / total,
+            "mapped_rate": 1.0 - (self._unresolved_calls / total),
+            "distinct_unresolved_labels": sorted(self._unresolved)[:100],
+        }
 
 
 _DEFAULT_RESOLVER = None

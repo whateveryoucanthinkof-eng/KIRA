@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 echo "================================================================="
-echo "DEPLOYING CYBERWORLD ENTERPRISE RANGE & STARTING SERVICES"
+echo "DEPLOYING cyberworld ENTERPRISE RANGE & STARTING SERVICES"
 echo "================================================================="
 
 cd "${ROOT_DIR}"
@@ -77,7 +77,7 @@ podman exec -d clab-enterprise-ws-file python3 /app/workloads/user_workload.py f
 podman exec -d clab-enterprise-ws-app python3 /app/workloads/user_workload.py app_heavy ws-app
 
 echo "================================================================="
-echo "CYBERWORLD ENTERPRISE LAB DEPLOYED & OPERATIONAL!"
+echo "cyberworld ENTERPRISE LAB DEPLOYED & OPERATIONAL!"
 echo "  Run './scripts/healthcheck.sh' to verify connectivity & policy."
 echo "  Run './scripts/run_telemetry.sh' to stream live telemetry states."
 echo "================================================================="

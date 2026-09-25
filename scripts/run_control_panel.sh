@@ -19,7 +19,7 @@ for arg in "$@"; do
 done
 
 echo "================================================================="
-echo "STARTING CYBERWORLD SOC CONTROL PANEL (Dual-Branch + DeepOP)"
+echo "STARTING cyberworld SOC CONTROL PANEL (Dual-Branch + DeepOP)"
 echo "================================================================="
 
 # Ensure bita wins over ambient model.py shadows
@@ -31,9 +31,16 @@ if [ ! -d "web_dashboard/dist" ]; then
     (cd web_dashboard && npm run build)
 fi
 
-# 2. Start FastAPI Control Backend
+# 2. Start FastAPI Control Backend (loopback unless CYBERWORLD_BIND_HOST says
+#    otherwise; a non-loopback bind requires an access token)
+BIND_HOST="${CYBERWORLD_BIND_HOST:-127.0.0.1}"
+if [ "$BIND_HOST" != "127.0.0.1" ] && [ "$BIND_HOST" != "localhost" ] && [ -z "${CYBERWORLD_API_TOKEN:-}" ]; then
+    CYBERWORLD_API_TOKEN="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(24))')"
+    export CYBERWORLD_API_TOKEN
+    echo "[!] Binding $BIND_HOST. Access token required: http://localhost:8000/?token=$CYBERWORLD_API_TOKEN"
+fi
 echo "[*] Starting FastAPI Control Backend on port 8000..."
-"$PYTHON_BIN" -m uvicorn control_backend.main:app --host 0.0.0.0 --port 8000 --log-level info &
+"$PYTHON_BIN" -m uvicorn control_backend.main:app --host "$BIND_HOST" --port 8000 --log-level info &
 BACKEND_PID=$!
 
 trap "echo '[*] Shutting down Control Panel...'; kill $BACKEND_PID 2>/dev/null || true; exit 0" INT TERM EXIT

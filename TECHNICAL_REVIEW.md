@@ -1,8 +1,8 @@
-# CyberWorld Technical Review
+# cyberworld Technical Review
 
 ## 1. Purpose and Scope
 
-CyberWorld is a passive network-observation and predictive SOC system. It accepts traffic from a SPAN or port-mirror interface, discovers communicating hosts and edges, builds temporal flow features, runs a multi-model prediction stack, and presents forecasts and explanations in a web dashboard.
+cyberworld is a passive network-observation and predictive SOC system. It accepts traffic from a SPAN or port-mirror interface, discovers communicating hosts and edges, builds temporal flow features, runs a multi-model prediction stack, and presents forecasts and explanations in a web dashboard.
 
 The repository supports two deployment modes:
 
@@ -51,7 +51,7 @@ The live temporal contract is approximately:
 | Forecast duration | About 16 seconds at 2-second windows |
 | Live labels | Not available; ground-truth labels are not used |
 
-The 72-D state assembled by `telemetry/state/state_builder.py` is a capture and recording artifact inherited from the earlier packet-feature pipeline. The live adapter primarily consumes normalized flow records and host trajectories, not the old V3.1 checkpoint contract.
+The 72-D state array that `telemetry/state/state_builder.py` used to assemble (42 flow + 30 packet features) was removed on 2026-09-19. It was written every window and read by nothing: `run_telemetry.py` stripped it before the JSONL stream, and its scaler was never fitted. The live adapter consumes normalized flow records and host trajectories.
 
 ## 3. End-to-End Runtime
 
@@ -64,6 +64,10 @@ Important environment variables include:
 - `CYBERWORLD_SITE`: site profile name, normally `containerlab-enterprise` or `local-default`.
 - `CYBERWORLD_SITE_CONFIG`: explicit YAML configuration path.
 - `CYBERWORLD_SENSOR_IFACE`: override for the observed host interface.
+- `CYBERWORLD_REPLAY_PCAP`: replay a PCAP instead of sniffing a live NIC (local SPAN only).
+
+These are read through `control_backend.site_config.env()`, which prefers the `CYBERWORLD_` prefix and
+falls back to the deprecated lowercase `cyberworld_` spelling with a one-time warning per variable.
 
 The backend is started from `control_backend.main:app` and serves the built dashboard when `web_dashboard/dist` exists.
 
@@ -156,19 +160,22 @@ The table emits flow dictionaries used by `flows_from_span_dicts()` and downstre
 
 It does not load a model checkpoint. It is a feature extractor only.
 
+**Wiring status: not connected.** Its 30 features reached the removed 72-D array and nothing else, so no model has ever consumed them. The module is retained because PS 26153 requires packet-level features (TTL variance, TCP window, retransmission counts, payload size distribution, port-scan signatures) and this is the only implementation of them in the repo. Feeding them to Branch A would widen its input from 27-D and require retraining.
+
 ### 4.4 Window state builder
 
 `telemetry/state/state_builder.py` closes non-overlapping two-second windows. It maintains:
 
 - The current packet list.
 - A live flow table.
-- A packet feature engine.
-- A rolling state buffer.
 - Window identifiers and latency measurements.
 
-It can emit raw and scaled state arrays and a list of active flows. `telemetry/run_telemetry.py` removes heavyweight arrays before writing the JSONL stream, so the backend receives practical flow-window records rather than a model inference result from the sensor.
+It emits the 5-tuple flow snapshot plus window metadata — exactly the keys the backend reads. No feature
+vector is built in the sensor; `control_backend` rebuilds host state from the flows and runs inference
+there.
 
-The module still exposes 70, 72, and 73 feature modes and a 72-feature canonical array because of historical compatibility. Those arrays are not the current production model input contract.
+`seek_to()` anchors the window clock to a capture timestamp. Live capture does not need it, but PCAP
+replay does: packet timestamps are historical, so without anchoring no window boundary is ever reached.
 
 ### 4.5 JSONL stream
 
@@ -324,7 +331,7 @@ Supporting files:
 - `saved_models/branch_b/host_wdt.pt`: trained Branch B checkpoint.
 - `saved_models/branch_b/branch_b.manifest.json`: checkpoint metadata.
 
-Branch B imports `ContinuousTimeEncoding` from `world_model/models/time_encoding.py`. This shared import is why the otherwise offline `world_model/` package is still partially coupled to live Branch B.
+Branch B defines `ContinuousTimeEncoding` locally in `rollout_encoder_decoder.py`. It has no dependency on any other model package.
 
 ### 7.4 DeepOP / CWA forecast decoder
 
@@ -390,22 +397,15 @@ The live adapter computes input saliency for the Branch A risk output. Gradients
 
 `explainability/unified_explanation.py` defines a broader explanation object and asynchronous queue for combining trajectory and campaign explanations. It is a reusable analytical layer, while the live adapter currently uses its local saliency implementation for low-latency dashboard output.
 
-The offline `world_model/explainability/` modules provide a different set of tools:
-
-- Attention extraction.
-- Integrated gradients.
-- Trajectory visualization.
-
-Those tools target the offline research WDT, not the promoted live adapter.
 
 ## 10. Correlation and Campaign Analysis
 
 The `correlation/` package is downstream analytical infrastructure:
 
 - `trajectory_assembler.py`: builds host attack trajectories from temporal entries.
-- `causal_edge_scorer.py`: scores likely causal transitions between events.
+- `causal_edge_scorer.py`: hand-set heuristic (not learned) scoring of causal transitions between events, bounded to the models' 180 s evidence horizon. Not called by the live backend.
 - `graph_compaction.py`: reduces detailed alert graphs while preserving important evidence.
-- `campaign_merge.py`: merges related host trajectories into campaigns.
+- `campaign_merge.py`: merges related host trajectories into campaigns, split on time gaps wider than the evidence horizon.
 
 These modules are useful for future campaign-level SOC correlation, but the current telemetry-to-dashboard path primarily emits per-window topology and prediction events. They are not the source of live model inference.
 
@@ -475,7 +475,8 @@ Profiles:
 - `config/sites/containerlab-enterprise.yaml`: Lab Mode, Containerlab sensor, enterprise CIDRs, and lab assets.
 - `config/sites/local-default.yaml`: non-lab Local SPAN profile.
 
-`config/temporal_contract.json` records shared timing and shape expectations.
+The temporal contract lives only in `cyberworld_v4/config.py` (`get_contract()`). The old
+`config/temporal_contract.json` (5 history / 8 forecast / 16 s) was read by nothing and has been deleted.
 
 ## 13. Commands and Event Transport
 
@@ -603,7 +604,6 @@ The frontend build is run from `web_dashboard/` with the package scripts, normal
 - `tests/test_site_config.py`: site loading, CIDR classification, target selection, and site/topology API contracts.
 - `tests/test_topology_service.py`: discovery graph creation, external/internal roles, TTL eviction, caps, API output, and Lab Mode gates.
 - `bita/test_pipeline.py`: BiTA pipeline test placeholder.
-- `world_model/models/test_wdt.py`: research WDT shape, masking, cache equivalence, and parameter tests.
 
 The production tests focus on contracts at the backend boundary rather than packet capture against a live interface.
 
@@ -615,7 +615,6 @@ The production tests focus on contracts at the backend boundary rather than pack
 - `implementation.md`: local implementation plan and design decisions; intentionally ignored from Git.
 - `run_dashboard.py`: primary application launcher.
 - `.gitignore`: generated files, datasets, caches, secrets, frontend dependencies, and local planning files.
-- `config/temporal_contract.json`: temporal contract metadata.
 - `captures/live.pcap`: local capture artifact.
 - `captures/states.jsonl`: local state-stream artifact.
 
@@ -714,10 +713,6 @@ The production tests focus on contracts at the backend boundary rather than pack
 - `explainability/unified_explanation.py`: unified explanation object and queue.
 - `explainability/__init__.py`: package exports.
 
-### `world_model/`
-
-The package contains the offline research WDT, data adapters, feature schemas, graph builders, latent datasets, training losses, checkpointing, evaluation metrics, baselines, ablation scripts, and explanation tools described in Section 15. Its only direct live dependency is the shared time encoder imported by Branch B.
-
 ### `containerlab/`, `nodes/`, and `workloads/`
 
 - `containerlab/enterprise.clab.yml`: 15-node Lab Mode topology.
@@ -748,7 +743,7 @@ The package contains the offline research WDT, data adapters, feature schemas, g
 Some historical files still describe the removed 72-D V3.1 transformer. The current live adapter does not use that model. In particular, older architecture documentation and comments may mention:
 
 - A root `model/` package.
-- `CyberWorldModel V3.1-PCAP`.
+- `cyberworldModel V3.1-PCAP`.
 - 72-D model input.
 - A 15-step, 30-second inference history.
 - A five-step forecast.

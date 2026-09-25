@@ -6,7 +6,7 @@ Consumes UnifiedFlowRecord windows from Containerlab SPAN,
 runs TGNE-TA → Branch A / Branch B (WDT) / DeepOP CWA, and emits PredictionEvent.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 import time
@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Any
 import numpy as np
 import torch
 
+from control_backend.forecast_band import forecast_band, forecast_band_halfwidths
 from control_backend.schema import (
     ModelMetadata,
     StateMetadata,
@@ -28,6 +29,7 @@ from control_backend.schema import (
     PredictionEvent,
     FocusEdge,
 )
+from data_unification.host_attributes import HOST_ATTRIBUTES
 from data_unification.unified_schema import UnifiedFlowRecord, CoarseCategory
 from data_unification.temporal_config import (
     LIVE_WINDOW_SIZE_SEC,
@@ -57,8 +59,44 @@ TECHNIQUE_TO_MITRE = {
     "T1020": ("Exfiltration", "T1020 Automated Exfiltration", "TA0010", "Automated exfiltration"),
 }
 
-FEATURE_GROUP_MAP = {
-    **{f"H_emb_{i}": "TGNE Latent" for i in range(12)},
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def advisory_rule_opinion(ext_flows: List[UnifiedFlowRecord]) -> tuple[Optional[float], Optional[str]]:
+    """The deterministic SOC heuristic, as a separate opinion. Never the verdict.
+
+    Hand-written, not learned: any inbound flow from outside the site CIDRs
+    scores at least 0.40 + 0.25, and the label is picked by counting ports.
+    That fires on ordinary web browsing, which is exactly why it must not be
+    allowed to overwrite the model. It is kept only so an operator who wants a
+    rule-based second opinion can see one, clearly labelled as such.
+
+    Returns (None, None) when there is no external traffic to have an opinion on.
+    """
+    if not ext_flows:
+        return None, None
+    ext_count = len(ext_flows)
+    rule_risk = float(min(0.96, 0.40 + min(0.65, (ext_count / 75.0) * 0.50 + 0.25)))
+    ports_seen = {getattr(r, "dst_port", 0) for r in ext_flows}
+    if len(ports_seen) >= 5:
+        label = "PortScan"
+    elif any(getattr(r, "dst_port", 0) in (80, 443, 8080) for r in ext_flows):
+        label = "WebAttack"
+    else:
+        label = "Exploit"
+    return rule_risk, label
+
+# Dashboard grouping for each feature, keyed off the CANONICAL names.
+#
+# This was a third hand-written copy of the attribute list, and two of its
+# keys did not exist: "avg_flow_duration" (canonical: avg_duration) and
+# "active_conn_density" (canonical: peer_density). Those two lookups silently
+# missed, so two of the fifteen attributes showed no group in the UI.
+#
+# Keyed off HOST_ATTRIBUTES and asserted complete below, so a rename in one
+# place can no longer leave a dangling key here.
+_ATTR_GROUPS = {
     "flow_count": "Connectivity",
     "fwd_bytes": "Volume",
     "bwd_bytes": "Volume",
@@ -68,12 +106,25 @@ FEATURE_GROUP_MAP = {
     "total_packets": "Volume",
     "unique_peers": "Connectivity",
     "unique_dst_ports": "Connectivity",
-    "tcp_ratio": "Connectivity",
-    "udp_ratio": "Connectivity",
-    "avg_flow_duration": "Timing",
-    "byte_rate": "Volume",
-    "packet_rate": "Volume",
-    "active_conn_density": "Connectivity",
+    "tcp_ratio": "Protocol",
+    "udp_ratio": "Protocol",
+    "avg_duration": "Timing",
+    "byte_rate": "Rate",
+    "packet_rate": "Rate",
+    "peer_density": "Connectivity",
+}
+
+_missing = [n for n in HOST_ATTRIBUTES if n not in _ATTR_GROUPS]
+_extra = [n for n in _ATTR_GROUPS if n not in HOST_ATTRIBUTES]
+if _missing or _extra:
+    raise RuntimeError(
+        f"FEATURE_GROUP_MAP is out of sync with host_attributes.HOST_ATTRIBUTES: "
+        f"missing={_missing} unknown={_extra}"
+    )
+
+FEATURE_GROUP_MAP = {
+    **{f"H_emb_{i}": "TGNE Latent" for i in range(12)},
+    **_ATTR_GROUPS,
 }
 
 class AntigravityModelAdapter:
@@ -84,11 +135,38 @@ class AntigravityModelAdapter:
         self.h_state_history: List[torch.Tensor] = []
         self.feature_history: List[torch.Tensor] = []
         self.h_state_history_by_target: Dict[str, List[torch.Tensor]] = {}
+        #: Window end time of each entry in h_state_history_by_target, kept in
+        #: lockstep with it. Branch B is trained on REAL elapsed times between
+        #: a host's steps (median 14 s, not the 2 s grid), so serving must pass
+        #: them too or it forecasts from a spacing the model never saw.
+        self.h_time_history_by_target: Dict[str, List[float]] = {}
         self.feature_history_by_target: Dict[str, List[torch.Tensor]] = {}
+        # Branch A's technique token per window, per host: the "observed
+        # attack sequence" DeepOP's encoder reads.
+        self.technique_history_by_target: Dict[str, List[int]] = {}
         self.alert_threshold = 0.65
+        # The SOC rule layer is OFF by default and, when on, ADVISORY ONLY: it
+        # reports rule_risk / rule_technique next to the model's output and
+        # never replaces risk, predicted_stage or alert. It used to be on by
+        # default and overwrite all three, so anyone starting the dashboard was
+        # looking at port-count if-statements presented as model predictions.
+        self.rules_enabled = _env_flag("CYBERWORLD_ENABLE_RULES")
+        if os.environ.get("CYBERWORLD_DISABLE_RULES") is not None:
+            logger.warning(
+                "CYBERWORLD_DISABLE_RULES is obsolete: rules are off by default and "
+                "never override the model. Use CYBERWORLD_ENABLE_RULES=1 to compute "
+                "the advisory rule layer.")
+        # Provisional; overwritten in _load_models by the contract the
+        # checkpoints actually carry. A model's temporal contract is a property
+        # of the model, not a global constant — hardcoding it here is how a v3
+        # checkpoint could be served under v4 settings without anything noticing.
         self.window_seconds = LIVE_WINDOW_SIZE_SEC
         self.forecast_steps = DEFAULT_ROLLOUT_HORIZON_LIVE
         self.history_steps = DEFAULT_HISTORY_STEPS
+        # Seconds per FORECAST step. Checkpoints that predate the field were
+        # single-scale, so it falls back to window_seconds for them.
+        self.forecast_step_seconds: Optional[float] = None
+        self.checkpoint_contract: Dict[str, Any] = {}
         self.fingerprinter = BehavioralFlowFingerprinter()
         self._load_models()
 
@@ -126,54 +204,247 @@ class AntigravityModelAdapter:
         self.technique_vocab = TECHNIQUE_VOCAB
 
         self.tgn = build_or_load_tgne_ta()
+        # persist_memory: every predict_window call is the next 2 s window of
+        # one continuous session, so a BiTA encoder's memory carries across
+        # calls (and is cleared by reset_history). No effect on a memoryless
+        # encoder.
         self.extractor = HostTrajectoryExtractor(
             tgne_ta_model=self.tgn,
             window_size_sec=self.window_seconds,
+            persist_memory=True,
         )
 
-        self.branch_a = MultiTaskLSTM(input_dim=27, hidden_dim=64).to(self.device)
         ba_path = os.path.join(repo, "saved_models/branch_a/branch_a_lstm.pt")
         if not os.path.exists(ba_path):
             raise RuntimeError(f"Missing Branch A checkpoint: {ba_path}")
         ckpt = torch.load(ba_path, map_location=self.device, weights_only=False)
-        self.branch_a.load_state_dict(ckpt["model_state_dict"])
+        # Rebuilds the architecture the checkpoint was trained as: the paper
+        # model (1 x 256 LSTM, linear heads) or the older 2 x 64 variant.
+        self.branch_a = MultiTaskLSTM.from_checkpoint(ckpt, device=self.device)
         self.branch_a.eval()
+        self._adopt_contract(ckpt, "branch_a")
+        self._warn_if_not_credible(ckpt, "branch_a")
 
-        self.wdt = HostWorldDynamicsTransformer(d_latent=12, d_model=64).to(self.device)
-        self.risk_head = InfiltrationRiskHead(d_latent=12, hidden_dim=32).to(self.device)
         bb_path = os.path.join(repo, "saved_models/branch_b/host_wdt.pt")
         if not os.path.exists(bb_path):
             raise RuntimeError(f"Missing Branch B checkpoint: {bb_path}")
         ckpt = torch.load(bb_path, map_location=self.device, weights_only=False)
+        # The world state Branch B was trained on: 27-D (TGNE latent + host
+        # attributes) for current checkpoints, 12-D (latent only) for older
+        # ones. Read it from the weights rather than assuming.
+        self.world_state_dim = int(
+            ckpt.get("d_state") or ckpt["wdt_state_dict"]["in_proj.weight"].shape[1])
+        self.wdt = HostWorldDynamicsTransformer(d_latent=self.world_state_dim, d_model=64).to(self.device)
+        self.risk_head = InfiltrationRiskHead(d_latent=self.world_state_dim, hidden_dim=32).to(self.device)
+        self._adopt_contract(ckpt, "branch_b")
+        # A Branch B that does not beat "copy the last step" makes every
+        # forecast on the dashboard a restatement of the present.
+        self._warn_if_not_credible(ckpt, "branch_b")
         self.wdt.load_state_dict(ckpt["wdt_state_dict"])
         self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
         self.wdt.eval()
         self.risk_head.eval()
+        self.forecast_risk_halfwidths = forecast_band_halfwidths(ckpt)
+        if self.forecast_risk_halfwidths is None:
+            logger.warning(
+                "Branch B checkpoint carries no fitted forecast_risk_conformal: the "
+                "forecast is served WITHOUT an uncertainty band. Retrain with "
+                "scripts/retrain_future_models_live.py to fit one.")
 
         self.vocab = get_joint_vocab()
         self.consolidate_network_technique = consolidate_network_technique
-        self.deepop = DeepOPForecastDecoder(
-            d_latent=12, d_model=72, vocab_size=self.vocab.vocab_size
-        ).to(self.device)
         dp_path = os.path.join(repo, "saved_models/deepop/cwa_forecast_decoder.pt")
         if not os.path.exists(dp_path):
             raise RuntimeError(f"Missing DeepOP checkpoint: {dp_path}")
         ckpt = torch.load(dp_path, map_location=self.device, weights_only=False)
-        self.deepop.load_state_dict(ckpt["decoder_state_dict"])
+        # Builds whichever architecture the checkpoint was trained as: the
+        # DeepOP encoder-decoder, or the older decoder-only model.
+        self.deepop = DeepOPForecastDecoder.from_checkpoint(ckpt, device=self.device)
         self.deepop.eval()
+        if self.deepop.d_latent != self.world_state_dim:
+            raise RuntimeError(
+                f"DeepOP decodes {self.deepop.d_latent}-D states but Branch B predicts "
+                f"{self.world_state_dim}-D ones; retrain them together.")
+        # DeepOP was the only checkpoint whose contract was never adopted, even
+        # though its horizon is what defines the served forecast length.
+        self._adopt_contract(ckpt, "deepop")
+
+        from cyberworld_v4.config import get_contract
+
+        # The extractor was constructed above from the PROVISIONAL window, before
+        # any checkpoint had been read. If a checkpoint carries a different
+        # window, _adopt_contract updated self.window_seconds but left the
+        # extractor bucketing at the old one -- so features were built on a
+        # different grid than the models were trained on. Rebind it now that the
+        # real contract is known.
+        if abs(self.extractor.window_size_sec - self.window_seconds) > 1e-9:
+            logger.warning(
+                "Rebinding extractor window %ss -> %ss to match the checkpoint contract",
+                self.extractor.window_size_sec, self.window_seconds,
+            )
+            self.extractor.window_size_sec = self.window_seconds
+
+        served_contract = {
+            "window_seconds": self.window_seconds,
+            "history_steps": self.history_steps,
+            "forecast_steps": self.forecast_steps,
+            "forecast_window_seconds": self.step_seconds,
+        }
+        served = get_contract().matches(served_contract)
 
         logger.info(
-            "Antigravity models loaded (device=%s, K=%s, dt=%ss)",
-            self.device,
-            self.forecast_steps,
-            self.window_seconds,
+            "Models loaded (device=%s) serving contract: %ss windows | %s history | %s forecast",
+            self.device, self.window_seconds, self.history_steps, self.forecast_steps,
         )
+
+        if not served:
+            # This used to be a parenthetical in a log line. Serving weights that
+            # disagree with the contract produces confident, wrong forecasts --
+            # the horizon and the history length are not cosmetic. Refuse by
+            # default; the escape hatch exists only so a demo can still run on
+            # known-stale checkpoints, and it says so loudly.
+            msg = (
+                f"Checkpoint contract mismatch: the loaded checkpoints serve "
+                f"{served_contract} but the authoritative contract is "
+                f"{get_contract().to_dict()}. These weights were trained for a "
+                f"different temporal granularity and their forecasts are not valid. "
+                f"Retrain, or set CYBERWORLD_ALLOW_CONTRACT_MISMATCH=1 to serve anyway."
+            )
+            if os.environ.get("CYBERWORLD_ALLOW_CONTRACT_MISMATCH", "") in ("1", "true", "True"):
+                logger.error("SERVING STALE CHECKPOINTS ANYWAY. %s", msg)
+            else:
+                raise RuntimeError(msg)
+
+    def _warn_if_not_credible(self, ckpt: Dict[str, Any], name: str) -> None:
+        """Surface a checkpoint that its own training run flagged as unsound.
+
+        The credibility gate measures whether a result can mean anything at
+        all -- label churn, base rate, host-group count, and whether the model
+        even beats a persistence baseline. A checkpoint that failed it can
+        still be loaded (an operator may want it for a demo), but serving one
+        silently is how a meaningless number becomes a reported result.
+        """
+        cred = ckpt.get("credibility") or {}
+        if not cred.get("checked"):
+            logger.warning(
+                "%s checkpoint carries no credibility verdict; its metrics are "
+                "unvalidated", name)
+            return
+        if not cred.get("credible", True):
+            logger.error(
+                "%s checkpoint was marked NOT CREDIBLE by its own training run: "
+                "%s. Its predictions are being served, but its metrics must not "
+                "be reported as results.",
+                name, "; ".join(cred.get("problems", [])) or "unspecified",
+            )
+
+    def _adopt_contract(self, ckpt: Dict[str, Any], name: str) -> None:
+        """Take the temporal contract from the checkpoint being loaded.
+
+        v3 weights carry window_size_sec/history_steps (or window_seconds/
+        history_steps/forecast_steps); v4 weights carry a `config.temporal`
+        block. Either way the served contract comes from the artefact rather
+        than from a constant that may no longer describe it.
+
+        Checkpoints that disagree with each other are a hard error: rolling a
+        5-step history against an 8-step decoder silently produces nonsense.
+        """
+        tc = ckpt.get("training_contract") or {}
+        cfg = (ckpt.get("config") or {}).get("temporal") or {}
+        src = cfg or tc or ckpt
+
+        found = {}
+        w = src.get("window_seconds", src.get("window_size_sec"))
+        if w:
+            found["window_seconds"] = float(w)
+        if src.get("history_steps"):
+            found["history_steps"] = int(src["history_steps"])
+        if src.get("forecast_steps"):
+            found["forecast_steps"] = int(src["forecast_steps"])
+        if src.get("forecast_window_seconds"):
+            found["forecast_window_seconds"] = float(src["forecast_window_seconds"])
+        if not found:
+            return
+
+        for k, v in found.items():
+            prev = self.checkpoint_contract.get(k)
+            if prev is not None and prev != v:
+                raise RuntimeError(
+                    f"Checkpoint contract conflict on {k}: {name} says {v}, "
+                    f"an earlier checkpoint said {prev}. Checkpoints trained under "
+                    f"different temporal contracts cannot be composed."
+                )
+            self.checkpoint_contract[k] = v
+
+        self._apply_checkpoint_contract()
+        if name == "branch_a":
+            self._adopt_risk_semantics(ckpt)
+
+    def _apply_checkpoint_contract(self) -> None:
+        """Serve with whatever the checkpoints loaded so far agree on."""
+        c = self.checkpoint_contract
+        self.window_seconds = c.get("window_seconds", self.window_seconds)
+        self.history_steps = c.get("history_steps", self.history_steps)
+        self.forecast_steps = c.get("forecast_steps", self.forecast_steps)
+        self.forecast_step_seconds = c.get("forecast_window_seconds", self.forecast_step_seconds)
+
+    def _adopt_risk_semantics(self, ckpt):
+        """What `risk_score` means, and where to alert on it.
+
+        Branch A's risk head has two objectives. Under "smooth_l1" the output
+        is a severity magnitude (benign 0.0, attack 0.50-0.96 by tactic), and
+        the historical 0.65 alerting cut was chosen against that scale. Under
+        "bce" -- the default since the head was shown to be worse than
+        predicting zero -- the output is P(next window is an attack window).
+
+        Those are different quantities on the same [0, 1] axis. A calibrated
+        probability against a 17.5% base rate rarely exceeds 0.65, so keeping
+        the old cut would quietly stop the system alerting at all. That is the
+        worst possible failure for a detector: silent, and it looks like
+        "no attacks today".
+
+        So the threshold is taken from the checkpoint when the training run
+        fitted one. If the objective is bce and no threshold was fitted, the
+        default is not silently reused -- it is reported.
+        """
+        tc = ckpt.get("training_contract") or {}
+        objective = tc.get("risk_objective") or ckpt.get("risk_objective")
+        self.risk_objective = objective or "smooth_l1"
+
+        fitted = (ckpt.get("operating_point") or {}).get("alert_threshold")
+        if fitted is not None:
+            self.alert_threshold = float(fitted)
+            op = ckpt.get("operating_point") or {}
+            logger.info(
+                "branch_a: alert threshold %.4f fitted on validation "
+                "(precision %.3f, recall %.3f, alert rate %.4f)",
+                self.alert_threshold, op.get("precision", float("nan")),
+                op.get("recall", float("nan")), op.get("alert_rate", float("nan")))
+        elif self.risk_objective == "bce":
+            logger.warning(
+                "branch_a was trained with the bce risk objective, so risk_score "
+                "is P(attack next window), but the checkpoint carries no fitted "
+                "operating point. Falling back to the %.2f cut that was chosen "
+                "for the old severity scale -- on a %s base rate a calibrated "
+                "probability will seldom reach it, so alerting may be far too "
+                "quiet. Re-run Branch A so it fits and stores a threshold.",
+                self.alert_threshold, "low")
+
+    @property
+    def step_seconds(self) -> float:
+        """Seconds per forecast step, as the loaded checkpoints were trained."""
+        return float(self.forecast_step_seconds or self.window_seconds)
 
     def reset_history(self):
         self.h_state_history.clear()
         self.feature_history.clear()
         self.h_state_history_by_target.clear()
         self.feature_history_by_target.clear()
+        self.technique_history_by_target.clear()
+        self.h_time_history_by_target.clear()
+        extractor = getattr(self, "extractor", None)
+        if extractor is not None and hasattr(extractor, "reset_memory_state"):
+            extractor.reset_memory_state()
 
     def _build_embedding(
         self, target_ip: str, flows: List[UnifiedFlowRecord]
@@ -190,32 +461,54 @@ class AntigravityModelAdapter:
 
         raise RuntimeError(f"TGNE produced no embedding for target host {target_ip}")
 
-    def _explain(self, feature_vector: np.ndarray) -> ExplainabilityPayload:
-        x = (
-            torch.from_numpy(feature_vector.astype(np.float32))
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .to(self.device)
-        )
+    def _explain(self, x_tensor: torch.Tensor,
+                 t_history: Optional[torch.Tensor] = None) -> ExplainabilityPayload:
+        """Input x Gradient attribution for the prediction actually made.
+
+        Two defects this fixes:
+
+        1. It used to rebuild a [1, 1, 27] tensor from the final feature vector
+           while the scored input was [1, 5, 27]. On a temporal model that
+           explains a single history-less timestep the model never scored -- not
+           an explanation of the prediction.
+
+        2. It called self.branch_a.train() as a cuDNN-RNN-backward workaround,
+           leaving dropout=0.2 active on the LSTM and every head, so the
+           attributions were stochastic and irreproducible run to run.
+           torch.backends.cudnn.flags(enabled=False) achieves the same thing
+           while the module stays in eval().
+
+        Attribution is over the last timestep of the real sequence, with
+        gradients flowing through the full history.
+        """
+        x = x_tensor.detach().clone().to(self.device)
         x.requires_grad_(True)
+
         was_training = self.branch_a.training
-        self.branch_a.train()
+        self.branch_a.eval()
         try:
-            out = self.branch_a(x)
-            risk = out["risk_score"]
-            if risk.ndim > 0:
-                risk = risk.reshape(-1)[0]
-            risk.backward()
+            # RNN backward needs cuDNN disabled in eval; this replaces the
+            # train()-mode workaround without enabling dropout.
+            with torch.backends.cudnn.flags(enabled=False):
+                # Same time input as the served forward, or the attribution
+                # would describe a computation that was never served.
+                out = self.branch_a(x, t_history=t_history)
+                risk = out["risk_score"]
+                if risk.ndim > 0:
+                    risk = risk.reshape(-1)[0]
+                self.branch_a.zero_grad(set_to_none=True)
+                risk.backward()
+
             grads = (
                 x.grad[0, -1, :].detach().cpu().numpy()
                 if x.grad is not None
-                else np.zeros(27, dtype=np.float32)
+                else np.zeros(x.shape[-1], dtype=np.float32)
             )
             inputs = x[0, -1, :].detach().cpu().numpy()
             attributions = np.abs(grads * inputs)
         finally:
-            if not was_training:
-                self.branch_a.eval()
+            if was_training:
+                self.branch_a.train()
 
         total = float(attributions.sum()) + 1e-12
         attributions = attributions / total
@@ -250,12 +543,35 @@ class AntigravityModelAdapter:
             top_features=top_features,
         )
 
+    def _relative_times(self, times):
+        """[1, history_steps] seconds relative to the latest window.
+
+        The convention both Branch A's time channel and Branch B's rollout are
+        trained with: <= 0, last entry exactly 0. Left-padded slots repeat the
+        earliest real time, matching the training datasets.
+        """
+        last = times[-1]
+        rel = [t - last for t in times]
+        while len(rel) < self.history_steps:
+            rel.insert(0, rel[0])
+        return torch.tensor([rel], dtype=torch.float32, device=self.device)
+
     def _alert_level(self, risk: float) -> str:
-        if risk >= 0.85:
+        """Band a risk score.
+
+        The ELEVATED cut used to be the literal 0.65, which is also the default
+        `alert_threshold`, so the WARNING band below it was unreachable: every
+        score that could have been WARNING had already returned ELEVATED. The
+        bands are now derived from the operating threshold, so WARNING means
+        "over the alerting threshold", ELEVATED "clearly over" and CRITICAL
+        "far over", whatever that threshold has been fitted to.
+        """
+        t = self.alert_threshold
+        if risk >= t + (1.0 - t) * 0.60:
             return "CRITICAL"
-        if risk >= 0.65:
+        if risk >= t + (1.0 - t) * 0.25:
             return "ELEVATED"
-        if risk >= self.alert_threshold:
+        if risk >= t:
             return "WARNING"
         return "NOMINAL"
 
@@ -266,36 +582,85 @@ class AntigravityModelAdapter:
         window_id: int = 0,
         attack_active: bool = False,
         attack_phase: Optional[str] = None,
-        is_mitigated: bool = False,
+        mitigation_recorded: bool = False,
+        mitigation_bypass_flows: int = 0,
         packet_count: int = 0,
         pipeline_latency_ms: float = 0.0,
         active_flows: Optional[int] = None,
+        throughput: float = 0.0,
     ) -> PredictionEvent:
+        """Score one window. The verdict is the model's and only the model's.
+
+        `attack_active` / `attack_phase` are the operator's ARM EXTERNAL state.
+        They are echoed on the event for display and are NEVER an input to
+        scoring: they are knowledge of the answer, and pressing a button must
+        not move the risk number.
+
+        `mitigation_recorded` / `mitigation_bypass_flows` describe a block or
+        isolation the operator recorded. The dashboard does not enforce it, so
+        the model keeps scoring the traffic it actually sees; if traffic the
+        block should have stopped is still present, that is reported rather
+        than hidden.
+        """
         t0 = time.perf_counter()
 
-        if is_mitigated:
-            flows = []
-
-        host_flows = [
-            record
-            for record in flows
-            if record.src_ip == target_ip or record.dst_ip == target_ip
-        ]
-        if host_flows:
-            window_end = max(record.end_time for record in host_flows)
+        # One window, defined once, and used by BOTH halves of the feature
+        # vector. `flows` as handed over by the sensor is NOT one window: the
+        # live flow table retains a flow until it has been silent for 30 s
+        # (telemetry/flow/flow_table.py), so a snapshot routinely carries flows
+        # last seen many windows ago. Training builds a window's features from
+        # `win_recs` -- the records of that window, for every host -- and takes
+        # the attributes and the TGNE embedding from that same slice
+        # (data_unification/multi_dataset_stream.py:extract_trajectories).
+        #
+        # This used to clip only the host-scoped list, then hand the FULL,
+        # unclipped snapshot to TGNE. The 15 attributes were therefore computed
+        # over one time window and the 12 embedding dimensions over another,
+        # which training never does. Measured on a snapshot mixing flows aged
+        # 0.2-18 s: the embedding moved by up to 3.3e-2 per dimension between
+        # the two slices (mean 1.1e-2) -- the same magnitude as the
+        # full-graph-vs-subgraph mismatch this block already guards against.
+        #
+        # A recorded mitigation does not empty `flows`: the model scores the
+        # traffic it actually sees (see the docstring).
+        window_flows = flows
+        if flows:
+            window_end = max(record.end_time for record in flows)
             window_start = window_end - self.window_seconds
-            host_flows = [
+            window_flows = [
                 record
-                for record in host_flows
+                for record in flows
                 if record.end_time >= window_start or record.start_time >= window_start
             ]
 
+        host_flows = [
+            record
+            for record in window_flows
+            if record.src_ip == target_ip or record.dst_ip == target_ip
+        ]
+
+        # Host-scoped flows are correct for the temporal ATTRIBUTES: those are
+        # per-host aggregates (this host's byte counts, peers, ports).
         temp_attrs = self.extractor.compute_host_temporal_attributes(
             host_ip=target_ip,
             window_records=host_flows,
             window_duration=self.window_seconds,
         )
-        h_emb = self._build_embedding(target_ip, host_flows)
+
+        # ...but NOT for the TGNE embedding. TGNE is a graph encoder: it
+        # aggregates over a host's neighbourhood, so the graph it is given
+        # changes the embedding it returns. The offline trainers call
+        # extract_trajectories() on the FULL window, while this path used to
+        # pass only host_flows — a strictly smaller subgraph. Measured on a
+        # replayed window with 16 flows of which 2 touched the target, the two
+        # embeddings differed by 1.5e-2 per dimension, and the gap widens with
+        # cross-host traffic. That is a train/serve mismatch: the model was
+        # fitted on full-graph embeddings and served subgraph ones.
+        #
+        # The full window is passed here -- every host's flows, clipped to the
+        # same window the attributes were computed over -- so live matches
+        # training on both axes: the whole graph, one window.
+        h_emb = self._build_embedding(target_ip, window_flows or host_flows)
         
         import model_contract
         model_contract.assert_shape(h_emb, (model_contract.TGNE_LATENT_DIM,), "TGNE Embedding")
@@ -304,20 +669,31 @@ class AntigravityModelAdapter:
         model_contract.assert_shape(feature_vector, (model_contract.BRANCH_A_INPUT_DIM,), "Branch A Input Vector")
 
         feature_history = self.feature_history_by_target.setdefault(target_ip, [])
+        # One window time per history entry. Recorded HERE, alongside the
+        # feature vector, because Branch A runs before the Branch B state is
+        # appended below; recording it there left Branch A's forward one
+        # window short of times. Feature and state histories always hold the
+        # same windows (one append each per call, both capped at
+        # history_steps), so both models read this one list.
+        h_time_history = self.h_time_history_by_target.setdefault(target_ip, [])
         feature_history.append(
             torch.from_numpy(feature_vector).float().to(self.device)
         )
+        h_time_history.append(
+            float(max(r.end_time for r in flows)) if flows else float(time.time()))
         if len(feature_history) > self.history_steps:
             feature_history.pop(0)
+            h_time_history.pop(0)
         self.feature_history = feature_history
         feature_history = list(feature_history)
         while len(feature_history) < self.history_steps:
             feature_history.insert(0, torch.zeros_like(feature_history[0]))
         x_tensor = torch.stack(feature_history).unsqueeze(0)
+        t_history = self._relative_times(h_time_history)
 
         with torch.no_grad():
             logger.debug("[TGNE] -> [BRANCH_A] -> [BRANCH_B] -> [DEEPOP]")
-            branch_a_out = self.branch_a(x_tensor)
+            branch_a_out = self.branch_a(x_tensor, t_history=t_history)
             risk_pred = branch_a_out["risk_score"]
             obs_logits = branch_a_out["technique_logits"]
             obs_probs = torch.softmax(obs_logits, dim=-1)
@@ -330,33 +706,93 @@ class AntigravityModelAdapter:
             )
             raw_risk = float(risk_pred.item()) if risk_pred.numel() == 1 else float(risk_pred.mean().item())
 
-        if is_mitigated:
-            obs_risk = max(0.02, raw_risk * 0.15)
-            obs_technique = "Benign"
-        else:
-            obs_risk = raw_risk
+        # --- The verdict: model output, untouched ------------------------------
+        #
+        # This used to be overwritten by an inline rule block, on by default:
+        # any external flow floored risk at 0.40 + 0.2567 (= the 0.6567 people
+        # saw on the dashboard) and replaced the LSTM's technique with a port
+        # count; no external flow multiplied risk by 0.4, so internal lateral
+        # movement at 0.80 was shown as 0.32 -- under the alert line. Pressing
+        # ARM EXTERNAL (attack_active) raised risk with zero traffic.
+        ml_risk = float(raw_risk)
+        ml_technique = obs_technique
+        obs_risk = ml_risk
 
-        curr_h = torch.from_numpy(h_emb).float().unsqueeze(0).to(self.device)
+        # --- Advisory SOC rule layer (opt-in, never the verdict) ---------------
+        rule_risk: Optional[float] = None
+        rule_technique: Optional[str] = None
+        if self.rules_enabled:
+            from control_backend.site_config import get_site_config
+            site = get_site_config()
+            ext_flows = [
+                r for r in host_flows
+                if site.classify_ip(getattr(r, "src_ip", "")) == "external"
+            ]
+            rule_risk, rule_technique = advisory_rule_opinion(ext_flows)
+
+        # Branch B's input is the world state it was trained on: the enriched
+        # tensor Branch A also reads (27-D), or the bare latent for a legacy
+        # 12-D checkpoint.
+        state = feature_vector if self.world_state_dim == feature_vector.shape[0] else h_emb
+        curr_h = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
         h_state_history = self.h_state_history_by_target.setdefault(target_ip, [])
         h_state_history.append(curr_h)
         if len(h_state_history) > self.history_steps:
             h_state_history.pop(0)
         self.h_state_history = h_state_history
-        while len(h_state_history) < self.history_steps:
-            h_state_history.insert(0, torch.zeros_like(curr_h))
-        h_seq = torch.stack(h_state_history, dim=1)
+        # Pad a COPY. `h_state_history` is the list held in
+        # h_state_history_by_target, so padding it in place wrote the zero
+        # placeholders into the retained history -- which made
+        # `len(self.h_state_history)` equal history_steps from the very first
+        # window. `state.sequence_ready` and `state.buffer_length` are derived
+        # from that length, so the payload reported a full 15-step buffer while
+        # 14 of the 15 slots were padding. Measured on window 0 of a fresh
+        # adapter: sequence_ready=True, buffer_length=15, non-zero entries=1.
+        # The Branch A feature history two blocks above already takes a copy;
+        # this one did not, and that was the whole difference.
+        padded_h = list(h_state_history)
+        while len(padded_h) < self.history_steps:
+            padded_h.insert(0, torch.zeros_like(curr_h))
+        h_seq = torch.stack(padded_h, dim=1)
+
+        # Real elapsed seconds of each history step, relative to the latest
+        # (the convention HostWorldDynamicsTransformer._elapsed_times and both
+        # training datasets use: <= 0, last entry exactly 0). Padded slots
+        # repeat the earliest real time, as the DeepOP dataset does.
+        # t_history was built once above from the shared per-window times.
+        # t_future is the contract's question, asked explicitly: step k is
+        # (k+1) * step_seconds ahead -- the same horizons the forecast points
+        # are labelled with (5 x 30 s = 150 s under the current contract).
+        # Training teaches h(t + dt) over the REAL dt to each future active
+        # window; serving chooses which dt to ask about. Leaving it None would
+        # fall back to a window_seconds grid (+2 ... +10 s) and label those
+        # answers as +30 ... +150 s.
+        t_future = torch.tensor(
+            [[(k + 1) * self.step_seconds for k in range(self.forecast_steps)]],
+            dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
+            # delta_t_step is the served window, not the module default. The
+            # adapter takes its contract from the checkpoints
+            # (_adopt_contract), so passing nothing here would silently encode
+            # positions at LIVE_WINDOW_SIZE_SEC whenever a checkpoint is served
+            # under a different window -- exactly the case the
+            # CYBERWORLD_ALLOW_CONTRACT_MISMATCH escape hatch permits.
             if hasattr(self.wdt, "rollout_with_uncertainty"):
-                h_future, radii = self.wdt.rollout_with_uncertainty(
-                    h_seq, K=self.forecast_steps, stabilize_horizon=True
+                # _radii are LATENT-space radii (NaN unless calibrate_radii was
+                # run) and cannot be drawn on a risk chart. The served band is
+                # the risk-space conformal interval: forecast_band() below.
+                h_future, _radii = self.wdt.rollout_with_uncertainty(
+                    h_seq, K=self.forecast_steps,
+                    delta_t_step=self.window_seconds, stabilize_horizon=True,
+                    t_history=t_history, t_future=t_future,
                 )
-                conf_radii = [float(r.item()) if hasattr(r, "item") else float(r) for r in radii]
             else:
                 h_future = self.wdt.rollout(
-                    h_seq, K=self.forecast_steps, stabilize_horizon=True
+                    h_seq, K=self.forecast_steps,
+                    delta_t_step=self.window_seconds, stabilize_horizon=True,
+                    t_history=t_history, t_future=t_future,
                 )
-                conf_radii = [0.05] * self.forecast_steps
 
             step_risks, _ = self.risk_head.forward_trajectory(h_future)
             fut_risks = [float(r) for r in step_risks.cpu().squeeze(0).numpy().tolist()]
@@ -373,10 +809,18 @@ class AntigravityModelAdapter:
             obs_token_tensor = torch.tensor(
                 [obs_token_id], dtype=torch.long, device=self.device
             )
+            tech_hist = self.technique_history_by_target.setdefault(target_ip, [])
+            tech_hist.append(int(obs_token_id))
+            del tech_hist[:-self.history_steps]
+            from deepop_decoder.forecast_decoder import observed_sequence_tokens
+            observed_seq = torch.tensor(
+                [observed_sequence_tokens(tech_hist, self.history_steps, self.vocab)],
+                dtype=torch.long, device=self.device)
             _, decoded_names, _, step_token_probs = self.deepop.forecast_sequence(
                 h_future,
                 max_steps=self.forecast_steps,
                 observed_token=obs_token_tensor,
+                observed_sequence=observed_seq,
                 return_probs=True,
             )
             deepop_confidences = step_token_probs[0] if step_token_probs else []
@@ -390,11 +834,7 @@ class AntigravityModelAdapter:
                 else:
                     forecast_techniques.append(str(item))
         while len(forecast_techniques) < self.forecast_steps:
-            forecast_techniques.append(obs_technique if not is_mitigated else "Benign")
-
-        if is_mitigated:
-            fut_risks = [max(0.01, r * 0.1) for r in fut_risks]
-            forecast_techniques = ["Benign"] * self.forecast_steps
+            forecast_techniques.append(obs_technique)
 
         # Clamp risks
         obs_risk = float(np.clip(obs_risk, 0.0, 1.0))
@@ -405,22 +845,45 @@ class AntigravityModelAdapter:
             obs_technique,
             ("Unknown", obs_technique, "TA0000", "Model-predicted technique"),
         )
-        alert = (not is_mitigated) and (
-            obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
-        )
+        alert = obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
 
-        explain = self._explain(feature_vector)
+        # Early warning: how far ahead the FORECAST first crosses the threshold.
+        # This used to be the constant forecast_steps * window_seconds on every
+        # alert -- a config value shown as if it were a measured lead time. It
+        # is 0.0 when the current window already crosses (the attack is in
+        # progress; there is no warning to claim) and None when nothing does.
+        # Steps are FORECAST steps (step_seconds), not 2 s input windows.
+        step_s = self.step_seconds
+        lead_time: Optional[float] = None
+        if obs_risk >= self.alert_threshold:
+            lead_time = 0.0
+        else:
+            for k, r in enumerate(fut_risks):
+                if r >= self.alert_threshold:
+                    lead_time = (k + 1) * step_s
+                    break
+
+        if not mitigation_recorded:
+            mitigation_status = None
+        elif mitigation_bypass_flows > 0:
+            mitigation_status = "traffic_persists"
+        else:
+            mitigation_status = "recorded_quiet"
+
+        explain = self._explain(x_tensor, t_history)
         inf_ms = (time.perf_counter() - t0) * 1000.0
         now_ts = time.time()
 
+        _hw = getattr(self, "forecast_risk_halfwidths", None)
         forecast_points = [
             ForecastPoint(
-                horizon_seconds=(i + 1) * self.window_seconds,
+                horizon_seconds=(i + 1) * step_s,
                 risk=round(fut_risks[i], 4),
                 confidence=round(deepop_confidences[i], 4)
                 if i < len(deepop_confidences)
                 else None,
                 predicted_stage=forecast_techniques[i],
+                **forecast_band(fut_risks[i], _hw, i),
             )
             for i in range(self.forecast_steps)
         ]
@@ -438,7 +901,14 @@ class AntigravityModelAdapter:
         return PredictionEvent(
             type="prediction",
             mode="LIVE",
-            timestamp=datetime.fromtimestamp(now_ts).isoformat() + "Z",
+            # datetime.fromtimestamp() with no tz is LOCAL time; suffixing "Z"
+            # then asserts it is UTC. On an IST (+0530) host the payload read
+            # 2026-09-22T18:19:46Z when UTC was 12:49:46Z -- every alert
+            # timestamp 5h30m in the future, and disagreeing with every other
+            # event on the bus, which all use schema.utc_now_iso().
+            timestamp=datetime.fromtimestamp(now_ts, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
             wall_clock=time.strftime("%H:%M:%S", time.localtime(now_ts)),
             model=ModelMetadata(
                 name="Antigravity-DualBranch-DeepOP",
@@ -449,6 +919,8 @@ class AntigravityModelAdapter:
                 forecast_steps=self.forecast_steps,
                 checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
                 threshold=self.alert_threshold,
+                forecast_step_seconds=step_s,
+                rules_enabled=self.rules_enabled,
             ),
             state=StateMetadata(
                 window_id=int(window_id),
@@ -460,6 +932,16 @@ class AntigravityModelAdapter:
             ),
             prediction=PredictionData(
                 risk=round(obs_risk, 4),
+                # Provenance (spec 21, 41): `risk` IS the model output. The
+                # advisory rule opinion, if enabled, sits beside it.
+                ml_risk=round(ml_risk, 4),
+                ml_technique=ml_technique,
+                rule_risk=(round(rule_risk, 4) if rule_risk is not None else None),
+                rule_technique=rule_technique,
+                rules_applied=False,
+                risk_source="model",
+                mitigation_status=mitigation_status,
+                mitigation_bypass_flows=(int(mitigation_bypass_flows) if mitigation_recorded else None),
                 max_future_risk=round(max_future, 4),
                 hazard_score=round(max_future, 4),
                 malicious_confidence=round(obs_risk, 4),
@@ -491,14 +973,23 @@ class AntigravityModelAdapter:
             early_warning=EarlyWarningData(
                 is_alert=alert,
                 alert_timestamp=now_ts if alert else None,
-                lead_time_seconds=self.forecast_steps * self.window_seconds if alert else None,
-                target_milestone_desc=forecast_techniques[0] if alert else None,
+                # Lead time is how far AHEAD the alert fires: the horizon of
+                # the first threshold crossing, 0.0 when the current window
+                # already crosses, None when nothing does. It used to report
+                # the full forecast horizon on every alert, overstating the
+                # warning on an attack already in progress.
+                lead_time_seconds=lead_time,
+                target_milestone_desc=(
+                    forecast_techniques[int(round(lead_time / step_s)) - 1]
+                    if lead_time else (obs_technique if lead_time == 0.0 else None)
+                ),
             ),
             attack_active=attack_active,
             attack_phase=attack_phase,
             focus_ips=focus_ips,
             focus_edges=focus_edges,
             target_ip=target_ip or None,
+            throughput=round(float(throughput), 2),
         )
 
     @staticmethod
@@ -573,5 +1064,16 @@ def flows_from_span_dicts(raw_flows: List[Dict[str, Any]]) -> List[UnifiedFlowRe
     return out
 
 
-# Module singleton used by tests and telemetry service
-model_adapter = AntigravityModelAdapter()
+# Module singleton used by the telemetry service and main.py, built on first
+# access (PEP 562) rather than at import. Importing this module for its helpers
+# or its class used to load all four checkpoints as a side effect.
+_singleton: Optional[AntigravityModelAdapter] = None
+
+
+def __getattr__(name: str):
+    global _singleton
+    if name == "model_adapter":
+        if _singleton is None:
+            _singleton = AntigravityModelAdapter()
+        return _singleton
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

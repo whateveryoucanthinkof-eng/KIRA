@@ -6,14 +6,47 @@ accommodating schema variations, column headers with or without spaces, and
 normalizing timestamps and flow features to UnifiedFlowRecord.
 """
 
+import logging
 import os
 import glob
 from typing import Iterator, Optional
 import pandas as pd
 import numpy as np
 
+from data_unification.row_guards import rejection_breakdown, valid_row_mask
+from data_unification.time_utils import (
+    detect_12h_clock_in_file,
+    repair_12h_clock,
+    to_epoch_seconds,
+    warn_if_resolution_too_coarse,
+)
+
+
+_CLOCK_REPAIR_CACHE: dict = {}
+
+
+def _file_needs_clock_repair(filepath: str) -> bool:
+    """Whether this file is on a 12-hour dial. Cached -- detection costs one
+    single-column read of the file (35s for the 7.9M-row tue_20)."""
+    key = os.path.abspath(filepath)
+    if key not in _CLOCK_REPAIR_CACHE:
+        try:
+            hdr = pd.read_csv(filepath, nrows=0, encoding="latin1")
+            ts = [c for c in hdr.columns if c.strip().lower() == "timestamp"]
+            verdict = detect_12h_clock_in_file(filepath, ts[0]) if ts else False
+        except Exception:
+            verdict = False
+        _CLOCK_REPAIR_CACHE[key] = verdict
+        if verdict:
+            logging.getLogger(__name__).warning(
+                "%s is on a 12-hour clock with no AM/PM; shifting 01:00-07:59 "
+                "forward 12h so afternoon traffic no longer sorts before morning.",
+                os.path.basename(filepath),
+            )
+    return _CLOCK_REPAIR_CACHE[key]
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
+from cyberworld_v4.config import get_contract
 
 
 class CIC2018Adapter:
@@ -30,6 +63,14 @@ class CIC2018Adapter:
     ) -> Iterator[UnifiedFlowRecord]:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
+
+        # Decide the clock dial ONCE for the whole file. Every CIC-2018 CSV
+        # records its Timestamp on a 12-hour dial with no AM/PM (hours 13-23 and
+        # 00 appear zero times across all 16,233,002 rows), so afternoon traffic
+        # parses twelve hours before the morning. Detection cannot be per-chunk:
+        # a chunk holding only afternoon rows is individually ambiguous.
+        # One CIC-2018 file is one capture day, so a per-file verdict is sound.
+        needs_clock_repair = _file_needs_clock_repair(filepath)
 
         chunks = pd.read_csv(
             filepath,
@@ -88,7 +129,19 @@ class CIC2018Adapter:
             # Timestamps
             if ts_col:
                 ts_series = pd.to_datetime(chunk[ts_col], dayfirst=True, errors="coerce")
-                start_timestamps = (ts_series.astype("int64") / 1e9).to_numpy()
+                # pandas >= 2 returns datetime64[us] (or [s]/[ms]) depending on input, not
+                # always [ns]. astype("int64") therefore yields MICROseconds here, and the
+                # old "/ 1e9" produced epoch seconds 1000x too small -- a 12-hour capture
+                # collapsed into 43 apparent seconds, so ~21,600 two-second windows became
+                # ~22 and every host trajectory was meaningless. Upcast to [ns] explicitly
+                # so the divisor is correct regardless of the parsed resolution.
+                start_timestamps = to_epoch_seconds(ts_series)
+                if needs_clock_repair:
+                    start_timestamps = repair_12h_clock(start_timestamps)
+                warn_if_resolution_too_coarse(
+                    start_timestamps, get_contract().window_seconds,
+                    source=os.path.basename(filepath),
+                )
             else:
                 start_timestamps = np.zeros(len(chunk), dtype=float)
 
@@ -126,7 +179,23 @@ class CIC2018Adapter:
             else:
                 labels = np.array(["BENIGN"] * len(chunk))
 
+            # Vectorised row guard. The previous per-row check tested only
+            # `start_timestamps[i] <= 0`, which misses the fourteen epoch-1970
+            # rows (their stamps are ~2.3e4, comfortably positive) and all
+            # 94,181 CICFlowMeter TSO failures (protocol 0 / port 0). See
+            # data_unification/row_guards.py for the evidence behind each rule.
+            keep = valid_row_mask(start_timestamps, protocols, dst_ports, src_ips)
+            n_dropped = int((~keep).sum())
+            if n_dropped:
+                self._rejections = getattr(self, "_rejections", {})
+                for k, v in rejection_breakdown(
+                    start_timestamps, protocols, dst_ports, src_ips
+                ).items():
+                    self._rejections[k] = self._rejections.get(k, 0) + v
+
             for i in range(len(chunk)):
+                if not keep[i]:
+                    continue
                 raw_lbl = labels[i]
                 coarse, attck, is_attack = self.resolver.resolve(raw_lbl, source=LabelSource.CIC2018)
 

@@ -26,7 +26,7 @@ REQUIRED_CHECKPOINTS = {
     "DeepOP CWA Forecasting Decoder": {
         "path": "saved_models/deepop/cwa_forecast_decoder.pt",
         "key": "decoder_state_dict",
-        "expected_keys": ["token_embedding.weight", "decoder_layers.0.cross_attn.in_proj_weight"],
+        "expected_keys": ["token_embed.weight", "layers.0.cross_attn.in_proj_weight"],
     },
     "TGNE-TA Pretrained Alert Graph": {
         "path": "bita/saved_models/bita_bigru_transformer-warden_alerts.pth",

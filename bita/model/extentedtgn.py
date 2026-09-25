@@ -13,6 +13,13 @@ import torch.nn as nn
 from model.tgn import TGN
 
 
+def legacy_category_pass() -> bool:
+    """True only when CYBERWORLD_LEGACY_CATEGORY_PASS=1: the leaky two-pass
+    category head, kept solely to measure what the leak was worth."""
+    import os
+    return os.environ.get("CYBERWORLD_LEGACY_CATEGORY_PASS", "") in ("1", "true", "True")
+
+
 class ExtendedTGN(TGN):
     def __init__(
         self,
@@ -68,7 +75,44 @@ class ExtendedTGN(TGN):
         )
 
         self.num_categories = num_categories
-        self.category_predictor = nn.Linear(self.embedding_dimension, num_categories)
+
+        # Category head: [src_emb ; dst_emb ; edge_features] -> class.
+        #
+        # This was `nn.Linear(embedding_dimension, num_categories)` applied to
+        # `src_emb + dst_emb`. Two defects, the first fatal:
+        #
+        #   1. It never saw the EDGE. The label (Benign / C2 / Impact /
+        #      InitialAccess / Recon) is a property of the FLOW -- its ports,
+        #      byte volumes, duration, protocol. With only node embeddings, a
+        #      benign flow and an attack flow between the SAME host pair are
+        #      literally identical inputs. The head could not separate them
+        #      even in principle, so it collapsed to a constant prediction.
+        #
+        #   2. Addition is symmetric, so A->B and B->A were indistinguishable.
+        #      Direction is most of what separates a scanner from its target.
+        #
+        # Measured collapse, both runs predicting one class for everything:
+        #   old alpha  -> always Benign,        aggregate CatAcc 0.8351 (looked fine)
+        #   new alpha  -> always InitialAccess, aggregate CatAcc 0.2115
+        # Only which class it collapsed onto changed, following whichever the
+        # loss favoured -- the signature of a head with no discriminative
+        # signal.
+        #
+        # Concatenation keeps direction; the edge features supply the flow;
+        # the hidden layer adds the nonlinearity a single Linear lacked.
+        edge_dim = (
+            self.edge_raw_features.shape[1]
+            if self.edge_raw_features is not None
+            else self.embedding_dimension
+        )
+        cat_in = self.embedding_dimension * 2 + edge_dim
+        hidden = max(32, cat_in)
+        self.category_predictor = nn.Sequential(
+            nn.Linear(cat_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden, num_categories),
+        )
 
     def compute_edge_probabilities_and_categories(
         self,
@@ -79,15 +123,43 @@ class ExtendedTGN(TGN):
         edge_idxs,
         n_neighbors=20,
     ):
-        pos_score, neg_score = super().compute_edge_probabilities(
-            source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
-        )
+        # ONE embedding pass feeds both heads. This used to call
+        # compute_temporal_embeddings a second time for the category head, and
+        # with memory updated at the start of a batch that second call first
+        # applied the CURRENT batch's messages: each edge's category was
+        # predicted from memory that already held every edge of its batch,
+        # including the ones after it in time (leakage, in training and in the
+        # val/test metrics), and every message was applied twice (the second
+        # call stored the batch again for the next batch to re-apply).
+        # CYBERWORLD_LEGACY_CATEGORY_PASS=1 restores it, only to measure it.
+        if legacy_category_pass():
+            pos_score, neg_score = super().compute_edge_probabilities(
+                source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
+            )
+            source_node_embedding, destination_node_embedding, _ = self.compute_temporal_embeddings(
+                source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
+            )
+        else:
+            source_node_embedding, destination_node_embedding, negative_node_embedding = (
+                self.compute_temporal_embeddings(
+                    source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
+                )
+            )
+            n_samples = len(source_nodes)
+            score = self.affinity_score(
+                torch.cat([source_node_embedding, source_node_embedding], dim=0),
+                torch.cat([destination_node_embedding, negative_node_embedding], dim=0),
+            ).squeeze(dim=-1)
+            pos_score, neg_score = score[:n_samples].sigmoid(), score[n_samples:].sigmoid()
 
-        source_node_embedding, destination_node_embedding, _ = self.compute_temporal_embeddings(
-            source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
+        # Concatenate, do not sum: summing erases direction. Append the edge's
+        # own features so the head can see what the flow actually is.
+        edge_feat = self.edge_raw_features[edge_idxs]
+        if edge_feat.device != source_node_embedding.device:
+            edge_feat = edge_feat.to(source_node_embedding.device)
+        combined_embeddings = torch.cat(
+            [source_node_embedding, destination_node_embedding, edge_feat.float()], dim=1
         )
-
-        combined_embeddings = source_node_embedding + destination_node_embedding
         category_logits = self.category_predictor(combined_embeddings)
 
         return pos_score, neg_score, category_logits
@@ -110,13 +182,19 @@ class ExtendedTGN(TGN):
         memory = None
         time_diffs = None
         if self.use_memory:
-            memory = self.memory.get_memory(list(range(self.n_nodes)))
+            # Every row, as a differentiable copy. This was get_memory(list(range(n_nodes))):
+            # a Python list of EVERY node id built and converted on every batch --
+            # ~3M ints per batch at a third of the PCAP corpus, which made the step
+            # O(nodes) and ran training at ~1 batch/s. clone() gives the same values
+            # and the same gradient (an all-rows gather backpropagates as a scatter-add
+            # into zeros); tests/test_memory_full_read_is_clone.py pins both.
+            memory = self.memory.memory.clone()
             last_update = self.memory.last_update
             time_diffs = (
-                torch.from_numpy(timestamps).float().to(self.device)
-                - last_update[node_ids].float()
+                torch.from_numpy(timestamps).double().to(self.device)
+                - last_update[node_ids].double()
             )
-            time_diffs = (time_diffs - self.mean_time_shift_src) / self.std_time_shift_src
+            time_diffs = ((time_diffs - self.mean_time_shift_src) / self.std_time_shift_src).float()
 
         node_embeddings = self.embedding_module.compute_embedding(
             memory=memory,
@@ -128,6 +206,55 @@ class ExtendedTGN(TGN):
         )
 
         return node_embeddings
+
+    # ------------------------------------------------------------------
+    # Streaming memory (window-by-window extraction and live serving)
+    #
+    # Training (bita/train.py) drives memory through compute_temporal_embeddings
+    # one batch at a time. Trajectory extraction and serving do not score
+    # edges, they read host embeddings at the end of each 2 s window, so they
+    # need the same causal protocol without the link-prediction machinery:
+    #
+    #   1. update_memory_for(nodes)   memory <- BiTA(messages stored EARLIER)
+    #   2. get_host_embeddings(...)   read embeddings from that memory
+    #   3. store_interactions(...)    queue this window's messages for later
+    #
+    # This is TGN's memory_update_at_start order (Rossi et al. 2020, and BiTA
+    # Section "Causality"): a window's own interactions never reach the
+    # memory that its own embedding is computed from.
+    # ------------------------------------------------------------------
+
+    def reset_state(self) -> None:
+        """Forget all memory and pending messages (start of a new capture/session)."""
+        if self.use_memory:
+            self.memory.__init_memory__()
+
+    def ensure_capacity(self, n_nodes: int) -> None:
+        if self.use_memory:
+            self.memory.ensure_capacity(n_nodes)
+
+    @torch.no_grad()
+    def update_memory_for(self, node_ids) -> None:
+        if not self.use_memory or len(node_ids) == 0:
+            return
+        nodes = np.unique(np.asarray(node_ids, dtype=int))
+        self.update_memory(nodes, self.memory.messages)
+        self.memory.clear_messages(nodes)
+
+    @torch.no_grad()
+    def store_interactions(self, sources, destinations, timestamps, edge_idxs) -> None:
+        if not self.use_memory or len(sources) == 0:
+            return
+        sources = np.asarray(sources, dtype=int)
+        destinations = np.asarray(destinations, dtype=int)
+        timestamps = np.asarray(timestamps, dtype=float)
+        edge_idxs = np.asarray(edge_idxs, dtype=int)
+        u_src, src_msgs = self.get_raw_messages(
+            sources, sources, destinations, destinations, timestamps, edge_idxs)
+        u_dst, dst_msgs = self.get_raw_messages(
+            destinations, destinations, sources, sources, timestamps, edge_idxs)
+        self.memory.store_raw_messages(u_src, src_msgs)
+        self.memory.store_raw_messages(u_dst, dst_msgs)
 
     def get_global_state(self, host_embeddings: torch.Tensor) -> torch.Tensor:
         """

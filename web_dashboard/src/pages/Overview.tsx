@@ -1,129 +1,389 @@
-import { useState } from "react";
+import { Area, ComposedChart, Line, ResponsiveContainer, Tooltip } from "recharts";
+import type { SystemStatus, ForecastPoint, PredictionResult, NetworkEvent, Topology } from "../api/types";
+import type { LivePoint, PredictionEnvelope } from "../types/live";
 import {
-  AreaChart,
-  Area,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  ReferenceLine,
-  ComposedChart,
-} from "recharts";
-import type {
-  SystemStatus,
-  TelemetryPoint,
-  ForecastPoint,
-  PredictionResult,
-  AttackEvent,
-  NetworkEvent,
-  Topology,
-} from "../api/types";
-import { SeverityBadge, StatusDot } from "../components/shared/StatusBadge";
-import { MetricCard } from "../components/shared/MetricCard";
+  BarRow,
+  Chip,
+  Data,
+  Empty,
+  Field,
+  Meter,
+  Micro,
+  Panel,
+  PanelBody,
+  PanelHead,
+  Readout,
+  sevColor,
+  sevFromRisk,
+} from "../design/primitives";
+import { FORECAST, Grid, Legend, OBSERVED, Plot, ThresholdLine, Tip, TimeAxis, ValueAxis } from "../design/charts";
+import { Num } from "../design/motion";
+import KillChain from "../components/KillChain";
 
 interface OverviewProps {
   status: SystemStatus | null;
-  telemetry: TelemetryPoint[];
+  history: LivePoint[];
   forecast: ForecastPoint[];
   prediction: PredictionResult | null;
-  attackEvents: AttackEvent[];
-  events: NetworkEvent[];
+  envelope: PredictionEnvelope | null;
   topology: Topology | null;
+  events: NetworkEvent[];
   logLines: string[];
 }
 
-function fmtTime(ts: string): string {
+/* ── formatting ────────────────────────────────────────────────────────── */
+
+const n = (v: unknown, d = 0): number => (Number.isFinite(Number(v)) ? Number(v) : d);
+
+function horizon(seconds: number, prefix = "+"): string {
+  if (!Number.isFinite(seconds)) return "—";
+  if (Math.abs(seconds) < 60) return `${prefix}${seconds % 1 === 0 ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+  const m = seconds / 60;
+  return `${prefix}${m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)}m`;
+}
+
+function hhmmss(ts: string): string {
   try {
-    return new Date(ts).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" });
-  } catch { return ts; }
+    return new Date(ts).toLocaleTimeString("en-GB", { hour12: false });
+  } catch {
+    return ts;
+  }
 }
 
-function fmtTs(ts: string): string {
-  try {
-    return new Date(ts).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch { return ts; }
+function compact(v: number): string {
+  if (!Number.isFinite(v)) return "—";
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return v.toFixed(0);
 }
 
-function fmtUptime(s: number): string {
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  return `${d}d ${h}h ${m}m`;
-}
+/* ════════════════════════════════════════════════════════════════════════
+   VERDICT — the hero. One serif numeral, and the honest story behind it.
+   ════════════════════════════════════════════════════════════════════════ */
 
-function ChartTip({ active, payload, label }: { active?: boolean; payload?: unknown[]; label?: string }) {
-  if (!active || !payload?.length) return null;
-  const items = payload as Array<{ name: string; value: number; color: string }>;
+function Verdict({ prediction, envelope }: { prediction: PredictionResult | null; envelope: PredictionEnvelope | null }) {
+  if (!prediction) {
+    return (
+      <Panel flush>
+        <PanelHead title="Verdict" />
+        <Empty hint="No inference window has been scored yet. Start the sensor and inference from Controls.">
+          Awaiting first prediction
+        </Empty>
+      </Panel>
+    );
+  }
+
+  const risk = n(prediction.risk);
+  const threshold = n(prediction.threshold, 0.65);
+  const level = prediction.alert_level ?? sevFromRisk(risk, threshold);
+  const color = sevColor(level);
+
+  const ml = prediction.ml_risk;
+  const mlTechnique = prediction.ml_technique ?? prediction.predicted_stage;
+  const rule = prediction.rule_risk;
+  const ruleTechnique = prediction.rule_technique;
+  const bypass = prediction.mitigation_status === "traffic_persists" ? n(prediction.mitigation_bypass_flows) : 0;
+
+  const lead = envelope?.early_warning?.lead_time_seconds;
+
   return (
-    <div style={{
-      background: "var(--color-surface)",
-      border: "1px solid var(--color-border)",
-      borderRadius: 6,
-      padding: "8px 12px",
-      fontSize: 11,
-      fontFamily: "var(--font-mono)",
-      boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
-      zIndex: 50,
-    }}>
-      <div style={{ color: "var(--color-text-muted)", marginBottom: 4 }}>{label}</div>
-      {items.map((item) => (
-        <div key={item.name} style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <span style={{ width: 8, height: 8, borderRadius: 2, background: item.color, display: "inline-block", flexShrink: 0 }} />
-          <span style={{ color: "var(--color-text-secondary)" }}>{item.name}</span>
-          <span style={{ color: "var(--color-text-primary)", fontWeight: 500, marginLeft: "auto", paddingLeft: 16 }}>{item.value}</span>
+    <Panel flush>
+      <PanelHead
+        title="Verdict"
+        note={envelope?.timestamp ? hhmmss(envelope.timestamp) : undefined}
+        aside={<Chip level={level} strong>{String(level)}</Chip>}
+      />
+
+      <PanelBody>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: "var(--s-6)", flexWrap: "wrap" }}>
+          {/* The one hero numeral on the page */}
+          <div style={{ minWidth: 168 }}>
+            <Micro style={{ marginBottom: "var(--s-2)" }}>Observed Risk</Micro>
+            <Num
+              value={risk}
+              digits={3}
+              className="t-display-xl"
+              style={{ color, display: "block", transition: "color var(--dur-value) var(--ease)" }}
+            />
+            <div style={{ marginTop: "var(--s-3)", width: 168 }}>
+              <Meter value={risk} level={level} height={6} />
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: "var(--s-1)" }}>
+                <span className="t-data-s" style={{ color: "var(--paper-600)" }}>0.00</span>
+                <span className="t-data-s" style={{ color: "var(--paper-600)" }}>θ {threshold.toFixed(2)}</span>
+                <span className="t-data-s" style={{ color: "var(--paper-600)" }}>1.00</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Technique attribution */}
+          <div style={{ flex: 1, minWidth: 220 }}>
+            <Micro style={{ marginBottom: "var(--s-2)" }}>Predicted Technique</Micro>
+            <div className="t-display-m" style={{ color: "var(--paper-000)", marginBottom: "var(--s-1)" }}>
+              {prediction.mitre_technique ?? prediction.predicted_stage ?? "Unclassified"}
+            </div>
+            <Data size="s" color="var(--paper-600)">
+              {[prediction.mitre_tactic_id, prediction.mitre_tactic].filter(Boolean).join("  ") || "no tactic mapping"}
+            </Data>
+
+            {prediction.mitre_description && (
+              <div className="t-body" style={{ color: "var(--paper-400)", marginTop: "var(--s-3)", maxWidth: 380 }}>
+                {prediction.mitre_description}
+              </div>
+            )}
+
+            <div style={{ marginTop: "var(--s-4)", display: "grid", gap: 0 }}>
+              <Field
+                label="Max future risk"
+                value={n(prediction.max_future_risk).toFixed(3)}
+                color={sevColor(sevFromRisk(n(prediction.max_future_risk), threshold))}
+              />
+              <Field
+                label="Technique conf."
+                value={prediction.technique_confidence != null ? n(prediction.technique_confidence).toFixed(3) : "—"}
+              />
+              {lead != null && Number.isFinite(lead) && (
+                // Stated fully in the early-warning band below; repeated here
+                // so the verdict panel stands alone when read in isolation.
+                <Field label="Early warning" value={`${n(lead).toFixed(1)}s lead`} color="var(--sev-nominal)" />
+              )}
+            </div>
+          </div>
         </div>
-      ))}
+
+        {/* ── Provenance ───────────────────────────────────────────────
+            The verdict above is the model's output, unmodified. The SOC rule
+            layer (off by default) is advisory: its opinion is shown here next
+            to the model's and never replaces risk, technique or alert. */}
+        <div style={{ marginTop: "var(--s-4)", paddingTop: "var(--s-3)", borderTop: "var(--hard)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: "var(--s-2)" }}>
+            <Micro>Provenance</Micro>
+            <Chip level="nominal">Model output</Chip>
+          </div>
+
+          <div style={{ display: "flex", gap: "var(--s-6)", flexWrap: "wrap" }}>
+            <Readout label="Model risk" value={ml != null ? n(ml).toFixed(3) : risk.toFixed(3)} level={level} sub="Branch A — the verdict" />
+            <Readout label="Model technique" value={mlTechnique ?? "—"} sub="Branch A technique head" />
+            <Readout
+              label="Rule opinion"
+              value={rule != null ? n(rule).toFixed(3) : "—"}
+              sub={rule != null ? `advisory only · ${ruleTechnique ?? "unlabelled"}` : "off / no external traffic"}
+            />
+          </div>
+        </div>
+
+        {bypass > 0 && (
+          // A recorded block is not enforcement. If traffic it should have
+          // stopped is still on the wire, say so instead of showing "quiet".
+          <div style={{ marginTop: "var(--s-3)", display: "flex", alignItems: "center", gap: "var(--s-2)" }}>
+            <Chip level="critical" strong>Mitigation not effective</Chip>
+            <Data size="s" color="var(--paper-400)">
+              {bypass} flow{bypass === 1 ? "" : "s"} this window still match a recorded block or isolation
+            </Data>
+          </div>
+        )}
+      </PanelBody>
+    </Panel>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   EARLY WARNING — the project's whole thesis, stated in one band.
+
+   `early_warning.lead_time_seconds` is how far ahead of the observed
+   milestone the model raised the alert. It is the number the system exists to
+   produce, and it was previously a 12px table row.
+   ════════════════════════════════════════════════════════════════════════ */
+
+function EarlyWarning({ envelope, prediction }: { envelope: PredictionEnvelope | null; prediction: PredictionResult | null }) {
+  const ew = envelope?.early_warning;
+  const lead = ew?.lead_time_seconds;
+  if (lead == null || !Number.isFinite(Number(lead))) return null;
+
+  const stage = prediction?.predicted_stage ?? envelope?.attack_phase ?? "next";
+  const technique = prediction?.mitre_technique ?? "";
+
+  return (
+    // Deliberately unkeyed. `alert_timestamp` changes every window, so keying
+    // on it would remount the band each tick and replay the reveal as a
+    // flicker. Mounting when the alert first fires is the only entrance.
+    <div className="sheet">
+      <Panel flush spine="nominal" className="is-revealing">
+        <PanelBody style={{ display: "flex", alignItems: "center", gap: "var(--s-8)", flexWrap: "wrap" }}>
+          <div>
+            <Micro style={{ marginBottom: "var(--s-2)" }}>Early warning</Micro>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)" }}>
+              <Num value={Number(lead)} digits={1} className="t-display-xl" style={{ color: "var(--sev-nominal)" }} />
+              <span className="t-data-l" style={{ color: "var(--sev-nominal)" }}>
+                s
+              </span>
+            </div>
+          </div>
+
+          <div style={{ flex: 1, minWidth: 240 }}>
+            <div className="t-display-m" style={{ color: "var(--paper-000)", marginBottom: "var(--s-1)" }}>
+              ahead of the {String(stage).toLowerCase()} milestone
+            </div>
+            <Data size="s" color="var(--paper-600)">
+              {ew?.target_milestone_desc ?? technique}
+            </Data>
+          </div>
+
+          <div style={{ minWidth: 200 }}>
+            <Field label="Alerted" value={ew?.alert_timestamp ? hhmmss(ew.alert_timestamp) : "—"} />
+            <Field
+              label="Milestone"
+              value={ew?.actual_milestone_timestamp ? hhmmss(ew.actual_milestone_timestamp) : "not yet observed"}
+            />
+          </div>
+        </PanelBody>
+      </Panel>
     </div>
   );
 }
 
-function TopologyMini({ topology }: { topology: Topology }) {
-  const nodeColor: Record<string, string> = {
-    online: "var(--color-status-green)",
-    offline: "var(--color-text-muted)",
-    degraded: "var(--color-status-amber)",
-    compromised: "var(--color-status-red)",
-    warning: "var(--color-status-amber)",
-  };
-  const edgeColor: Record<string, string> = {
-    active: "#d1d5db",
-    saturated: "var(--color-status-red)",
-    down: "#e5e7eb",
-    suspicious: "var(--color-status-amber)",
-  };
+/* ════════════════════════════════════════════════════════════════════════
+   PIPELINE — which model produced which part of the verdict.
+   Straight from PredictionData.stage_provenance.
+   ════════════════════════════════════════════════════════════════════════ */
+
+function Pipeline({ prediction, envelope }: { prediction: PredictionResult | null; envelope: PredictionEnvelope | null }) {
+  const prov = prediction?.stage_provenance ?? null;
+  const lat = envelope?.latency;
+  const total = n(lat?.total_ms);
+
+  const stages = prov
+    ? Object.entries(prov)
+    : [
+        ["TGNE", "encoder"],
+        ["BRANCH_A", "nowcast"],
+        ["BRANCH_B", "rollout"],
+        ["DEEPOP", "sequence"],
+      ];
+
+  const segs = [
+    { label: "telemetry", ms: n(lat?.telemetry_ms), color: "var(--paper-600)" },
+    { label: "inference", ms: n(lat?.inference_ms), color: OBSERVED },
+  ];
+  const segTotal = segs.reduce((a, s) => a + s.ms, 0) || 1;
+
   return (
-    <svg width="100%" viewBox="0 0 800 500" preserveAspectRatio="xMidYMid meet" style={{ display: "block" }}>
-      {topology.edges.map((edge) => {
-        const src = topology.nodes.find((n) => n.id === edge.source);
-        const tgt = topology.nodes.find((n) => n.id === edge.target);
-        if (!src || !tgt) return null;
+    <Panel flush style={{ display: "flex", flexDirection: "column" }}>
+      <PanelHead title="Inference pipeline" note={prov ? "live provenance" : "idle"} />
+      <PanelBody style={{ flex: 1, display: "flex", flexDirection: "column", gap: "var(--s-3)" }}>
+        {stages.map(([stage, detail], i) => (
+          <div
+            key={stage}
+            style={{
+              display: "flex",
+              alignItems: "baseline",
+              gap: "var(--s-2)",
+              paddingBottom: "var(--s-2)",
+              borderBottom: i < stages.length - 1 ? "var(--hair)" : undefined,
+            }}
+          >
+            <span className="t-data-s" style={{ color: "var(--paper-600)", width: 16, flexShrink: 0 }}>
+              {String(i + 1).padStart(2, "0")}
+            </span>
+            <span className="t-label" style={{ color: prov ? "var(--paper-000)" : "var(--paper-600)", width: 74, flexShrink: 0 }}>
+              {stage}
+            </span>
+            <span
+              className="t-data-s"
+              style={{ color: "var(--paper-600)", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+              title={String(detail)}
+            >
+              {String(detail)}
+            </span>
+          </div>
+        ))}
+
+        <div style={{ marginTop: "auto", paddingTop: "var(--s-3)", borderTop: "var(--hard)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "var(--s-2)" }}>
+            <Micro>Latency budget</Micro>
+            <Data size="s" color={total > 0 && total < 250 ? "var(--sev-nominal)" : "var(--paper-400)"}>
+              {total > 0 ? `${total.toFixed(1)} ms` : "—"}
+            </Data>
+          </div>
+
+          <div style={{ display: "flex", height: 6, border: "var(--hair)", background: "var(--ink-200)" }}>
+            {segs.map((s) => (
+              <div key={s.label} style={{ width: `${(s.ms / segTotal) * 100}%`, background: s.color }} title={`${s.label} ${s.ms.toFixed(1)}ms`} />
+            ))}
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: "var(--s-1)" }}>
+            {segs.map((s) => (
+              <span key={s.label} className="t-data-s" style={{ color: "var(--paper-600)" }}>
+                {s.label} {s.ms.toFixed(1)}
+              </span>
+            ))}
+          </div>
+        </div>
+      </PanelBody>
+    </Panel>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   HOST GRAPH — zone bands, square nodes. Ruled diagram, not a force layout.
+   ════════════════════════════════════════════════════════════════════════ */
+
+function HostGraph({ topology }: { topology: Topology }) {
+  const nodes = topology.nodes ?? [];
+  if (!nodes.length) return <Empty hint="Nodes appear as the sensor observes traffic.">No hosts discovered</Empty>;
+
+  return (
+    <svg width="100%" height="100%" viewBox="0 0 800 460" preserveAspectRatio="xMidYMid meet" style={{ display: "block" }}>
+      {/* Zone rules */}
+      {[
+        { y: 60, label: "EXTERNAL" },
+        { y: 190, label: "PERIMETER" },
+        { y: 320, label: "ENTERPRISE" },
+      ].map((band) => (
+        <g key={band.label}>
+          <line x1={0} y1={band.y - 34} x2={800} y2={band.y - 34} stroke="var(--rule-hair)" strokeWidth={1} shapeRendering="crispEdges" />
+          <text x={8} y={band.y - 42} fill="var(--paper-600)" fontSize={9} fontFamily="var(--face-ui)" letterSpacing="2">
+            {band.label}
+          </text>
+        </g>
+      ))}
+
+      {topology.edges?.map((e) => {
+        const s = nodes.find((x) => x.id === e.source);
+        const t = nodes.find((x) => x.id === e.target);
+        if (!s || !t) return null;
+        const crit = e.status === "saturated";
         return (
-          <line key={edge.id} x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
-            stroke={edgeColor[edge.status] ?? "#d1d5db"}
-            strokeWidth={edge.status === "saturated" ? 2.5 : 1.5}
-            strokeDasharray={edge.status === "suspicious" ? "4 3" : undefined}
-            opacity={0.8}
+          <line
+            key={e.id}
+            x1={s.x}
+            y1={s.y}
+            x2={t.x}
+            y2={t.y}
+            stroke={crit ? "var(--sev-critical)" : e.status === "suspicious" ? "var(--sev-warning)" : "var(--rule-hard)"}
+            strokeWidth={crit ? 1.6 : 1}
+            strokeDasharray={e.status === "suspicious" ? "3 3" : undefined}
+            shapeRendering={crit ? undefined : "crispEdges"}
           />
         );
       })}
-      {topology.nodes.map((node) => {
-        const color = nodeColor[node.status] ?? "var(--color-text-muted)";
-        const r = node.type === "router" || node.type === "firewall" ? 9 : node.type === "internet" ? 11 : node.type === "attacker" ? 8 : 7;
+
+      {nodes.map((node) => {
+        const c = sevColor(node.status);
+        const half = node.status === "compromised" ? 7 : 5;
         return (
           <g key={node.id}>
-            <circle cx={node.x} cy={node.y} r={r} fill={color} fillOpacity={0.15} stroke={color} strokeWidth={1.5} />
-            <text x={node.x} y={node.y + r + 11} textAnchor="middle"
-              style={{ fontSize: 9, fontFamily: "var(--font-mono)", fill: "var(--color-text-secondary)" }}>
+            <rect x={node.x - half} y={node.y - half} width={half * 2} height={half * 2} fill={c} shapeRendering="crispEdges" />
+            <text
+              x={node.x}
+              y={node.y + half + 12}
+              textAnchor="middle"
+              fill="var(--paper-400)"
+              fontSize={9}
+              fontFamily="var(--face-data)"
+            >
               {node.label}
             </text>
-            {node.ip && (
-              <text x={node.x} y={node.y + r + 20} textAnchor="middle"
-                style={{ fontSize: 8, fontFamily: "var(--font-mono)", fill: "var(--color-text-muted)" }}>
-                {node.ip}
-              </text>
-            )}
           </g>
         );
       })}
@@ -131,466 +391,330 @@ function TopologyMini({ topology }: { topology: Topology }) {
   );
 }
 
+/* ════════════════════════════════════════════════════════════════════════ */
 
-
-function logLineColor(line: string): string {
-  if (line.includes("CRITICAL") || line.includes("ALERT")) return "var(--color-status-red)";
-  if (line.includes("WARN")) return "var(--color-status-amber)";
-  if (line.includes("ERROR") || line.includes("DENY") || line.includes("BLOCK")) return "#e57373";
-  if (line.includes("INFO")) return "#9ca3af";
-  return "#6b7280";
-}
-
-export default function Overview({
-  status, telemetry, forecast, prediction, attackEvents, events, topology, logLines,
-}: OverviewProps) {
+export default function Overview({ status, history, forecast, prediction, envelope, topology, events, logLines }: OverviewProps) {
   if (!status) {
-    return (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--color-text-muted)", fontSize: 13 }}>
-        Loading…
-      </div>
-    );
+    return <Empty hint="Waiting for /api/status from the control backend.">Connecting</Empty>;
   }
 
-  const chartData = telemetry.slice(-60).map((p) => ({
-    t: fmtTime(p.timestamp),
-    observed: p.observed,
-    predicted: p.predicted,
-    band: p.upperBound - p.lowerBound,
-    lower: p.lowerBound,
-    anomaly: Math.round(p.anomalyScore),
+  const threshold = n(prediction?.threshold, 0.65);
+  const level = prediction?.alert_level ?? status.threatLevel;
+  const last = history[history.length - 1];
+
+  /* ── Risk trajectory: observed (solid, warm) vs forecast peak (dashed, cool) */
+  const riskSeries = history.map((p) => ({
+    t: p.label,
+    observed: p.risk,
+    forecast: p.maxFutureRisk,
   }));
 
-  const forecastChartData = forecast.slice(0, 20).map((p) => ({
-    t: fmtTime(p.timestamp),
-    predicted: p.predicted,
-    band: p.upperBound - p.lowerBound,
-    lower: p.lowerBound,
+  /* ── Measured telemetry, not derived from risk */
+  const telemetrySeries = history.map((p) => ({
+    t: p.label,
+    throughput: Number(p.throughput.toFixed(2)),
+    flows: p.flows,
   }));
 
-  const trafficMin = chartData.length ? Math.max(0, Math.min(...chartData.map(d => d.lower)) - 80) : 0;
-  const forecastMin = forecastChartData.length ? Math.max(0, Math.min(...forecastChartData.map(d => d.lower)) - 60) : 0;
+  /* ── Forward rollout */
+  const rollout = forecast.slice(0, 24).map((f) => ({
+    t: horizon(f.horizonSeconds),
+    risk: f.predicted / 100,
+    band: [f.lowerBound / 100, f.upperBound / 100] as [number, number],
+    stage: f.predictedStage ?? "—",
+  }));
 
-  const [explainExpanded, setExplainExpanded] = useState(true);
-  const recentLogs = logLines.slice(-8);
+  const kpis: { label: string; value: string; unit?: string; sub?: string; level?: unknown }[] = [
+    { label: "Anomaly", value: n(status.anomalyScore).toFixed(1), unit: "%", level, sub: "max(obs, forecast)" },
+    { label: "Throughput", value: n(status.throughput).toFixed(1), unit: "Mb/s", sub: "measured" },
+    { label: "Active flows", value: compact(n(status.activeConnections)), sub: "in window" },
+    { label: "Packets", value: compact(n(last?.packets)), sub: "last window" },
+    { label: "Pipeline", value: n(status.latency).toFixed(1), unit: "ms", sub: "telemetry + inference" },
+    { label: "Packet loss", value: n(status.packetLoss).toFixed(2), unit: "%", sub: "unanswered flows" },
+    // Sensor blind spots: windows scored on a partial capture (kernel drops) or
+    // never scored (missed). Zero is the only healthy value, so any count is a warning.
+    {
+      label: "Sensor gaps",
+      value: compact(n(status.incompleteWindows) + n(status.windowsMissed)),
+      unit: "win",
+      level: n(status.incompleteWindows) + n(status.windowsMissed) > 0 ? "warning" : undefined,
+      sub: `${compact(n(status.sensorKernelDrops))} frames dropped · ${compact(n(status.windowsMissed))} missed`,
+    },
+    { label: "Windows", value: String(history.length), sub: `of ${90} retained` },
+  ];
+
+  const groups = prediction?.explainability?.groups ?? [];
+  const feats = prediction?.explainability?.top_features ?? [];
 
   return (
-    <div className="overview-scroll">
-
-      {/* ── Row 1: Status bar ─────────────────────────────────── */}
-      <div className="ov-status">
-        <MetricCard label="Throughput" value={Math.round(status.throughput)} unit="Mbps" sub="10 GbE uplink" accent={status.throughput > 900 ? "red" : "default"} mono />
-        <MetricCard label="Latency" value={status.latency.toFixed(0)} unit="ms" sub="edge→core" mono />
-        <MetricCard label="Packet Loss" value={status.packetLoss.toFixed(1)} unit="%" sub="5m avg" accent={status.packetLoss > 1 ? "amber" : "default"} mono />
-        <MetricCard label="Connections" value={status.activeConnections.toLocaleString()} sub="established TCP" mono />
-        <MetricCard label="Anomaly Score" value={Math.round(status.anomalyScore)} unit="/ 100" accent={status.anomalyScore >= 70 ? "red" : status.anomalyScore >= 40 ? "amber" : "green"} mono />
-        <MetricCard label="Threat Level" value={status.threatLevel.toUpperCase()} sub="current" accent={status.threatLevel === "high" || status.threatLevel === "critical" ? "red" : "amber"} />
-        <MetricCard label="Uptime" value={fmtUptime(status.uptime)} sub="this session" />
+    <div className="ov">
+      {/* ── Verdict + pipeline ───────────────────────────────────────── */}
+      <div className="sheet ov-verdict">
+        <Verdict prediction={prediction} envelope={envelope} />
+        <Pipeline prediction={prediction} envelope={envelope} />
       </div>
 
-      {/* ── Rows 2-4: Main 2-col area ─────────────────────────── */}
-      <div className="ov-main">
+      {/* ── Kill chain: how far it got, and where the model says it goes ── */}
+      <div className="sheet">
+        <Panel flush>
+          <PanelHead
+            title="Kill chain"
+            note={forecast.length ? `observed → +${forecast[forecast.length - 1].horizonSeconds.toFixed(0)}s forecast` : undefined}
+            aside={
+              prediction?.predicted_stage ? (
+                <Chip level={level}>{prediction.predicted_stage}</Chip>
+              ) : undefined
+            }
+          />
+          <PanelBody>
+            <KillChain
+              stage={prediction?.predicted_stage}
+              technique={prediction?.mitre_technique}
+              forecast={forecast}
+              threshold={threshold}
+            />
+          </PanelBody>
+        </Panel>
+      </div>
 
-        {/* Left column */}
-        <div className="ov-left">
+      {/* ── Early warning ────────────────────────────────────────────── */}
+      <EarlyWarning envelope={envelope} prediction={prediction} />
 
-          {/* Live Traffic */}
-          <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
-            <div className="panel-header">
-              <span className="panel-title">Live Traffic — Observed vs Predicted</span>
-              <div style={{ display: "flex", gap: 14, alignItems: "center", flexShrink: 0 }}>
-                <LegendItem color="var(--color-status-blue)" label="Observed" />
-                <LegendItem color="var(--color-status-amber)" label="Predicted" dashed />
-              </div>
-            </div>
-            <div style={{ padding: "12px 8px 4px", height: 200 }}>
-              <ResponsiveContainer width="100%" height={200}>
-                <ComposedChart data={chartData} margin={{ top: 4, right: 16, left: 0, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="confBand" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%"  stopColor="var(--color-status-amber)" stopOpacity={0.18} />
-                      <stop offset="100%" stopColor="var(--color-status-amber)" stopOpacity={0.04} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" strokeOpacity={0.6} />
-                  <XAxis dataKey="t" tick={{ fontSize: 9, fontFamily: "var(--font-mono)" }} tickLine={false} axisLine={false} interval={9} />
-                  <YAxis domain={[trafficMin, "auto"]} tick={{ fontSize: 9, fontFamily: "var(--font-mono)" }} tickLine={false} axisLine={false} width={38} unit="M" />
-                  <Tooltip content={<ChartTip />} />
-                  <ReferenceLine y={900} stroke="var(--color-status-red)" strokeDasharray="4 3" strokeOpacity={0.5}
-                    label={{ value: "cap", position: "right", fontSize: 9, fill: "var(--color-status-red)" }} />
-                  {/* Stacked band: transparent base (lower) + visible band (upper-lower) */}
-                  <Area type="monotone" dataKey="lower" stackId="cb" stroke="none" fill="transparent" legendType="none" />
-                  <Area type="monotone" dataKey="band" stackId="cb" stroke="none" fill="url(#confBand)" legendType="none" />
-                  <Line type="monotone" dataKey="observed" stroke="var(--color-status-blue)" strokeWidth={1.5} dot={false} name="Observed" />
-                  <Line type="monotone" dataKey="predicted" stroke="var(--color-status-amber)" strokeWidth={1.5} dot={false} strokeDasharray="5 3" name="Predicted" />
+      {/* ── KPI strip ────────────────────────────────────────────────── */}
+      <div className="sheet ov-kpi">
+        {kpis.map((k) => (
+          <Panel key={k.label} flush>
+            <PanelBody style={{ padding: "var(--s-3)" }}>
+              <Readout label={k.label} value={k.value} unit={k.unit} sub={k.sub} level={k.level} />
+            </PanelBody>
+          </Panel>
+        ))}
+      </div>
+
+      {/* ── Plots ────────────────────────────────────────────────────── */}
+      <div className="sheet ov-plots">
+        <Panel flush style={{ display: "flex", flexDirection: "column" }}>
+          <PanelHead
+            title="Risk trajectory"
+            note={`${history.length} windows`}
+            aside={
+              <Legend
+                items={[
+                  { color: OBSERVED, label: "observed" },
+                  { color: FORECAST, label: "forecast peak", dashed: true },
+                ]}
+              />
+            }
+          />
+          {riskSeries.length ? (
+            <Plot height={212}>
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={riskSeries} margin={{ top: 14, right: 8, left: 0, bottom: 0 }}>
+                  <Grid />
+                  <TimeAxis />
+                  <ValueAxis domain={[0, 1]} ticks={[0, 0.25, 0.5, 0.75, 1]} />
+                  <Tooltip content={<Tip fmt={(v) => Number(v).toFixed(3)} />} cursor={{ stroke: "var(--rule-hard)" }} />
+                  <ThresholdLine y={threshold} />
+                  <Area type="monotone" dataKey="observed" name="observed" stroke="none" fill="var(--fill-observed)" isAnimationActive={false} />
+                  <Line type="monotone" dataKey="observed" name="observed" stroke={OBSERVED} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                  <Line
+                    type="monotone"
+                    dataKey="forecast"
+                    name="forecast peak"
+                    stroke={FORECAST}
+                    strokeWidth={1.5}
+                    strokeDasharray="3 3"
+                    dot={false}
+                    isAnimationActive={false}
+                  />
                 </ComposedChart>
               </ResponsiveContainer>
-            </div>
-            <div style={{ borderTop: "1px solid var(--color-border)", padding: "8px 8px 4px" }}>
-              <div className="panel-title" style={{ paddingLeft: 4, marginBottom: 6 }}>Anomaly Score (60m)</div>
-              <div style={{ height: 40 }}>
-                <ResponsiveContainer width="100%" height={40}>
-                  <AreaChart data={chartData} margin={{ top: 0, right: 16, left: 38, bottom: 0 }}>
-                    <defs>
-                      <linearGradient id="anomGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%"  stopColor="var(--color-status-red)" stopOpacity={0.25} />
-                        <stop offset="95%" stopColor="var(--color-status-red)" stopOpacity={0.02} />
-                      </linearGradient>
-                    </defs>
-                    <Area type="monotone" dataKey="anomaly" stroke="var(--color-status-red)" strokeWidth={1} fill="url(#anomGrad)" dot={false} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </div>
-
-          {/* Middle row: Network Topology | 30-Min Forecast */}
-          <div className="ov-mid">
-
-            {/* Network Topology */}
-            {topology ? (
-              <div className="panel panel-clipped" style={{ display: "flex", flexDirection: "column" }}>
-                <div className="panel-header">
-                  <span className="panel-title">Network Topology</span>
-                  <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", flexShrink: 0 }}>
-                    {topology.nodes.length}n · {topology.edges.length}l
-                  </span>
-                </div>
-                <div style={{ padding: "8px 4px", flex: 1 }}>
-                  <TopologyMini topology={topology} />
-                </div>
-              </div>
-            ) : (
-              <div className="panel" style={{ padding: 16, color: "var(--color-text-muted)", fontSize: 12 }}>No topology data</div>
-            )}
-
-            {/* 30-Min Forecast */}
-            <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
-              <div className="panel-header">
-                <span className="panel-title">30-Min Forecast</span>
-                <span style={{ fontSize: 9, color: "var(--color-text-muted)", flexShrink: 0 }}>horizon</span>
-              </div>
-              <div style={{ padding: "10px 8px 4px", height: 120 }}>
-                <ResponsiveContainer width="100%" height={120}>
-                  <ComposedChart data={forecastChartData} margin={{ top: 4, right: 12, left: 0, bottom: 0 }}>
-                    <defs>
-                      <linearGradient id="fcBand" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%"  stopColor="var(--color-status-blue)" stopOpacity={0.18} />
-                        <stop offset="100%" stopColor="var(--color-status-blue)" stopOpacity={0.04} />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" strokeOpacity={0.6} />
-                    <XAxis dataKey="t" tick={{ fontSize: 8, fontFamily: "var(--font-mono)" }} tickLine={false} axisLine={false} interval={4} />
-                    <YAxis domain={[forecastMin, "auto"]} tick={{ fontSize: 8, fontFamily: "var(--font-mono)" }} tickLine={false} axisLine={false} width={32} unit="M" />
-                    <Tooltip content={<ChartTip />} />
-                    <Area type="monotone" dataKey="lower" stackId="fc" stroke="none" fill="transparent" legendType="none" />
-                    <Area type="monotone" dataKey="band" stackId="fc" stroke="none" fill="url(#fcBand)" legendType="none" />
-                    <Line type="monotone" dataKey="predicted" stroke="var(--color-status-blue)" strokeWidth={1.5} dot={false} strokeDasharray="4 2" name="Forecast" />
-                  </ComposedChart>
-                </ResponsiveContainer>
-              </div>
-              <div style={{ borderTop: "1px solid var(--color-border)", padding: "6px 12px 8px" }}>
-                {forecast.slice(0, 4).map((f, i) => (
-                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0", borderBottom: i < 3 ? "1px solid var(--color-border)" : "none" }}>
-                    <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>+{(i + 1) * 5}m</span>
-                    <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)" }}>
-                      {f.predicted}<span style={{ color: "var(--color-text-muted)", fontSize: 9 }}> M</span>
-                    </span>
-                    <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-                      ci {(f.confidence * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Model Inference Provenance & Active Threats — full left-column width */}
-          <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
-            <div className="panel-header">
-              <span className="panel-title">Model Inference Provenance & Active Threats</span>
-              <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-status-red)", flexShrink: 0 }}>
-                {attackEvents.filter((e) => !e.mitigated).length} active threats
-              </span>
-            </div>
-            <div style={{ padding: "10px 12px" }}>
-              {/* Dynamic Provenance Rendering */}
-              {prediction?.stage_provenance ? (
-                <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-                  {Object.entries(prediction.stage_provenance).map(([key, val], idx, arr) => (
-                    <div key={key} style={{ flex: 1, display: "flex", alignItems: "center" }}>
-                      <div style={{ flex: 1, padding: "4px 8px", background: "var(--color-base)", borderRadius: 4, border: "1px solid var(--color-border)" }}>
-                        <div style={{ fontSize: 9, color: "var(--color-text-muted)", fontWeight: 600, textTransform: "uppercase", marginBottom: 2 }}>{key}</div>
-                        <div style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-status-blue)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{val}</div>
-                      </div>
-                      {idx < arr.length - 1 && (
-                        <div style={{ padding: "0 4px", color: "var(--color-text-muted)" }}>→</div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={{ fontSize: 11, color: "var(--color-text-muted)", marginBottom: 12 }}>Provenance data unavailable</div>
-              )}
-              {/* Attack event cards — horizontal when wide */}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 6 }}>
-                {attackEvents.map((atk) => (
-                  <div key={atk.id} style={{
-                    padding: "6px 8px",
-                    borderRadius: 4,
-                    background: atk.mitigated ? "var(--color-base)" : "var(--color-status-red-bg)",
-                    border: `1px solid ${atk.mitigated ? "var(--color-border)" : "var(--color-status-red)"}22`,
-                  }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2, gap: 6 }}>
-                      <span style={{ fontSize: 11, fontWeight: 600, color: atk.mitigated ? "var(--color-text-muted)" : "var(--color-status-red)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {atk.type}
-                      </span>
-                      <span style={{ fontSize: 9, color: "var(--color-text-muted)", fontFamily: "var(--font-mono)", flexShrink: 0 }}>
-                        {atk.mitigated ? "mitigated" : atk.stage}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {atk.sourceIp} → {atk.targetIp}
-                    </div>
-                    <div style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", marginTop: 2 }}>
-                      {atk.packets.toLocaleString()} pkts · {atk.bytes.toLocaleString()} B
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Right column: Prediction Summary + Recent Events */}
-        <div className="ov-right">
-
-          {/* Prediction Summary */}
-          {prediction && (
-            <div className="panel" style={{ flexShrink: 0 }}>
-              <div className="panel-header">
-                <span className="panel-title">Prediction Summary</span>
-                <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-                  {prediction.horizon}m horizon
-                </span>
-              </div>
-              <div style={{ padding: 12 }}>
-                <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginBottom: 6 }}>
-                  <span style={{
-                    fontSize: 36,
-                    fontWeight: 700,
-                    fontFamily: "var(--font-mono)",
-                    lineHeight: 1,
-                    color: prediction.value >= 0.7 ? "var(--color-status-red)" : prediction.value >= 0.4 ? "var(--color-status-amber)" : "var(--color-status-green)",
-                  }}>
-                    {(prediction.value * 100).toFixed(0)}%
-                  </span>
-                  <span style={{ fontSize: 11, color: "var(--color-text-muted)" }}>attack prob.</span>
-                </div>
-                <div style={{ display: "flex", gap: 12, marginBottom: 10 }}>
-                  <span style={{ fontSize: 10, color: "var(--color-text-muted)" }}>
-                    confidence <span style={{ fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)" }}>{(prediction.confidence * 100).toFixed(0)}%</span>
-                  </span>
-                  <span style={{ fontSize: 10, color: "var(--color-text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {prediction.model}
-                  </span>
-                </div>
-                <div className="panel-title" style={{ marginBottom: 8 }}>Contributing Signals</div>
-                {prediction.signals.slice(0, 6).map((sig) => (
-                  <div key={sig.name} style={{ marginBottom: 7 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, gap: 6 }}>
-                      <span style={{ fontSize: 10, color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {sig.name}
-                      </span>
-                      <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", flexShrink: 0 }}>
-                        {(sig.weight * 100).toFixed(0)}%
-                      </span>
-                    </div>
-                    <div style={{ height: 4, background: "var(--color-base)", borderRadius: 2 }}>
-                      <div style={{
-                        width: `${sig.weight * 100}%`, height: "100%", borderRadius: 2,
-                        background: sig.direction === "positive" ? "var(--color-status-red)" : sig.direction === "negative" ? "var(--color-status-green)" : "var(--color-text-muted)",
-                        transition: "width 0.3s ease",
-                      }} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            </Plot>
+          ) : (
+            <Empty hint="Risk history accumulates from the prediction stream.">No inference history</Empty>
           )}
+        </Panel>
 
-          {/* Recent Events — fills remaining height */}
-          <div className="panel panel-clipped ov-events">
-            <div className="panel-header" style={{ flexShrink: 0 }}>
-              <span className="panel-title">Recent Events</span>
-              <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-                {events.length} total
-              </span>
-            </div>
-            <div style={{ overflowY: "auto", flex: 1, minHeight: 0 }}>
-              {events.slice(0, 12).map((ev) => (
-                <div key={ev.id} style={{
-                  padding: "7px 12px",
-                  borderBottom: "1px solid var(--color-border)",
-                  display: "flex",
-                  gap: 8,
-                  alignItems: "flex-start",
-                }}>
-                  <div style={{ flexShrink: 0, paddingTop: 1 }}>
-                    <SeverityBadge severity={ev.severity} />
+        <Panel flush style={{ display: "flex", flexDirection: "column" }}>
+          <PanelHead
+            title="Forward rollout"
+            note={rollout.length ? `K=${rollout.length}` : undefined}
+            aside={<Legend items={[{ color: FORECAST, label: "risk" }, { color: FORECAST, label: "band", fill: true }]} />}
+          />
+          {rollout.length ? (
+            <Plot height={212}>
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={rollout} margin={{ top: 14, right: 8, left: 0, bottom: 0 }}>
+                  <Grid />
+                  <TimeAxis />
+                  <ValueAxis domain={[0, 1]} ticks={[0, 0.25, 0.5, 0.75, 1]} />
+                  <Tooltip content={<Tip fmt={(v) => (Array.isArray(v) ? "" : Number(v).toFixed(3))} />} cursor={{ stroke: "var(--rule-hard)" }} />
+                  <ThresholdLine y={threshold} />
+                  <Area dataKey="band" name="band" stroke="none" fill="var(--fill-forecast)" isAnimationActive={false} />
+                  {/* The rollout is a discrete 8-point shape that changes
+                      meaningfully each window, so it earns a morph. The
+                      rolling history charts stay un-animated — re-drawing a
+                      90-point path every tick reads as lag, not motion. */}
+                  <Line
+                    type="monotone"
+                    dataKey="risk"
+                    name="risk"
+                    stroke={FORECAST}
+                    strokeWidth={1.5}
+                    strokeDasharray="3 3"
+                    dot={{ r: 1.5, fill: FORECAST, strokeWidth: 0 }}
+                    isAnimationActive
+                    animationDuration={200}
+                    animationEasing="ease-out"
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </Plot>
+          ) : (
+            <Empty hint="The world model emits a K-step rollout with each scored window.">No forecast</Empty>
+          )}
+        </Panel>
+      </div>
+
+      {/* ── Telemetry + attribution + stream ─────────────────────────── */}
+      <div className="sheet ov-lower">
+        <Panel flush clip style={{ display: "flex", flexDirection: "column", minHeight: 260 }}>
+          <PanelHead title="Host graph" note={topology ? `${topology.nodes.length} hosts · ${topology.edges.length} edges` : undefined} />
+          <div style={{ flex: 1, minHeight: 0, padding: "var(--s-2)" }}>
+            {topology ? <HostGraph topology={topology} /> : <Empty>No topology</Empty>}
+          </div>
+        </Panel>
+
+        <Panel flush style={{ display: "flex", flexDirection: "column", minHeight: 260 }}>
+          <PanelHead
+            title="Feature attribution"
+            note={prediction?.explainability?.method ?? undefined}
+            aside={groups.length ? <Data size="s" color="var(--paper-600)">{groups.length} groups</Data> : undefined}
+          />
+          {feats.length ? (
+            <PanelBody style={{ display: "flex", flexDirection: "column", gap: "var(--s-2)", overflowY: "auto" }}>
+              {feats.slice(0, 8).map((f) => (
+                <BarRow key={f.feature} label={f.feature} value={n(f.score)} note={f.group} />
+              ))}
+
+              {groups.length > 0 && (
+                <div style={{ marginTop: "var(--s-2)", paddingTop: "var(--s-3)", borderTop: "var(--hard)" }}>
+                  <Micro style={{ marginBottom: "var(--s-2)" }}>By group</Micro>
+                  <div style={{ display: "flex", height: 8, border: "var(--hair)" }}>
+                    {groups.map((g, i) => (
+                      <div
+                        key={g.name}
+                        title={`${g.name} ${n(g.percentage).toFixed(1)}%`}
+                        style={{
+                          width: `${n(g.percentage)}%`,
+                          background: OBSERVED,
+                          opacity: 1 - i * 0.13,
+                          borderRight: i < groups.length - 1 ? "1px solid var(--ink-050)" : undefined,
+                        }}
+                      />
+                    ))}
                   </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {ev.message}
-                    </div>
-                    <div style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)", marginTop: 1 }}>
-                      {fmtTs(ev.timestamp)}
-                    </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-2)", marginTop: "var(--s-2)" }}>
+                    {groups.map((g) => (
+                      <span key={g.name} className="t-data-s" style={{ color: "var(--paper-600)" }}>
+                        {g.name} {n(g.percentage).toFixed(0)}%
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </PanelBody>
+          ) : (
+            <Empty hint="Input × Gradient attributions arrive with each scored window.">No attribution</Empty>
+          )}
+        </Panel>
+
+        <Panel flush clip style={{ display: "flex", flexDirection: "column", minHeight: 260 }}>
+          <PanelHead title="Event stream" note={events.length ? `${events.length}` : undefined} />
+          {events.length ? (
+            <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+              {events.slice(0, 40).map((e) => (
+                <div
+                  key={e.id}
+                  className="is-stamping"
+                  style={{
+                    padding: "var(--s-2) var(--s-3)",
+                    borderBottom: "var(--hair)",
+                    borderLeft: `3px solid ${sevColor(e.severity)}`,
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "var(--s-2)" }}>
+                    <span className="t-micro" style={{ color: sevColor(e.severity) }}>
+                      {e.category}
+                    </span>
+                    <Data size="s" color="var(--paper-600)">
+                      {hhmmss(e.timestamp)}
+                    </Data>
+                  </div>
+                  <div
+                    className="t-data-s"
+                    style={{ color: "var(--paper-400)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                    title={e.message}
+                  >
+                    {e.message}
                   </div>
                 </div>
               ))}
             </div>
-          </div>
-        </div>
+          ) : (
+            <Empty hint="Alerts, commands and attack stages land here as they occur.">Stream quiet</Empty>
+          )}
+        </Panel>
       </div>
 
-      {/* ── Row 5: Bottom row — Anomaly | Explainability | Console ── */}
-      <div className="ov-bottom">
-
-        {/* Anomaly Score + service status */}
-        <div className="panel" style={{ padding: "12px 14px" }}>
-          <div className="panel-title" style={{ marginBottom: 10 }}>Live Anomaly Score</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-            <div style={{ flex: 1, height: 6, background: "var(--color-base)", borderRadius: 3, overflow: "hidden" }}>
-              <div style={{
-                width: `${status.anomalyScore}%`, height: "100%", borderRadius: 3,
-                background: status.anomalyScore >= 80 ? "var(--color-status-red)" : status.anomalyScore >= 50 ? "var(--color-status-amber)" : "var(--color-status-green)",
-                transition: "width 0.4s ease",
-              }} />
-            </div>
-            <span style={{
-              fontSize: 13, fontWeight: 700, fontFamily: "var(--font-mono)", minWidth: 32, textAlign: "right", flexShrink: 0,
-              color: status.anomalyScore >= 80 ? "var(--color-status-red)" : status.anomalyScore >= 50 ? "var(--color-status-amber)" : "var(--color-status-green)",
-            }}>
-              {status.anomalyScore.toFixed(0)}
-            </span>
-          </div>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "var(--color-text-muted)", marginBottom: 14 }}>
-            <span>Normal</span><span>Suspicious</span><span>Critical</span>
-          </div>
-          <div className="panel-title" style={{ marginBottom: 8 }}>Service Health</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {([
-              ["Network",    status.networkStatus],
-              ["Telemetry",  status.telemetryStatus],
-              ["Prediction", status.predictionStatus],
-              ["Attack Det.", status.attackStatus === "none" ? "online" : status.attackStatus === "active" ? "compromised" : "warning"],
-            ] as [string, string][]).map(([label, st]) => (
-              <div key={label} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <StatusDot status={st as "online" | "offline" | "degraded" | "compromised" | "warning"} pulse />
-                <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>{label}</span>
-                <span style={{ marginLeft: "auto", fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>{st}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* ML Explainability — SHAP-style feature impact */}
-        <div className="panel" style={{ display: "flex", flexDirection: "column" }}>
-          <div className="panel-header">
-            <span className="panel-title">ML Explainability — Feature Impact</span>
-            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              {prediction && (
-                <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-                  {prediction.model.split(" ").slice(0, 2).join(" ")}
-                </span>
-              )}
-              <button
-                onClick={() => setExplainExpanded(v => !v)}
-                style={{
-                  fontSize: 10, fontWeight: 600, letterSpacing: "0.04em",
-                  padding: "2px 8px", borderRadius: 4, cursor: "pointer",
-                  border: "1px solid var(--color-border-strong)", background: "transparent",
-                  color: "var(--color-status-blue)", whiteSpace: "nowrap",
-                  fontFamily: "var(--font-sans)",
-                }}
-              >
-                {explainExpanded ? "HIDE FEATURE DRIVERS" : "VIEW TOP FEATURE DRIVERS"}
-              </button>
-            </div>
-          </div>
-          {explainExpanded && (
-            <div style={{ padding: "10px 14px 12px", flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
-              {prediction ? prediction.signals.map((sig) => {
-                const impact = sig.weight * 100;
-                const isPos = sig.direction === "positive";
-                const isNeg = sig.direction === "negative";
-                const barColor = isPos ? "var(--color-status-red)" : isNeg ? "var(--color-status-green)" : "var(--color-text-muted)";
-                const dirLabel = isPos ? "↑ risk" : isNeg ? "↓ risk" : "neutral";
-                return (
-                  <div key={sig.name} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center" }}>
-                    <div>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, alignItems: "baseline" }}>
-                        <span style={{ fontSize: 10, color: "var(--color-text-secondary)" }}>{sig.name}</span>
-                        <span style={{ fontSize: 9, fontFamily: "var(--font-mono)", color: barColor, marginLeft: 8, flexShrink: 0 }}>{dirLabel}</span>
-                      </div>
-                      <div style={{ height: 5, background: "var(--color-base)", borderRadius: 3, overflow: "hidden" }}>
-                        <div style={{ width: `${impact}%`, height: "100%", borderRadius: 3, background: barColor }} />
-                      </div>
-                    </div>
-                    <span style={{ fontSize: 11, fontWeight: 600, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", minWidth: 32, textAlign: "right" }}>
-                      {impact.toFixed(0)}%
-                    </span>
-                  </div>
-                );
-              }) : (
-                <div style={{ color: "var(--color-text-muted)", fontSize: 12, paddingTop: 8 }}>No prediction data</div>
-              )}
-            </div>
+      {/* ── Telemetry + console ──────────────────────────────────────── */}
+      <div className="sheet ov-plots">
+        <Panel flush style={{ display: "flex", flexDirection: "column" }}>
+          <PanelHead
+            title="Measured telemetry"
+            aside={<Legend items={[{ color: OBSERVED, label: "Mb/s" }, { color: "var(--paper-600)", label: "flows" }]} />}
+          />
+          {telemetrySeries.length ? (
+            <Plot height={150}>
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={telemetrySeries} margin={{ top: 10, right: 8, left: 0, bottom: 0 }}>
+                  <Grid />
+                  <TimeAxis />
+                  <ValueAxis width={40} />
+                  <Tooltip content={<Tip />} cursor={{ stroke: "var(--rule-hard)" }} />
+                  <Area
+                    type="monotone"
+                    dataKey="throughput"
+                    name="Mb/s"
+                    stroke={OBSERVED}
+                    strokeWidth={1.5}
+                    fill="var(--fill-observed)"
+                    isAnimationActive={false}
+                  />
+                  <Line type="monotone" dataKey="flows" name="flows" stroke="var(--paper-600)" strokeWidth={1} dot={false} isAnimationActive={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </Plot>
+          ) : (
+            <Empty hint="Throughput and flow counts come from the sensor's 2s windows.">No telemetry</Empty>
           )}
-        </div>
+        </Panel>
 
-        {/* System Console */}
-        <div className="panel panel-clipped" style={{ display: "flex", flexDirection: "column" }}>
-          <div className="panel-header" style={{ flexShrink: 0 }}>
-            <span className="panel-title">System Log</span>
-            <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--color-text-muted)" }}>
-              live · {logLines.length}
-            </span>
+        <Panel flush clip style={{ display: "flex", flexDirection: "column" }}>
+          <PanelHead title="Console" note={logLines.length ? `${logLines.length} lines` : undefined} />
+          <div className="log">
+            {logLines.length ? (
+              logLines.slice(-60).map((line, i) => (
+                <div key={i} className="log-line">
+                  {line}
+                </div>
+              ))
+            ) : (
+              <span className="log-line">— idle —</span>
+            )}
           </div>
-          <div style={{
-            flex: 1,
-            overflow: "auto",
-            padding: "8px 10px",
-            fontFamily: "var(--font-mono)",
-            fontSize: 10,
-            background: "#1a1e24",
-            borderRadius: "0 0 8px 8px",
-            display: "flex",
-            flexDirection: "column",
-            justifyContent: "flex-end",
-          }}>
-            {recentLogs.map((line, i) => (
-              <div key={i} style={{ color: logLineColor(line), lineHeight: 1.65, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {line}
-              </div>
-            ))}
-          </div>
-        </div>
-
+        </Panel>
       </div>
     </div>
-  );
-}
-
-function LegendItem({ color, label, dashed }: { color: string; label: string; dashed?: boolean }) {
-  return (
-    <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, whiteSpace: "nowrap" }}>
-      <span style={{
-        width: 20, height: 2, background: dashed ? "transparent" : color, display: "inline-block", borderRadius: 1,
-        borderTop: dashed ? `2px dashed ${color}` : undefined,
-      }} />
-      <span style={{ color: "var(--color-text-muted)" }}>{label}</span>
-    </span>
   );
 }

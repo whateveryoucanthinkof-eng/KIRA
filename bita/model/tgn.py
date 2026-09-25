@@ -18,6 +18,41 @@ from modules.embedding_module import get_embedding_module
 from model.time_encoding import TimeEncode
 
 
+class HostEdgeFeatures:
+    """Edge-feature matrix left in host memory (typically a file mapping).
+
+    Indexing returns a device tensor holding exactly the rows a device-resident
+    copy would return for the same index: `feats[idx]` and `feats[idx, :]`
+    with numpy or torch integer indices of any shape, negative indices
+    wrapping, out-of-range indices raising. Only the gathered rows reach the
+    GPU, so device memory no longer grows with the edge count.
+    """
+
+    def __init__(self, array, device):
+        if array.dtype != np.float32 or array.ndim != 2:
+            raise ValueError("HostEdgeFeatures expects a 2-D float32 array")
+        self.array = array
+        self.device = torch.device(device)
+        self.shape = torch.Size(array.shape)
+        self.dtype = torch.float32
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            if len(idx) != 2 or idx[1] != slice(None):
+                raise IndexError("HostEdgeFeatures supports [rows] and [rows, :] only")
+            idx = idx[0]
+        if torch.is_tensor(idx):
+            idx = idx.detach().cpu().numpy()
+        idx = np.asarray(idx)
+        if idx.dtype.kind not in "iu":
+            raise IndexError(f"HostEdgeFeatures: integer indices only, got {idx.dtype}")
+        rows = np.take(self.array, idx, axis=0)          # mode='raise'; negatives wrap
+        return torch.from_numpy(np.ascontiguousarray(rows)).to(self.device)
+
+
 class TGN(nn.Module):
     def __init__(
         self,
@@ -58,11 +93,22 @@ class TGN(nn.Module):
             if node_features is not None
             else None
         )
-        self.edge_raw_features = (
-            torch.from_numpy(edge_features.astype(np.float32)).to(device)
-            if edge_features is not None
-            else None
-        )
+        # np.asarray, not .astype: astype copies even when the array is already
+        # float32, and at full PCAP density the edge block is ~6 GB -- the copy
+        # existed only to be moved to the GPU and discarded.
+        #
+        # A np.memmap stays where it is: at ~133M edges the block is 6.4 GB,
+        # most of an 8 GB GPU, and every batch reads only its own few thousand
+        # rows. HostEdgeFeatures gathers those rows on the host and moves just
+        # them -- the same float32 values indexing a device copy returns.
+        if isinstance(edge_features, np.memmap):
+            self.edge_raw_features = HostEdgeFeatures(edge_features, device)
+        else:
+            self.edge_raw_features = (
+                torch.from_numpy(np.ascontiguousarray(edge_features, dtype=np.float32)).to(device)
+                if edge_features is not None
+                else None
+            )
 
         self.n_node_features = (
             self.node_raw_features.shape[1]
@@ -107,25 +153,39 @@ class TGN(nn.Module):
                 raw_message_dimension=raw_message_dimension,
                 message_dimension=message_dimension,
             )
+            # The identity message function passes the raw message through, so
+            # the message width IS the raw width. Sizing the memory updater from
+            # `message_dimension` regardless (as this used to) built a GRUCell
+            # for 100-D input that received 48-D messages -- latent only because
+            # memory had never been switched on.
+            computed_message_dim = (
+                raw_message_dimension if message_function == "identity" else message_dimension
+            )
+            is_bita = aggregator_type.lower() in ("bita", "bigru_transformer")
+            # BiTA (paper Step 1) applies MSG before aggregating and emits
+            # d_trans-wide vectors for the memory update; last/mean aggregate
+            # raw messages and MSG runs afterwards (Rossi et al.).
+            memory_input_dim = message_dimension if is_bita else computed_message_dim
             self.message_aggregator = get_message_aggregator(
                 aggregator_type=aggregator_type,
                 device=device,
-                input_dim=raw_message_dimension,
+                input_dim=computed_message_dim if is_bita else raw_message_dimension,
                 hidden_dim=raw_message_dimension,
                 n_heads=n_heads,
                 dropout=dropout,
+                d_trans=message_dimension if is_bita else None,
             )
             self.memory = Memory(
                 n_nodes=self.n_nodes,
                 memory_dimension=self.memory_dimension,
-                input_dimension=message_dimension,
-                message_dimension=message_dimension,
+                input_dimension=memory_input_dim,
+                message_dimension=memory_input_dim,
                 device=device,
             )
             self.memory_updater = get_memory_updater(
                 module_type=memory_updater_type,
                 memory=self.memory,
-                message_dimension=message_dimension,
+                message_dimension=memory_input_dim,
                 memory_dimension=self.memory_dimension,
                 device=device,
             )
@@ -195,28 +255,34 @@ class TGN(nn.Module):
                 self.memory.store_raw_messages(unique_sources, source_id_to_messages)
                 self.memory.store_raw_messages(unique_destinations, destination_id_to_messages)
 
-            memory = self.memory.get_memory(list(range(self.n_nodes)))
+            # Every row, as a differentiable copy. This was get_memory(list(range(n_nodes))):
+            # a Python list of EVERY node id built and converted on every batch --
+            # ~3M ints per batch at a third of the PCAP corpus, which made the step
+            # O(nodes) and ran training at ~1 batch/s. clone() gives the same values
+            # and the same gradient (an all-rows gather backpropagates as a scatter-add
+            # into zeros); tests/test_memory_full_read_is_clone.py pins both.
+            memory = self.memory.memory.clone()
             last_update = self.memory.last_update
 
             source_time_diffs = (
-                torch.from_numpy(edge_times).float().to(self.device)
-                - last_update[source_nodes].float()
+                torch.from_numpy(edge_times).double().to(self.device)
+                - last_update[source_nodes].double()
             )
             source_time_diffs = (
                 source_time_diffs - self.mean_time_shift_src
             ) / self.std_time_shift_src
 
             destination_time_diffs = (
-                torch.from_numpy(edge_times).float().to(self.device)
-                - last_update[destination_nodes].float()
+                torch.from_numpy(edge_times).double().to(self.device)
+                - last_update[destination_nodes].double()
             )
             destination_time_diffs = (
                 destination_time_diffs - self.mean_time_shift_dst
             ) / self.std_time_shift_dst
 
             negative_time_diffs = (
-                torch.from_numpy(edge_times).float().to(self.device)
-                - last_update[negative_nodes].float()
+                torch.from_numpy(edge_times).double().to(self.device)
+                - last_update[negative_nodes].double()
             )
             negative_time_diffs = (
                 negative_time_diffs - self.mean_time_shift_dst
@@ -224,7 +290,7 @@ class TGN(nn.Module):
 
             time_diffs = torch.cat(
                 [source_time_diffs, destination_time_diffs, negative_time_diffs], dim=0
-            )
+            ).float()
 
         node_embedding = self.embedding_module.compute_embedding(
             memory=memory,
@@ -278,22 +344,28 @@ class TGN(nn.Module):
 
         return pos_score, neg_score
 
-    def update_memory(self, nodes, messages):
+    def _aggregate(self, nodes, messages):
+        """(nodes, memory-updater inputs, timestamps) for the configured aggregator."""
+        if getattr(self.message_aggregator, "applies_message_function", False):
+            # BiTA: MSG -> time encoding -> BiGRU -> Transformer -> mean pool.
+            return self.message_aggregator.aggregate(nodes, messages, self.message_function)
         unique_nodes, unique_messages, unique_timestamps = (
             self.message_aggregator.aggregate(nodes, messages)
         )
         if len(unique_nodes) > 0:
             unique_messages = self.message_function.compute_message(unique_messages)
+        return unique_nodes, unique_messages, unique_timestamps
+
+    def update_memory(self, nodes, messages):
+        unique_nodes, unique_messages, unique_timestamps = self._aggregate(nodes, messages)
+        if len(unique_nodes) > 0:
             self.memory_updater.update_memory(
                 unique_nodes, unique_messages, timestamps=unique_timestamps
             )
 
     def get_updated_memory(self, nodes, messages):
-        unique_nodes, unique_messages, unique_timestamps = (
-            self.message_aggregator.aggregate(nodes, messages)
-        )
+        unique_nodes, unique_messages, unique_timestamps = self._aggregate(nodes, messages)
         if len(unique_nodes) > 0:
-            unique_messages = self.message_function.compute_message(unique_messages)
             updated_memory, updated_last_update = (
                 self.memory_updater.get_updated_memory(
                     unique_nodes, unique_messages, timestamps=unique_timestamps
@@ -313,7 +385,8 @@ class TGN(nn.Module):
         edge_times,
         edge_idxs,
     ):
-        edge_times = torch.from_numpy(edge_times).float().to(self.device)
+        # float64: absolute times; only the differences below go to float32.
+        edge_times = torch.from_numpy(np.asarray(edge_times, dtype=np.float64)).to(self.device)
         edge_features = (
             self.edge_raw_features[edge_idxs]
             if self.edge_raw_features is not None
@@ -323,8 +396,19 @@ class TGN(nn.Module):
         source_memory = self.memory.get_memory(source_nodes)
         destination_memory = self.memory.get_memory(destination_nodes)
 
-        source_time_delta = edge_times - self.memory.last_update[source_nodes]
-        source_time_delta_encoding = self.time_encoder(source_time_delta.unsqueeze(1)).view(
+        # "Time since this node's memory was last updated" -- which is undefined
+        # on first contact. Memory starts at last_update = 0, so a first message
+        # used to encode the ABSOLUTE Unix time (~1.5e9 s): cos(w * 1.5e9) is a
+        # random phase that flips on every optimiser step, i.e. noise written
+        # into memory, and d/dw of it scales with 1.5e9. Measured by the
+        # training guard on the dry run: time_encoder.w carried 100% of the
+        # gradient norm (4.7e7 against ~40 for everything else) and every step
+        # was clipped. The reference TGN never hit this because its datasets'
+        # clocks start at 0. A first contact now encodes a delta of 0.
+        last_update = self.memory.last_update[source_nodes]
+        source_time_delta = torch.where(
+            last_update > 0, edge_times - last_update, torch.zeros_like(edge_times))
+        source_time_delta_encoding = self.time_encoder(source_time_delta.float().unsqueeze(1)).view(
             len(source_nodes), -1
         )
 
@@ -333,10 +417,13 @@ class TGN(nn.Module):
             dim=1,
         )
 
+        # (raw message, time, peer). The peer lets BiTA group a node's messages
+        # by the edge they arrived on (paper Algorithm 1, Step 2).
         messages = defaultdict(list)
         unique_sources = np.unique(source_nodes)
         for i in range(len(source_nodes)):
-            messages[source_nodes[i]].append((source_message[i], edge_times[i]))
+            messages[source_nodes[i]].append(
+                (source_message[i], edge_times[i], int(destination_nodes[i])))
 
         return unique_sources, messages
 

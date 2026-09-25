@@ -11,6 +11,9 @@ import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
 
+from cyberworld_v4.identity import stable_id
+
+from data_unification.time_utils import to_epoch_seconds
 from data_unification.unified_schema import UnifiedFlowRecord, LabelSource
 from data_unification.label_resolver import get_default_resolver, LabelResolver
 
@@ -41,7 +44,13 @@ class CTU13Adapter:
             df = batch.to_pandas()
 
             # Extract fields
-            timestamps = pd.to_datetime(df["timestamp"], utc=True).astype("int64") / 1e9
+            # pandas >= 2 returns datetime64[us] (or [s]/[ms]) depending on input, not
+            # always [ns]. astype("int64") therefore yields MICROseconds here, and the
+            # old "/ 1e9" produced epoch seconds 1000x too small -- a 12-hour capture
+            # collapsed into 43 apparent seconds, so ~21,600 two-second windows became
+            # ~22 and every host trajectory was meaningless. Upcast to [ns] explicitly
+            # so the divisor is correct regardless of the parsed resolution.
+            timestamps = pd.Series(to_epoch_seconds(pd.to_datetime(df["timestamp"], utc=True)))
             scenario_ids = df["scenario_id"].astype(str).to_numpy()
             malware_families = df["malware_family"].astype(str).to_numpy()
 
@@ -56,10 +65,25 @@ class CTU13Adapter:
                 family = malware_families[i]
                 coarse, attck, is_attack = self.resolver.resolve(family, source=LabelSource.CTU13)
 
-                # Consistent host IPs per scenario
-                bot_id = abs(hash(scen)) % 250 + 2
+                # Synthetic endpoints. This parquet holds pre-aggregated 2-second
+                # flow states, not the original 5-tuples, so topology has to be
+                # constructed. Two rules make that defensible:
+                #
+                #   1. Endpoints are derived ONLY from the scenario id, never from
+                #      is_attack. v3 used `"147.32.84.180" if is_attack else ...`,
+                #      which put the ground-truth label into the destination node —
+                #      i.e. into the graph edge the TGNE attends over — making the
+                #      topology trivially separable. That is label leakage, not a
+                #      workaround.
+                #   2. Ids come from SHA-256, not Python hash(), which is salted per
+                #      process and so produces different graphs on every run.
+                #
+                # A graph built this way still cannot support claims about learned
+                # network topology; it is a carrier for the flow statistics only.
+                bot_id = stable_id(scen, "src", modulo=250) + 2
+                svc_id = stable_id(scen, "dst", modulo=200) + 2
                 src_ip = f"10.0.2.{bot_id}"
-                dst_ip = "147.32.84.180" if is_attack else "147.32.80.1"
+                dst_ip = f"147.32.84.{svc_id}"
                 src_port = 1024 + (i % 60000)
                 dst_port = 6667 if "irc" in family.lower() else (80 if "http" in family.lower() else 443)
 
@@ -123,12 +147,7 @@ class CTU13Adapter:
             src_bytes_col = cols.get("srcbytes", "SrcBytes")
             lbl_col = cols.get("label", "Label")
 
-            start_timestamps = (
-                pd.to_datetime(chunk[ts_col], errors="coerce")
-                .astype("int64", copy=False)
-                .to_numpy()
-                / 1e9
-            )
+            start_timestamps = to_epoch_seconds(pd.to_datetime(chunk[ts_col], errors="coerce"))
             durations = pd.to_numeric(chunk[dur_col], errors="coerce").fillna(0.0).to_numpy()
             end_timestamps = start_timestamps + durations
 

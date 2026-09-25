@@ -21,23 +21,33 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from cyberworld_v4.config import get_contract
 from telemetry.capture.sniffer import StreamingPacketSniffer
 from telemetry.state.state_builder import LiveStateBuilder
 
 
 class AsyncStateRecorder:
-    """Asynchronously writes state records to disk off the critical live path."""
+    """Asynchronously writes state records to disk off the critical live path.
+
+    This is not only a log: control_backend tails this file, so it is the only
+    route by which a window reaches the models. A window dropped here because
+    the queue was full is a window that was never scored. `dropped` counts
+    them, and the backend also detects the resulting gap in window_id.
+    """
 
     def __init__(self, output_path: str):
         self.output_path = output_path
         self.queue: queue.Queue = queue.Queue(maxsize=1000)
+        self.dropped = 0
         self.running = True
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
     def record(self, state_dict: dict):
-        if not self.queue.full():
+        try:
             self.queue.put_nowait(state_dict)
+        except queue.Full:
+            self.dropped += 1
 
     def _worker(self):
         os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
@@ -69,13 +79,16 @@ class AsyncPcapRecorder:
     def __init__(self, output_path: str):
         self.output_path = output_path
         self.queue: queue.Queue = queue.Queue(maxsize=10000)
+        self.dropped = 0
         self.running = True
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
     def record(self, ts: float, raw_data: bytes):
-        if not self.queue.full():
+        try:
             self.queue.put_nowait((ts, raw_data))
+        except queue.Full:
+            self.dropped += 1
 
     def _worker(self):
         os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
@@ -101,25 +114,48 @@ class AsyncPcapRecorder:
         self.thread.join(timeout=2.0)
 
 
+def _capture_completeness(sniffer, recorder, pcap_recorder) -> dict:
+    """What this window may be missing, as far as the sensor can tell.
+
+    Kernel counters cover the interval since the previous window closed. A
+    window with kernel drops was built from a partial capture: its flows and
+    host attributes undercount, and an attacker who can flood the sensor can
+    use exactly that gap.
+    """
+    k = sniffer.read_kernel_stats() if sniffer is not None else {"available": False}
+    packets, drops = int(k.get("packets", 0)), int(k.get("drops", 0))
+    return {
+        "kernel_stats_available": bool(k.get("available")),
+        "kernel_packets": packets,
+        "kernel_drops": drops,
+        "kernel_drop_ratio": (drops / packets) if packets else 0.0,
+        "kernel_drops_total": int(k.get("drops_total", 0)),
+        "capture_loop_errors": int(getattr(sniffer, "loop_errors", 0)),
+        "state_records_dropped": int(recorder.dropped) if recorder else 0,
+        "pcap_frames_dropped": int(pcap_recorder.dropped) if pcap_recorder else 0,
+    }
+
+
 def _emit_window(state: dict, recorder: AsyncStateRecorder | None) -> str:
     n_flows = len(state.get("flows") or [])
     if recorder:
-        slim = {
-            k: v
-            for k, v in state.items()
-            if k not in ("raw_state", "scaled_state")
-        }
-        recorder.record({**slim, "prediction": None})
-    return f" | Flows: {n_flows} | [SPAN CAPTURE → Dual-Branch/DeepOP]"
+        recorder.record({**state, "prediction": None})
+    cap = state.get("capture") or {}
+    warn = ""
+    if cap.get("kernel_drops"):
+        warn = (f" | !! KERNEL DROPPED {cap['kernel_drops']} frames "
+                f"({cap['kernel_drop_ratio']:.1%}) -- window is incomplete")
+    if cap.get("state_records_dropped"):
+        warn += f" | !! {cap['state_records_dropped']} windows never reached the backend"
+    return f" | Flows: {n_flows} | [SPAN CAPTURE → Dual-Branch/DeepOP]{warn}"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CyberWorld Live SPAN Telemetry (capture for Dual-Branch/DeepOP)"
+        description="cyberworld Live SPAN Telemetry (capture for Dual-Branch/DeepOP)"
     )
     parser.add_argument("--interface", default="eth1", help="Observation interface")
     parser.add_argument("--replay", "--pcap", dest="replay", default=None, help="Replay PCAP")
-    parser.add_argument("--dim", type=int, default=72, choices=[70, 72, 73])
     parser.add_argument("--record-state", default=None, help="JSONL state stream path")
     parser.add_argument("--record-pcap", default=None, help="Optional raw PCAP path")
     parser.add_argument("--max-windows", type=int, default=None)
@@ -134,20 +170,18 @@ def main():
     )
     args = parser.parse_args()
 
+    window_sec = get_contract().window_seconds
+
     print("=" * 80)
-    print("CYBERWORLD LIVE SPAN TELEMETRY (CAPTURE ONLY)")
+    print("cyberworld LIVE SPAN TELEMETRY (CAPTURE ONLY)")
     print(f"  Interface:            {args.interface}")
-    print(f"  Window Resolution:    2.0 seconds")
-    print(f"  Output:               5-tuple flows + window metadata → Dual-Branch/DeepOP")
-    print(f"  Hot Path Storage:     Zero-Disk (Pure In-Memory)")
+    print(f"  Window Resolution:    {window_sec:g} seconds")
+    print("  Output:               5-tuple flows + window metadata → Dual-Branch/DeepOP")
+    print("  Hot Path Storage:     Zero-Disk (Pure In-Memory)")
     print("=" * 80)
     sys.stdout.flush()
 
-    state_builder = LiveStateBuilder(
-        window_sec=2.0,
-        history_len=15,
-        dim_mode=args.dim,
-    )
+    state_builder = LiveStateBuilder(window_sec=window_sec)
 
     recorder = AsyncStateRecorder(args.record_state) if args.record_state else None
     pcap_recorder = AsyncPcapRecorder(args.record_pcap) if args.record_pcap else None
@@ -174,8 +208,9 @@ def main():
             sys.exit(1)
             
         windows_processed = 0
+        anchored = False
         with open(args.replay, "rb") as f:
-            global_hdr = f.read(24)
+            f.read(24)  # skip 24-byte pcap global header
             while running:
                 hdr = f.read(16)
                 if len(hdr) < 16:
@@ -183,7 +218,13 @@ def main():
                 ts_sec, ts_usec, incl_len, orig_len = struct.unpack("=IIII", hdr)
                 pkt_data = f.read(incl_len)
                 ts = ts_sec + (ts_usec / 1e6)
-                
+
+                # Capture timestamps are historical; anchor the window clock to the
+                # first packet or no window boundary is ever reached.
+                if not anchored:
+                    state_builder.seek_to(ts)
+                    anchored = True
+
                 pkt = StreamingPacketSniffer.parse_frame(pkt_data, ts)
                 if pkt:
                     live_packet_callback(pkt)
@@ -229,6 +270,7 @@ def main():
             if state_builder.is_window_ready():
                 now = time.time()
                 state = state_builder.close_window(close_ts=now)
+                state["capture"] = _capture_completeness(sniffer, recorder, pcap_recorder)
                 windows_processed += 1
                 pred_str = _emit_window(state, recorder)
 
@@ -245,6 +287,11 @@ def main():
                     print(f"[*] Reached target {args.max_windows} windows. Exiting.")
                     break
     finally:
+        final = _capture_completeness(sniffer, recorder, pcap_recorder)
+        print(f"[*] Capture totals: kernel drops {final['kernel_drops_total']}, "
+              f"windows not delivered {final['state_records_dropped']}, "
+              f"pcap frames not recorded {final['pcap_frames_dropped']}, "
+              f"capture-loop errors {final['capture_loop_errors']}")
         sniffer.stop()
         if recorder:
             recorder.stop()

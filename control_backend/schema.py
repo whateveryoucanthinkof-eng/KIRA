@@ -4,8 +4,14 @@ Pydantic data models for the Antigravity Predictive Attack-Trajectory Event Cont
 Decouples React dashboard from specific model architectures, dimensions, or checkpoints.
 """
 
-from typing import Dict, List, Optional, Any
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
+
+
+def utc_now_iso() -> str:
+    """Current UTC time as the dashboard's wire format: ISO-8601 with a 'Z' suffix."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class ModelMetadata(BaseModel):
@@ -17,6 +23,11 @@ class ModelMetadata(BaseModel):
     forecast_steps: int = Field(..., description="Number of forward prediction steps, e.g. 8")
     checkpoint: Optional[str] = Field(None, description="Model checkpoint file name")
     threshold: float = Field(..., description="Calibrated operating alert threshold, e.g. 0.40")
+    forecast_step_seconds: Optional[float] = Field(
+        None, description="Seconds per forecast step (may differ from window_seconds)")
+    rules_enabled: bool = Field(
+        False, description="Whether the advisory SOC rule layer is computed. It never "
+                            "changes `risk`, `predicted_stage` or `alert`.")
 
 
 class StateMetadata(BaseModel):
@@ -33,6 +44,10 @@ class ForecastPoint(BaseModel):
     risk: float
     confidence: Optional[float] = None
     predicted_stage: Optional[str] = None
+    # Split-conformal band on `risk` for this step, fitted on validation
+    # (control_backend/forecast_band.py). None when the checkpoint has none.
+    risk_lower: Optional[float] = None
+    risk_upper: Optional[float] = None
 
 
 class ExplainabilityGroup(BaseModel):
@@ -73,6 +88,22 @@ class PredictionData(BaseModel):
     technique_confidence: Optional[float] = None
     stage_provenance: Optional[Dict[str, str]] = None
 
+    # Provenance (spec 21, 41). `risk`, `predicted_stage` and `alert` are always
+    # the model's output. The optional SOC rule layer is advisory: its opinion
+    # is reported here, next to the model's, and never replaces it.
+    ml_risk: Optional[float] = None          # model output (== risk)
+    ml_technique: Optional[str] = None       # model technique (== predicted_stage)
+    rule_risk: Optional[float] = None        # advisory rule layer, None when off/not fired
+    rule_technique: Optional[str] = None     # advisory rule label, None when off/not fired
+    rules_applied: Optional[bool] = None     # always False: rules never adjust `risk`
+    risk_source: str = "model"               # what produced `risk`; only "model" today
+
+    # Mitigation is recorded by the dashboard, not enforced by it. The model
+    # keeps scoring the traffic it actually sees; these say whether traffic
+    # that a recorded block/isolation should have stopped is still present.
+    mitigation_status: Optional[str] = None  # None | "recorded_quiet" | "traffic_persists"
+    mitigation_bypass_flows: Optional[int] = None
+
 
 class LatencyData(BaseModel):
     telemetry_ms: float
@@ -111,6 +142,7 @@ class PredictionEvent(BaseModel):
     focus_ips: List[str] = Field(default_factory=list)
     focus_edges: List[FocusEdge] = Field(default_factory=list)
     target_ip: Optional[str] = None
+    throughput: float = 0.0
 
 
 class TopologyNode(BaseModel):
@@ -183,6 +215,15 @@ class SystemStatusEvent(BaseModel):
     topology_nodes: int = 0
     topology_edges: int = 0
     sensor_interface: Optional[str] = None
+    # Live operational reality metrics
+    uptime: int = 0
+    throughput: float = 0.0
+    latency: float = 0.0
+    packetLoss: float = 0.0
+    activeConnections: int = 0
+    anomalyScore: float = 0.0
+    threatLevel: str = "low"
+    timestamp: Optional[str] = None
 
 
 class CommandEvent(BaseModel):
