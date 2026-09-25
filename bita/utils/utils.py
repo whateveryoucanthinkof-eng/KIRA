@@ -1,7 +1,156 @@
 import os
+import shutil
 
 import numpy as np
 import torch
+
+
+# ------------------------------------------------------------ out-of-core store
+#
+# The encoder was sized for ~34M edges. The full PCAP + CTU-13 corpus is ~133M,
+# and at the measured ~288 B/edge peak (42.2M-edge probe: 12.2 GB) that is
+# ~38 GB of anonymous memory on a 22 GB machine. Almost all of it is
+# read-mostly per-edge columns: the loaded columns, the split's per-subset
+# copies, the two neighbour finders' CSR arrays and the edge features.
+#
+# DiskStore puts those in files and hands back numpy arrays mapped onto them.
+# Pages of a file mapping are page cache: the kernel reclaims them under
+# pressure (clean ones for free, dirty ones after writeback) instead of the
+# cgroup OOM-killing the run, and only the pages a batch touches need to be
+# resident. Values, dtypes and shapes are exactly those of the in-RAM arrays.
+#
+# `store=None` everywhere means "plain RAM arrays", the previous behaviour.
+
+CHUNK = 1 << 22        # rows per streaming pass: bounds every transient
+
+
+class DiskStore:
+  """A directory of file-backed numpy arrays. Never put it on tmpfs (= RAM)."""
+
+  def __init__(self, root):
+    self.root = os.path.abspath(root)
+    shutil.rmtree(self.root, ignore_errors=True)   # a crashed run's files are never reused
+    os.makedirs(self.root, exist_ok=True)
+    self._n = 0
+
+  def _path(self, name):
+    self._n += 1
+    return os.path.join(self.root, f"{self._n:04d}_{name}.bin")
+
+  def empty(self, name, shape, dtype, path=None):
+    """A writable array mapped onto a new file (plain ndarray view, not np.memmap)."""
+    shape = tuple(int(s) for s in (shape if isinstance(shape, (tuple, list)) else (shape,)))
+    path = path or self._path(name)
+    if int(np.prod(shape)) == 0:
+      return np.empty(shape, dtype=dtype)
+    return np.asarray(np.memmap(path, dtype=dtype, mode="w+", shape=shape))
+
+  def memmap(self, name, shape, dtype):
+    """Like empty() but returns the np.memmap object itself (TGN detects it)."""
+    shape = tuple(int(s) for s in shape)
+    return np.memmap(self._path(name), dtype=dtype, mode="w+", shape=shape)
+
+  def remove(self, arr):
+    """Delete the file behind `arr` (the caller must drop its references)."""
+    base = arr
+    while base is not None and not isinstance(base, np.memmap):
+      base = getattr(base, "base", None)
+    fn = getattr(base, "filename", None)
+    if fn and os.path.dirname(os.path.abspath(fn)) == self.root:
+      try:
+        os.remove(fn)          # unlinked now; the pages go when the mapping does
+      except OSError:
+        pass
+
+  def cleanup(self):
+    shutil.rmtree(self.root, ignore_errors=True)
+
+
+def store_empty(store, name, shape, dtype):
+  return np.empty(shape, dtype=dtype) if store is None else store.empty(name, shape, dtype)
+
+
+def masked_copy(col, mask, store=None, name="col", count=None):
+  """`col[mask]`, streamed into the store when one is given (identical values)."""
+  if store is None:
+    return col[mask]
+  n_out = int(np.count_nonzero(mask)) if count is None else int(count)
+  out = store.empty(name, (n_out,) + col.shape[1:], col.dtype)
+  p = 0
+  for a in range(0, len(col), CHUNK):
+    part = col[a:a + CHUNK][mask[a:a + CHUNK]]
+    out[p:p + len(part)] = part
+    p += len(part)
+  assert p == n_out
+  return out
+
+
+def _as_nonneg_int(arr, limit=None):
+  """(min, max) when `arr` is a non-negative integer array a bitmap can cover, else None."""
+  arr = np.asarray(arr)
+  if arr.dtype.kind not in "iu" or arr.ndim != 1 or arr.size == 0:
+    return None
+  lo, hi = int(arr.min()), int(arr.max())
+  if lo < 0 or (limit is not None and hi >= limit):
+    return None
+  return lo, hi
+
+
+def mark_present(seen, arr):
+  """seen[arr] = True, streamed."""
+  for a in range(0, len(arr), CHUNK):
+    seen[arr[a:a + CHUNK]] = True
+  return seen
+
+
+def sorted_unique(arr):
+  """np.unique(arr) for a 1-D array, via a bitmap when the values are small
+  non-negative integers: no sorted copy of the whole column. Same values, same
+  dtype, same (ascending) order as np.unique."""
+  arr = np.asarray(arr)
+  r = _as_nonneg_int(arr, limit=max(1 << 26, 4 * arr.size))
+  if r is None:
+    return np.unique(arr)
+  seen = mark_present(np.zeros(r[1] + 1, dtype=bool), arr)
+  return np.flatnonzero(seen).astype(arr.dtype, copy=False)
+
+
+def count_unique(*arrays):
+  """len(set(a) | set(b) | ...) without building the set."""
+  rs = [_as_nonneg_int(a, limit=1 << 34) for a in arrays]
+  if any(r is None for r in rs):
+    s = set()
+    for a in arrays:
+      s |= set(np.asarray(a).tolist())
+    return len(s)
+  seen = np.zeros(max(r[1] for r in rs) + 1, dtype=bool)
+  for a in arrays:
+    mark_present(seen, a)
+  return int(np.count_nonzero(seen))
+
+
+def first_seen_order(arr, max_id=None):
+  """The distinct values of `arr` in order of FIRST occurrence (streamed).
+
+  Inserting a sequence into a Python set and inserting only its first
+  occurrences, in the same order, produce the same set in the same internal
+  layout -- a duplicate insert is a lookup that changes nothing (no resize is
+  triggered by it). So `set(first_seen_order(a).tolist())` iterates exactly as
+  `set(a)` does, and anything drawn from `list(that set)` is the same draw."""
+  arr = np.asarray(arr)
+  if len(arr) == 0:
+    return arr[:0].copy()
+  hi = int(arr.max()) if max_id is None else int(max_id)
+  seen = np.zeros(hi + 1, dtype=bool)
+  out = []
+  for a in range(0, len(arr), CHUNK):
+    c = arr[a:a + CHUNK]
+    u, first = np.unique(c, return_index=True)
+    u = u[np.argsort(first, kind="stable")]
+    u = u[~seen[u]]
+    seen[u] = True
+    out.append(u)
+  return np.concatenate(out)
 
 
 class MergeLayer(torch.nn.Module):
@@ -79,8 +228,10 @@ class RandEdgeSampler(object):
 
   def __init__(self, src_list, dst_list, seed=None, node_group=None):
     self.seed = None
-    self.src_list = np.unique(src_list)
-    self.dst_list = np.unique(dst_list)
+    # sorted_unique == np.unique (same values, dtype, order) without a sorted
+    # copy of a whole ~100M-edge column.
+    self.src_list = sorted_unique(src_list)
+    self.dst_list = sorted_unique(dst_list)
     self.node_group = None
     if node_group is not None:
       self.node_group = np.asarray(node_group)
@@ -165,7 +316,78 @@ class _CSRRows:
     return len(self.offsets) - 1
 
 
-def get_neighbor_finder(data, uniform, max_node_idx=None):
+def _is_sorted(ts):
+  for a in range(0, len(ts), CHUNK):
+    c = ts[a:a + CHUNK + 1]
+    if not np.all(c[1:] >= c[:-1]):       # False on NaN too: falls back
+      return False
+  return True
+
+
+def _streamed_csr(src, dst, eidx, ts, n_nodes, store):
+  """The CSR get_neighbor_finder builds, without its ~64 B per directed entry
+  of transients, written straight into `store`.
+
+  The reference order is np.lexsort((ts2, owner)) over the two directions
+  concatenated: by owner, then time, then position in the concatenation
+  (lexsort is stable), i.e. (owner, ts, direction, k). Equivalently: a STABLE
+  sort by owner of the sequence ordered by (ts, direction, k). When the edges
+  are already time-sorted (every split of the loader's output is), that
+  sequence is produced chunk by chunk -- chunks cut only between distinct
+  timestamps, so no tie spans two chunks -- and a stable counting sort by owner
+  scatters each chunk into place: two passes, O(chunk) memory.
+  """
+  n = len(src)
+  counts = np.zeros(n_nodes, dtype=np.int64)
+  for a in range(0, n, CHUNK):
+    counts += np.bincount(src[a:a + CHUNK], minlength=n_nodes)
+    counts += np.bincount(dst[a:a + CHUNK], minlength=n_nodes)
+  offsets = np.zeros(n_nodes + 1, dtype=np.int64)
+  np.cumsum(counts, out=offsets[1:])
+  del counts
+  total = int(offsets[-1])
+  flat_nbr = store.empty("csr_nbr", total, np.int32)
+  flat_eidx = store.empty("csr_eidx", total, np.int32)
+  flat_ts = store.empty("csr_ts", total, np.float64)
+  cursor = offsets[:-1].copy()
+
+  a = 0
+  while a < n:
+    b = min(n, a + CHUNK)
+    if b < n:                              # never split a run of equal timestamps
+      b = int(np.searchsorted(ts, ts[b - 1], side="right"))
+    m = b - a
+    s_c = np.asarray(src[a:b]).astype(np.int64, copy=False)
+    d_c = np.asarray(dst[a:b]).astype(np.int64, copy=False)
+    t_c = np.asarray(ts[a:b], dtype=np.float64)
+    e_c = np.asarray(eidx[a:b])
+    owner = np.concatenate([s_c, d_c])
+    # (ts, direction, k): position in the local concatenation encodes (direction, k)
+    seq = np.lexsort((np.arange(2 * m), np.concatenate([t_c, t_c])))
+    owner = owner[seq]
+    by_owner = np.argsort(owner, kind="stable")
+    take = seq[by_owner]                   # local concat positions, final order
+    o_sorted = owner[by_owner]
+    del owner, seq, by_owner
+    L = len(o_sorted)
+    starts = np.flatnonzero(np.r_[True, o_sorted[1:] != o_sorted[:-1]])
+    sizes = np.diff(np.r_[starts, L])
+    rank = np.arange(L, dtype=np.int64) - np.repeat(starts, sizes)
+    pos = cursor[o_sorted] + rank
+    cursor[o_sorted[starts]] += sizes
+    del rank, o_sorted
+    first = take < m                       # source direction: peer is dst
+    k = np.where(first, take, take - m)
+    flat_nbr[pos] = np.where(first, d_c[k], s_c[k]).astype(np.int32, copy=False)
+    flat_eidx[pos] = e_c[k].astype(np.int32, copy=False)
+    flat_ts[pos] = t_c[k]
+    del take, first, k, pos
+    a = b
+  assert np.array_equal(cursor, offsets[1:])
+  return flat_nbr, flat_eidx, flat_ts, offsets
+
+
+def get_neighbor_finder(data, uniform, max_node_idx=None, store=None):
   """Build a NeighborFinder without materialising a Python object per edge.
 
   The previous implementation built `adj_list = [[] for _ in range(n_nodes)]`
@@ -184,6 +406,10 @@ def get_neighbor_finder(data, uniform, max_node_idx=None):
   entries come out sorted by timestamp -- the invariant `find_before`'s
   `np.searchsorted` depends on. A stable sort on node alone would NOT do: the
   two directions are concatenated, so their timestamps interleave.
+
+  With `store` (a DiskStore) and time-sorted edges, the same arrays are built
+  by _streamed_csr() straight into files: identical contents, O(chunk)
+  transient memory, and served from page cache.
   """
   src = np.asarray(data.sources)
   dst = np.asarray(data.destinations)
@@ -192,6 +418,12 @@ def get_neighbor_finder(data, uniform, max_node_idx=None):
 
   max_node_idx = int(max(src.max(), dst.max())) if max_node_idx is None else int(max_node_idx)
   n_nodes = max_node_idx + 1
+
+  if (store is not None and len(src) > 0 and src.dtype.kind in "iu" and dst.dtype.kind in "iu"
+          and int(min(src.min(), dst.min())) >= 0
+          and int(max(src.max(), dst.max())) < n_nodes and _is_sorted(ts)):
+    return NeighborFinder(None, uniform=uniform,
+                          _csr=_streamed_csr(src, dst, eidx, ts, n_nodes, store))
 
   # Each undirected edge appears once per endpoint.
   owner = np.concatenate([src, dst]).astype(np.int64, copy=False)

@@ -18,6 +18,41 @@ from modules.embedding_module import get_embedding_module
 from model.time_encoding import TimeEncode
 
 
+class HostEdgeFeatures:
+    """Edge-feature matrix left in host memory (typically a file mapping).
+
+    Indexing returns a device tensor holding exactly the rows a device-resident
+    copy would return for the same index: `feats[idx]` and `feats[idx, :]`
+    with numpy or torch integer indices of any shape, negative indices
+    wrapping, out-of-range indices raising. Only the gathered rows reach the
+    GPU, so device memory no longer grows with the edge count.
+    """
+
+    def __init__(self, array, device):
+        if array.dtype != np.float32 or array.ndim != 2:
+            raise ValueError("HostEdgeFeatures expects a 2-D float32 array")
+        self.array = array
+        self.device = torch.device(device)
+        self.shape = torch.Size(array.shape)
+        self.dtype = torch.float32
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            if len(idx) != 2 or idx[1] != slice(None):
+                raise IndexError("HostEdgeFeatures supports [rows] and [rows, :] only")
+            idx = idx[0]
+        if torch.is_tensor(idx):
+            idx = idx.detach().cpu().numpy()
+        idx = np.asarray(idx)
+        if idx.dtype.kind not in "iu":
+            raise IndexError(f"HostEdgeFeatures: integer indices only, got {idx.dtype}")
+        rows = np.take(self.array, idx, axis=0)          # mode='raise'; negatives wrap
+        return torch.from_numpy(np.ascontiguousarray(rows)).to(self.device)
+
+
 class TGN(nn.Module):
     def __init__(
         self,
@@ -61,11 +96,19 @@ class TGN(nn.Module):
         # np.asarray, not .astype: astype copies even when the array is already
         # float32, and at full PCAP density the edge block is ~6 GB -- the copy
         # existed only to be moved to the GPU and discarded.
-        self.edge_raw_features = (
-            torch.from_numpy(np.ascontiguousarray(edge_features, dtype=np.float32)).to(device)
-            if edge_features is not None
-            else None
-        )
+        #
+        # A np.memmap stays where it is: at ~133M edges the block is 6.4 GB,
+        # most of an 8 GB GPU, and every batch reads only its own few thousand
+        # rows. HostEdgeFeatures gathers those rows on the host and moves just
+        # them -- the same float32 values indexing a device copy returns.
+        if isinstance(edge_features, np.memmap):
+            self.edge_raw_features = HostEdgeFeatures(edge_features, device)
+        else:
+            self.edge_raw_features = (
+                torch.from_numpy(np.ascontiguousarray(edge_features, dtype=np.float32)).to(device)
+                if edge_features is not None
+                else None
+            )
 
         self.n_node_features = (
             self.node_raw_features.shape[1]

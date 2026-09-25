@@ -164,3 +164,21 @@ Desktop.ini
 # Regenerable from scripts/make_parity_fixture.py; 21MB of replayed capture.
 captures/parity_states.jsonl
 .claude/worktrees/
+
+# --- Training outputs (results/) ---
+# results/ keeps what a run CONCLUDES: comparison.json/.md, per-run results
+# JSON, curve CSV/PNG, and the summary. Everything below is bulk, regenerable
+# or per-run state, and must never be committed:
+#   .ingest_cache/  parsed captures (~8.4 GB), rebuilt by `run_training_plan.sh warm`
+#   ingest/, store/ an encoder run's ingest scratch and out-of-core arrays
+#   .warm-scratch/  the warm stage's scratch
+#   *.npy/*.npz     column parts and memmapped stores
+# Checkpoints (*.pt/*.pth), logs (*.log, logs/) and .spill/ are ignored above.
+.ingest_cache/
+.warm-scratch/
+results/**/ingest/
+results/**/store/
+*.npy
+*.npz
+*.memmap
+results/**/*.tmp-*
