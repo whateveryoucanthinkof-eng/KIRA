@@ -278,7 +278,10 @@ def main() -> int:
         "PCAP_ROOT": paths["pcap"].as_posix(), "CIC2018_CSV_DIR": paths["csv"].as_posix(),
         "CIC2017_DIR": paths["cic2017"].as_posix(), "CTU_DIR": paths["ctu13"].as_posix(),
         "OUT": out.as_posix(), "PYTHON": Path(sys.executable).as_posix(), "NUM_WORKERS": "0",
-        "PLAN_ENCODER_EXTRA": f"--n_epoch {a.epochs} --batch_size 200",
+        # The real run's own encoder flags (e.g. --ingest_workers) stay in, so
+        # the dry run exercises the same ingest path; ours come last and win.
+        "PLAN_ENCODER_EXTRA": (os.environ.get("PLAN_ENCODER_EXTRA", "")
+                               + f" --n_epoch {a.epochs} --batch_size 200").strip(),
         "PLAN_BRANCH_A_EXTRA": f"--epochs {a.epochs}",
         # DeepOP must run even though Branch B cannot beat persistence on
         # synthetic traffic, or its code path would go untested.
