@@ -53,6 +53,29 @@ def upload(a: np.ndarray, device, dtype=None) -> torch.Tensor:
     return t.pin_memory().to(device, non_blocking=True)
 
 
+def upload_many(device, *arrays):
+    """Several host arrays -> device in ONE pinned buffer and ONE copy.
+
+    Returns device tensors (views into one byte buffer) with each array's
+    dtype and shape. Offsets are 8-byte aligned so every dtype can be viewed.
+    """
+    arrs = [np.ascontiguousarray(a) for a in arrays]
+    offs, total = [], 0
+    for a in arrs:
+        offs.append(total)
+        total += (a.nbytes + 7) & ~7
+    buf = torch.empty(max(total, 8), dtype=torch.uint8, pin_memory=device.type == "cuda")
+    host = buf.numpy()
+    for a, o in zip(arrs, offs):
+        host[o: o + a.nbytes] = a.reshape(-1).view(np.uint8)
+    dev = buf.to(device, non_blocking=True)
+    out = []
+    for a, o in zip(arrs, offs):
+        t = dev[o: o + a.nbytes].view(torch.from_numpy(np.empty(0, a.dtype)).dtype)
+        out.append(t.view(a.shape))
+    return out
+
+
 class Overlay:
     """Rows written since the last detach, with their autograd history.
 
@@ -85,19 +108,6 @@ class Overlay:
     @property
     def active(self) -> bool:
         return bool(self.chunks)
-
-
-def overlay_gather(base_rows: torch.Tensor, overlay: Overlay, ptr_np: np.ndarray, device) -> torch.Tensor:
-    """base_rows (detached gather) with live rows replaced by their overlay rows."""
-    live = ptr_np >= 0
-    if not overlay.active or not live.any():
-        return base_rows
-    ptr = upload(np.where(live, ptr_np, 0), device, torch.int64)
-    mask = upload(live, device)
-    src = overlay.cat()
-    shape = ptr_np.shape
-    picked = src.index_select(0, ptr.reshape(-1)).reshape(*shape, src.shape[-1])
-    return torch.where(mask.unsqueeze(-1), picked, base_rows)
 
 
 class MessagePool:
@@ -166,7 +176,12 @@ class MessagePool:
         self.live_row0 = self.cur
 
     # --------------------------------------------------------------- write
-    def write(self, owners: np.ndarray, peers: np.ndarray, times: np.ndarray, raw: torch.Tensor):
+    def write_order(self, owners: np.ndarray) -> np.ndarray:
+        """The row order write() will use (callers may upload it early)."""
+        return np.argsort(owners, kind="stable")
+
+    def write(self, owners: np.ndarray, peers: np.ndarray, times: np.ndarray, raw: torch.Tensor,
+              order: np.ndarray = None, order_g: torch.Tensor = None):
         """Replace each owner's pending list with its rows of `raw`, in order.
 
         `raw` rows are in the reference's append order (all source-side
@@ -179,7 +194,10 @@ class MessagePool:
                 self.compact()
             if self.capacity - self.cur < n:
                 self._grow(n)
-        order = np.argsort(owners, kind="stable")
+        if order is None:
+            order = self.write_order(owners)
+        if order_g is None:
+            order_g = upload(order, self.device, torch.int64)
         o_sorted = owners[order]
         base = self.cur
         rows = slice(base, base + n)
@@ -188,7 +206,7 @@ class MessagePool:
         uniq, first, counts = np.unique(o_sorted, return_index=True, return_counts=True)
         self.start[uniq] = base + first
         self.cnt[uniq] = counts
-        sorted_raw = raw.index_select(0, upload(order, self.device, torch.int64))
+        sorted_raw = raw.index_select(0, order_g)
         with torch.no_grad():
             self.pool[rows] = sorted_raw
         if torch.is_grad_enabled() or self.overlay.active:
@@ -208,13 +226,16 @@ class MessagePool:
             self.compact()
 
     # ---------------------------------------------------------------- read
-    def gather(self, rows: np.ndarray) -> torch.Tensor:
+    def gather(self, rows: np.ndarray, rows_g: torch.Tensor = None) -> torch.Tensor:
         """Rows of the pool (any shape of row ids), live rows with history."""
-        base = self.pool[upload(rows, self.device, torch.int64)]
-        if not self.overlay.active:
+        if rows_g is None:
+            rows_g = upload(rows, self.device, torch.int64)
+        base = self.pool[rows_g]
+        if not self.overlay.active or not (rows >= self.live_row0).any():
             return base
-        ptr = np.where(rows >= self.live_row0, rows - self.live_row0, -1)
-        return overlay_gather(base, self.overlay, ptr, self.device)
+        live = rows_g >= self.live_row0
+        picked = self.overlay.cat()[(rows_g - self.live_row0).clamp(min=0)]
+        return torch.where(live.unsqueeze(-1), picked, base)
 
     # ---------------------------------------------------------- snapshots
     def snapshot(self):
@@ -251,13 +272,17 @@ class MemoryOverlay:
 
     def __init__(self, n_nodes: int, device):
         self.device = device
-        self.ptr = np.full(n_nodes, -1, dtype=np.int64)
+        self.ptr = np.full(n_nodes, -1, dtype=np.int64)          # host copy: "is anything live?"
+        self.ptr_g = torch.full((n_nodes,), -1, dtype=torch.int64, device=device)
         self.touched = []
+        self.touched_g = []
         self.overlay = Overlay()
 
     def ensure_nodes(self, n_nodes):
         if n_nodes > len(self.ptr):
-            self.ptr = np.concatenate([self.ptr, np.full(n_nodes - len(self.ptr), -1, np.int64)])
+            extra = n_nodes - len(self.ptr)
+            self.ptr = np.concatenate([self.ptr, np.full(extra, -1, np.int64)])
+            self.ptr_g = torch.cat([self.ptr_g, torch.full((extra,), -1, dtype=torch.int64, device=self.device)])
 
     def write(self, table: torch.Tensor, nodes_np: np.ndarray, nodes_gpu: torch.Tensor, values: torch.Tensor):
         """`nodes_np` must be unique."""
@@ -266,16 +291,23 @@ class MemoryOverlay:
         if torch.is_grad_enabled() or self.overlay.active:
             start = self.overlay.append(values)
             self.ptr[nodes_np] = start + np.arange(len(nodes_np))
+            self.ptr_g[nodes_gpu] = torch.arange(start, start + len(nodes_np), device=self.device)
             self.touched.append(nodes_np)
+            self.touched_g.append(nodes_gpu)
 
     def read(self, table: torch.Tensor, nodes_np: np.ndarray, nodes_gpu: torch.Tensor) -> torch.Tensor:
         base = table[nodes_gpu]
-        if not self.overlay.active:
+        if not self.overlay.active or not (self.ptr[nodes_np] >= 0).any():
             return base
-        return overlay_gather(base, self.overlay, self.ptr[nodes_np], self.device)
+        p = self.ptr_g[nodes_gpu]
+        picked = self.overlay.cat().index_select(0, p.clamp(min=0))
+        return torch.where((p >= 0).unsqueeze(-1), picked, base)
 
     def detach(self):
         for t in self.touched:
             self.ptr[t] = -1
+        if self.touched_g:
+            self.ptr_g[torch.cat(self.touched_g)] = -1
         self.touched = []
+        self.touched_g = []
         self.overlay.clear()

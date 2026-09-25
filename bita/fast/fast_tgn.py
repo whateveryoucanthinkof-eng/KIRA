@@ -16,7 +16,7 @@ from torch import nn
 from torch.nn.utils.rnn import PackedSequence
 
 from modules.memory import Memory
-from fast.store import MemoryOverlay, MessagePool, upload
+from fast.store import MemoryOverlay, MessagePool, upload, upload_many
 
 
 # ------------------------------------------------------------------ memory
@@ -106,10 +106,17 @@ class _Batch:
         self.eidx = np.asarray(eidx, dtype=np.int64)
         self.nodes = np.concatenate([self.src, self.dst, self.neg])
         self.ts3 = np.concatenate([self.ts, self.ts, self.ts])
-        ints = upload(np.concatenate([self.nodes, self.eidx]), dev, torch.int64)
+        self.pos = self.nodes[: 2 * B]                  # src ; dst  (owners of this batch's messages)
+        self.peers = np.concatenate([self.dst, self.src])
+        self.ts2 = self.ts3[: 2 * B]
+        # Row order of this batch's messages in the pool (stable by owner).
+        self.write_order = np.argsort(self.pos, kind="stable")
+        ints, = upload_many(dev, np.concatenate([self.nodes, self.eidx, self.write_order]))
         self.nodes_g = ints[: 3 * B]
+        self.pos_g = ints[: 2 * B]
         self.src_g, self.dst_g = ints[:B], ints[B: 2 * B]
-        self.eidx_g = ints[3 * B:]
+        self.eidx_g = ints[3 * B: 4 * B]
+        self.write_order_g = ints[4 * B:]
         self.ef = model.edge_raw_features[self.eidx_g] if model.edge_raw_features is not None \
             else torch.zeros((B, model.n_edge_features), device=dev)
         self.cache = {}
@@ -199,30 +206,37 @@ class FastTGNMixin:
         owner = np_f[new_e]
         counts = np.bincount(owner, minlength=n_nodes).astype(np.float32)
 
-        lengths = torch.tensor(klen, dtype=torch.long)
-        lengths_sorted, sorted_idx = torch.sort(lengths, descending=True)   # as pack_padded_sequence
-        unsorted_idx = torch.empty_like(sorted_idx)
-        unsorted_idx[sorted_idx] = torch.arange(E)
-
-        ints = upload(np.concatenate([owner, sorted_idx.numpy(), unsorted_idx.numpy(), to_update, klen]),
-                      dev, torch.int64)
+        level1 = self._fast_level < 2
+        if level1:
+            lengths = torch.tensor(klen, dtype=torch.long)
+            lengths_sorted, sorted_idx = torch.sort(lengths, descending=True)   # as pack_padded_sequence
+            unsorted_idx = torch.empty_like(sorted_idx)
+            unsorted_idx[sorted_idx] = torch.arange(E)
+            perm = np.concatenate([sorted_idx.numpy(), unsorted_idx.numpy()])
+        else:
+            perm = np.zeros(0, np.int64)
+        C = agg.context_size
+        n_groups = (E + C - 1) // C
+        pad_np = np.ones(n_groups * C, dtype=bool)
+        pad_np[:E] = False
+        ints, idx_g, lens_g, f32, f64, pad = upload_many(
+            dev, np.concatenate([owner, to_update, perm]), idx, klen.astype(np.int32),
+            np.concatenate([dt.reshape(-1), counts]), np.concatenate([last_t, node_ts]), pad_np)
         owner_g = ints[:E]
-        sorted_g, unsorted_g = ints[E: 2 * E], ints[2 * E: 3 * E]
-        to_update_g = ints[3 * E: 3 * E + n_nodes]
-        lens_g = ints[3 * E + n_nodes:].to(torch.int32)
-        f32 = upload(np.concatenate([dt.reshape(-1), counts]), dev)
+        to_update_g = ints[E: E + n_nodes]
+        if level1:
+            sorted_g, unsorted_g = ints[E + n_nodes: 2 * E + n_nodes], ints[2 * E + n_nodes:]
         dt_g = f32[: E * L].view(E, L)
         counts_g = f32[E * L:]
-        f64 = upload(np.concatenate([last_t, node_ts]), dev)
         last_t_g = f64[:E]
         node_ts_g = f64[E:]
 
-        raw = pool.gather(idx)                                        # [E, L, raw]
+        raw = pool.gather(idx, idx_g)                                 # [E, L, raw]
         m = self.message_function.compute_message(raw)
         if m.shape[-1] != agg.message_dim:
             raise ValueError(f"BiTA expects {agg.message_dim}-D messages, got {m.shape[-1]}.")
         x = m + agg.time_encoder(dt_g)
-        if self._fast_level >= 2:
+        if not level1:
             from fast.triton_gru import bigru_final_states
             h_n = bigru_final_states(agg.bigru, x, lens_g)
         else:
@@ -232,13 +246,8 @@ class FastTGNMixin:
         z_temp = torch.cat([h_n[0], h_n[1]], dim=-1)
         e = agg.W_e(z_temp)
         order = torch.argsort(last_t_g)
-        C = agg.context_size
-        n_groups = (E + C - 1) // C
         grouped = torch.zeros(n_groups * C, agg.d_trans, device=dev, dtype=e.dtype)
         grouped[:E] = e[order]
-        pad_np = np.ones(n_groups * C, dtype=bool)
-        pad_np[:E] = False
-        pad = upload(pad_np, dev)
         zc = self._fast_fn("transformer", _transformer_core)(
             agg.transformer, grouped.view(n_groups, C, agg.d_trans), pad.view(n_groups, C))
         z_ctx = torch.empty_like(e)
@@ -261,14 +270,22 @@ class FastTGNMixin:
         mem.fast_write(to_update, to_update_g, updated)
 
     # --------------------------------------------------------- messages
-    def _fast_raw_messages(self, bt: _Batch, owner_np, owner_g, peer_np, peer_g):
+    def _fast_raw_messages(self, bt: _Batch):
+        """get_raw_messages for both sides: [src messages ; dst messages].
+
+        One memory read of [src ; dst] serves both sides (a source's message
+        holds [mem(src), mem(dst), edge, t(dt)], a destination's the mirror).
+        The time encoding still runs once per side at the reference's shape."""
         mem: FastMemory = self.memory
-        owner_mem = mem.fast_read(owner_np, owner_g)
-        peer_mem = mem.fast_read(peer_np, peer_g)
-        lu = mem._lu[owner_np]
-        delta = np.where(lu > 0, bt.ts - lu, 0.0).astype(np.float32)
-        te = self.time_encoder(upload(delta, self.device).unsqueeze(1)).view(bt.B, -1)
-        return torch.cat([owner_mem, peer_mem, bt.ef, te], dim=1)
+        B = bt.B
+        m = mem.fast_read(bt.pos, bt.pos_g)
+        lu = mem._lu[bt.pos]
+        delta, = upload_many(self.device, np.where(lu > 0, bt.ts2 - lu, 0.0).astype(np.float32))
+        te_s = self.time_encoder(delta[:B].unsqueeze(1)).view(B, -1)
+        te_d = self.time_encoder(delta[B:].unsqueeze(1)).view(B, -1)
+        src_msg = torch.cat([m[:B], m[B:], bt.ef, te_s], dim=1)
+        dst_msg = torch.cat([m[B:], m[:B], bt.ef, te_d], dim=1)
+        return torch.cat([src_msg, dst_msg], dim=0)
 
     # -------------------------------------------------------- embedding
     def _fast_embedding(self, bt: _Batch, n_neighbors):
@@ -289,13 +306,15 @@ class FastTGNMixin:
             mask_fixed = mask.copy()
             mask_fixed[invalid[:, 0], 0] = False
             nbr = neighbors.reshape(-1).astype(np.int64)
-            ints = upload(np.concatenate([nbr, edge_idxs.reshape(-1).astype(np.int64)]), dev, torch.int64)
-            bools = upload(np.concatenate([mask_fixed.reshape(-1), invalid[:, 0]]), dev)
             n = len(bt.nodes)
-            c.update(n_neighbors=n_neighbors, nbr=nbr, nbr_g=ints[: nbr.size],
-                     eidx_n_g=ints[nbr.size:].view(n, -1),
-                     deltas_g=upload(deltas, dev),
-                     mask_g=bools[: mask.size].view(n, -1), invalid_g=bools[mask.size:].view(n, 1))
+            all_nodes = np.concatenate([bt.nodes, nbr])
+            ints, deltas_g, mask_g, invalid_g = upload_many(
+                dev, np.concatenate([all_nodes, edge_idxs.reshape(-1).astype(np.int64)]),
+                deltas, mask_fixed, invalid)
+            c.update(n_neighbors=n_neighbors, nbr=nbr, all_nodes=all_nodes,
+                     all_g=ints[: all_nodes.size], nbr_g=ints[n: all_nodes.size],
+                     eidx_n_g=ints[all_nodes.size:].view(n, -1),
+                     deltas_g=deltas_g, mask_g=mask_g, invalid_g=invalid_g)
             c["nf_src"] = em.node_features[bt.nodes_g, :] if em.node_features is not None \
                 else torch.zeros((n, self.n_node_features), device=dev)
             c["nf_nbr"] = em.node_features[c["nbr_g"], :] if em.node_features is not None \
@@ -311,10 +330,10 @@ class FastTGNMixin:
             if te_frozen:
                 c["src_time"], c["edge_time_emb"] = src_time, edge_time_emb
 
+        rows = mem.fast_read(c["all_nodes"], c["all_g"])            # sources and neighbours, one gather
         return self._fast_fn("attention", _attention_core)(
-            em.attention_models[0], mem.fast_read(bt.nodes, bt.nodes_g), c["nf_src"],
-            mem.fast_read(c["nbr"], c["nbr_g"]), c["nf_nbr"], src_time, c["ef_n"], edge_time_emb,
-            c["mask_g"], c["invalid_g"])
+            em.attention_models[0], rows[:n], c["nf_src"], rows[n:], c["nf_nbr"], src_time, c["ef_n"],
+            edge_time_emb, c["mask_g"], c["invalid_g"])
 
     def _fast_fn(self, name, fn):
         """`fn`, or with CYBERWORLD_FAST_TGN_COMPILE=1 a torch.compile'd copy.
@@ -338,12 +357,10 @@ class FastTGNMixin:
     # ------------------------------------------------------------- steps
     def _fast_cte(self, bt: _Batch, n_neighbors):
         B = bt.B
-        self._fast_update_memory(np.concatenate([bt.src, bt.dst]))
-        self.memory.clear_messages(np.concatenate([bt.src, bt.dst]))
-        src_msg = self._fast_raw_messages(bt, bt.src, bt.src_g, bt.dst, bt.dst_g)
-        dst_msg = self._fast_raw_messages(bt, bt.dst, bt.dst_g, bt.src, bt.src_g)
-        self.memory._pool.write(np.concatenate([bt.src, bt.dst]), np.concatenate([bt.dst, bt.src]),
-                                np.concatenate([bt.ts, bt.ts]), torch.cat([src_msg, dst_msg], dim=0))
+        self._fast_update_memory(bt.pos)
+        self.memory.clear_messages(bt.pos)
+        self.memory._pool.write(bt.pos, bt.peers, bt.ts2, self._fast_raw_messages(bt),
+                                order=bt.write_order, order_g=bt.write_order_g)
         emb = self._fast_embedding(bt, n_neighbors)
         return emb[:B], emb[B: 2 * B], emb[2 * B:]
 
@@ -391,14 +408,11 @@ class FastTGNMixin:
         if len(sources) == 0:
             return
         bt = _Batch(self, sources, destinations, destinations, timestamps, edge_idxs)
-        src_msg = self._fast_raw_messages(bt, bt.src, bt.src_g, bt.dst, bt.dst_g)
-        dst_msg = self._fast_raw_messages(bt, bt.dst, bt.dst_g, bt.src, bt.src_g)
         # store_raw_messages EXTENDS lists; the pool replaces them. Streaming
         # always updates before it stores, so the lists are empty here.
-        both = np.concatenate([bt.src, bt.dst])
-        assert (self.memory._pool.cnt[both] == 0).all(), "fast path: store before update"
-        self.memory._pool.write(both, np.concatenate([bt.dst, bt.src]),
-                                np.concatenate([bt.ts, bt.ts]), torch.cat([src_msg, dst_msg], dim=0))
+        assert (self.memory._pool.cnt[bt.pos] == 0).all(), "fast path: store before update"
+        self.memory._pool.write(bt.pos, bt.peers, bt.ts2, self._fast_raw_messages(bt),
+                                order=bt.write_order, order_g=bt.write_order_g)
 
 
 def _check_supported(tgn):
