@@ -52,7 +52,7 @@ _BLOCK = 262_144       # rows per in-RAM block before spilling
 
 
 class _Col:
-    """A growable numpy column.
+    """A growable numpy column, stored as fixed-size chunks.
 
     The builder originally accumulated these as Python lists and converted to
     numpy only in finalize(). That made the *finalized* store compact while the
@@ -61,25 +61,78 @@ class _Col:
     snapshots a full-density corpus produces, those ten metadata lists came to
     tens of GB and dwarfed the memmapped feature block -- which is exactly how
     a run died with the spill file still at 0 bytes.
+
+    It then grew by doubling, which keeps up to 2x the data allocated (and 3x
+    while copying into the bigger buffer). At the ~80M snapshots of the
+    cross_year_ctu train split that slack was several GB against a 10 GB cap.
+    Chunks of `_CHUNK` cells bound the slack to one chunk per column.
     """
 
-    __slots__ = ("buf", "n")
+    __slots__ = ("_chunks", "_cur", "_k", "n", "dtype")
+
+    _CHUNK = 1 << 20
 
     def __init__(self, dtype, capacity: int = 1 << 16):
-        self.buf = np.empty(capacity, dtype=dtype)
+        self.dtype = np.dtype(dtype)
+        self._chunks: list = []
+        self._cur = np.empty(min(capacity, self._CHUNK), dtype=self.dtype)
+        self._k = 0          # cells used in _cur
         self.n = 0
 
+    def _roll(self) -> None:
+        if self._cur.shape[0] < self._CHUNK:
+            # Small columns start small; grow the first chunk up to _CHUNK.
+            bigger = np.empty(min(self._cur.shape[0] * 2, self._CHUNK), dtype=self.dtype)
+            bigger[: self._k] = self._cur[: self._k]
+            self._cur = bigger
+            return
+        self._chunks.append(self._cur)
+        self._cur = np.empty(self._CHUNK, dtype=self.dtype)
+        self._k = 0
+
     def append(self, v) -> None:
-        if self.n == self.buf.shape[0]:
-            bigger = np.empty(self.buf.shape[0] * 2, dtype=self.buf.dtype)
-            bigger[: self.n] = self.buf
-            self.buf = bigger
-        self.buf[self.n] = v
+        if self._k == self._cur.shape[0]:
+            self._roll()
+        self._cur[self._k] = v
+        self._k += 1
         self.n += 1
 
+    def extend(self, values) -> None:
+        """Append many values; the same cells `append` would write, one by one."""
+        values = np.asarray(values)
+        k = values.shape[0]
+        i = 0
+        while i < k:
+            if self._k == self._cur.shape[0]:
+                self._roll()
+            take = min(k - i, self._cur.shape[0] - self._k)
+            self._cur[self._k:self._k + take] = values[i:i + take]
+            self._k += take
+            i += take
+        self.n += k
+
+    @property
+    def buf(self) -> np.ndarray:
+        """The values so far as ONE array (a copy once there are several
+        chunks). Kept for callers that read `col.buf[: col.n]`; prefer `max()`."""
+        if not self._chunks:
+            return self._cur[: self._k]
+        return np.concatenate(self._chunks + [self._cur[: self._k]])
+
+    def max(self):
+        parts = [c.max() for c in self._chunks]
+        if self._k:
+            parts.append(self._cur[: self._k].max())
+        return max(parts)
+
     def finalize(self) -> np.ndarray:
-        out = self.buf[: self.n].copy()
-        self.buf = np.empty(0, dtype=self.buf.dtype)   # release promptly
+        if self._chunks:
+            out = np.concatenate(self._chunks + [self._cur[: self._k]])
+        else:
+            out = self._cur[: self._k].copy()
+        self._chunks = []                                  # release promptly
+        self._cur = np.empty(0, dtype=self.dtype)
+        self._k = 0
         return out
 
 
@@ -460,13 +513,7 @@ class TrajectoryStoreBuilder:
     def append(self, *, host_ip, host_id, window_idx, window_start, window_end,
                embedding, temporal_attrs, is_attack, coarse_category,
                technique_ids, risk_score) -> None:
-        if self._block_n == _BLOCK:
-            if self._spill_fh is not None:
-                self._flush_block()
-            else:
-                self._block = np.concatenate(
-                    [self._block, np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)]
-                )
+        self._make_room()
         row = self._block_n
         got = EMB_DIM + len(temporal_attrs)
         if got != self.feat_dim:
@@ -495,6 +542,161 @@ class TrajectoryStoreBuilder:
             self._tech_flat.append(self._intern(t, self._tech_index, self._techniques))
         self._tech_off.append(self._tech_flat.n)
         self._n += 1
+
+    def next_window_base(self) -> int:
+        """1 + the largest window_idx appended so far (0 when empty): the
+        `window_idx_base` for the next capture."""
+        return int(self._window_idx.max()) + 1 if self._window_idx.n else 0
+
+    def _make_room(self) -> None:
+        """Free the in-RAM block when it is full: spill it, or grow it.
+
+        Growth used to trigger only at `_block_n == _BLOCK`, so without a
+        spill dir the block grew once and the row after 2 * _BLOCK raised
+        IndexError. Comparing against the block's actual size keeps the spill
+        behaviour identical (the block is always _BLOCK rows there) and lets
+        the in-RAM one keep growing.
+        """
+        if self._block_n == self._block.shape[0]:
+            if self._spill_fh is not None:
+                self._flush_block()
+            else:
+                self._block = np.concatenate(
+                    [self._block, np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)]
+                )
+
+    def append_batch(self, *, host_ips, host_ids, window_idx, window_start, window_end,
+                     embeddings, temporal_attrs, is_attack, coarse_categories,
+                     technique_ids, risk_scores) -> None:
+        """`append` for every row of one window, in row order; identical result.
+
+        Per-row arguments are sequences of equal length; `window_idx`,
+        `window_start` and `window_end` are shared by all rows. Interning
+        (hosts, categories, techniques) happens in row order, so ids come out
+        as the per-row calls would assign them.
+        """
+        m = len(host_ips)
+        if m == 0:
+            return
+        emb = np.asarray(embeddings)
+        att = np.asarray(temporal_attrs)
+        got = EMB_DIM + att.shape[1]
+        if got != self.feat_dim:
+            raise ValueError(
+                f"snapshot is {got} wide ({EMB_DIM} embedding + "
+                f"{att.shape[1]} attributes) but this store was built "
+                f"for {self.feat_dim}. Build the store with "
+                f"feat_dim={got} -- e.g. TrajectoryStoreBuilder(feat_dim="
+                f"EMB_DIM + EXTENDED_HOST_ATTR_DIM) when the extractor has "
+                f"include_packet_features=True."
+            )
+        i = 0
+        while i < m:
+            self._make_room()
+            k = min(m - i, self._block.shape[0] - self._block_n)
+            b = self._block_n
+            self._block[b:b + k, :EMB_DIM] = emb[i:i + k]
+            self._block[b:b + k, EMB_DIM:] = att[i:i + k]
+            self._block_n += k
+            i += k
+
+        ns = self._namespace
+        hidx, hnames = self._host_index, self._host_names
+        keys = host_ips if ns is None else [f"{ip}@{ns}" for ip in host_ips]
+        self._host_name_id.extend(np.fromiter(
+            (self._intern(kk, hidx, hnames) for kk in keys), dtype=np.int64, count=m))
+        self._node_id.extend(np.asarray(host_ids).astype(np.int64))
+        self._window_idx.extend(np.full(m, int(window_idx), dtype=np.int64))
+        self._window_start.extend(np.full(m, window_start, dtype=np.float64))
+        self._window_end.extend(np.full(m, window_end, dtype=np.float64))
+        self._is_attack.extend(np.asarray(is_attack, dtype=bool))
+        self._risk.extend(np.asarray(risk_scores, dtype=np.float64))
+        cidx, cnames = self._cat_index, self._categories
+        self._cat_id.extend(np.fromiter(
+            (self._intern(c, cidx, cnames) for c in coarse_categories), dtype=np.int64, count=m))
+        tidx, tnames = self._tech_index, self._techniques
+        flat: list = []
+        offs = np.empty(m, dtype=np.int64)
+        base = self._tech_flat.n
+        for r, techs in enumerate(technique_ids):
+            for t in (techs or ()):
+                flat.append(self._intern(t, tidx, tnames))
+            offs[r] = base + len(flat)
+        if flat:
+            self._tech_flat.extend(np.asarray(flat, dtype=np.int64))
+        self._tech_off.extend(offs)
+        self._n += m
+
+    # -- parts: one capture extracted elsewhere, appended here -------------
+    _PART_COLS = ("_host_name_id", "_node_id", "_window_idx", "_window_start", "_window_end",
+                  "_is_attack", "_risk", "_cat_id", "_tech_off", "_tech_flat")
+
+    def export_part(self, out_dir) -> None:
+        """Write everything appended so far to `out_dir` for `append_part`.
+
+        Only for a builder that started empty, spilled to `out_dir` itself and
+        is not used afterwards (data_unification/parallel_extract.py). Its
+        local ids are then in first-appearance order, which `append_part`
+        relies on to reproduce the interning a single builder would have done.
+        """
+        import json
+        if self._spill_fh is None or os.path.dirname(self._spill_path) != os.path.abspath(str(out_dir)):
+            raise ValueError("export_part needs a builder spilling into out_dir")
+        self._flush_block()
+        self._spill_fh.close()
+        self._spill_fh = None
+        os.replace(self._spill_path, os.path.join(out_dir, "feats.bin"))
+        for name in self._PART_COLS:
+            np.save(os.path.join(out_dir, f"{name[1:]}.npy"), getattr(self, name).finalize())
+        with open(os.path.join(out_dir, "part.json"), "w") as f:
+            json.dump({"n": self._n, "feat_dim": self.feat_dim, "host_names": self._host_names,
+                       "categories": self._categories, "techniques": self._techniques}, f)
+
+    def append_part(self, part_dir, window_idx_offset: int = 0) -> None:
+        """Append a part written by `export_part`, as if its rows had been
+        appended here one by one with `window_idx_base` raised by
+        `window_idx_offset`. Ids are re-interned in the part's local id order,
+        which is its first-appearance order, so they come out identical."""
+        import json
+        with open(os.path.join(part_dir, "part.json")) as f:
+            meta = json.load(f)
+        n = int(meta["n"])
+        if int(meta["feat_dim"]) != self.feat_dim:
+            raise ValueError(f"part is {meta['feat_dim']} wide, store is {self.feat_dim}")
+        if n == 0:
+            return
+        col = {name[1:]: np.load(os.path.join(part_dir, f"{name[1:]}.npy"))
+               for name in self._PART_COLS}
+        feats = np.memmap(os.path.join(part_dir, "feats.bin"), dtype=np.float32, mode="r",
+                          shape=(n, self.feat_dim))
+        i = 0
+        while i < n:
+            self._make_room()
+            k = min(n - i, self._block.shape[0] - self._block_n)
+            self._block[self._block_n:self._block_n + k] = feats[i:i + k]
+            self._block_n += k
+            i += k
+        del feats
+
+        def remap(names, index, table):
+            return np.array([self._intern(x, index, table) for x in names], dtype=np.int64)
+
+        hmap = remap(meta["host_names"], self._host_index, self._host_names)
+        cmap = remap(meta["categories"], self._cat_index, self._categories)
+        tmap = remap(meta["techniques"], self._tech_index, self._techniques)
+        self._host_name_id.extend(hmap[col["host_name_id"]] if hmap.size else col["host_name_id"])
+        self._node_id.extend(col["node_id"])
+        self._window_idx.extend(col["window_idx"].astype(np.int64) + int(window_idx_offset))
+        self._window_start.extend(col["window_start"])
+        self._window_end.extend(col["window_end"])
+        self._is_attack.extend(col["is_attack"])
+        self._risk.extend(col["risk"])
+        self._cat_id.extend(cmap[col["cat_id"]] if cmap.size else col["cat_id"])
+        base = self._tech_flat.n
+        if col["tech_flat"].size:
+            self._tech_flat.extend(tmap[col["tech_flat"]])
+        self._tech_off.extend(col["tech_off"][1:].astype(np.int64) + base)
+        self._n += n
 
     def finalize(self) -> TrajectoryStore:
         if self._spill_fh is not None:

@@ -847,6 +847,67 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         torch.save(_ck, output)
 
 
+def _downstream_column_jobs(args):
+    """[(split, namespace, ColumnSpec)] in exactly the order, and with exactly
+    the reads, of the record path in _pcap_trajectories_per_day: every PCAP day
+    sorted by name (iter_pcap_day_records: windows concatenated, no label
+    filter), then under cross_year_ctu the CTU-13 train and val scenarios
+    (read_one_capture)."""
+    from data_unification.capture_columns import ColumnSpec
+    from data_unification.training_sources import discover_captures
+    from data_unification.trajectory_store import capture_namespace
+    ws = float(get_contract().window_seconds)
+    jobs = []
+    caps = discover_captures(scheme=args.split_scheme, pcap2018_root=args.pcap_root)
+    for cap in sorted((c for sp in caps.values() for c in sp), key=lambda c: c.name):
+        jobs.append((cap.split, f"pcap/{cap.name}", ColumnSpec(
+            "pcap_windows", cap.dataset, cap.name, str(cap.path), ws,
+            str(args.cic2018_csv_dir), None, 1, args.pcap_max_windows_per_day,
+            int(args.pcap_window_stride), None)))
+    if args.split_scheme == "cross_year_ctu":
+        ctu_caps = discover_captures(scheme=args.split_scheme, ctu13_dir=args.ctu_dir)
+        assert not ctu_caps["test"], "cross_year_ctu must never test on CTU-13"
+        for split in ("train", "val"):
+            for cap in ctu_caps[split]:
+                jobs.append((split, capture_namespace(cap), ColumnSpec(
+                    "one_capture", cap.dataset, cap.name, str(cap.path), ws,
+                    None, args.rows_per_file, int(args.stride))))
+    return jobs
+
+
+def _columns_extract_in_order(jobs, plan, args, extractor, builders, wbase):
+    """Extract each job's columns into builders[split], in job order.
+
+    Yields (split, namespace, n_records, seconds) after each capture."""
+    from data_unification.capture_columns import iter_capture_columns
+    stream = iter_capture_columns(
+        [spec for _s, _n, spec in jobs], cache_dir=plan.cache_dir,
+        scratch_dir=plan.scratch_dir, workers=args.ingest_workers)
+    if plan.cache_dir is not None and args.extract_workers > 1:
+        # Independent captures, extracted at once, appended in job order:
+        # the same stores (data_unification/parallel_extract.py).
+        from data_unification.parallel_extract import extract_parallel
+        items = ((n, cols, ns) for n, ((split, ns, _spec), (_sp, cols))
+                 in enumerate(zip(jobs, stream)))
+        for n, info in extract_parallel(
+                items, extractor=extractor, builder_for=lambda k: builders[jobs[k][0]],
+                tgne=str(args.tgne), part_dir=Path(args.spill_dir or plan.cache_dir) / "parts_downstream",
+                workers=args.extract_workers):
+            yield jobs[n][0], jobs[n][1], info["n_records"], info["seconds"]
+        return
+    for (split, ns, _spec), (_sp, cols) in zip(jobs, stream):
+        t = time.time()
+        b = builders[split]
+        b.set_namespace(ns)
+        extractor.extract_trajectories_columns(cols, builder=b, window_idx_base=wbase[split])
+        if b._window_idx.n:
+            wbase[split] = b.next_window_base()
+        n = len(cols)
+        del cols
+        gc.collect()
+        yield split, ns, n, time.time() - t
+
+
 def _pcap_trajectories_per_day(args, extractor):
     """Per-day extraction into two shared stores -- see iter_pcap_day_records.
 
@@ -864,6 +925,23 @@ def _pcap_trajectories_per_day(args, extractor):
     builders = {k: TrajectoryStoreBuilder(spill_dir=spill)
                 for k in ("train", "val", "test")}
     wbase = {"train": 0, "val": 0, "test": 0}
+    from data_unification.capture_columns import columns_plan
+    plan = columns_plan(args.capture_cache, args.spill_dir, extractor)
+    print(plan.describe(args.ingest_workers), flush=True)
+    if plan.enabled:
+        # The same captures, in the same order, into the same stores as the
+        # record path below -- as cached columns (data_unification/
+        # capture_columns.py), because a PCAP day as records is ~12 GB.
+        for split, ns, n_recs, _t in _columns_extract_in_order(
+                _downstream_column_jobs(args), plan, args, extractor, builders, wbase):
+            print(f"  [{split}] {ns}: {n_recs} records -> {builders[split]._n} snapshots "
+                  f"({_t:.1f}s)", flush=True)
+        out = {}
+        for k, b in builders.items():
+            st = b.finalize()
+            print(f"{k}: {st.n_snapshots} snapshots over {len(st)} hosts | {st.memory_report()}", flush=True)
+            out[k] = st
+        return out
     for split, day, recs in iter_pcap_day_records(
             args.pcap_root, args.cic2018_csv_dir, get_contract().window_seconds,
             args.pcap_max_windows_per_day, window_stride=args.pcap_window_stride,
@@ -873,7 +951,7 @@ def _pcap_trajectories_per_day(args, extractor):
         b.set_namespace(f"pcap/{day}")   # one trajectory per (host, capture day)
         extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
         if b._window_idx.n:
-            wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+            wbase[split] = b.next_window_base()
         print(f"    -> {split} store: {b._n} snapshots ({time.time()-t:.1f}s)", flush=True)
         del recs
         gc.collect()
@@ -894,7 +972,7 @@ def _pcap_trajectories_per_day(args, extractor):
                 b.set_namespace(capture_namespace(cap))   # one trajectory per (host, capture)
                 extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
                 if b._window_idx.n:
-                    wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+                    wbase[split] = b.next_window_base()
                 print(f"  [CTU13 {split}] {cap.name}: {len(recs)} recs -> {b._n} snapshots "
                       f"({time.time()-t:.1f}s)", flush=True)
                 del recs
@@ -965,6 +1043,16 @@ def main():
     parser.add_argument("--allow-noncredible-branch-b",action="store_true",
                         help="Train DeepOP even if Branch B does not beat the "
                              "persistence baseline (see MIN_BRANCH_B_SKILL).")
+    parser.add_argument("--capture-cache",type=str,default=None,
+                        help="Cache of captures parsed to compact columns "
+                             "(data_unification/capture_columns.py). Default: "
+                             "$CYBERWORLD_CAPTURE_CACHE, else <--spill-dir>/capture_cache, "
+                             "shared with Branch A. 'off' reads records as before.")
+    parser.add_argument("--ingest-workers",type=int,default=3,
+                        help="Captures parsed at once, each in its own process")
+    parser.add_argument("--extract-workers",type=int,default=3,
+                        help="Captures extracted at once, each in its own CPU process "
+                             "(data_unification/parallel_extract.py); 1 = in this process")
     parser.add_argument("--num-workers",type=int,default=4,
                         help="DataLoader worker processes; 0 loads in the main "
                              "process and serialises loading with GPU compute.")
@@ -1044,7 +1132,7 @@ def main():
                 extractor.extract_trajectories(recs, builder=shared,
                                                window_idx_base=widx_base)
                 if shared._window_idx.n:
-                    widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
+                    widx_base = shared.next_window_base()
                 print(f"  [{label} {i+1}/{len(files)}] {f.name}: {len(recs)} recs, "
                       f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
                 del recs
@@ -1095,7 +1183,7 @@ def main():
     dp_out = args.out_dir / "deepop" / "cwa_forecast_decoder.pt"
     # Crash recovery. Kept until the whole run finishes, so a crash in DeepOP
     # does not retrain a Branch B that had already finished.
-    _fp = run_fingerprint(args, ignore=("epochs", "num_workers"))
+    _fp = run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers"))
     _log = lambda m: print(m, flush=True)
     bb_resume = ResumePoint(bb_out.with_name(bb_out.stem + "_resume.pt"), {**_fp, "stage": "'branch_b'"},
                             enabled=not args.no_resume, log=_log)
@@ -1197,11 +1285,24 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
     caps = discover_captures(scheme="cross_year", cic2017_dir=args.cic2017_dir)["test"]
     b = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
     wbase = 0
-    for cap in caps:
+    from data_unification.capture_columns import ColumnSpec, columns_plan, iter_capture_columns
+    plan = columns_plan(args.capture_cache, args.spill_dir, extractor)
+    if plan.enabled:
+        specs = [ColumnSpec.for_read_capture(cap, window_seconds=_c.window_seconds) for cap in caps]
+        for cap, (_s, cols) in zip(caps, iter_capture_columns(
+                specs, cache_dir=plan.cache_dir, scratch_dir=plan.scratch_dir,
+                workers=args.ingest_workers)):
+            extractor.extract_trajectories_columns(cols, builder=b, window_idx_base=wbase)
+            if b._window_idx.n:
+                wbase = b.next_window_base()
+            print(f"  [test] {cap.label}: {len(cols)} records", flush=True)
+            del cols
+            gc.collect()
+    for cap in (caps if not plan.enabled else ()):
         recs = read_capture(cap, window_seconds=_c.window_seconds)
         extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase)
         if b._window_idx.n:
-            wbase = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+            wbase = b.next_window_base()
         print(f"  [test] {cap.label}: {len(recs)} records", flush=True)
         del recs
         gc.collect()
