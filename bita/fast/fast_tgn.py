@@ -405,12 +405,17 @@ class FastTGNMixin:
         # the second call consumes the messages the first one stored. Both
         # calls are kept; what they share is only what does not depend on
         # memory (uploads, neighbours, feature gathers).
+        # One embedding pass for both heads, as the reference now does
+        # (model/extentedtgn.py explains the leak the second pass caused).
+        from model.extentedtgn import legacy_category_pass
         bt = _Batch(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs)
-        pos, neg = self._fast_scores(*self._fast_cte(bt, n_neighbors))
-        if getattr(self.embedding_module.neighbor_finder, "uniform", False):
-            bt.cache = {}       # uniform sampling draws again, as the reference does
-        s2, d2, _ = self._fast_cte(bt, n_neighbors)
-        combined = torch.cat([s2, d2, bt.ef.float()], dim=1)
+        s1, d1, n1 = self._fast_cte(bt, n_neighbors)
+        pos, neg = self._fast_scores(s1, d1, n1)
+        if legacy_category_pass():
+            if getattr(self.embedding_module.neighbor_finder, "uniform", False):
+                bt.cache = {}   # uniform sampling draws again, as the reference does
+            s1, d1, _ = self._fast_cte(bt, n_neighbors)
+        combined = torch.cat([s1, d1, bt.ef.float()], dim=1)
         return pos, neg, self.category_predictor(combined)
 
     # ---------------------------------------------- streaming (serving)

@@ -13,6 +13,13 @@ import torch.nn as nn
 from model.tgn import TGN
 
 
+def legacy_category_pass() -> bool:
+    """True only when CYBERWORLD_LEGACY_CATEGORY_PASS=1: the leaky two-pass
+    category head, kept solely to measure what the leak was worth."""
+    import os
+    return os.environ.get("CYBERWORLD_LEGACY_CATEGORY_PASS", "") in ("1", "true", "True")
+
+
 class ExtendedTGN(TGN):
     def __init__(
         self,
@@ -116,13 +123,34 @@ class ExtendedTGN(TGN):
         edge_idxs,
         n_neighbors=20,
     ):
-        pos_score, neg_score = super().compute_edge_probabilities(
-            source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
-        )
-
-        source_node_embedding, destination_node_embedding, _ = self.compute_temporal_embeddings(
-            source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
-        )
+        # ONE embedding pass feeds both heads. This used to call
+        # compute_temporal_embeddings a second time for the category head, and
+        # with memory updated at the start of a batch that second call first
+        # applied the CURRENT batch's messages: each edge's category was
+        # predicted from memory that already held every edge of its batch,
+        # including the ones after it in time (leakage, in training and in the
+        # val/test metrics), and every message was applied twice (the second
+        # call stored the batch again for the next batch to re-apply).
+        # CYBERWORLD_LEGACY_CATEGORY_PASS=1 restores it, only to measure it.
+        if legacy_category_pass():
+            pos_score, neg_score = super().compute_edge_probabilities(
+                source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
+            )
+            source_node_embedding, destination_node_embedding, _ = self.compute_temporal_embeddings(
+                source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
+            )
+        else:
+            source_node_embedding, destination_node_embedding, negative_node_embedding = (
+                self.compute_temporal_embeddings(
+                    source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors
+                )
+            )
+            n_samples = len(source_nodes)
+            score = self.affinity_score(
+                torch.cat([source_node_embedding, source_node_embedding], dim=0),
+                torch.cat([destination_node_embedding, negative_node_embedding], dim=0),
+            ).squeeze(dim=-1)
+            pos_score, neg_score = score[:n_samples].sigmoid(), score[n_samples:].sigmoid()
 
         # Concatenate, do not sum: summing erases direction. Append the edge's
         # own features so the head can see what the flow actually is.
