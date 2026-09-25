@@ -166,15 +166,24 @@ class StepLossLog:
         self._pending = []
         self._total, self._edge, self._cat = [], [], []
 
-    def append_step(self, total, edge, cat) -> None:
-        self._pending.append((total.detach(), edge.detach(), cat.detach()))
+    def append_step(self, total, edge, cat, ok=True) -> None:
+        """`ok`: the guard's verdict -- a bool, or a device bool from
+        TrainingGuard.backward_step_deferred (a skipped step is dropped at
+        read time, exactly as the loop dropped it when ok was a bool)."""
+        if ok is False:
+            return
+        okt = ok.detach().to(total.dtype) if torch.is_tensor(ok) else torch.ones((), dtype=total.dtype,
+                                                                                   device=total.device)
+        self._pending.append((total.detach(), edge.detach(), cat.detach(), okt))
 
     def _flush(self) -> None:
         if not self._pending:
             return
         vals = torch.stack([t for step in self._pending for t in step]).tolist()
         self._pending = []
-        for i in range(0, len(vals), 3):
+        for i in range(0, len(vals), 4):
+            if not vals[i + 3]:
+                continue
             self._total.append(vals[i])
             self._edge.append(vals[i + 1] / self.div)
             self._cat.append(vals[i + 2] / self.div)
@@ -1618,6 +1627,7 @@ def train(args):
         # Per-step losses stay on the device and are read (one sync) only
         # when printed; see StepLossLog.
         m_loss = StepLossLog(args.backprop_every)
+        guard_step = guard.backward_step_deferred if guard.deferred_supported() else guard.backward_step
         fast_batch_losses = getattr(tgn, "fast_batch_losses", None)
 
         # Sample order for this epoch.
@@ -1715,8 +1725,10 @@ def train(args):
             # standalone).
             total_loss = (loss + args.cat_loss_weight * category_loss_total) / args.backprop_every
             # backward + clip + step; a non-finite loss is skipped, not stepped on.
-            if guard.backward_step(total_loss):
-                m_loss.append_step(total_loss, loss, category_loss_total)
+            # One device->host sync per step (backward_step), or none at all
+            # (backward_step_deferred: the verdict is read a step later; same
+            # decisions and weights bit for bit, see training_guard.py).
+            m_loss.append_step(total_loss, loss, category_loss_total, ok=guard_step(total_loss))
 
             if k % 500 == 0:
                 elapsed = time.time() - start_epoch
@@ -1731,6 +1743,7 @@ def train(args):
             if args.use_memory:
                 tgn.memory.detach_memory()
 
+        guard.flush()
         epoch_time = time.time() - start_epoch
         epoch_times.append(epoch_time)
         mean_train_loss = float(np.mean(m_loss.total))

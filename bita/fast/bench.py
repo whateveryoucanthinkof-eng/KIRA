@@ -116,6 +116,8 @@ def run(args):
     tgn.set_neighbor_finder(B["train_ngh"])
     rec = dict(total=[], edge=[], cat=[], outputs=[], grads_first=None, norms=[])
     losslog = T.StepLossLog(args.backprop_every)
+    guard_step = guard.backward_step_deferred if guard.deferred_supported() else guard.backward_step
+    print(f"guard step: {guard_step.__name__}", flush=True)
     prof = None
     if args.profile:
         from torch.profiler import profile, ProfilerActivity, schedule
@@ -160,9 +162,8 @@ def run(args):
                                   if p.requires_grad and p.grad is not None}
             ok = guard.step_after_backward()
         else:
-            ok = guard.backward_step(total)
-        if ok:
-            losslog.append_step(total, loss, cat_total)     # as bita/train.py
+            ok = guard_step(total)
+        losslog.append_step(total, loss, cat_total, ok=ok)  # as bita/train.py
         tgn.memory.detach_memory()
         if prof is not None:
             prof.step()
@@ -170,6 +171,7 @@ def run(args):
             torch.cuda.synchronize()
             rates.append((k, (k - mark_batch) / (time.time() - t_mark)))
             print(f"batch {k}: {rates[-1][1]:.2f} batch/s", flush=True)
+    guard.flush()
     torch.cuda.synchronize()
     t_end = time.time()
     if prof is not None:

@@ -60,6 +60,7 @@ def _run(step_fn):
     m, opt, g = _make()
     torch.manual_seed(1)
     out = []
+    deferred_flags = []
     for epoch in range(2):
         for i in range(15):
             opt.zero_grad()
@@ -74,23 +75,48 @@ def _run(step_fn):
                 loss = loss + (m[0].weight.sum() * 0.0).sqrt()      # finite loss, NaN gradient
             elif f == "big":
                 loss = loss * 1e4
-            out.append(step_fn(g, loss))
+            r = step_fn(g, loss)
+            out.append(r if not torch.is_tensor(r) else "deferred")
+            if torch.is_tensor(r):
+                deferred_flags.append(r)
+        g.flush()
         stats = (g.n_steps, g.n_nonfinite, g.n_grad, g.n_clipped, g.grad_norm_sum, g.grad_norm_max,
                  copy.deepcopy(g.top_grads), g.global_step, g.current_lr())
         out.append(stats)
         g._reset_epoch_stats()
-    return out, [p.detach().cpu().clone() for p in m.parameters()], opt.state_dict()
+    flags = [bool(f) for f in deferred_flags]
+    return out, [p.detach().cpu().clone() for p in m.parameters()], opt.state_dict(), flags
 
 
 def test_one_sync_step_is_the_two_sync_step():
-    ref_out, ref_params, ref_opt = _run(_reference_backward_step)
-    new_out, new_params, new_opt = _run(lambda g, loss: g.backward_step(loss))
+    ref_out, ref_params, ref_opt, _ = _run(_reference_backward_step)
+    new_out, new_params, new_opt, _ = _run(lambda g, loss: g.backward_step(loss))
     assert ref_out == new_out
     assert any(o is False for o in ref_out) and any(o is True for o in ref_out)
     # both kinds of skip happened: a non-finite loss and a non-finite gradient
     assert ref_out[-1][1] == 5 and ref_out[-1][0] == 15
     for a, b in zip(ref_params, new_params):
         assert torch.equal(a, b)
+    for k, st in ref_opt["state"].items():
+        for name, v in st.items():
+            assert torch.equal(torch.as_tensor(v), torch.as_tensor(new_opt["state"][k][name])), name
+
+
+def test_deferred_step_is_the_two_sync_step():
+    """backward_step_deferred: no sync; a skipped step is undone on the device
+    and its outcome read one step later. Weights, Adam state (step counts
+    included), counters, diagnostics and the warmup LR: all identical."""
+    ref_out, ref_params, ref_opt, _ = _run(_reference_backward_step)
+    new_out, new_params, new_opt, flags = _run(lambda g, loss: g.backward_step_deferred(loss))
+    assert "deferred" in new_out                       # the deferred path actually ran
+    # per-step verdicts: the deferred ones, read back, match the reference's
+    it = iter(flags)
+    merged = [next(it) if o == "deferred" else o for o in new_out]
+    assert merged == ref_out
+    assert False in flags                              # a skip went through the deferred path
+    for a, b in zip(ref_params, new_params):
+        assert torch.equal(a, b)
+    assert ref_opt["param_groups"] == new_opt["param_groups"]
     for k, st in ref_opt["state"].items():
         for name, v in st.items():
             assert torch.equal(torch.as_tensor(v), torch.as_tensor(new_opt["state"][k][name])), name

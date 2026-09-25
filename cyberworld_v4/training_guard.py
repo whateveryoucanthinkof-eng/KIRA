@@ -101,6 +101,8 @@ class TrainingGuard:
         self.stop_reason: Optional[str] = None
         self.history: List[Dict[str, Any]] = []
         self._best_state: Optional[Dict[str, Any]] = None
+        self._pending = None            # a deferred step whose outcome is not read yet
+        self._snap = None
         self._reset_epoch_stats()
         self._apply_lr()
 
@@ -200,6 +202,130 @@ class TrainingGuard:
         self.global_step += 1
         return True
 
+    # ------------------------------------------------- deferred (no-sync) step
+    def deferred_supported(self) -> bool:
+        """backward_step_deferred needs an optimizer whose skipped step it can
+        undo exactly: torch.optim.Adam/AdamW, foreach or single-tensor (not
+        fused, not capturable, no amsgrad), parameters on one CUDA device."""
+        import os
+        if os.environ.get("CYBERWORLD_GUARD_SYNC", "") in ("1", "true", "True"):
+            return False
+        opt = self.optimizer
+        if type(opt) not in (torch.optim.Adam, torch.optim.AdamW):
+            return False
+        for g in opt.param_groups:
+            if g.get("fused") or g.get("capturable") or g.get("amsgrad") or g.get("differentiable"):
+                return False
+            if torch.is_tensor(g.get("lr")):
+                return False
+        devs = {p.device for p in self._params()}
+        return len(devs) == 1 and next(iter(devs)).type == "cuda"
+
+    def backward_step_deferred(self, loss: torch.Tensor):
+        """backward_step without a device->host synchronisation.
+
+        Same decisions, counters, diagnostics and weights as backward_step,
+        bit for bit (tests/test_training_guard_one_sync.py). The step is
+        taken on the device speculatively and undone on the device if the
+        loss or the gradient is not finite:
+
+          snapshot   params, exp_avg, exp_avg_sq  (one multi-tensor copy)
+          step       the optimizer's own step, unchanged
+          undo       x = where(ok, x, snapshot)   (selects, never computes)
+
+        The outcome (ok, grad norm) is copied to pinned host memory without
+        waiting and read at the NEXT step (or flush()), by which time the
+        device has long finished it; only then are the host-side counters,
+        the global step (the warmup LR) and, for a skipped step, Adam's step
+        counts updated -- before anything reads them. Returns a device bool
+        (or a Python bool when it fell back to backward_step).
+        """
+        self._resolve()
+        if self.n_grad == 0:            # first step of an epoch: records top grads, keeps the exact order
+            return self.backward_step(loss)
+        params = list(self._params())
+        self.n_steps += 1
+        loss_ok = torch.isfinite(loss.detach()).all()
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(params, self.clip_norm if self.clip_norm else float("inf"))
+        ok = loss_ok & torch.isfinite(norm)
+        live, stepped = [], []
+        opt = self.optimizer
+        for g in opt.param_groups:
+            for q in g["params"]:
+                if q.grad is None:
+                    continue
+                st = opt.state.get(q)
+                if not st or "exp_avg" not in st:
+                    # a parameter's first step creates its state; nothing to snapshot. Rare
+                    # (first use of a parameter): settle this step synchronously.
+                    return self._settle_now(ok, norm)
+                live += [q, st["exp_avg"], st["exp_avg_sq"]]
+                stepped.append(st["step"])
+        snap = self._snapshot_buffers(live)
+        with torch.no_grad():
+            torch._foreach_copy_(snap, live)
+        self._apply_lr()
+        opt.step()
+        with torch.no_grad():
+            for x, y in zip(live, snap):
+                torch.where(ok, x, y, out=x)
+        out = torch.stack([ok.to(norm.dtype), norm.detach()])
+        host = torch.empty(2, dtype=out.dtype, pin_memory=True)
+        host.copy_(out, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self._pending = (host, ev, stepped)
+        return ok
+
+    def _snapshot_buffers(self, live):
+        key = [(x.shape, x.dtype, x.device) for x in live]
+        if self._snap is None or self._snap[0] != key:
+            self._snap = (key, [torch.empty_like(x) for x in live])
+        return self._snap[1]
+
+    def _settle_now(self, ok, norm) -> bool:
+        ok_f, norm_f = torch.stack([ok.to(norm.dtype), norm]).tolist()
+        return self._account(bool(ok_f), norm_f, step=True)
+
+    def _account(self, ok: bool, norm_f: float, step: bool) -> bool:
+        """The host-side bookkeeping of one step, as step_after_backward does it."""
+        if not ok:
+            if step:
+                self.optimizer.zero_grad(set_to_none=True)
+            self.n_nonfinite += 1
+            return False
+        self.grad_norm_sum += norm_f
+        self.grad_norm_max = max(self.grad_norm_max, norm_f)
+        self.n_grad += 1
+        if self.clip_norm and norm_f > self.clip_norm:
+            self.n_clipped += 1
+        if step:
+            self._apply_lr()
+            self.optimizer.step()
+        self.global_step += 1
+        return True
+
+    def _resolve(self) -> None:
+        """Read the outcome of the pending deferred step (see backward_step_deferred)."""
+        if self._pending is None:
+            return
+        host, ev, stepped = self._pending
+        self._pending = None
+        ev.synchronize()                # long done in practice: a whole accumulation group ago
+        ok_f, norm_f = host.tolist()
+        ok = bool(ok_f)
+        if not ok:
+            # The device already undid the weights and moments; Adam's step
+            # counts live on the host and were advanced by the step: undo them.
+            for t in stepped:
+                t.sub_(1)
+        self._account(ok, norm_f, step=False)
+
+    def flush(self) -> None:
+        """Settle any deferred step (call before reading counters/state)."""
+        self._resolve()
+
     def _reset_epoch_stats(self) -> None:
         self.n_steps = 0
         self.n_nonfinite = 0
@@ -235,6 +361,7 @@ class TrainingGuard:
     def end_epoch(self, score: float, train_loss: Optional[float] = None,
                   health: Optional[Sequence[str]] = None) -> str:
         """Record one epoch and decide what happens next. Returns the action."""
+        self._resolve()
         self.epoch += 1
         health = [h for h in (health or []) if h]
         frac_bad = self.n_nonfinite / max(self.n_steps, 1)
@@ -371,9 +498,11 @@ class TrainingGuard:
 
     def state_dict(self) -> Dict[str, Any]:
         """Everything the guard knows, including the best snapshot, for a resume point."""
+        self._resolve()
         return {k: getattr(self, k) for k in self._RESUME_KEYS}
 
     def load_state_dict(self, sd: Dict[str, Any]) -> None:
+        self._pending = None
         for k in self._RESUME_KEYS:
             setattr(self, k, sd[k])
         self._reset_epoch_stats()
