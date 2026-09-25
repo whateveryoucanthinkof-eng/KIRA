@@ -114,6 +114,27 @@ def _window_attack_label(atk_recs):
     return coarse, techs
 
 
+def _attack_window_risk(coarse: str, n_attack: int, n_host: int) -> float:
+    """Severity risk of an attack host-window: tactic severity + density + volume.
+
+    Shared by extract_trajectories and extract_trajectories_columns so the two
+    cannot drift apart.
+    """
+    base_sev = TACTIC_BASE_SEVERITY.get(coarse, 0.50)
+    atk_density = min(1.0, n_attack / max(1, n_host))
+    vol_scale = min(1.0, float(np.log1p(n_attack) / 5.0))
+    return min(1.0, max(0.20, base_sev + 0.04 * atk_density + 0.04 * vol_scale))
+
+
+class _LabelView:
+    """The two record fields _window_attack_label reads, for the columnar path."""
+    __slots__ = ("coarse_category", "attck_technique_ids")
+
+    def __init__(self, coarse_category, attck_technique_ids):
+        self.coarse_category = coarse_category
+        self.attck_technique_ids = attck_technique_ids
+
+
 # ---------------------------------------------------------------------------
 # Heuristic label OVERRIDE -- off by default
 # ---------------------------------------------------------------------------
@@ -720,10 +741,7 @@ class HostTrajectoryExtractor:
                     # Most severe category present + UNION of techniques, not
                     # whichever record happened to sort first.
                     coarse, techs = _window_attack_label(atk_recs)
-                    base_sev = TACTIC_BASE_SEVERITY.get(coarse, 0.50)
-                    atk_density = min(1.0, len(atk_recs) / max(1, len(host_recs)))
-                    vol_scale = min(1.0, float(np.log1p(len(atk_recs)) / 5.0))
-                    risk = min(1.0, max(0.20, base_sev + 0.04 * atk_density + 0.04 * vol_scale))
+                    risk = _attack_window_risk(coarse, len(atk_recs), len(host_recs))
                 else:
                     coarse, techs, risk = "Benign", [], 0.0
 
@@ -786,6 +804,378 @@ class HostTrajectoryExtractor:
         if sliding_buffer is not None:
             return sliding_buffer.get_all_trajectories()
         return builder.finalize() if owns_builder else builder
+
+    # ------------------------------------------------------------------
+    # Columnar extraction (data_unification/capture_columns.py)
+    # ------------------------------------------------------------------
+
+    def columns_unsupported_reason(self) -> Optional[str]:
+        """Why extract_trajectories_columns cannot reproduce extract_trajectories
+        under this extractor's settings, or None when it can.
+
+        Every mode it refuses needs something the columns do not carry (the
+        records themselves, packet features, auth events), carries state
+        across calls, or draws random numbers in a different order (uniform
+        neighbour sampling).
+        """
+        if self.include_packet_features:
+            return "include_packet_features reads record.metadata, which the columns do not keep"
+        if self.heuristic_label_augmentation or heuristic_label_override_enabled():
+            return "the heuristic label override fingerprints whole records"
+        if self.auth_events:
+            return "auth events are matched against records"
+        if self.persist_memory:
+            return "persist_memory carries state across calls (live serving)"
+        if self.neighbor_uniform:
+            return "uniform neighbour sampling draws random numbers per node"
+        if self.n_neighbors < 0:
+            return "negative n_neighbors"
+        return None
+
+    def extract_trajectories_columns(
+        self,
+        cols,
+        builder: Optional[TrajectoryStoreBuilder] = None,
+        window_idx_base: int = 0,
+    ) -> "TrajectoryStore | TrajectoryStoreBuilder":
+        """extract_trajectories(records, builder=..., window_idx_base=...) on a
+        capture_columns.CaptureColumns: the same snapshots, bit for bit.
+
+        Only how the same numbers are computed differs:
+
+        * no Python object per record -- ~127 B/record of columns instead of
+          ~1 KB/record of UnifiedFlowRecord plus its shared metadata (measured
+          998 B/record resident on a CIC-2018 PCAP day);
+        * each window's per-host attributes are grouped with numpy instead of
+          a list comprehension over the window's records per active host,
+          which is O(hosts x records) per window;
+        * the neighbour finder is built in CSR form directly, in exactly the
+          per-node order the list-of-tuples form produces, instead of one
+          Python tuple per edge direction.
+
+        Float summation order is preserved where it matters: a host's total
+        duration is accumulated left to right, as the loop did. Integer sums
+        are exact either way. tests/test_capture_columns.py checks the stores.
+        """
+        why = self.columns_unsupported_reason()
+        if why is not None:
+            raise ValueError(f"columnar extraction unavailable: {why}; use extract_trajectories")
+
+        n = len(cols)
+        src_c = np.asarray(cols.src)
+        dst_c = np.asarray(cols.dst)
+        timestamps = np.asarray(cols.start, dtype=np.float64)
+        n_ips = len(cols.ips)
+
+        # Node ids exactly as FlowToTemporalEventAdapter.get_or_create_node_id
+        # assigns them over time-sorted records: src then dst, first seen first.
+        id_of_code = np.zeros(max(n_ips, 1), dtype=np.int64)
+        if n:
+            inter = np.empty(2 * n, dtype=np.int64)
+            inter[0::2] = src_c
+            inter[1::2] = dst_c
+            uniq, first = np.unique(inter, return_index=True)
+            seen_order = uniq[np.argsort(first, kind="stable")]
+            id_of_code[seen_order] = np.arange(1, seen_order.size + 1, dtype=np.int64)
+            del inter, uniq, first
+        else:
+            seen_order = np.zeros(0, dtype=np.int64)
+        ip_to_id = {cols.ips[int(c)]: int(i) for i, c in enumerate(seen_order, start=1)}
+
+        # What _adapter_for_call(continuing=False) leaves behind.
+        if self.uses_memory:
+            self.reset_memory_state()
+            self._event_adapter = FlowToTemporalEventAdapter(
+                window_size_sec=self.window_size_sec, initial_ip_map=ip_to_id)
+
+        sources = id_of_code[src_c] if n else np.zeros(0, dtype=np.int64)
+        destinations = id_of_code[dst_c] if n else np.zeros(0, dtype=np.int64)
+        edge_idxs = np.arange(n, dtype=int)
+
+        windowed_nf: Optional[_WindowedNeighborFinder] = None
+        if hasattr(self.tgn, "embedding_module") and n > 0:
+            from utils.utils import NeighborFinder
+            n_nodes = max(len(ip_to_id) + 1 + 10, getattr(self.tgn, "n_nodes", 0))
+            # The record path appends (v, i, t) to adj[u] and then (u, i, t) to
+            # adj[v] for i in time order, then stable-sorts each list on t -- a
+            # no-op, since t is non-decreasing in i. So a node's entries run in
+            # (i, src side first) order: a stable argsort of interleaved owners.
+            owner = np.empty(2 * n, dtype=np.int64)
+            owner[0::2] = sources
+            owner[1::2] = destinations
+            order = np.argsort(owner, kind="stable")
+            peer = np.empty(2 * n, dtype=np.int32)
+            peer[0::2] = destinations
+            peer[1::2] = sources
+            flat_nbr = peer[order]
+            del peer
+            flat_eidx = (order >> 1).astype(np.int32)
+            flat_ts = timestamps[order >> 1]
+            offsets = np.searchsorted(owner[order], np.arange(n_nodes + 1), side="left")
+            del owner, order
+            windowed_nf = _WindowedNeighborFinder(NeighborFinder(
+                None, uniform=False, _csr=(flat_nbr, flat_eidx, flat_ts, offsets)))
+            self.tgn.neighbor_finder = windowed_nf
+            self.tgn.embedding_module.neighbor_finder = windowed_nf
+            edge_feats_t = torch.from_numpy(cols.edge_features()).float().to(self.tgn.device)
+            self.tgn.edge_raw_features = edge_feats_t
+            self.tgn.embedding_module.edge_features = edge_feats_t
+            from data_unification.ip_features import build_node_feature_matrix
+            node_feats_t = torch.from_numpy(
+                build_node_feature_matrix(ip_to_id, n_nodes=n_nodes)
+            ).float().to(self.tgn.device)
+            self.tgn.node_raw_features = node_feats_t
+            self.tgn.embedding_module.node_features = node_feats_t
+            self.tgn.n_nodes = n_nodes
+            if hasattr(self.tgn, "ensure_capacity"):
+                self.tgn.ensure_capacity(n_nodes)
+
+        owns_builder = builder is None
+        if builder is None:
+            builder = TrajectoryStoreBuilder(
+                spill_dir=self.spill_dir,
+                feat_dim=EMB_DIM + self.n_temporal_attrs,
+            )
+
+        # A window's hosts are visited in sorted-address order.
+        ip_rank = np.zeros(max(n_ips, 1), dtype=np.int64)
+        if n_ips:
+            ip_rank[np.array(sorted(range(n_ips), key=cols.ips.__getitem__), dtype=np.int64)] = \
+                np.arange(n_ips, dtype=np.int64)
+        pos_of_code = np.zeros(max(n_ips, 1), dtype=np.int64)
+        K = self.n_neighbors
+        count_exposure = windowed_nf is not None and not self.neighbor_uniform
+        e_x = self._exposure
+        role = self.attack_role
+        dur_window = max(1.0, self.window_size_sec)
+        cat_col = cols.cat
+        tech_col = cols.tech
+
+        for win_idx, (win_start, win_end, s_idx, e_idx) in enumerate(
+                _window_boundaries(timestamps, self.window_size_sec)):
+            if s_idx >= e_idx:
+                continue
+            m = e_idx - s_idx
+            ws = np.asarray(src_c[s_idx:e_idx], dtype=np.int64)
+            wd = np.asarray(dst_c[s_idx:e_idx], dtype=np.int64)
+            act = np.unique(np.concatenate([ws, wd]))
+            act = act[np.argsort(ip_rank[act], kind="stable")]
+            H = act.size
+            active_host_ids = np.array(id_of_code[act], dtype=int)
+
+            if self.uses_memory:
+                self.tgn.update_memory_for(active_host_ids)
+            if windowed_nf is not None:
+                windowed_nf.lower_bound = win_start
+            with torch.no_grad():
+                H_t = self.tgn.get_host_embeddings(
+                    active_host_ids, timestamp=win_end, n_neighbors=self.n_neighbors
+                ).cpu().numpy()
+            if self.uses_memory:
+                ts_w = timestamps[s_idx:e_idx]
+                new = ts_w > self._ingested_until
+                if new.any():
+                    self.tgn.store_interactions(
+                        sources[s_idx:e_idx][new],
+                        destinations[s_idx:e_idx][new],
+                        ts_w[new],
+                        edge_idxs[s_idx:e_idx][new],
+                    )
+                    self._ingested_until = float(ts_w[new].max())
+
+            # (host, record) incidences: each record once for its src, and once
+            # more for its dst unless that is the same host. Sorted by (host
+            # position, record index), each host's run IS its host_recs list.
+            pos_of_code[act] = np.arange(H, dtype=np.int64)
+            two = ws != wd
+            jr = np.arange(m, dtype=np.int64)
+            h = np.concatenate([pos_of_code[ws], pos_of_code[wd][two]])
+            j = np.concatenate([jr, jr[two]])
+            as_src = np.zeros(h.size, dtype=bool)
+            as_src[:m] = True
+            o = np.argsort(h * m + j, kind="stable")
+            h, j, as_src = h[o], j[o], as_src[o]
+            # `peer = r.dst_ip if r.src_ip == host_ip else r.src_ip`
+            peer = np.where(as_src, wd[j], ws[j])
+            is_src = as_src                     # r.src_ip == host
+            is_dst = ~as_src | ~two[j]          # r.dst_ip == host
+            counts = np.bincount(h, minlength=H)
+            starts = np.zeros(H, dtype=np.int64)
+            np.cumsum(counts[:-1], out=starts[1:])
+            g = j + s_idx                       # row in the columns
+
+            fwd_b = np.add.reduceat(np.asarray(cols.fwd_bytes[s_idx:e_idx])[j], starts)
+            bwd_b = np.add.reduceat(np.asarray(cols.bwd_bytes[s_idx:e_idx])[j], starts)
+            fwd_p = np.add.reduceat(np.asarray(cols.fwd_packets[s_idx:e_idx])[j], starts)
+            bwd_p = np.add.reduceat(np.asarray(cols.bwd_packets[s_idx:e_idx])[j], starts)
+            tot_b = fwd_b + bwd_b
+            tot_p = fwd_p + bwd_p
+            proto = np.asarray(cols.protocol[s_idx:e_idx])[j]
+            tcp = np.bincount(h, weights=(proto == 6), minlength=H)
+            udp = np.bincount(h, weights=(proto == 17), minlength=H)
+            n_peers = _distinct_per_group(h, peer, H)
+            n_ports = _distinct_per_group(h, np.asarray(cols.dst_port[s_idx:e_idx])[j], H)
+            raw_d = (np.asarray(cols.end[s_idx:e_idx])[j]
+                     - np.asarray(cols.start[s_idx:e_idx])[j])
+            dur_rec = np.where(raw_d > 0.0, raw_d, 0.0)     # record.duration
+            tot_dur = _sequential_group_sums(dur_rec, counts, starts)
+
+            nf = counts.astype(np.float64)
+            f64 = lambda a: a.astype(np.float64)
+            attrs = np.zeros((H, self.n_temporal_attrs), dtype=np.float32)
+            attrs[:, 0] = np.minimum(1.0, np.log1p(nf) / COUNT_LOG_SCALE)
+            attrs[:, 1] = np.minimum(1.0, np.log1p(f64(fwd_b)) / BYTE_LOG_SCALE)
+            attrs[:, 2] = np.minimum(1.0, np.log1p(f64(bwd_b)) / BYTE_LOG_SCALE)
+            attrs[:, 3] = np.minimum(1.0, np.log1p(f64(tot_b)) / BYTE_LOG_SCALE)
+            attrs[:, 4] = np.minimum(1.0, np.log1p(f64(fwd_p)) / COUNT_LOG_SCALE)
+            attrs[:, 5] = np.minimum(1.0, np.log1p(f64(bwd_p)) / COUNT_LOG_SCALE)
+            attrs[:, 6] = np.minimum(1.0, np.log1p(f64(tot_p)) / COUNT_LOG_SCALE)
+            attrs[:, 7] = np.minimum(1.0, np.log1p(f64(n_peers)) / PEER_COUNT_LOG_SCALE)
+            attrs[:, 8] = np.minimum(1.0, np.log1p(f64(n_ports)) / PORT_COUNT_LOG_SCALE)
+            attrs[:, 9] = tcp / nf
+            attrs[:, 10] = udp / nf
+            attrs[:, 11] = np.minimum(1.0, (tot_dur / nf) / DURATION_SCALE_SECONDS)
+            attrs[:, 12] = np.minimum(1.0, np.log1p(f64(tot_b) / dur_window) / BYTE_RATE_LOG_SCALE)
+            attrs[:, 13] = np.minimum(1.0, np.log1p(f64(tot_p) / dur_window) / COUNT_LOG_SCALE)
+            attrs[:, 14] = np.minimum(1.0, f64(n_peers) / nf)
+
+            atk_rec = np.asarray(cols.is_attack[s_idx:e_idx])[j]
+            if role == "target":
+                atk = atk_rec & is_dst
+            elif role == "source":
+                atk = atk_rec & is_src
+            else:
+                atk = atk_rec
+            n_atk = np.bincount(h, weights=atk, minlength=H)
+            is_atk = n_atk > 0
+
+            if count_exposure:
+                hidden = np.maximum(0, counts - K)
+                e_x["host_windows"] += int(H)
+                e_x["flows"] += int(h.size)
+                e_x["truncated_host_windows"] += int((hidden > 0).sum())
+                e_x["flows_outside_latent"] += int(hidden.sum())
+                e_x["attack_host_windows"] += int(is_atk.sum())
+                if K > 0:
+                    rank_in = np.arange(h.size, dtype=np.int64) - starts[h]
+                    visible = rank_in >= (counts[h] - K)
+                else:                       # host_recs[-0:] is every record
+                    visible = np.ones(h.size, dtype=bool)
+                vis_atk = np.bincount(h, weights=atk & visible, minlength=H)
+                e_x["attack_host_windows_all_attack_flows_outside_latent"] += int(
+                    (is_atk & (hidden > 0) & (vis_atk == 0)).sum())
+
+            coarse_l = ["Benign"] * H
+            techs_l: List[List[str]] = [[] for _ in range(H)]
+            risk = np.zeros(H, dtype=np.float64)
+            if is_atk.any():
+                arows = np.flatnonzero(atk)     # grouped by host, record order within
+                ah = h[arows]
+                ag = g[arows]
+                acat = np.asarray(cat_col[ag])
+                atech = np.asarray(tech_col[ag])
+                bnd = np.flatnonzero(np.r_[True, ah[1:] != ah[:-1], True])
+                cats, tls = cols.categories, cols.tech_lists
+                for a, b in zip(bnd[:-1].tolist(), bnd[1:].tolist()):
+                    hh = int(ah[a])
+                    views = [_LabelView(cats[c], tls[t])
+                             for c, t in zip(acat[a:b].tolist(), atech[a:b].tolist())]
+                    coarse, techs = _window_attack_label(views)
+                    coarse_l[hh] = coarse
+                    techs_l[hh] = techs
+                    risk[hh] = _attack_window_risk(coarse, b - a, int(counts[hh]))
+
+            builder.append_batch(
+                host_ips=[cols.ips[c] for c in act.tolist()],
+                host_ids=active_host_ids,
+                window_idx=win_idx + window_idx_base,
+                window_start=win_start,
+                window_end=win_end,
+                embeddings=H_t,
+                temporal_attrs=attrs,
+                is_attack=is_atk,
+                coarse_categories=coarse_l,
+                technique_ids=techs_l,
+                risk_scores=risk,
+            )
+
+        return builder.finalize() if owns_builder else builder
+
+
+def _window_boundaries(timestamps: np.ndarray, window_size_sec: float):
+    """FlowToTemporalEventAdapter.process_records' window grid: same values, same types.
+
+    The same loop, compared on Python floats for speed; the boundaries are
+    built from the same numpy float64 anchor, so they are the same numpy
+    scalars the record path yields.
+    """
+    import math
+    n = len(timestamps)
+    out = []
+    if n == 0:
+        return out
+    ts = timestamps.tolist()
+    first_t = timestamps[0]
+    W = window_size_sec
+    current_win_start = first_t
+    bound = float(current_win_start + W)
+    start_idx = 0
+    for i in range(n):
+        if ts[i] >= bound:
+            out.append((current_win_start, current_win_start + W, start_idx, i))
+            k = math.floor((timestamps[i] - first_t) / window_size_sec)
+            current_win_start = first_t + k * window_size_sec
+            bound = float(current_win_start + W)
+            start_idx = i
+    out.append((current_win_start, current_win_start + window_size_sec, start_idx, n))
+    return out
+
+
+def _distinct_per_group(group: np.ndarray, values: np.ndarray, n_groups: int) -> np.ndarray:
+    """Number of distinct `values` within each group id 0..n_groups-1."""
+    if group.size == 0:
+        return np.zeros(n_groups, dtype=np.int64)
+    o = np.lexsort((values, group))
+    gs, vs = group[o], values[o]
+    new = np.empty(gs.size, dtype=bool)
+    new[0] = True
+    new[1:] = (gs[1:] != gs[:-1]) | (vs[1:] != vs[:-1])
+    return np.bincount(gs[new], minlength=n_groups)
+
+
+#: Groups up to this long are summed in one padded matrix; longer ones in a loop.
+_SEQ_SUM_PAD = 64
+
+
+def _sequential_group_sums(x: np.ndarray, counts: np.ndarray, starts: np.ndarray) -> np.ndarray:
+    """Per-group sum of non-negative float64 `x`, accumulated left to right from 0.0.
+
+    That is `t = 0.0; for v in group: t += v`, not numpy's pairwise sum, which
+    rounds differently. `np.cumsum` along an axis is strictly sequential, and
+    trailing zero padding leaves a non-negative running sum unchanged, so the
+    last column of a zero-padded row-wise cumsum is the loop's result exactly.
+    """
+    G = counts.size
+    out = np.zeros(G, dtype=np.float64)
+    if G == 0:
+        return out
+    small = counts <= _SEQ_SUM_PAD
+    if small.any():
+        gi = np.flatnonzero(small)
+        cg = counts[gi]
+        L = int(cg.max())
+        if L > 0:
+            mat = np.zeros((gi.size, L), dtype=np.float64)
+            row = np.repeat(np.arange(gi.size), cg)
+            col = np.arange(row.size) - np.repeat(np.cumsum(cg) - cg, cg)
+            mat[row, col] = x[np.repeat(starts[gi], cg) + col]
+            out[gi] = np.cumsum(mat, axis=1)[:, -1]
+    for gg in np.flatnonzero(~small).tolist():
+        t = 0.0
+        for v in x[starts[gg]:starts[gg] + counts[gg]].tolist():
+            t += v
+        out[gg] = t
+    return out
 
 
 def format_neighbor_exposure(report: Dict[str, Any], where: str = "") -> str:

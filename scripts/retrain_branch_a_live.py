@@ -1251,6 +1251,16 @@ def main():
                              "of every epoch. Default 4 is deliberately modest: "
                              "loading costs ~1.0x compute, so 2 already hide it, "
                              "and this box has ~9 GiB free under a 17 GiB cap.")
+    parser.add_argument("--capture-cache", type=str, default=None,
+                        help="Directory caching each capture parsed to compact columns "
+                             "(data_unification/capture_columns.py), shared by every "
+                             "Branch A / downstream run with the same inputs and parsing "
+                             "code. Default: $CYBERWORLD_CAPTURE_CACHE, else "
+                             "<--spill-dir>/capture_cache. 'off' reads records as before.")
+    parser.add_argument("--ingest-workers", type=int, default=3,
+                        help="Captures parsed at once, each in its own process (a PCAP "
+                             "day takes ~30 min on one core and ~1-2 GB while parsing). "
+                             "Extraction itself stays sequential and in capture order.")
     parser.add_argument("--log-every", type=int, default=2000,
                         help="Print a progress line every N batches. At full "
                              "density an epoch is ~161k batches; with no "
@@ -1337,6 +1347,37 @@ def main():
     record_counts: Dict[str, int] = {}
     neighbor_exposure: Dict[str, Dict[str, Any]] = {}
 
+    # Captures as compact cached columns (data_unification/capture_columns.py)
+    # rather than ~1 KB/record UnifiedFlowRecord lists: a CIC-2018 PCAP day is
+    # ~12M records, ~12 GB as objects, so one day alone breaks the 17 GiB cap.
+    # Same records, same order, same snapshots -- tests/test_capture_columns.py.
+    from data_unification.capture_columns import ColumnSpec, columns_plan, iter_capture_columns
+    _cplan = columns_plan(args.capture_cache, args.spill_dir, extractor)
+    print(_cplan.describe(args.ingest_workers), flush=True)
+
+    def _iter_capture_inputs(files):
+        """(capture, records or None, columns or None, coverage), in capture order."""
+        if not _cplan.enabled:
+            for f in files:
+                cov: List[dict] = []
+                recs = read_capture(
+                    f, window_seconds=_c.window_seconds, pcap_label_dir=args.cic2018_csv_dir,
+                    rows_per_file=args.rows_per_file, stride=args.stride,
+                    pcap_max_windows=args.pcap_max_windows_per_day,
+                    pcap_window_stride=args.pcap_window_stride, coverage=cov)
+                yield f, recs, None, cov[0]
+            return
+        specs = [ColumnSpec.for_read_capture(
+                     f, window_seconds=_c.window_seconds, pcap_label_dir=args.cic2018_csv_dir,
+                     rows_per_file=args.rows_per_file, stride=args.stride,
+                     pcap_max_windows=args.pcap_max_windows_per_day,
+                     pcap_window_stride=args.pcap_window_stride) for f in files]
+        for f, (_spec, cols) in zip(files, iter_capture_columns(
+                specs, cache_dir=_cplan.cache_dir, scratch_dir=_cplan.scratch_dir,
+                workers=args.ingest_workers)):
+            yield f, None, cols, cols.coverage
+
+
     def _store_per_capture(files, label):
         """Load -> extract -> free, one capture file at a time.
 
@@ -1358,25 +1399,26 @@ def main():
         widx_base = 0
         total_recs = 0
         coverage: List[dict] = []
-        for i, f in enumerate(files):
+        for i, (f, recs, cols, cov) in enumerate(_iter_capture_inputs(files)):
             t = time.time()
-            recs = read_capture(
-                f, window_seconds=_c.window_seconds, pcap_label_dir=args.cic2018_csv_dir,
-                rows_per_file=args.rows_per_file, stride=args.stride,
-                pcap_max_windows=args.pcap_max_windows_per_day,
-                pcap_window_stride=args.pcap_window_stride, coverage=coverage)
-            total_recs += len(recs)
+            n_recs = len(cols) if cols is not None else len(recs)
+            total_recs += n_recs
+            coverage.append(cov)
             # One trajectory per (host, capture): see TrajectoryStoreBuilder.
             # set_namespace. Without it, the fabricated CIC-2018 days merged
             # all 350 of their hosts across days, and 2018 rows preceded 2011
             # rows in merged CTU-13 hosts.
             shared.set_namespace(capture_namespace(f))
-            extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
+            if cols is not None:
+                extractor.extract_trajectories_columns(cols, builder=shared,
+                                                       window_idx_base=widx_base)
+            else:
+                extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
             if shared._window_idx.n:
                 widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
-            print(f"  [{label} {i+1}/{len(files)}] {f.label}: {len(recs)} recs, "
+            print(f"  [{label} {i+1}/{len(files)}] {f.label}: {n_recs} recs, "
                   f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
-            del recs
+            del recs, cols
             gc.collect()
         store = shared.finalize()
         print(format_unresolved_report(merge_unresolved_reports(coverage), where=label), flush=True)
@@ -1711,7 +1753,7 @@ def main():
     # Crash recovery (cyberworld_v4/training_guard.ResumePoint). Extraction
     # re-runs on a restart; the finished epochs do not.
     resume = ResumePoint(args.output.with_name(args.output.stem + "_resume.pt"),
-                         run_fingerprint(args, ignore=("epochs", "num_workers")),
+                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers")),
                          enabled=not args.no_resume, log=lambda m: print(m, flush=True))
     first_epoch = 1
     _rp = resume.load()

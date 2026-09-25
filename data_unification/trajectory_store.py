@@ -77,6 +77,22 @@ class _Col:
         self.buf[self.n] = v
         self.n += 1
 
+    def extend(self, values) -> None:
+        """Append many values; the same cells `append` would write, one by one."""
+        values = np.asarray(values)
+        k = values.shape[0]
+        if k == 0:
+            return
+        cap = self.buf.shape[0]
+        if self.n + k > cap:
+            while cap < self.n + k:
+                cap *= 2
+            bigger = np.empty(cap, dtype=self.buf.dtype)
+            bigger[: self.n] = self.buf[: self.n]
+            self.buf = bigger
+        self.buf[self.n:self.n + k] = values
+        self.n += k
+
     def finalize(self) -> np.ndarray:
         out = self.buf[: self.n].copy()
         self.buf = np.empty(0, dtype=self.buf.dtype)   # release promptly
@@ -460,13 +476,7 @@ class TrajectoryStoreBuilder:
     def append(self, *, host_ip, host_id, window_idx, window_start, window_end,
                embedding, temporal_attrs, is_attack, coarse_category,
                technique_ids, risk_score) -> None:
-        if self._block_n == _BLOCK:
-            if self._spill_fh is not None:
-                self._flush_block()
-            else:
-                self._block = np.concatenate(
-                    [self._block, np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)]
-                )
+        self._make_room()
         row = self._block_n
         got = EMB_DIM + len(temporal_attrs)
         if got != self.feat_dim:
@@ -495,6 +505,85 @@ class TrajectoryStoreBuilder:
             self._tech_flat.append(self._intern(t, self._tech_index, self._techniques))
         self._tech_off.append(self._tech_flat.n)
         self._n += 1
+
+    def _make_room(self) -> None:
+        """Free the in-RAM block when it is full: spill it, or grow it.
+
+        Growth used to trigger only at `_block_n == _BLOCK`, so without a
+        spill dir the block grew once and the row after 2 * _BLOCK raised
+        IndexError. Comparing against the block's actual size keeps the spill
+        behaviour identical (the block is always _BLOCK rows there) and lets
+        the in-RAM one keep growing.
+        """
+        if self._block_n == self._block.shape[0]:
+            if self._spill_fh is not None:
+                self._flush_block()
+            else:
+                self._block = np.concatenate(
+                    [self._block, np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)]
+                )
+
+    def append_batch(self, *, host_ips, host_ids, window_idx, window_start, window_end,
+                     embeddings, temporal_attrs, is_attack, coarse_categories,
+                     technique_ids, risk_scores) -> None:
+        """`append` for every row of one window, in row order; identical result.
+
+        Per-row arguments are sequences of equal length; `window_idx`,
+        `window_start` and `window_end` are shared by all rows. Interning
+        (hosts, categories, techniques) happens in row order, so ids come out
+        as the per-row calls would assign them.
+        """
+        m = len(host_ips)
+        if m == 0:
+            return
+        emb = np.asarray(embeddings)
+        att = np.asarray(temporal_attrs)
+        got = EMB_DIM + att.shape[1]
+        if got != self.feat_dim:
+            raise ValueError(
+                f"snapshot is {got} wide ({EMB_DIM} embedding + "
+                f"{att.shape[1]} attributes) but this store was built "
+                f"for {self.feat_dim}. Build the store with "
+                f"feat_dim={got} -- e.g. TrajectoryStoreBuilder(feat_dim="
+                f"EMB_DIM + EXTENDED_HOST_ATTR_DIM) when the extractor has "
+                f"include_packet_features=True."
+            )
+        i = 0
+        while i < m:
+            self._make_room()
+            k = min(m - i, self._block.shape[0] - self._block_n)
+            b = self._block_n
+            self._block[b:b + k, :EMB_DIM] = emb[i:i + k]
+            self._block[b:b + k, EMB_DIM:] = att[i:i + k]
+            self._block_n += k
+            i += k
+
+        ns = self._namespace
+        hidx, hnames = self._host_index, self._host_names
+        keys = host_ips if ns is None else [f"{ip}@{ns}" for ip in host_ips]
+        self._host_name_id.extend(np.fromiter(
+            (self._intern(kk, hidx, hnames) for kk in keys), dtype=np.int64, count=m))
+        self._node_id.extend(np.asarray(host_ids).astype(np.int64))
+        self._window_idx.extend(np.full(m, int(window_idx), dtype=np.int64))
+        self._window_start.extend(np.full(m, window_start, dtype=np.float64))
+        self._window_end.extend(np.full(m, window_end, dtype=np.float64))
+        self._is_attack.extend(np.asarray(is_attack, dtype=bool))
+        self._risk.extend(np.asarray(risk_scores, dtype=np.float64))
+        cidx, cnames = self._cat_index, self._categories
+        self._cat_id.extend(np.fromiter(
+            (self._intern(c, cidx, cnames) for c in coarse_categories), dtype=np.int64, count=m))
+        tidx, tnames = self._tech_index, self._techniques
+        flat: list = []
+        offs = np.empty(m, dtype=np.int64)
+        base = self._tech_flat.n
+        for r, techs in enumerate(technique_ids):
+            for t in (techs or ()):
+                flat.append(self._intern(t, tidx, tnames))
+            offs[r] = base + len(flat)
+        if flat:
+            self._tech_flat.extend(np.asarray(flat, dtype=np.int64))
+        self._tech_off.extend(offs)
+        self._n += m
 
     def finalize(self) -> TrajectoryStore:
         if self._spill_fh is not None:
