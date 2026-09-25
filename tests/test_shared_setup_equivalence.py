@@ -55,3 +55,15 @@ def test_shared_setup_trains_identically(corpus, tmp_path):
     assert ea and ea == eb == ec
     keys = [k for k in a if torch.is_tensor(a[k])]
     assert keys and all(torch.equal(a[k], b[k]) and torch.equal(a[k], c[k]) for k in keys)
+
+
+def test_prune_only_removes_setup_entries(tmp_path):
+    from bita.utils import setup_store as ss
+    root = tmp_path / "shared"
+    (root / "ckpt").mkdir(parents=True)                       # not an entry
+    (root / "ckpt" / "model.pth").write_bytes(b"x")
+    old = root / ("a" * 24); (old / "store").mkdir(parents=True)
+    keep = root / ("b" * 24); (keep / "store").mkdir(parents=True)
+    ss.prune(str(root), keep="b" * 24)
+    assert (root / "ckpt" / "model.pth").exists()
+    assert not old.exists() and keep.exists()

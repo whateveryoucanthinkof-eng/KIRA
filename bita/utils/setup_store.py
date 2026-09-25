@@ -152,9 +152,18 @@ def load(root: str, key: str):
 
 
 def prune(root: str, keep: str) -> None:
-    """Remove other keys' stores (they can never be read again) unless locked."""
+    """Remove other keys' stores (they can never be read again) unless locked.
+
+    Only directories that ARE setup entries -- a 24-hex-digit key name holding
+    a store/ or setup.pkl -- are candidates. Anything else under `root` (a
+    checkpoint dir someone placed there, say) is left alone: a diagnostic run
+    with --checkpoint_dir inside --shared_setup_dir lost its checkpoints to
+    the old "every other directory" rule."""
+    import re
+    key_re = re.compile(r"^[0-9a-f]{24}$")
     for p in Path(root).iterdir() if Path(root).exists() else ():
-        if p.is_dir() and p.name != keep:
+        if (p.is_dir() and p.name != keep and key_re.match(p.name)
+                and ((p / "store").is_dir() or (p / "setup.pkl").exists())):
             lock = Path(root) / f"{p.name}.lock"
             try:
                 with open(lock, "w") as fh:
