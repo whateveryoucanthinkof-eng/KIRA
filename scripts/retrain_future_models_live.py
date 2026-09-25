@@ -883,6 +883,18 @@ def _columns_extract_in_order(jobs, plan, args, extractor, builders, wbase):
     stream = iter_capture_columns(
         [spec for _s, _n, spec in jobs], cache_dir=plan.cache_dir,
         scratch_dir=plan.scratch_dir, workers=args.ingest_workers)
+    if plan.cache_dir is not None and args.extract_workers > 1:
+        # Independent captures, extracted at once, appended in job order:
+        # the same stores (data_unification/parallel_extract.py).
+        from data_unification.parallel_extract import extract_parallel
+        items = ((n, cols, ns) for n, ((split, ns, _spec), (_sp, cols))
+                 in enumerate(zip(jobs, stream)))
+        for n, info in extract_parallel(
+                items, extractor=extractor, builder_for=lambda k: builders[jobs[k][0]],
+                tgne=str(args.tgne), part_dir=Path(args.spill_dir or plan.cache_dir) / "parts_downstream",
+                workers=args.extract_workers):
+            yield jobs[n][0], jobs[n][1], info["n_records"], info["seconds"]
+        return
     for (split, ns, _spec), (_sp, cols) in zip(jobs, stream):
         t = time.time()
         b = builders[split]
@@ -1038,6 +1050,9 @@ def main():
                              "shared with Branch A. 'off' reads records as before.")
     parser.add_argument("--ingest-workers",type=int,default=3,
                         help="Captures parsed at once, each in its own process")
+    parser.add_argument("--extract-workers",type=int,default=3,
+                        help="Captures extracted at once, each in its own CPU process "
+                             "(data_unification/parallel_extract.py); 1 = in this process")
     parser.add_argument("--num-workers",type=int,default=4,
                         help="DataLoader worker processes; 0 loads in the main "
                              "process and serialises loading with GPU compute.")
@@ -1168,7 +1183,7 @@ def main():
     dp_out = args.out_dir / "deepop" / "cwa_forecast_decoder.pt"
     # Crash recovery. Kept until the whole run finishes, so a crash in DeepOP
     # does not retrain a Branch B that had already finished.
-    _fp = run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers"))
+    _fp = run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers"))
     _log = lambda m: print(m, flush=True)
     bb_resume = ResumePoint(bb_out.with_name(bb_out.stem + "_resume.pt"), {**_fp, "stage": "'branch_b'"},
                             enabled=not args.no_resume, log=_log)

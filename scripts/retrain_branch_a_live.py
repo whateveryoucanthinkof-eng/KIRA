@@ -1261,6 +1261,11 @@ def main():
                         help="Captures parsed at once, each in its own process (a PCAP "
                              "day takes ~30 min on one core and ~1-2 GB while parsing). "
                              "Extraction itself stays sequential and in capture order.")
+    parser.add_argument("--extract-workers", type=int, default=3,
+                        help="Captures extracted at once, each in its own CPU process "
+                             "(data_unification/parallel_extract.py); 1 = in this process. "
+                             "Needs the capture cache. Each worker holds one capture "
+                             "(~1.2 GB for a CIC-2018 PCAP day).")
     parser.add_argument("--log-every", type=int, default=2000,
                         help="Print a progress line every N batches. At full "
                              "density an epoch is ~161k batches; with no "
@@ -1399,7 +1404,29 @@ def main():
         widx_base = 0
         total_recs = 0
         coverage: List[dict] = []
-        for i, (f, recs, cols, cov) in enumerate(_iter_capture_inputs(files)):
+        if _cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1:
+            # Captures are independent (memory and host ids reset per capture),
+            # so extract several at once and append them in capture order:
+            # the same store -- see data_unification/parallel_extract.py.
+            from data_unification.parallel_extract import extract_parallel
+            caps = list(files)
+
+            def _items():
+                for i, (f, _r, cols, cov) in enumerate(_iter_capture_inputs(caps)):
+                    coverage.append(cov)
+                    yield i, cols, capture_namespace(f)
+            items = _items()
+            for i, info in extract_parallel(
+                    items, extractor=extractor, builder_for=lambda _k: shared,
+                    tgne=str(args.tgne) if args.tgne else None,
+                    part_dir=Path(args.spill_dir) / f"parts_{label}",
+                    workers=args.extract_workers):
+                total_recs += info["n_records"]
+                print(f"  [{label} {i+1}/{len(caps)}] {caps[i].label}: {info['n_records']} recs, "
+                      f"store={shared._n} snaps, extract {info['seconds']:.1f}s "
+                      f"(in a worker), merge {info['merge_seconds']:.1f}s", flush=True)
+        else:
+          for i, (f, recs, cols, cov) in enumerate(_iter_capture_inputs(files)):
             t = time.time()
             n_recs = len(cols) if cols is not None else len(recs)
             total_recs += n_recs
@@ -1414,8 +1441,7 @@ def main():
                                                        window_idx_base=widx_base)
             else:
                 extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
-            if shared._window_idx.n:
-                widx_base = shared.next_window_base()
+            widx_base = shared.next_window_base()
             print(f"  [{label} {i+1}/{len(files)}] {f.label}: {n_recs} recs, "
                   f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
             del recs, cols
@@ -1753,7 +1779,7 @@ def main():
     # Crash recovery (cyberworld_v4/training_guard.ResumePoint). Extraction
     # re-runs on a restart; the finished epochs do not.
     resume = ResumePoint(args.output.with_name(args.output.stem + "_resume.pt"),
-                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers")),
+                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers")),
                          enabled=not args.no_resume, log=lambda m: print(m, flush=True))
     first_epoch = 1
     _rp = resume.load()

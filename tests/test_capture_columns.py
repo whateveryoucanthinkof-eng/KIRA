@@ -410,3 +410,40 @@ def test_unresolved_labels_dropped_like_read_capture(tmp_path):
             stores.append(b.finalize())
         assert stores[0].is_attack.any()
         assert_stores_equal(*stores)
+
+
+# ------------------------------------------------- parallel extraction
+@pytest.mark.parametrize("use_memory", [True, False])
+def test_parallel_extraction_equals_serial(captures, corpus, tmp_path, use_memory):
+    """Captures extracted in worker processes and appended in order give the
+    serial loop's store and exposure counters (Branch A's _store_per_capture)."""
+    from data_unification.parallel_extract import WHOLE_MODEL, extract_parallel
+    caps = ([c for c in captures["train"] if c.dataset == "PCAP2018"][:3]
+            + [c for c in captures["train"] if c.dataset == "CTU13"][:3]
+            + captures["test"][:2])
+    specs = [cc.ColumnSpec.for_read_capture(c, window_seconds=WS, pcap_label_dir=corpus["csv"])
+             for c in caps]
+    cache = tmp_path / "cache"
+    cols = [c for _s, c in cc.iter_capture_columns(specs, cache_dir=cache, workers=0)]
+
+    torch.set_num_threads(1)
+    ex = _extractor(use_memory)
+    b = TrajectoryStoreBuilder(spill_dir=str(tmp_path / "s1"))
+    for cap, c in zip(caps, cols):
+        b.set_namespace(capture_namespace(cap))
+        ex.extract_trajectories_columns(c, builder=b, window_idx_base=b.next_window_base())
+    serial, serial_exp = b.finalize(), ex.neighbor_exposure_report(reset=True)
+
+    ex2 = _extractor(use_memory)
+    model_path = tmp_path / "enc.pt"
+    torch.save(ex2.tgn, model_path)
+    b2 = TrajectoryStoreBuilder(spill_dir=str(tmp_path / "s2"))
+    got = list(extract_parallel(
+        ((i, c, capture_namespace(cap)) for i, (cap, c) in enumerate(zip(caps, cols))),
+        extractor=ex2, builder_for=lambda _k: b2, tgne=WHOLE_MODEL + str(model_path),
+        part_dir=tmp_path / "parts", workers=3))
+    assert [k for k, _i in got] == list(range(len(caps)))
+    assert_stores_equal(serial, b2.finalize())
+    par_exp = ex2.neighbor_exposure_report(reset=True)
+    assert str(serial_exp) == str(par_exp)
+    assert not any((tmp_path / "parts").iterdir()), "parts left behind"

@@ -627,6 +627,77 @@ class TrajectoryStoreBuilder:
         self._tech_off.extend(offs)
         self._n += m
 
+    # -- parts: one capture extracted elsewhere, appended here -------------
+    _PART_COLS = ("_host_name_id", "_node_id", "_window_idx", "_window_start", "_window_end",
+                  "_is_attack", "_risk", "_cat_id", "_tech_off", "_tech_flat")
+
+    def export_part(self, out_dir) -> None:
+        """Write everything appended so far to `out_dir` for `append_part`.
+
+        Only for a builder that started empty, spilled to `out_dir` itself and
+        is not used afterwards (data_unification/parallel_extract.py). Its
+        local ids are then in first-appearance order, which `append_part`
+        relies on to reproduce the interning a single builder would have done.
+        """
+        import json
+        if self._spill_fh is None or os.path.dirname(self._spill_path) != os.path.abspath(str(out_dir)):
+            raise ValueError("export_part needs a builder spilling into out_dir")
+        self._flush_block()
+        self._spill_fh.close()
+        self._spill_fh = None
+        os.replace(self._spill_path, os.path.join(out_dir, "feats.bin"))
+        for name in self._PART_COLS:
+            np.save(os.path.join(out_dir, f"{name[1:]}.npy"), getattr(self, name).finalize())
+        with open(os.path.join(out_dir, "part.json"), "w") as f:
+            json.dump({"n": self._n, "feat_dim": self.feat_dim, "host_names": self._host_names,
+                       "categories": self._categories, "techniques": self._techniques}, f)
+
+    def append_part(self, part_dir, window_idx_offset: int = 0) -> None:
+        """Append a part written by `export_part`, as if its rows had been
+        appended here one by one with `window_idx_base` raised by
+        `window_idx_offset`. Ids are re-interned in the part's local id order,
+        which is its first-appearance order, so they come out identical."""
+        import json
+        with open(os.path.join(part_dir, "part.json")) as f:
+            meta = json.load(f)
+        n = int(meta["n"])
+        if int(meta["feat_dim"]) != self.feat_dim:
+            raise ValueError(f"part is {meta['feat_dim']} wide, store is {self.feat_dim}")
+        if n == 0:
+            return
+        col = {name[1:]: np.load(os.path.join(part_dir, f"{name[1:]}.npy"))
+               for name in self._PART_COLS}
+        feats = np.memmap(os.path.join(part_dir, "feats.bin"), dtype=np.float32, mode="r",
+                          shape=(n, self.feat_dim))
+        i = 0
+        while i < n:
+            self._make_room()
+            k = min(n - i, self._block.shape[0] - self._block_n)
+            self._block[self._block_n:self._block_n + k] = feats[i:i + k]
+            self._block_n += k
+            i += k
+        del feats
+
+        def remap(names, index, table):
+            return np.array([self._intern(x, index, table) for x in names], dtype=np.int64)
+
+        hmap = remap(meta["host_names"], self._host_index, self._host_names)
+        cmap = remap(meta["categories"], self._cat_index, self._categories)
+        tmap = remap(meta["techniques"], self._tech_index, self._techniques)
+        self._host_name_id.extend(hmap[col["host_name_id"]] if hmap.size else col["host_name_id"])
+        self._node_id.extend(col["node_id"])
+        self._window_idx.extend(col["window_idx"].astype(np.int64) + int(window_idx_offset))
+        self._window_start.extend(col["window_start"])
+        self._window_end.extend(col["window_end"])
+        self._is_attack.extend(col["is_attack"])
+        self._risk.extend(col["risk"])
+        self._cat_id.extend(cmap[col["cat_id"]] if cmap.size else col["cat_id"])
+        base = self._tech_flat.n
+        if col["tech_flat"].size:
+            self._tech_flat.extend(tmap[col["tech_flat"]])
+        self._tech_off.extend(col["tech_off"][1:].astype(np.int64) + base)
+        self._n += n
+
     def finalize(self) -> TrajectoryStore:
         if self._spill_fh is not None:
             self._flush_block()
