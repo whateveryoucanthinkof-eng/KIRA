@@ -81,7 +81,7 @@ def build(args, device):
     alpha = T.FocalLoss.inverse_frequency_alpha(train_data.labels, num_categories)
     return dict(tgn=tgn, train_data=train_data, val_data=val_data, full_ngh=full_ngh,
                 train_ngh=train_ngh, train_sampler=train_sampler, val_sampler=val_sampler,
-                edge_criterion=nn.BCELoss(), category_criterion=T.FocalLoss(alpha=alpha, gamma=2.0))
+                edge_criterion=nn.BCELoss(), category_criterion=T.FocalLoss(alpha=alpha, gamma=2.0).to(device))
 
 
 def run(args):
@@ -115,6 +115,9 @@ def run(args):
     tgn.memory.__init_memory__()
     tgn.set_neighbor_finder(B["train_ngh"])
     rec = dict(total=[], edge=[], cat=[], outputs=[], grads_first=None, norms=[])
+    losslog = T.StepLossLog(args.backprop_every)
+    guard_step = guard.backward_step_deferred if guard.deferred_supported() else guard.backward_step
+    print(f"guard step: {guard_step.__name__}", flush=True)
     prof = None
     if args.profile:
         from torch.profiler import profile, ProfilerActivity, schedule
@@ -139,11 +142,15 @@ def run(args):
             eidx, ts, cat = train_data.edge_idxs[s:e], train_data.timestamps[s:e], train_data.labels[s:e]
             size = len(src)
             _, neg = B["train_sampler"].sample(size, sources=src, destinations=dst)
-            pos_prob, neg_prob, logits = tgn.compute_edge_probabilities_and_categories(
-                src, dst, neg, ts, eidx, n_neighbors=args.n_degree)
-            bel = ec(pos_prob.squeeze(-1), torch.ones(size, device=device)) + \
-                ec(neg_prob.squeeze(-1), torch.zeros(size, device=device))
-            bcl = cc(logits, torch.tensor(cat, dtype=torch.long, device=device))
+            if hasattr(tgn, "fast_batch_losses"):                # as bita/train.py
+                bel, bcl, (pos_prob, neg_prob, logits) = tgn.fast_batch_losses(
+                    src, dst, neg, ts, eidx, cat, ec, cc, n_neighbors=args.n_degree)
+            else:
+                pos_prob, neg_prob, logits = tgn.compute_edge_probabilities_and_categories(
+                    src, dst, neg, ts, eidx, n_neighbors=args.n_degree)
+                bel = ec(pos_prob.squeeze(-1), torch.ones(size, device=device)) + \
+                    ec(neg_prob.squeeze(-1), torch.zeros(size, device=device))
+                bcl = cc(logits, T.upload(np.asarray(cat), device, torch.long))
             loss = loss + bel
             cat_total = cat_total + bcl
             if args.dump and bi < args.dump_outputs:
@@ -155,11 +162,8 @@ def run(args):
                                   if p.requires_grad and p.grad is not None}
             ok = guard.step_after_backward()
         else:
-            ok = guard.backward_step(total)
-        if args.dump and ok:
-            rec["total"].append(float(total.item()))
-            rec["edge"].append(float(loss.item()) / args.backprop_every)
-            rec["cat"].append(float(cat_total.item()) / args.backprop_every)
+            ok = guard_step(total)
+        losslog.append_step(total, loss, cat_total, ok=ok)  # as bita/train.py
         tgn.memory.detach_memory()
         if prof is not None:
             prof.step()
@@ -167,6 +171,7 @@ def run(args):
             torch.cuda.synchronize()
             rates.append((k, (k - mark_batch) / (time.time() - t_mark)))
             print(f"batch {k}: {rates[-1][1]:.2f} batch/s", flush=True)
+    guard.flush()
     torch.cuda.synchronize()
     t_end = time.time()
     if prof is not None:
@@ -190,6 +195,7 @@ def run(args):
         if args.trace:
             prof.export_chrome_trace(args.trace)
 
+    rec["total"], rec["edge"], rec["cat"] = losslog.total, losslog.edge, losslog.cat
     if args.dump:
         val = None
         if args.val:

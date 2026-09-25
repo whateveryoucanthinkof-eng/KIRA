@@ -50,6 +50,7 @@ class FastMemory(Memory):
         # The tables hold detached values already; only the overlays hold history.
         self._pool.detach()
         self._mo.detach()
+        self._graph_slot_next = 0        # level 3: graph slots are free again (bita/fast/graphs.py)
 
     def backup_memory(self):
         self.detach_memory()
@@ -90,6 +91,25 @@ class _MemView:
         flat = nodes_np.reshape(-1)
         out = self.mem.fast_read(flat, upload(flat, self.mem.memory.device, torch.int64))
         return out.reshape(*nodes_np.shape, out.shape[-1])
+
+
+#: level 4 graphs BiTA only up to this padded message-sequence length; longer
+#: batches (rare: a hub's long burst) run the eager level-3 step. Bounds the
+#: graphs' saved activations (the GRU keeps [2, E, L, 5, 64] floats).
+_BITA_GRAPH_MAX_L = 32
+_GRAPHED = object()
+
+
+def _pad_rows(t, n, fill="zeros"):
+    """t with its leading dim padded to n (for capture examples)."""
+    if t.shape[0] == n:
+        return t
+    if fill == "arange":
+        out = torch.arange(n, device=t.device, dtype=t.dtype)
+    else:
+        out = torch.zeros((n,) + tuple(t.shape[1:]), device=t.device, dtype=t.dtype)
+    out[: t.shape[0]] = t.detach()
+    return out
 
 
 def _host_edge_array(table):
@@ -218,6 +238,9 @@ class FastTGNMixin:
         owner = np_f[new_e]
         counts = np.bincount(owner, minlength=n_nodes).astype(np.float32)
 
+        if getattr(self, "_bita_graph_on", False) and L <= _BITA_GRAPH_MAX_L:
+            return self._fast_bita_graphed(to_update, E, L, idx, klen, dt, last_t, owner, counts, node_ts)
+
         level1 = self._fast_level < 2
         if level1:
             lengths = torch.tensor(klen, dtype=torch.long)
@@ -273,6 +296,12 @@ class FastTGNMixin:
         res = self._fast_bita(nodes_np)
         if res is None:
             return
+        if res[0] is _GRAPHED:              # level 4: the region already applied the memory updater
+            _, to_update, to_update_g, updated, node_ts, node_ts_g = res
+            mem.last_update[to_update_g] = node_ts_g
+            mem._lu[to_update] = node_ts
+            mem.fast_write(to_update, to_update_g, updated)
+            return
         to_update, to_update_g, h_bar, node_ts, node_ts_g = res
         assert (mem._lu[to_update] <= node_ts).all(), "Trying to update memory to time in the past"
         rows = mem.fast_read(to_update, to_update_g)
@@ -280,6 +309,100 @@ class FastTGNMixin:
         mem._lu[to_update] = node_ts
         updated = self.memory_updater.memory_updater(h_bar, rows)
         mem.fast_write(to_update, to_update_g, updated)
+
+    # ------------------------------------------- BiTA as a graph (level 4)
+    def _fast_bita_graphed(self, to_update, E, L, idx, klen, dt, last_t, owner, counts, node_ts):
+        """BiTA + the GRU memory updater for one batch as a replayed graph,
+        on shapes padded to a few buckets:
+
+          edges    E -> n_groups * C   (n_groups = ceil(E / C) exactly, so the
+                                        Transformer runs at the eager shape and
+                                        its dropout draws the eager masks)
+          length   L -> max(8, next power of two), at most _BITA_GRAPH_MAX_L
+          nodes    n -> 2 * batch + 1  (row n_pad-1 is a dummy owner for padding)
+
+        Padding is inert: padded edges have length 0 (the GRU leaves them 0),
+        sort after every real edge, are masked as Transformer keys exactly
+        like the eager group padding, and are pooled into the dummy row, whose
+        memory update is discarded; padded node rows are discarded likewise.
+        Real rows see the same operations on the same values; what can differ
+        is fp32 rounding in GEMMs whose row count grew (cuBLAS may pick
+        another kernel) and in weight-gradient reductions over the padding.
+        """
+        mem: FastMemory = self.memory
+        agg = self.message_aggregator
+        dev = self.device
+        n_nodes = len(to_update)
+        assert (mem._lu[to_update] <= node_ts).all(), "Trying to update memory to time in the past"
+        C = agg.context_size
+        n_groups = (E + C - 1) // C
+        E_pad = n_groups * C
+        L_pad = max(8, 1 << (L - 1).bit_length())
+        N_pad = 2 * self._graph_batch + 1
+        assert n_nodes < N_pad
+        idx_p = np.zeros((E_pad, L_pad), np.int64)
+        idx_p[:E, :L] = idx
+        dt_p = np.zeros((E_pad, L_pad), np.float32)
+        dt_p[:E, :L] = dt
+        lens_p = np.zeros(E_pad, np.int32)
+        lens_p[:E] = klen
+        owner_p = np.full(E_pad, N_pad - 1, np.int64)
+        owner_p[:E] = owner
+        counts_p = np.ones(N_pad, np.float32)
+        counts_p[:n_nodes] = counts
+        ints, idx_g, lens_g, f32, f64 = upload_many(
+            dev, np.concatenate([owner_p, to_update]), idx_p, lens_p,
+            np.concatenate([dt_p.reshape(-1), counts_p]), np.concatenate([last_t, node_ts]))
+        owner_g = ints[:E_pad]
+        to_update_g = ints[E_pad:]
+        dt_g = f32[: E_pad * L_pad].view(E_pad, L_pad)
+        counts_g = f32[E_pad * L_pad:]
+        last_t_g = f64[:E]
+        node_ts_g = f64[E:]
+        raw = mem._pool.gather(idx_p, idx_g)                          # [E_pad, L_pad, raw]
+        order = torch.argsort(last_t_g)                               # the eager order, real edges only
+        rows = mem.fast_read(to_update, to_update_g)
+        inputs = (raw, rows, dt_g, lens_g, order, owner_g, counts_g)
+        key = ("bita", n_groups, L_pad, N_pad)
+        slot = self._graph_slot(key, self._bita_region, inputs, kind="bita", diff_inputs=(0, 1), diff_outputs=(0,),
+                                examples=lambda: (raw, _pad_rows(rows, N_pad), dt_g, lens_g,
+                                                  _pad_rows(order, E_pad, fill="arange"), owner_g, counts_g),
+                                params=self._bita_params())
+        updated, = slot(*inputs)
+        return _GRAPHED, to_update, to_update_g, updated[:n_nodes], node_ts, node_ts_g
+
+    def _bita_params(self):
+        params, seen = [], set()
+        for m in (self.message_function, self.message_aggregator, self.memory_updater):
+            for p in m.parameters():
+                if p.requires_grad and id(p) not in seen:
+                    seen.add(id(p))
+                    params.append(p)
+        return params
+
+    def _bita_region(self, raw, rows, dt, lens, order_buf, owner, counts):
+        """BiTAAggregator.aggregate (as _fast_bita, level 2) + the memory
+        updater, on padded shapes (see _fast_bita_graphed)."""
+        from fast.triton_gru import bigru_final_states
+        agg = self.message_aggregator
+        E_pad = raw.shape[0]
+        C = agg.context_size
+        n_groups = E_pad // C
+        m = self.message_function.compute_message(raw)
+        x = m + agg.time_encoder(dt)
+        h_n = bigru_final_states(agg.bigru, x, lens)
+        e = agg.W_e(torch.cat([h_n[0], h_n[1]], dim=-1))
+        valid = lens > 0                            # real edges are rows [0, E), and so are real positions
+        pos = torch.arange(E_pad, device=raw.device)
+        order = torch.where(valid, order_buf, pos)  # a permutation of [0, E_pad): padding stays in place
+        grouped = torch.where(valid.unsqueeze(1), e[order], 0.0)
+        zc = _transformer_core(agg.transformer, grouped.view(n_groups, C, agg.d_trans),
+                               (~valid).view(n_groups, C))
+        z_ctx = torch.zeros_like(e).index_copy(0, order, zc.reshape(E_pad, agg.d_trans))
+        summed = torch.zeros(counts.shape[0], agg.d_trans, device=raw.device, dtype=z_ctx.dtype)
+        summed = summed.index_add_(0, owner, z_ctx)
+        h_bar = summed / counts.unsqueeze(1)
+        return (self.memory_updater.memory_updater(h_bar, rows),)
 
     # --------------------------------------------------------- messages
     def _fast_raw_messages(self, bt: _Batch):
@@ -307,9 +430,41 @@ class FastTGNMixin:
             return em.compute_embedding(memory=_MemView(mem), source_nodes=bt.nodes, timestamps=bt.ts3,
                                         n_layers=self.n_layers, n_neighbors=n_neighbors, time_diffs=None)
         dev = self.device
-        c = bt.cache
+        c = self._fast_nbr(bt, n_neighbors)
+        n = len(bt.nodes)
+        if "nf_src" not in c:
+            c["nf_src"] = em.node_features[bt.nodes_g, :] if em.node_features is not None \
+                else torch.zeros((n, self.n_node_features), device=dev)
+            c["nf_nbr"] = em.node_features[c["nbr_g"], :] if em.node_features is not None \
+                else torch.zeros((c["nbr"].size, self.n_node_features), device=dev)
+            if "ef_n_host" in c:
+                c["ef_n"] = c["ef_n_host"]
+            elif em.edge_features is not None:
+                c["ef_n"] = em.edge_features[c["eidx_n_g"], :]
+            else:
+                c["ef_n"] = torch.zeros((n, n_neighbors, self.n_edge_features), device=dev)
         te_frozen = not any(p.requires_grad for p in em.time_encoder.parameters())
+        if te_frozen and "src_time" in c:
+            src_time, edge_time_emb = c["src_time"], c["edge_time_emb"]
+        else:
+            src_time = em.time_encoder(torch.zeros((n, 1), device=dev))
+            edge_time_emb = em.time_encoder(c["deltas_g"])
+            if te_frozen:
+                c["src_time"], c["edge_time_emb"] = src_time, edge_time_emb
+
+        rows = mem.fast_read(c["all_nodes"], c["all_g"])            # sources and neighbours, one gather
+        return self._fast_fn("attention", _attention_core)(
+            em.attention_models[0], rows[:n], c["nf_src"], rows[n:], c["nf_nbr"], src_time, c["ef_n"],
+            edge_time_emb, c["mask_g"], c["invalid_g"])
+
+    def _fast_nbr(self, bt: _Batch, n_neighbors):
+        """Neighbour lookup and its one upload (memory-independent, cached per batch)."""
+        em = self.embedding_module
+        dev = self.device
+        c = bt.cache
         if "nbr" not in c or c["n_neighbors"] != n_neighbors:
+            for key in ("nf_src", "src_time", "ef_n_host"):
+                c.pop(key, None)
             neighbors, edge_idxs, edge_times = em.neighbor_finder.get_temporal_neighbor(
                 bt.nodes, bt.ts3, n_neighbors=n_neighbors)
             deltas = (bt.ts3[:, None] - edge_times).astype(np.float32)
@@ -330,29 +485,9 @@ class FastTGNMixin:
                      all_g=ints[: all_nodes.size], nbr_g=ints[n: all_nodes.size],
                      eidx_n_g=ints[all_nodes.size:].view(n, -1),
                      deltas_g=deltas_g, mask_g=mask_g, invalid_g=invalid_g)
-            c["nf_src"] = em.node_features[bt.nodes_g, :] if em.node_features is not None \
-                else torch.zeros((n, self.n_node_features), device=dev)
-            c["nf_nbr"] = em.node_features[c["nbr_g"], :] if em.node_features is not None \
-                else torch.zeros((nbr.size, self.n_node_features), device=dev)
             if ef_n:
-                c["ef_n"] = ef_n[0]
-            elif em.edge_features is not None:
-                c["ef_n"] = em.edge_features[c["eidx_n_g"], :]
-            else:
-                c["ef_n"] = torch.zeros((n, n_neighbors, self.n_edge_features), device=dev)
-        n = len(bt.nodes)
-        if te_frozen and "src_time" in c:
-            src_time, edge_time_emb = c["src_time"], c["edge_time_emb"]
-        else:
-            src_time = em.time_encoder(torch.zeros((n, 1), device=dev))
-            edge_time_emb = em.time_encoder(c["deltas_g"])
-            if te_frozen:
-                c["src_time"], c["edge_time_emb"] = src_time, edge_time_emb
-
-        rows = mem.fast_read(c["all_nodes"], c["all_g"])            # sources and neighbours, one gather
-        return self._fast_fn("attention", _attention_core)(
-            em.attention_models[0], rows[:n], c["nf_src"], rows[n:], c["nf_nbr"], src_time, c["ef_n"],
-            edge_time_emb, c["mask_g"], c["invalid_g"])
+                c["ef_n_host"] = ef_n[0]
+        return c
 
     def _fast_fn(self, name, fn):
         """`fn`, or with CYBERWORLD_FAST_TGN_COMPILE=1 a torch.compile'd copy.
@@ -417,6 +552,160 @@ class FastTGNMixin:
             s1, d1, _ = self._fast_cte(bt, n_neighbors)
         combined = torch.cat([s1, d1, bt.ef.float()], dim=1)
         return pos, neg, self.category_predictor(combined)
+
+    # ------------------------------------------------- training losses
+    def fast_batch_losses(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs,
+                          labels, edge_criterion, category_criterion, n_neighbors=20):
+        """One training batch's (edge loss, category loss, (pos_prob, neg_prob,
+        category_logits)), computed exactly as bita/train.py computes them from
+        compute_edge_probabilities_and_categories:
+
+            edge = BCE(pos, 1) + BCE(neg, 0)      category = criterion(logits, labels)
+
+        Level 3 runs the fixed-shape part (graph-attention embedding, both
+        heads, both losses) as a replayed CUDA graph (bita/fast/graphs.py);
+        every other case runs it eagerly. The returned probabilities/logits
+        are read-only and valid until the next batch in the same slot."""
+        bt = _Batch(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs)
+        dev = self.device
+        B = bt.B
+        region = self._graph_region_ok(bt, edge_criterion, category_criterion)
+        if region is None:
+            s1, d1, n1 = self._fast_cte(bt, n_neighbors)
+            pos, neg = self._fast_scores(s1, d1, n1)
+            from model.extentedtgn import legacy_category_pass
+            if legacy_category_pass():
+                if getattr(self.embedding_module.neighbor_finder, "uniform", False):
+                    bt.cache = {}
+                s1, d1, _ = self._fast_cte(bt, n_neighbors)
+            logits = self.category_predictor(torch.cat([s1, d1, bt.ef.float()], dim=1))
+            pos_label = torch.ones(B, dtype=torch.float, device=dev)
+            neg_label = torch.zeros(B, dtype=torch.float, device=dev)
+            edge_loss = edge_criterion(pos.squeeze(-1), pos_label) + edge_criterion(neg.squeeze(-1), neg_label)
+            cat_loss = category_criterion(logits, upload(np.asarray(labels), dev, torch.long))
+            return edge_loss, cat_loss, (pos, neg, logits)
+        # memory update + message store exactly as _fast_cte, then the region
+        self._bita_graph_on = self._fast_level >= 4
+        try:
+            self._fast_update_memory(bt.pos)
+        finally:
+            self._bita_graph_on = False
+        self.memory.clear_messages(bt.pos)
+        self.memory._pool.write(bt.pos, bt.peers, bt.ts2, self._fast_raw_messages(bt),
+                                order=bt.write_order, order_g=bt.write_order_g)
+        c = self._fast_nbr(bt, n_neighbors)
+        rows = self.memory.fast_read(c["all_nodes"], c["all_g"])
+        host = "ef_n_host" in c
+        inputs = (rows, bt.nodes_g, c["nbr_g"], c["deltas_g"], c["mask_g"], c["invalid_g"],
+                  upload(np.asarray(labels), dev, torch.long),
+                  bt.ef if host else bt.eidx_g, c["ef_n_host"] if host else c["eidx_n_g"])
+        slot = self._graph_slot((B, n_neighbors, host), region, inputs)
+        pos, neg, logits, edge_loss, cat_loss = slot(*inputs)
+        return edge_loss, cat_loss, (pos, neg, logits)
+
+    def _graph_region_ok(self, bt, edge_criterion, category_criterion):
+        """The region function when this batch can replay a graph, else None."""
+        from model.extentedtgn import legacy_category_pass
+        if self._fast_level < 3 or not self.training or not torch.is_grad_enabled() or not self._fast_ga1:
+            return None
+        if self.device.type != "cuda" or legacy_category_pass():
+            return None
+        em = self.embedding_module
+        if any(p.requires_grad for p in em.time_encoder.parameters()):
+            return None                 # a learned time encoding would be a region parameter; not handled
+        if getattr(self, "_graph_batch", None) is None:
+            self._graph_batch = bt.B    # the batch size of the run; the short last batch stays eager
+        if bt.B != self._graph_batch:
+            return None
+        alpha = getattr(category_criterion, "alpha", None)
+        if torch.is_tensor(alpha) and alpha.device.type != "cuda":
+            return None                 # would be a host->device copy inside the graph
+        key = (id(edge_criterion), id(category_criterion))
+        fns = self.__dict__.setdefault("_graph_fns", {})
+        if key not in fns:
+            fns[key] = self._make_region(edge_criterion, category_criterion)
+        return fns[key]
+
+    def _make_region(self, edge_criterion, category_criterion):
+        model = self
+
+        def region(rows, nodes_g, nbr_g, deltas, mask, invalid, labels, ef_in, efn_in):
+            """The eager step's ops from the memory read to both losses, in
+            the eager order (see _fast_embedding, _fast_scores,
+            compute_edge_probabilities_and_categories, bita/train.py)."""
+            em = model.embedding_module
+            dev = rows.device
+            n = nodes_g.shape[0]
+            B = n // 3
+            host = efn_in.is_floating_point()
+            nf_src = em.node_features[nodes_g, :] if em.node_features is not None \
+                else torch.zeros((n, model.n_node_features), device=dev)
+            nf_nbr = em.node_features[nbr_g, :] if em.node_features is not None \
+                else torch.zeros((nbr_g.shape[0], model.n_node_features), device=dev)
+            if host:
+                ef_n = efn_in
+            elif em.edge_features is not None:
+                ef_n = em.edge_features[efn_in, :]
+            else:
+                ef_n = torch.zeros((n, mask.shape[1], model.n_edge_features), device=dev)
+            src_time = em.time_encoder(torch.zeros((n, 1), device=dev))
+            edge_time_emb = em.time_encoder(deltas)
+            emb = _attention_core(em.attention_models[0], rows[:n], nf_src, rows[n:], nf_nbr, src_time, ef_n,
+                                  edge_time_emb, mask, invalid)
+            s, d, ng = emb[:B], emb[B: 2 * B], emb[2 * B:]
+            pos, neg = model._fast_scores(s, d, ng)
+            if host:
+                ef = ef_in
+            elif model.edge_raw_features is not None:
+                ef = model.edge_raw_features[ef_in]
+            else:
+                ef = torch.zeros((B, model.n_edge_features), device=dev)
+            logits = model.category_predictor(torch.cat([s, d, ef.float()], dim=1))
+            pos_label = torch.ones(B, dtype=torch.float, device=dev)
+            neg_label = torch.zeros(B, dtype=torch.float, device=dev)
+            edge_loss = edge_criterion(pos.squeeze(-1), pos_label) + edge_criterion(neg.squeeze(-1), neg_label)
+            cat_loss = category_criterion(logits, labels)
+            return pos, neg, logits, edge_loss, cat_loss
+
+        return region
+
+    def _graph_slot(self, key, region, inputs, kind="embed", diff_inputs=(0,), diff_outputs=(3, 4),
+                    examples=None, params=None):
+        """The graph of `kind` for the current batch's slot: slot i serves
+        the i-th batch since the last detach_memory() (the embedding region,
+        the batch's last graph, advances the counter). Graphs of one
+        (kind, slot) share a memory pool: only one of them runs per batch, and
+        the slot's previous batch was consumed by a backward before this one."""
+        from fast.graphs import GraphSlot
+        mem = self.memory
+        i = getattr(mem, "_graph_slot_next", 0)
+        if kind == "embed":
+            mem._graph_slot_next = i + 1
+        slots = self.__dict__.setdefault("_graph_slots", {}).setdefault(key + (kind,), {})
+        if i in slots and slots[i].stale():
+            raise RuntimeError(
+                "fast path level >= 3: a parameter or feature tensor was re-allocated after its CUDA "
+                "graph was captured (e.g. `p.data = ...`); the graphs would read the old memory. "
+                "Update weights in place (optimizer steps, load_state_dict do), or run level 2.")
+        if i not in slots:
+            if params is None:
+                em = self.embedding_module
+                params, seen = [], set()
+                for m in (em, self.affinity_score, self.category_predictor):
+                    for p in m.parameters():
+                        if p.requires_grad and id(p) not in seen:
+                            seen.add(id(p))
+                            params.append(p)
+            pools = self.__dict__.setdefault("_graph_pools", {})
+            if (kind, i) not in pools:
+                pools[(kind, i)] = torch.cuda.graph_pool_handle()
+            em = self.embedding_module
+            watch = [getattr(em, "node_features", None), getattr(em, "edge_features", None),
+                     getattr(self, "edge_raw_features", None)]
+            slots[i] = GraphSlot(region, examples() if examples is not None else inputs, params,
+                                 diff_inputs=list(diff_inputs), diff_outputs=list(diff_outputs),
+                                 module=self, pool=pools[(kind, i)], watch=watch)
+        return slots[i]
 
     # ---------------------------------------------- streaming (serving)
     @torch.no_grad()

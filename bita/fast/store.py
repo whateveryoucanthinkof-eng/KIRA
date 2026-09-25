@@ -254,7 +254,14 @@ class MessagePool:
         if not self.overlay.active or not (rows >= self.live_row0).any():
             return base
         live = rows_g >= self.live_row0
-        picked = self.overlay.cat()[(rows_g - self.live_row0).clamp(min=0)]
+        # index_select, not advanced indexing: every non-live position maps to
+        # overlay row 0, and advanced indexing's backward (a sorted
+        # index_put_ with accumulate) sums those duplicates serially -- up to
+        # ~0.5 ms of GPU per batch. index_select's backward is index_add_;
+        # the duplicates carry exact zeros (the where below masks them), and
+        # no live row is gathered twice, so the gradient values are the same.
+        flat = (rows_g - self.live_row0).clamp(min=0).reshape(-1)
+        picked = self.overlay.cat().index_select(0, flat).view(*rows_g.shape, -1)
         return torch.where(live.unsqueeze(-1), picked, base)
 
     # ---------------------------------------------------------- snapshots
@@ -328,7 +335,9 @@ class MemoryOverlay:
         for t in self.touched:
             self.ptr[t] = -1
         if self.touched_g:
-            self.ptr_g[torch.cat(self.touched_g)] = -1
+            # index_fill_, not `ptr_g[idx] = -1`: the latter copies the scalar
+            # through a synchronising host->device transfer.
+            self.ptr_g.index_fill_(0, torch.cat(self.touched_g), -1)
         self.touched = []
         self.touched_g = []
         self.overlay.clear()

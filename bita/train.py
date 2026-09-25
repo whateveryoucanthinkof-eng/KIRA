@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.extentedtgn import ExtendedTGN
+from fast.store import upload
 from model.time_encoding import TimeEncode
 from utils.utils import RandEdgeSampler, get_neighbor_finder, EarlyStopMonitor
 from utils.utils import (CHUNK, DiskStore, count_unique, first_seen_order, mark_present,
@@ -147,6 +148,60 @@ class FocalLoss(nn.Module):
         elif self.reduction == 'sum':
             return loss.sum()
         return loss
+
+
+class StepLossLog:
+    """The per-optimizer-step training losses, kept on the device.
+
+    The loop used to call .item() three times per step, i.e. three
+    device->host synchronisations every `backprop_every` batches. The detached
+    scalars are queued here instead and read in ONE transfer when a value is
+    printed (`total`, `edge`, `cat` flush first). The numbers are the same
+    Python floats the .item() calls produced: `total` is total_loss.item(),
+    `edge`/`cat` are float(x.item()) / backprop_every.
+    """
+
+    def __init__(self, backprop_every: int):
+        self.div = backprop_every
+        self._pending = []
+        self._total, self._edge, self._cat = [], [], []
+
+    def append_step(self, total, edge, cat, ok=True) -> None:
+        """`ok`: the guard's verdict -- a bool, or a device bool from
+        TrainingGuard.backward_step_deferred (a skipped step is dropped at
+        read time, exactly as the loop dropped it when ok was a bool)."""
+        if ok is False:
+            return
+        okt = ok.detach().to(total.dtype) if torch.is_tensor(ok) else torch.ones((), dtype=total.dtype,
+                                                                                   device=total.device)
+        self._pending.append((total.detach(), edge.detach(), cat.detach(), okt))
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        vals = torch.stack([t for step in self._pending for t in step]).tolist()
+        self._pending = []
+        for i in range(0, len(vals), 4):
+            if not vals[i + 3]:
+                continue
+            self._total.append(vals[i])
+            self._edge.append(vals[i + 1] / self.div)
+            self._cat.append(vals[i + 2] / self.div)
+
+    @property
+    def total(self):
+        self._flush()
+        return self._total
+
+    @property
+    def edge(self):
+        self._flush()
+        return self._edge
+
+    @property
+    def cat(self):
+        self._flush()
+        return self._cat
 
 
 class Data:
@@ -1472,7 +1527,10 @@ def train(args):
         _alpha = FocalLoss.inverse_frequency_alpha(train_data.labels, num_categories)
         logging.info(f"focal-loss per-class alpha (inverse frequency): "
                      f"{ {category_mapping.get(i, i): round(float(w), 3) for i, w in enumerate(_alpha)} }")
-        category_criterion = FocalLoss(alpha=_alpha, gamma=2.0)
+        # On the device: FocalLoss moves alpha to the logits' device on every
+        # call, and from a CPU buffer that copy synchronised host and device
+        # once per batch. Same values, same kernels.
+        category_criterion = FocalLoss(alpha=_alpha, gamma=2.0).to(device)
     else:
         category_criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam([p for p in tgn.parameters() if p.requires_grad],
@@ -1566,8 +1624,11 @@ def train(args):
             tgn.memory.__init_memory__()
 
         tgn.set_neighbor_finder(train_ngh_finder)
-        m_loss = []
-        m_edge_loss, m_cat_loss = [], []
+        # Per-step losses stay on the device and are read (one sync) only
+        # when printed; see StepLossLog.
+        m_loss = StepLossLog(args.backprop_every)
+        guard_step = guard.backward_step_deferred if guard.deferred_supported() else guard.backward_step
+        fast_batch_losses = getattr(tgn, "fast_batch_losses", None)
 
         # Sample order for this epoch.
         #
@@ -1616,19 +1677,29 @@ def train(args):
                 size = len(sources_batch)
                 _, negatives_batch = train_rand_sampler.sample(size, sources=sources_batch, destinations=destinations_batch)
 
-                pos_prob, neg_prob, category_logits = tgn.compute_edge_probabilities_and_categories(
-                    sources_batch, destinations_batch, negatives_batch,
-                    timestamps_batch, edge_idxs_batch, n_neighbors=args.n_degree
-                )
+                if fast_batch_losses is not None:
+                    # The fast path computes the same two losses itself, the
+                    # fixed-shape part as a CUDA graph at --fast_step_level 3.
+                    batch_edge_loss, batch_cat_loss, _ = fast_batch_losses(
+                        sources_batch, destinations_batch, negatives_batch, timestamps_batch,
+                        edge_idxs_batch, categories_batch, edge_criterion, category_criterion,
+                        n_neighbors=args.n_degree)
+                else:
+                    pos_prob, neg_prob, category_logits = tgn.compute_edge_probabilities_and_categories(
+                        sources_batch, destinations_batch, negatives_batch,
+                        timestamps_batch, edge_idxs_batch, n_neighbors=args.n_degree
+                    )
 
-                pos_label = torch.ones(size, dtype=torch.float, device=device)
-                neg_label = torch.zeros(size, dtype=torch.float, device=device)
+                    pos_label = torch.ones(size, dtype=torch.float, device=device)
+                    neg_label = torch.zeros(size, dtype=torch.float, device=device)
 
-                batch_edge_loss = edge_criterion(pos_prob.squeeze(-1), pos_label) + \
-                                  edge_criterion(neg_prob.squeeze(-1), neg_label)
+                    batch_edge_loss = edge_criterion(pos_prob.squeeze(-1), pos_label) + \
+                                      edge_criterion(neg_prob.squeeze(-1), neg_label)
 
-                categories_batch_tensor = torch.tensor(categories_batch, dtype=torch.long, device=device)
-                batch_cat_loss = category_criterion(category_logits, categories_batch_tensor)
+                    # Pinned, asynchronous upload (torch.tensor(..., device=cuda)
+                    # from pageable memory synchronises the stream every batch).
+                    categories_batch_tensor = upload(np.asarray(categories_batch), device, torch.long)
+                    batch_cat_loss = category_criterion(category_logits, categories_batch_tensor)
 
                 loss += batch_edge_loss
                 category_loss_total += batch_cat_loss
@@ -1654,10 +1725,10 @@ def train(args):
             # standalone).
             total_loss = (loss + args.cat_loss_weight * category_loss_total) / args.backprop_every
             # backward + clip + step; a non-finite loss is skipped, not stepped on.
-            if guard.backward_step(total_loss):
-                m_loss.append(total_loss.item())
-                m_edge_loss.append(float(loss.item()) / args.backprop_every)
-                m_cat_loss.append(float(category_loss_total.item()) / args.backprop_every)
+            # One device->host sync per step (backward_step), or none at all
+            # (backward_step_deferred: the verdict is read a step later; same
+            # decisions and weights bit for bit, see training_guard.py).
+            m_loss.append_step(total_loss, loss, category_loss_total, ok=guard_step(total_loss))
 
             if k % 500 == 0:
                 elapsed = time.time() - start_epoch
@@ -1665,16 +1736,17 @@ def train(args):
                 remaining = (num_batch - k - 1) / rate if rate > 0 else float("nan")
                 logging.info(
                     f"  epoch {epoch+1} batch {k}/{num_batch} "
-                    f"loss={np.mean(m_loss[-500:]):.4f} "
+                    f"loss={np.mean(m_loss.total[-500:]):.4f} "
                     f"{rate:.2f} batch/s, ~{remaining/60:.1f} min left this epoch"
                 )
 
             if args.use_memory:
                 tgn.memory.detach_memory()
 
+        guard.flush()
         epoch_time = time.time() - start_epoch
         epoch_times.append(epoch_time)
-        mean_train_loss = float(np.mean(m_loss))
+        mean_train_loss = float(np.mean(m_loss.total))
         train_losses.append(mean_train_loss)
 
         # Validation phase
@@ -1724,7 +1796,7 @@ def train(args):
         new_nodes_val_accuracies.append(nn_val_cat_acc)
         new_nodes_val_mrrs.append(nn_val_mrr)
 
-        logging.info(f"Epoch {epoch:02d} [{epoch_time:.2f}s] Loss: {mean_train_loss:.4f} (edge {np.mean(m_edge_loss):.4f} cat {np.mean(m_cat_loss):.4f} x{args.cat_loss_weight:g}) | "
+        logging.info(f"Epoch {epoch:02d} [{epoch_time:.2f}s] Loss: {mean_train_loss:.4f} (edge {np.mean(m_loss.edge):.4f} cat {np.mean(m_loss.cat):.4f} x{args.cat_loss_weight:g}) | "
                      f"Val AUC: {val_auc:.4f}, AP: {val_ap:.4f}, CatAcc: {val_cat_acc:.4f}, MRR: {val_mrr:.4f} | "
                      f"Inductive Val AUC: {nn_val_auc:.4f}, AP: {nn_val_ap:.4f}, CatAcc: {nn_val_cat_acc:.4f}")
 
@@ -2050,7 +2122,9 @@ if __name__ == '__main__':
                         help='Same model/data/batch, re-expressed without per-message Python work or '
                              'device syncs (also CYBERWORLD_FAST_TGN=1). See bita/fast/__init__.py')
     parser.add_argument('--fast_step_level', type=int, default=2,
-                        help='1: forward bit-identical to the reference; 2: + Triton BiGRU (fp32 rounding)')
+                        help='1: forward bit-identical to the reference; 2: + Triton BiGRU (fp32 rounding); '
+                             '3: + the embedding/heads/losses as replayed CUDA graphs (bit-identical to 2); '
+                             '4: + BiTA and the memory updater as graphs on padded shapes (fp32 rounding)')
     parser.add_argument('--learn_time_encoding', action='store_true',
                         help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
                              'Off by default: fixed encoding, see the note in train()')
