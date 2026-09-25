@@ -1415,7 +1415,7 @@ def main():
             else:
                 extractor.extract_trajectories(recs, builder=shared, window_idx_base=widx_base)
             if shared._window_idx.n:
-                widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
+                widx_base = shared.next_window_base()
             print(f"  [{label} {i+1}/{len(files)}] {f.label}: {n_recs} recs, "
                   f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
             del recs, cols

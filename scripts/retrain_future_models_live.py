@@ -889,7 +889,7 @@ def _columns_extract_in_order(jobs, plan, args, extractor, builders, wbase):
         b.set_namespace(ns)
         extractor.extract_trajectories_columns(cols, builder=b, window_idx_base=wbase[split])
         if b._window_idx.n:
-            wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+            wbase[split] = b.next_window_base()
         n = len(cols)
         del cols
         gc.collect()
@@ -939,7 +939,7 @@ def _pcap_trajectories_per_day(args, extractor):
         b.set_namespace(f"pcap/{day}")   # one trajectory per (host, capture day)
         extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
         if b._window_idx.n:
-            wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+            wbase[split] = b.next_window_base()
         print(f"    -> {split} store: {b._n} snapshots ({time.time()-t:.1f}s)", flush=True)
         del recs
         gc.collect()
@@ -960,7 +960,7 @@ def _pcap_trajectories_per_day(args, extractor):
                 b.set_namespace(capture_namespace(cap))   # one trajectory per (host, capture)
                 extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase[split])
                 if b._window_idx.n:
-                    wbase[split] = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+                    wbase[split] = b.next_window_base()
                 print(f"  [CTU13 {split}] {cap.name}: {len(recs)} recs -> {b._n} snapshots "
                       f"({time.time()-t:.1f}s)", flush=True)
                 del recs
@@ -1117,7 +1117,7 @@ def main():
                 extractor.extract_trajectories(recs, builder=shared,
                                                window_idx_base=widx_base)
                 if shared._window_idx.n:
-                    widx_base = int(shared._window_idx.buf[: shared._window_idx.n].max()) + 1
+                    widx_base = shared.next_window_base()
                 print(f"  [{label} {i+1}/{len(files)}] {f.name}: {len(recs)} recs, "
                       f"store={shared._n} snaps, {time.time()-t:.1f}s", flush=True)
                 del recs
@@ -1279,7 +1279,7 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
                 workers=args.ingest_workers)):
             extractor.extract_trajectories_columns(cols, builder=b, window_idx_base=wbase)
             if b._window_idx.n:
-                wbase = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+                wbase = b.next_window_base()
             print(f"  [test] {cap.label}: {len(cols)} records", flush=True)
             del cols
             gc.collect()
@@ -1287,7 +1287,7 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
         recs = read_capture(cap, window_seconds=_c.window_seconds)
         extractor.extract_trajectories(recs, builder=b, window_idx_base=wbase)
         if b._window_idx.n:
-            wbase = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+            wbase = b.next_window_base()
         print(f"  [test] {cap.label}: {len(recs)} records", flush=True)
         del recs
         gc.collect()

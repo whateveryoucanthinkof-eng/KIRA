@@ -128,7 +128,7 @@ def _both(caps, tmp_path, *, use_memory, reader_kw=None, spill=None, **ex_kw):
                 covs.append(cols.coverage)
                 ex.extract_trajectories_columns(cols, builder=b, window_idx_base=base)
             if b._window_idx.n:
-                base = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+                base = b.next_window_base()
         out.append((b.finalize(), ex.neighbor_exposure_report(reset=True), covs))
     return out
 
@@ -233,7 +233,7 @@ def test_downstream_readers_match(captures, corpus, tmp_path):
                 ex.extract_trajectories_columns(_columns(spec, tmp_path), builder=b,
                                                 window_idx_base=base)
             if b._window_idx.n:
-                base = int(b._window_idx.buf[: b._window_idx.n].max()) + 1
+                base = b.next_window_base()
         if mode == "records":
             ref = b.finalize()
         else:

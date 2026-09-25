@@ -982,6 +982,8 @@ class HostTrajectoryExtractor:
                         edge_idxs[s_idx:e_idx][new],
                     )
                     self._ingested_until = float(ts_w[new].max())
+                if win_idx % _COMPACT_EVERY == 0:
+                    _compact_pending_messages(self.tgn)
 
             # (host, record) incidences: each record once for its src, and once
             # more for its dst unless that is the same host. Sorted by (host
@@ -1100,6 +1102,39 @@ class HostTrajectoryExtractor:
             )
 
         return builder.finalize() if owns_builder else builder
+
+
+#: How often (in windows) extract_trajectories_columns compacts pending messages.
+_COMPACT_EVERY = 64
+
+
+def _compact_pending_messages(tgn) -> None:
+    """Give each queued TGN memory message its own storage.
+
+    `TGN.get_raw_messages` queues `source_message[i]` and `edge_times[i]`:
+    row VIEWS of the whole window's message batch. A host that is never active
+    again keeps its last message queued until the capture ends, and that one
+    view pins the entire batch it was sliced from. Over a CIC-2018 PCAP day
+    nearly every window's batch stays alive -- measured ~0.5 KB per snapshot,
+    growing linearly, ~3.5 GB by the end of a 12M-record day.
+
+    `clone()` copies exactly the viewed values, so the aggregator later reads
+    bit-identical inputs; only the pinned batches are released. Messages that
+    already own their storage (`_base is None`) are left alone, so each is
+    copied at most once. bita/ is not ours to change, hence doing it here.
+    """
+    mem = getattr(tgn, "memory", None)
+    msgs = getattr(mem, "messages", None)
+    if not msgs:
+        return
+    for node, lst in msgs.items():
+        if not lst:
+            continue
+        if any((x[0]._base is not None) or (x[1]._base is not None) for x in lst):
+            msgs[node] = [
+                (x[0].clone() if x[0]._base is not None else x[0],
+                 x[1].clone() if x[1]._base is not None else x[1]) + tuple(x[2:])
+                for x in lst]
 
 
 def _window_boundaries(timestamps: np.ndarray, window_size_sec: float):

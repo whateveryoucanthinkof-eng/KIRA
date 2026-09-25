@@ -52,7 +52,7 @@ _BLOCK = 262_144       # rows per in-RAM block before spilling
 
 
 class _Col:
-    """A growable numpy column.
+    """A growable numpy column, stored as fixed-size chunks.
 
     The builder originally accumulated these as Python lists and converted to
     numpy only in finalize(). That made the *finalized* store compact while the
@@ -61,41 +61,78 @@ class _Col:
     snapshots a full-density corpus produces, those ten metadata lists came to
     tens of GB and dwarfed the memmapped feature block -- which is exactly how
     a run died with the spill file still at 0 bytes.
+
+    It then grew by doubling, which keeps up to 2x the data allocated (and 3x
+    while copying into the bigger buffer). At the ~80M snapshots of the
+    cross_year_ctu train split that slack was several GB against a 10 GB cap.
+    Chunks of `_CHUNK` cells bound the slack to one chunk per column.
     """
 
-    __slots__ = ("buf", "n")
+    __slots__ = ("_chunks", "_cur", "_k", "n", "dtype")
+
+    _CHUNK = 1 << 20
 
     def __init__(self, dtype, capacity: int = 1 << 16):
-        self.buf = np.empty(capacity, dtype=dtype)
+        self.dtype = np.dtype(dtype)
+        self._chunks: list = []
+        self._cur = np.empty(min(capacity, self._CHUNK), dtype=self.dtype)
+        self._k = 0          # cells used in _cur
         self.n = 0
 
+    def _roll(self) -> None:
+        if self._cur.shape[0] < self._CHUNK:
+            # Small columns start small; grow the first chunk up to _CHUNK.
+            bigger = np.empty(min(self._cur.shape[0] * 2, self._CHUNK), dtype=self.dtype)
+            bigger[: self._k] = self._cur[: self._k]
+            self._cur = bigger
+            return
+        self._chunks.append(self._cur)
+        self._cur = np.empty(self._CHUNK, dtype=self.dtype)
+        self._k = 0
+
     def append(self, v) -> None:
-        if self.n == self.buf.shape[0]:
-            bigger = np.empty(self.buf.shape[0] * 2, dtype=self.buf.dtype)
-            bigger[: self.n] = self.buf
-            self.buf = bigger
-        self.buf[self.n] = v
+        if self._k == self._cur.shape[0]:
+            self._roll()
+        self._cur[self._k] = v
+        self._k += 1
         self.n += 1
 
     def extend(self, values) -> None:
         """Append many values; the same cells `append` would write, one by one."""
         values = np.asarray(values)
         k = values.shape[0]
-        if k == 0:
-            return
-        cap = self.buf.shape[0]
-        if self.n + k > cap:
-            while cap < self.n + k:
-                cap *= 2
-            bigger = np.empty(cap, dtype=self.buf.dtype)
-            bigger[: self.n] = self.buf[: self.n]
-            self.buf = bigger
-        self.buf[self.n:self.n + k] = values
+        i = 0
+        while i < k:
+            if self._k == self._cur.shape[0]:
+                self._roll()
+            take = min(k - i, self._cur.shape[0] - self._k)
+            self._cur[self._k:self._k + take] = values[i:i + take]
+            self._k += take
+            i += take
         self.n += k
 
+    @property
+    def buf(self) -> np.ndarray:
+        """The values so far as ONE array (a copy once there are several
+        chunks). Kept for callers that read `col.buf[: col.n]`; prefer `max()`."""
+        if not self._chunks:
+            return self._cur[: self._k]
+        return np.concatenate(self._chunks + [self._cur[: self._k]])
+
+    def max(self):
+        parts = [c.max() for c in self._chunks]
+        if self._k:
+            parts.append(self._cur[: self._k].max())
+        return max(parts)
+
     def finalize(self) -> np.ndarray:
-        out = self.buf[: self.n].copy()
-        self.buf = np.empty(0, dtype=self.buf.dtype)   # release promptly
+        if self._chunks:
+            out = np.concatenate(self._chunks + [self._cur[: self._k]])
+        else:
+            out = self._cur[: self._k].copy()
+        self._chunks = []                                  # release promptly
+        self._cur = np.empty(0, dtype=self.dtype)
+        self._k = 0
         return out
 
 
@@ -505,6 +542,11 @@ class TrajectoryStoreBuilder:
             self._tech_flat.append(self._intern(t, self._tech_index, self._techniques))
         self._tech_off.append(self._tech_flat.n)
         self._n += 1
+
+    def next_window_base(self) -> int:
+        """1 + the largest window_idx appended so far (0 when empty): the
+        `window_idx_base` for the next capture."""
+        return int(self._window_idx.max()) + 1 if self._window_idx.n else 0
 
     def _make_room(self) -> None:
         """Free the in-RAM block when it is full: spill it, or grow it.
