@@ -6,6 +6,7 @@ import glob
 import logging
 import argparse
 import pickle
+import shutil
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -430,6 +431,7 @@ def load_and_preprocess_unified_dataset(
     window_seconds=2.0,
     ingest_scratch=None,
     ingest_cache=None,
+    apply_node_mask=True,
     store=None,
 ):
     """Loads CIC-2017 + CIC-2018 + CTU-13 into TGN's (u, i, ts, label, idx) graph format.
@@ -928,7 +930,7 @@ def load_and_preprocess_unified_dataset(
                               IP_FEATURE_DIM), dtype=np.float32)
     for (_cap, ip), nid in node_to_id.items():
         node_features[nid] = ip_node_features(ip)
-    _mask = node_ablation_mask()
+    _mask = node_ablation_mask() if apply_node_mask else None
     if _mask is not None:
         node_features *= _mask
     del node_to_id
@@ -1202,6 +1204,38 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     return node_features, edge_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data
 
 
+def _shared_setup_parts(args):
+    """Everything the encoder setup reads, for the shared-setup key (not the
+    seed, not the IP ablation: neither affects setup). The captures enter
+    through their ingest-cache keys, which already cover inputs + parse code."""
+    from data_unification.parallel_ingest import cache_key, parse_code_hash, pcap_parser_choice
+    import sys as _sys
+    sys_path = str(Path(__file__).resolve().parents[1] / "scripts")
+    if sys_path not in _sys.path:
+        _sys.path.insert(0, sys_path)
+    from warm_ingest_cache import encoder_captures
+    from data_unification.tgne_features import extract_canonical_edge_features
+    edge_dim = len(extract_canonical_edge_features(
+        fwd_bytes=0, bwd_bytes=0, fwd_packets=0, bwd_packets=0, duration_sec=0.0,
+        byte_rate=0.0, packet_rate=0.0, protocol=6, dst_port=0))
+    code_hash = parse_code_hash()[0]
+    caps = encoder_captures(ctu13_dir=args.ctu13_dir, pcap2018_root=args.pcap2018_root,
+                            cic2017_dir=args.cic2017_dir, cic2018_dir=args.cic2018_dir,
+                            scheme=args.split_scheme,
+                            splits=tuple(args.train_splits.split(",")) if args.train_splits else None)
+    keys = [cache_key(k, p, stride=args.stride, max_rows=args.rows_per_file, edge_dim=edge_dim,
+                      pcap_label_dir=args.pcap2018_label_dir,
+                      window_seconds=_contract_window_seconds(), code_hash=code_hash,
+                      pcap_parser=pcap_parser_choice())
+            for k, p in caps]
+    return {"captures": keys, "scheme": args.split_scheme, "train_splits": args.train_splits,
+            "stride": args.stride, "rows_per_file": args.rows_per_file,
+            "allow_cic2018_csv": args.allow_cic2018_csv,
+            "different_new_nodes": args.different_new_nodes,
+            "randomize_features": args.randomize_features, "uniform": args.uniform,
+            "window_seconds": _contract_window_seconds()}
+
+
 def train(args):
     # Set random seeds
     torch.manual_seed(args.seed)
@@ -1241,86 +1275,137 @@ def train(args):
     # of anonymous memory, and the edge features no longer sit on the GPU.
     # Nothing it computes changes. Removed when the run ends; a crashed run's
     # store is wiped (not reused) by the next run's DiskStore().
-    store = None
-    if (args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root) \
-            and not args.in_memory:
-        import atexit
-        store = DiskStore(os.path.join(args.checkpoint_dir, "store"))
-        atexit.register(store.cleanup)
-        logging.info("Out-of-core store: %s", store.root)
-    if args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root:
-        if args.data_name == 'warden_alerts':  # still the default; unified run wasn't given its own name
-            args.data_name = 'unified_cic_ctu13'
-        require_full_density(
-            'TGNE encoder training',
-            stride=args.stride,
-            rows_per_file=args.rows_per_file,
-        )
-        graph_df, edge_features, node_features, category_mapping = load_and_preprocess_unified_dataset(
-            cic2017_dir=args.cic2017_dir,
-            cic2018_dir=args.cic2018_dir,
-            ctu13_dir=args.ctu13_dir,
-            max_rows_per_file=args.rows_per_file,
-            stride=args.stride,
-            splits=tuple(args.train_splits.split(",")) if args.train_splits else None,
-            parallel_workers=args.ingest_workers,
-            pcap2018_root=args.pcap2018_root,
-            pcap2018_label_dir=args.pcap2018_label_dir,
-            scheme=args.split_scheme,
-            allow_cic2018_csv=args.allow_cic2018_csv,
-            window_seconds=_contract_window_seconds(),
-            # On disk beside the epoch checkpoints: never the tmpfs temp dir.
-            ingest_scratch=os.path.join(args.checkpoint_dir, "ingest") if args.ingest_workers else None,
-            ingest_cache=args.ingest_cache if args.ingest_workers else None,
-            store=store,
-        )
+    # The whole setup (load -> split -> finders -> samplers -> time stats) is
+    # identical for every run on the same captures: it depends on neither the
+    # seed nor the IP ablation. With --shared_setup_dir it is built once, under
+    # a lock, and every other run maps it read-only (utils/setup_store.py).
+    _setup_names = ("store", "graph_df", "edge_features", "node_features", "category_mapping",
+                    "full_data", "train_data", "val_data", "test_data", "new_node_val_data",
+                    "new_node_test_data", "train_ngh_finder", "full_ngh_finder", "_node_group",
+                    "train_rand_sampler", "val_rand_sampler", "nn_val_rand_sampler",
+                    "test_rand_sampler", "nn_test_rand_sampler", "mean_time_shift_src",
+                    "std_time_shift_src", "mean_time_shift_dst", "std_time_shift_dst")
+
+    def _build_setup(store_root=None, apply_node_mask=True):
+        store = None
+        if store_root is not None:
+            store = DiskStore(store_root)
+        elif (args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root) \
+                and not args.in_memory:
+            import atexit
+            store = DiskStore(os.path.join(args.checkpoint_dir, "store"))
+            atexit.register(store.cleanup)
+            logging.info("Out-of-core store: %s", store.root)
+        if args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root:
+            if args.data_name == 'warden_alerts':  # still the default; unified run wasn't given its own name
+                args.data_name = 'unified_cic_ctu13'
+            require_full_density(
+                'TGNE encoder training',
+                stride=args.stride,
+                rows_per_file=args.rows_per_file,
+            )
+            graph_df, edge_features, node_features, category_mapping = load_and_preprocess_unified_dataset(
+                cic2017_dir=args.cic2017_dir,
+                cic2018_dir=args.cic2018_dir,
+                ctu13_dir=args.ctu13_dir,
+                max_rows_per_file=args.rows_per_file,
+                stride=args.stride,
+                splits=tuple(args.train_splits.split(",")) if args.train_splits else None,
+                parallel_workers=args.ingest_workers,
+                pcap2018_root=args.pcap2018_root,
+                pcap2018_label_dir=args.pcap2018_label_dir,
+                scheme=args.split_scheme,
+                allow_cic2018_csv=args.allow_cic2018_csv,
+                window_seconds=_contract_window_seconds(),
+                # On disk beside the epoch checkpoints: never the tmpfs temp dir.
+                ingest_scratch=os.path.join(args.checkpoint_dir, "ingest") if args.ingest_workers else None,
+                ingest_cache=args.ingest_cache if args.ingest_workers else None,
+                apply_node_mask=apply_node_mask,
+                store=store,
+            )
+        else:
+            graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
+                dataset_dir=args.dataset_dir, embedding_dim=args.feature_dim,
+                resample_to_median=not args.no_median_resample,
+                ip_node_features=not args.warden_zero_node_features,
+            )
+        num_categories = len(category_mapping)
+
+        node_features, edge_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
+            split_data(graph_df, edge_features, node_features, different_new_nodes=args.different_new_nodes,
+                       randomize_features=args.randomize_features, store=store)
+
+        # Neighbor finders
+        train_ngh_finder = get_neighbor_finder(train_data, uniform=args.uniform, store=store)
+        full_ngh_finder = get_neighbor_finder(full_data, uniform=args.uniform, store=store)
+        logging.info("Setup: neighbour finders built")
+
+        # Samplers. Negatives come from the positive edge's own capture: nodes are
+        # per capture (load_and_preprocess_unified_dataset), so each node has one.
+        _node_group = None
+        if "capture" in graph_df.columns:
+            _node_group = np.full(int(max(graph_df.u.max(), graph_df.i.max())) + 1, -1, dtype=np.int64)
+            # In chunks, u then i as before: the int16 -> int64 cast of a whole
+            # column was a transient 8 B per edge.
+            _u, _i, _c = graph_df.u.values, graph_df.i.values, graph_df["capture"].values
+            for _a in range(0, len(_c), CHUNK):
+                _node_group[_u[_a:_a + CHUNK]] = _c[_a:_a + CHUNK]
+            for _a in range(0, len(_c), CHUNK):
+                _node_group[_i[_a:_a + CHUNK]] = _c[_a:_a + CHUNK]
+            del _u, _i, _c
+        train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations, node_group=_node_group)
+        val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=0, node_group=_node_group)
+        # Inductive negatives: with per-capture pools, the new-node edges' own
+        # destinations are often one server per capture, so the pool is the whole
+        # capture's destinations instead (the transductive samplers already use
+        # full_data). The sampler also never returns the positive destination.
+        _nn_pool = (lambda d: full_data) if _node_group is not None else (lambda d: d)
+        nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.sources, _nn_pool(new_node_val_data).destinations, seed=1, node_group=_node_group)
+        test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=2, node_group=_node_group)
+        nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources, _nn_pool(new_node_test_data).destinations, seed=3, node_group=_node_group)
+        logging.info("Setup: negative samplers built")
+
+        # Compute time statistics
+        mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst = \
+            compute_time_statistics(full_data.sources, full_data.destinations, full_data.timestamps,
+                                    store=store)
+        logging.info("Setup: time statistics computed")
+        _l = locals()
+        return {k: _l.get(k) for k in _setup_names}
+
+    _unified = bool(args.cic2017_dir or args.cic2018_dir or args.ctu13_dir or args.pcap2018_root)
+    if args.shared_setup_dir and _unified and not args.in_memory:
+        from utils import setup_store as _ss
+        from data_unification.ip_features import node_ablation_mask as _nam
+        _key = _ss.setup_key(_shared_setup_parts(args), repo=str(Path(__file__).resolve().parents[1]))
+        with _ss.locked(args.shared_setup_dir, _key):
+            _got = _ss.load(args.shared_setup_dir, _key)
+            if _got is None:
+                logging.info("Shared setup %s: building", _key)
+                _dir = os.path.join(args.shared_setup_dir, _key)
+                shutil.rmtree(_dir, ignore_errors=True)
+                _setup = _build_setup(store_root=os.path.join(_dir, "store"), apply_node_mask=False)
+                _ss.save(args.shared_setup_dir, _key, os.path.join(_dir, "store"), _setup)
+                _got = _ss.load(args.shared_setup_dir, _key)   # the SAME read-only view every run gets
+            else:
+                logging.info("Shared setup %s: reused (read-only)", _key)
+            _ss.prune(args.shared_setup_dir, keep=_key)
+        _setup = dict(_got[0])
+        _setup["store"] = None               # shared: never cleaned up by this run
+        # Per-run: the IP ablation, applied as the loader would (same float32 multiply).
+        _nf = np.array(_setup["node_features"], dtype=np.float32, copy=True)
+        _mask = _nam()
+        if _mask is not None:
+            _nf *= _mask
+        _setup["node_features"] = _nf
     else:
-        graph_df, edge_features, node_features, category_mapping = load_and_preprocess_dataset(
-            dataset_dir=args.dataset_dir, embedding_dim=args.feature_dim,
-            resample_to_median=not args.no_median_resample,
-            ip_node_features=not args.warden_zero_node_features,
-        )
+        _setup = _build_setup()
+    (store, graph_df, edge_features, node_features, category_mapping, full_data, train_data,
+     val_data, test_data, new_node_val_data, new_node_test_data, train_ngh_finder,
+     full_ngh_finder, _node_group, train_rand_sampler, val_rand_sampler, nn_val_rand_sampler,
+     test_rand_sampler, nn_test_rand_sampler, mean_time_shift_src, std_time_shift_src,
+     mean_time_shift_dst, std_time_shift_dst) = (_setup[k] for k in _setup_names)
     num_categories = len(category_mapping)
-
-    node_features, edge_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
-        split_data(graph_df, edge_features, node_features, different_new_nodes=args.different_new_nodes,
-                   randomize_features=args.randomize_features, store=store)
-
-    # Neighbor finders
-    train_ngh_finder = get_neighbor_finder(train_data, uniform=args.uniform, store=store)
-    full_ngh_finder = get_neighbor_finder(full_data, uniform=args.uniform, store=store)
-    logging.info("Setup: neighbour finders built")
-
-    # Samplers. Negatives come from the positive edge's own capture: nodes are
-    # per capture (load_and_preprocess_unified_dataset), so each node has one.
-    _node_group = None
-    if "capture" in graph_df.columns:
-        _node_group = np.full(int(max(graph_df.u.max(), graph_df.i.max())) + 1, -1, dtype=np.int64)
-        # In chunks, u then i as before: the int16 -> int64 cast of a whole
-        # column was a transient 8 B per edge.
-        _u, _i, _c = graph_df.u.values, graph_df.i.values, graph_df["capture"].values
-        for _a in range(0, len(_c), CHUNK):
-            _node_group[_u[_a:_a + CHUNK]] = _c[_a:_a + CHUNK]
-        for _a in range(0, len(_c), CHUNK):
-            _node_group[_i[_a:_a + CHUNK]] = _c[_a:_a + CHUNK]
-        del _u, _i, _c
-    train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations, node_group=_node_group)
-    val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=0, node_group=_node_group)
-    # Inductive negatives: with per-capture pools, the new-node edges' own
-    # destinations are often one server per capture, so the pool is the whole
-    # capture's destinations instead (the transductive samplers already use
-    # full_data). The sampler also never returns the positive destination.
-    _nn_pool = (lambda d: full_data) if _node_group is not None else (lambda d: d)
-    nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.sources, _nn_pool(new_node_val_data).destinations, seed=1, node_group=_node_group)
-    test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=2, node_group=_node_group)
-    nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources, _nn_pool(new_node_test_data).destinations, seed=3, node_group=_node_group)
-    logging.info("Setup: negative samplers built")
-
-    # Compute time statistics
-    mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst = \
-        compute_time_statistics(full_data.sources, full_data.destinations, full_data.timestamps,
-                                store=store)
-    logging.info("Setup: time statistics computed")
 
     model_save_path = os.path.join(args.save_dir, f"{args.prefix}-{args.data_name}.pth")
     checkpoint_path_fn = lambda epoch: os.path.join(args.checkpoint_dir, f"{args.prefix}-{args.data_name}-{epoch}.pth")
@@ -2017,6 +2102,10 @@ if __name__ == '__main__':
     # Promote a winner with scripts/select_best_encoder.py --copy.
     parser.add_argument('--checkpoint_dir', type=str, default='.spill/encoder_epochs')
     parser.add_argument('--log_dir', type=str, default='logs')
+    parser.add_argument('--shared_setup_dir', type=str, default=None,
+                        help='Build the encoder setup (load, split, finders, samplers) once '
+                             'under this dir and share it read-only between runs on the same '
+                             'captures (bita/utils/setup_store.py). Seeds and IP ablations reuse it.')
     parser.add_argument('--in_memory', action='store_true', default=False,
                         help='Keep every per-edge array in RAM and the edge features on the '
                              'GPU (the pre-out-of-core behaviour). Default: file-backed under '

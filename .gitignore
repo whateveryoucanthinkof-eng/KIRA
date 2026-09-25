@@ -175,6 +175,7 @@ captures/parity_states.jsonl
 #   *.npy/*.npz     column parts and memmapped stores
 # Checkpoints (*.pt/*.pth), logs (*.log, logs/) and .spill/ are ignored above.
 .ingest_cache/
+.shared_setup/
 .warm-scratch/
 results/**/ingest/
 results/**/store/

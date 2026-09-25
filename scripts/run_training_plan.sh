@@ -54,6 +54,13 @@ INGEST_WORKERS="${INGEST_WORKERS:-8}"
 # Independent training chains run at once. Each lane's jobs get MEM_MAX, so
 # LANES x MEM_MAX must fit the machine: keep LANES=1 unless measured.
 LANES="${LANES:-1}"
+# One encoder setup (load/split/finders/samplers) shared read-only by every
+# encoder run on the same captures (bita/utils/setup_store.py).
+SHARED_SETUP="${SHARED_SETUP:-$OUT/.shared_setup}"
+# Two encoders share one 8 GB GPU and their pending-message pools grow through
+# an epoch; expandable segments stop the caching allocator from stranding
+# freed blocks (it logged OOM retries at 7.1 of 8 GB). No effect on the math.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCHEME=cross_year_ctu
 CHOSEN_IP=cross_network            # decided in advance; see analysis 30, "winner"
@@ -68,7 +75,7 @@ SEEDS_EXTRA=(123 2024)             # with 42 from `compare`: cyberworld_v4.confi
 # to each stage's arguments (later flags win). scripts/dry_run_plan.py uses
 # them to run this exact plan on a tiny synthetic corpus.
 ENCODER_ARGS="--use_memory --n_degree 10 --n_epoch 50 --patience 3 --step_back_after 2 \
---ingest_workers $INGEST_WORKERS --ingest_cache $INGEST_CACHE ${PLAN_ENCODER_EXTRA:-}"
+--ingest_workers $INGEST_WORKERS --ingest_cache $INGEST_CACHE --shared_setup_dir $SHARED_SETUP ${PLAN_ENCODER_EXTRA:-}"
 BRANCH_A_ARGS="--architecture paper --risk-objective soft_bce --risk-target hazard \
 --epochs 15 --patience 3 --step-back-after 2 --operating-point-criterion budgeted_f1 --alert-budget 2.0 \
 --spill-dir $OUT/.spill --num-workers $NUM_WORKERS ${PLAN_BRANCH_A_EXTRA:-}"
