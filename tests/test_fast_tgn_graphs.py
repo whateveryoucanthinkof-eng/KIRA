@@ -33,7 +33,8 @@ def _train(level, n_batches=27, bs=64, backprop_every=4, seed=0):
     labels = (np.arange(len(src)) % 3 == 0).astype(np.int64)
     finder = get_neighbor_finder(_Data(src, dst, ts, eidx), uniform=False, max_node_idx=len(nf) - 1)
     m = _model(ef, nf, finder, seed=seed)
-    enable_fast_tgn(m, level=level)
+    if level:                                   # level 0: the reference model, losses as bita/train.py
+        enable_fast_tgn(m, level=level)
     opt = torch.optim.Adam([p for p in m.parameters() if p.requires_grad], lr=1e-3)
     guard = TrainingGuard("t", [m], opt, warmup_steps=2, clip_norm=100.0, log=lambda *_: None)
     ec = torch.nn.BCELoss()
@@ -55,8 +56,16 @@ def _train(level, n_batches=27, bs=64, backprop_every=4, seed=0):
             if b == n_batches - 1:
                 sl = slice(b * bs, b * bs + bs // 2)          # a short last batch
             neg = rng.integers(1, len(nf), sl.stop - sl.start)
-            e, c, (p, n, lg) = m.fast_batch_losses(src[sl], dst[sl], neg, ts[sl], eidx[sl], labels[sl], ec, cc,
-                                                   n_neighbors=10)
+            if level:
+                e, c, (p, n, lg) = m.fast_batch_losses(src[sl], dst[sl], neg, ts[sl], eidx[sl], labels[sl], ec, cc,
+                                                       n_neighbors=10)
+            else:
+                p, n, lg = m.compute_edge_probabilities_and_categories(src[sl], dst[sl], neg, ts[sl], eidx[sl],
+                                                                       n_neighbors=10)
+                size = len(p)
+                e = ec(p.squeeze(-1), torch.ones(size, device="cuda")) + \
+                    ec(n.squeeze(-1), torch.zeros(size, device="cuda"))
+                c = cc(lg, torch.as_tensor(labels[sl], device="cuda"))
             outs.append(torch.cat([p.detach().reshape(-1), n.detach().reshape(-1), lg.detach().reshape(-1)]).cpu())
             el = el + e
             cl = cl + c
@@ -98,3 +107,28 @@ def test_level3_eval_and_no_grad_run_eagerly():
         m.compute_edge_probabilities_and_categories(src[600:664], dst[600:664], dst[600:664], ts[600:664],
                                                     eidx[600:664], n_neighbors=10)
     assert sum(len(v) for v in m._graph_slots.values()) == n_slots
+
+
+def test_level4_bita_graphs_within_fp32_rounding(deterministic):
+    """Level 4 also replays BiTA + the memory updater on padded shapes: the
+    padding is inert, so only fp32 rounding may differ (GEMMs over more rows).
+    Measured against the envelope already accepted for level 2: level 4's
+    distance from level 2 must not exceed level 2's distance from the
+    reference (weights after Adam steps amplify rounding in small
+    gradients, so both are compared on the same run)."""
+    l0, o0, p0, m0, _ = _train(level=0)
+    l2, o2, p2, m2, _ = _train(level=2)
+    l4, o4, p4, m4, model4 = _train(level=4)
+    kinds = {k[-1] for k in model4._graph_slots}
+    assert "bita" in kinds, "level 4 captured no BiTA graph"
+
+    def rel_loss(a, b):
+        return max(abs(x - y) / max(abs(x), 1e-12) for x, y in zip(a, b))
+
+    def dmax(a, b):
+        return max(float((x - y).abs().max()) for x, y in zip(a, b))
+
+    assert rel_loss(l2, l4) < 1e-5
+    assert dmax(o2, o4) < 1e-5
+    assert dmax(p2, p4) <= max(dmax(p0, p2), 1e-6), (dmax(p2, p4), dmax(p0, p2))
+    assert float((m2 - m4).abs().max()) <= max(float((m0 - m2).abs().max()), 1e-6)

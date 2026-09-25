@@ -34,6 +34,19 @@ from typing import Callable, List, Sequence
 import torch
 
 
+_WARMUP_STREAMS = {}
+
+
+def _warmup_stream(device) -> torch.cuda.Stream:
+    """ONE side stream for every warmup: cuBLAS keeps a workspace per
+    (handle, stream) for the life of the process, so a new stream per
+    capture cost ~32-64 MB of GPU memory each."""
+    key = torch.device(device).index
+    if key not in _WARMUP_STREAMS:
+        _WARMUP_STREAMS[key] = torch.cuda.Stream(device)
+    return _WARMUP_STREAMS[key]
+
+
 class GraphSlot:
     """One captured forward + backward of `fn`.
 
@@ -44,7 +57,8 @@ class GraphSlot:
     """
 
     def __init__(self, fn: Callable, example_inputs: Sequence[torch.Tensor], params: List[torch.nn.Parameter],
-                 diff_inputs: Sequence[int], diff_outputs: Sequence[int], warmup: int = 2):
+                 diff_inputs: Sequence[int], diff_outputs: Sequence[int], module: torch.nn.Module,
+                 warmup: int = 2, pool=None, watch: Sequence[torch.Tensor] = ()):
         self.fn = fn
         self.diff_inputs = list(diff_inputs)
         self.diff_outputs = list(diff_outputs)
@@ -54,66 +68,103 @@ class GraphSlot:
             if i in self.diff_inputs:
                 s.requires_grad_(True)
             self.static_inputs.append(s)
-        self.pool = torch.cuda.graph_pool_handle()
+        # A pool may be shared only by graphs that are never live at the same
+        # time (the variants of one slot); see fast_tgn._graph_slot.
+        self.pool = pool if pool is not None else torch.cuda.graph_pool_handle()
         dev = self.static_inputs[0].device
         rng = torch.cuda.get_rng_state(dev)
         try:
-            self._capture(params, warmup)
+            self._capture(module, params, warmup)
         finally:
             torch.cuda.set_rng_state(rng, dev)       # capture draws nothing from the stream
+        # The graphs read these tensors at their capture-time addresses.
+        self._watch = list(self.params) + [t for t in watch if torch.is_tensor(t)]
+        self._ptrs = [t.data_ptr() for t in self._watch]
+
+    def stale(self) -> bool:
+        """True if a parameter or watched tensor was re-allocated since capture
+        (e.g. `p.data = ...`); in-place updates (the optimizer,
+        load_state_dict) keep the address and need nothing."""
+        return any(t.data_ptr() != q for t, q in zip(self._watch, self._ptrs))
+
+    def _capture(self, module, params, warmup):
+        """Warmup and capture run against SHADOW parameters: leaves that alias
+        each parameter's storage (so a replay reads the current weights) but
+        are not the parameters. The real parameters' AccumulateGrad nodes are
+        therefore only ever created and run by the training backward, on the
+        training stream; capture never touches them (torch refuses a capture
+        that would, and a node first made on the side stream would make the
+        training backward accumulate .grad on that stream)."""
+        from torch.nn.utils.stateless import _reparametrize_module
+        names = {id(p): n for n, p in module.named_parameters()}
+        shadows = [p.detach().requires_grad_(True) for p in params]
+        swap = {names[id(p)]: q for p, q in zip(params, shadows)}
+        side = _warmup_stream(self.static_inputs[0].device)
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), _reparametrize_module(module, swap):
+            for _ in range(warmup):                  # lazy init, autotuning, cuBLAS workspaces
+                outs = self.fn(*self.static_inputs)
+                grads = torch.autograd.grad([outs[i] for i in self.diff_outputs], self._grad_targets(shadows),
+                                            [torch.ones_like(outs[i]) for i in self.diff_outputs],
+                                            allow_unused=True)
+            del outs
+            # Parameters the region does not reach get no gradient from it.
+            used = [g is not None for g in grads[len(self.diff_inputs):]]
+            del grads
+        torch.cuda.current_stream().wait_stream(side)
+        self.params = [p for p, u in zip(params, used) if u]
+        shadows = [q for q, u in zip(shadows, used) if u]
+
+        self.fwd = torch.cuda.CUDAGraph()
+        self.bwd = torch.cuda.CUDAGraph()
+        with _reparametrize_module(module, swap):
+            with torch.cuda.graph(self.fwd, pool=self.pool, stream=side):
+                outs = self.fn(*self.static_inputs)
+            self.static_outputs = tuple(outs)
+            self.static_grad_outputs = [torch.empty_like(self.static_outputs[i]) for i in self.diff_outputs]
+            with torch.cuda.graph(self.bwd, pool=self.pool, stream=side):
+                grads = torch.autograd.grad([self.static_outputs[i] for i in self.diff_outputs],
+                                            self._grad_targets(shadows), self.static_grad_outputs,
+                                            allow_unused=True)
+        n = len(self.diff_inputs)
+        self.static_grad_inputs = grads[:n]
+        self.static_grad_params = grads[n:]
+        assert all(g is not None for g in self.static_grad_params)
+        self._held = ()
 
     def _grad_targets(self, params):
         return [self.static_inputs[i] for i in self.diff_inputs] + list(params)
 
-    def _capture(self, params, warmup):
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(warmup):                  # lazy init, autotuning, cuBLAS workspaces
-                outs = self.fn(*self.static_inputs)
-                grads = torch.autograd.grad([outs[i] for i in self.diff_outputs], self._grad_targets(params),
-                                            [torch.ones_like(outs[i]) for i in self.diff_outputs],
-                                            allow_unused=True)
-            del outs
-        torch.cuda.current_stream().wait_stream(side)
-        # Parameters the region does not reach get no gradient from it.
-        self.params = [p for p, g in zip(params, grads[len(self.diff_inputs):]) if g is not None]
-        del grads
-
-        self.fwd = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.fwd, pool=self.pool):
-            outs = self.fn(*self.static_inputs)
-        self.static_outputs = tuple(outs)
-        self.static_grad_outputs = [torch.empty_like(self.static_outputs[i]) for i in self.diff_outputs]
-        self.bwd = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.bwd, pool=self.pool):
-            grads = torch.autograd.grad([self.static_outputs[i] for i in self.diff_outputs],
-                                        self._grad_targets(self.params), self.static_grad_outputs,
-                                        allow_unused=True)
-        n = len(self.diff_inputs)
-        self.static_grad_inputs = grads[:n]
-        self.static_grad_params = grads[n:]
-        self._held = ()
-
     def __call__(self, *inputs):
         """Non-differentiable inputs are copied into the static buffers here
         (pass None for one already written in place); differentiable ones are
-        copied inside the autograd Function."""
+        copied inside the autograd Function. An input with fewer rows than its
+        static buffer fills the leading rows (the caller's padding contract
+        says what the remaining rows may hold); its gradient is those rows'."""
         diff_live = []
         for i, x in enumerate(inputs):
             if i in self.diff_inputs:
                 diff_live.append(x)
             elif x is not None:
-                self.static_inputs[i].copy_(x)
+                _copy_in(self.static_inputs[i], x)
         return _SlotFunction.apply(self, *diff_live, *self.params)
+
+
+def _copy_in(static: torch.Tensor, x: torch.Tensor) -> None:
+    if x.shape[0] == static.shape[0]:
+        static.copy_(x)
+    else:
+        static[: x.shape[0]].copy_(x)
 
 
 class _SlotFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, slot: GraphSlot, *args):
         ctx.slot = slot
+        ctx.rows = []
         for i, x in zip(slot.diff_inputs, args):
-            slot.static_inputs[i].copy_(x)
+            _copy_in(slot.static_inputs[i], x)
+            ctx.rows.append(x.shape[0])
         slot.fwd.replay()
         outs = tuple(o.detach() for o in slot.static_outputs)
         ctx.mark_non_differentiable(*[o for k, o in enumerate(outs) if k not in slot.diff_outputs])
@@ -131,7 +182,7 @@ class _SlotFunction(torch.autograd.Function):
                 buf.copy_(g)
         slot.bwd.replay()
         n = len(slot.diff_inputs)
-        gin = tuple(g.detach() if (g is not None and ctx.needs_input_grad[1 + i]) else None
+        gin = tuple(g.detach()[: ctx.rows[i]] if (g is not None and ctx.needs_input_grad[1 + i]) else None
                     for i, g in enumerate(slot.static_grad_inputs))
         gpar = tuple(g.detach() for g in slot.static_grad_params)
         # Holding a second reference stops AccumulateGrad from adopting the

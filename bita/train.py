@@ -2110,7 +2110,8 @@ if __name__ == '__main__':
                              'device syncs (also CYBERWORLD_FAST_TGN=1). See bita/fast/__init__.py')
     parser.add_argument('--fast_step_level', type=int, default=2,
                         help='1: forward bit-identical to the reference; 2: + Triton BiGRU (fp32 rounding); '
-                             '3: + the embedding/heads/losses as replayed CUDA graphs (bit-identical to 2)')
+                             '3: + the embedding/heads/losses as replayed CUDA graphs (bit-identical to 2); '
+                             '4: + BiTA and the memory updater as graphs on padded shapes (fp32 rounding)')
     parser.add_argument('--learn_time_encoding', action='store_true',
                         help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
                              'Off by default: fixed encoding, see the note in train()')

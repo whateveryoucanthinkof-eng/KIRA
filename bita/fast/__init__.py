@@ -24,6 +24,11 @@ def enable_fast_tgn(tgn, level: int = 2):
     level 3: + in training, the fixed-shape part of each batch (graph-attention
              embedding, both heads, both losses; forward and backward) replayed
              as CUDA graphs (bita/fast/graphs.py). Bit-identical to level 2:
-             tests/test_fast_tgn_graphs.py, bench.py --compare."""
+             tests/test_fast_tgn_graphs.py, bench.py --compare.
+    level 4: + BiTA and the GRU memory updater replayed as CUDA graphs on
+             padded shapes (edges to whole Transformer groups, message length
+             to a power of two <= 32, nodes to 2*batch+1). The padding is inert;
+             fp32-rounding-level (GEMMs over more rows), measured well inside
+             level 2's own distance from the reference."""
     from fast.fast_tgn import enable
     return enable(tgn, level=level)
