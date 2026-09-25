@@ -95,7 +95,7 @@ def test_every_trainer_steps_through_the_guard(path, name):
     src = (REPO / path).read_text(encoding="utf-8")
     assert f'TrainingGuard(\n        "{name}"' in src or f'TrainingGuard("{name}"' in src, \
         f"{path} does not build a guard for {name}"
-    assert "guard.backward_step(" in src and "guard.end_epoch(" in src
+    assert ("guard.backward_step(" in src or "guard.backward_step_deferred" in src) and "guard.end_epoch(" in src
     assert "optimizer.step()" not in src, f"{path} still steps the optimizer outside the guard"
 
 

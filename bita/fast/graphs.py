@@ -29,6 +29,7 @@ bench.py --compare and tests/test_fast_tgn_graphs.py measure it.
 """
 from __future__ import annotations
 
+import contextlib
 from typing import Callable, List, Sequence
 
 import torch
@@ -45,6 +46,30 @@ def _warmup_stream(device) -> torch.cuda.Stream:
     if key not in _WARMUP_STREAMS:
         _WARMUP_STREAMS[key] = torch.cuda.Stream(device)
     return _WARMUP_STREAMS[key]
+
+
+@contextlib.contextmanager
+def _capturing(graph: torch.cuda.CUDAGraph, pool, stream: torch.cuda.Stream):
+    """torch.cuda.graph(graph, pool, stream) WITHOUT its torch.cuda.empty_cache().
+
+    Slots are captured lazily, in the middle of an accumulation group, while
+    other slots' graphs are live. Measured: once graphs of ANOTHER model had
+    been destroyed in the same process (tests do this; one training process
+    never does), an empty_cache() while this model's graphs lived made a
+    later backward replay hit an illegal memory access
+    (tests/test_fast_tgn_graphs.py as one file: 5/5 failures with
+    torch.cuda.graph, 4/4 passes with this; an explicit empty_cache() before
+    every replay fails the same way unless the dead graphs were collected
+    before the new ones were captured). So captures here never empty the
+    cache, and fast_tgn never destroys a model's graphs while it trains.
+    """
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream):
+        graph.capture_begin(pool=pool)
+        try:
+            yield
+        finally:
+            graph.capture_end()
 
 
 class GraphSlot:
@@ -118,11 +143,11 @@ class GraphSlot:
         self.fwd = torch.cuda.CUDAGraph()
         self.bwd = torch.cuda.CUDAGraph()
         with _reparametrize_module(module, swap):
-            with torch.cuda.graph(self.fwd, pool=self.pool, stream=side):
+            with _capturing(self.fwd, self.pool, side):
                 outs = self.fn(*self.static_inputs)
             self.static_outputs = tuple(outs)
             self.static_grad_outputs = [torch.empty_like(self.static_outputs[i]) for i in self.diff_outputs]
-            with torch.cuda.graph(self.bwd, pool=self.pool, stream=side):
+            with _capturing(self.bwd, self.pool, side):
                 grads = torch.autograd.grad([self.static_outputs[i] for i in self.diff_outputs],
                                             self._grad_targets(shadows), self.static_grad_outputs,
                                             allow_unused=True)

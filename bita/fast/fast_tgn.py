@@ -683,8 +683,10 @@ class FastTGNMixin:
             mem._graph_slot_next = i + 1
         slots = self.__dict__.setdefault("_graph_slots", {}).setdefault(key + (kind,), {})
         if i in slots and slots[i].stale():
-            self.__dict__.pop("_graph_slots", None)          # a weight was re-allocated: capture again
-            slots = self.__dict__.setdefault("_graph_slots", {}).setdefault(key + (kind,), {})
+            raise RuntimeError(
+                "fast path level >= 3: a parameter or feature tensor was re-allocated after its CUDA "
+                "graph was captured (e.g. `p.data = ...`); the graphs would read the old memory. "
+                "Update weights in place (optimizer steps, load_state_dict do), or run level 2.")
         if i not in slots:
             if params is None:
                 em = self.embedding_module
