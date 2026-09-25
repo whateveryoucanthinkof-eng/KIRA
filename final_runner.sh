@@ -48,10 +48,10 @@ fi
 echo "=== launch $(date) commit $(git log --oneline -1) extra=[${PLAN_ENCODER_EXTRA:-}] lanes=${LANES:-1} ===" >> plan.log
 systemctl --user reset-failed train-plan 2>/dev/null || true
 systemd-run --user --unit=train-plan --working-directory="$REPO" \
-    --setenv=PATH="$PATH" --setenv=MEM_MAX="$MEM_MAX" --setenv=ENV_FILE="$ENV_FILE" \
+    --setenv=PATH="$PATH" --setenv=RUNNER_MEM_MAX="$MEM_MAX" --setenv=ENV_FILE="$ENV_FILE" \
     --setenv=PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
     -p StandardOutput=append:"$REPO/plan.log" -p StandardError=append:"$REPO/plan.log" \
-    bash -c 'source "$ENV_FILE" && export MEM_MAX PYTORCH_CUDA_ALLOC_CONF && SKIP_DRY_RUN=1 exec bash scripts/run_training_plan.sh all'
+    bash -c 'source "$ENV_FILE" && export MEM_MAX="$RUNNER_MEM_MAX" PYTORCH_CUDA_ALLOC_CONF && SKIP_DRY_RUN=1 exec bash scripts/run_training_plan.sh all'
 
 cat <<EOF
 

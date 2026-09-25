@@ -10,6 +10,5 @@ export CIC2017_DIR="$HOME/Documents/SIH/test/extracted_flows/TrafficLabelling /"
 export CTU_DIR=$HOME/Documents/SIH/CTU-13-Dataset
 export PYTHON=$HOME/.pyenv/versions/3.12.14/bin/python
 export LANES=2
-export MEM_MAX=10G
 export INGEST_WORKERS=8
 export PLAN_ENCODER_EXTRA="--fast_step --fast_step_level 3 --batch_planner"
