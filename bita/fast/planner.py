@@ -457,6 +457,15 @@ class BatchPlanner:
         self.n_plans += 1
         return p
 
+    def cpu_seconds(self) -> float:
+        """CPU time the planner process has used (user + system)."""
+        try:
+            with open(f"/proc/{self.proc.pid}/stat") as fh:
+                f = fh.read().rsplit(")", 1)[1].split()
+            return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+        except (OSError, AttributeError):
+            return float("nan")
+
     def close(self):
         if getattr(self, "proc", None) is None:
             return
