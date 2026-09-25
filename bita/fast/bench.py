@@ -114,6 +114,14 @@ def run(args):
     tgn.train()
     tgn.memory.__init_memory__()
     tgn.set_neighbor_finder(B["train_ngh"])
+    planner = plans = None
+    if args.planner:
+        # bita/fast/planner.py: batches, negatives and the value-independent
+        # host work computed ahead in a forked process (as train.py --batch_planner)
+        from fast.planner import BatchPlanner
+        planner = BatchPlanner(tgn, train_data, B["train_ngh"], B["train_sampler"], batch_size=args.batch_size,
+                               backprop_every=args.backprop_every, n_degree=args.n_degree)
+        plans = planner.epoch(num_batch, ec, cc)
     rec = dict(total=[], edge=[], cat=[], outputs=[], grads_first=None, norms=[])
     losslog = T.StepLossLog(args.backprop_every)
     guard_step = guard.backward_step_deferred if guard.deferred_supported() else guard.backward_step
@@ -126,16 +134,27 @@ def run(args):
                        record_shapes=False)
         prof.start()
     t_start, t_mark, mark_batch = time.time(), None, None
+    cpu_mark = None           # process CPU time, all threads (the CUDA autograd backward runs on its own thread) from t_mark: host cost of the loop
     rates = []
     for k in range(0, num_batch, args.backprop_every):
         if k >= args.warm_batches and t_mark is None:
             torch.cuda.synchronize()
             t_mark, mark_batch = time.time(), k
+            cpu_mark = time.process_time()
+            planner_cpu_mark = planner.cpu_seconds() if planner else None
         loss, cat_total = 0.0, 0.0
         optimizer.zero_grad()
         for j in range(args.backprop_every):
             bi = k + j
             if bi >= num_batch:
+                continue
+            if plans is not None:
+                bel, bcl, (pos_prob, neg_prob, logits) = tgn.fast_batch_losses(
+                    None, None, None, None, None, None, ec, cc, n_neighbors=args.n_degree, plan=plans.next(bi))
+                loss = loss + bel
+                cat_total = cat_total + bcl
+                if args.dump and bi < args.dump_outputs:
+                    rec["outputs"].append((pos_prob.detach().cpu(), neg_prob.detach().cpu(), logits.detach().cpu()))
                 continue
             s, e = bi * args.batch_size, min(num_instance, (bi + 1) * args.batch_size)
             src, dst = train_data.sources[s:e], train_data.destinations[s:e]
@@ -171,6 +190,14 @@ def run(args):
             torch.cuda.synchronize()
             rates.append((k, (k - mark_batch) / (time.time() - t_mark)))
             print(f"batch {k}: {rates[-1][1]:.2f} batch/s", flush=True)
+    cpu_end = time.process_time()
+    planner_line = ""
+    if planner is not None:
+        pc = planner.cpu_seconds()
+        planner_line = (f" planner_cpu={1e3 * (pc - planner_cpu_mark) / max(num_batch - (mark_batch or 0), 1):.3f}"
+                        f" ms/batch trainer_waited_for_plans={planner.wait_s:.2f}s")
+        plans.finish()
+        planner.close()
     guard.flush()
     torch.cuda.synchronize()
     t_end = time.time()
@@ -180,7 +207,10 @@ def run(args):
     rate = measured / (t_end - t_mark) if t_mark else float("nan")
     print(f"mode={args.mode} level={args.level} batches={num_batch} measured={measured} "
           f"rate={rate:.2f} batch/s total_wall={t_end - t_start:.1f}s "
-          f"peak_gpu_mem={torch.cuda.max_memory_allocated() / 2**20:.0f} MiB", flush=True)
+          f"peak_gpu_mem={torch.cuda.max_memory_allocated() / 2**20:.0f} MiB "
+          f"host_cpu={1e3 * (cpu_end - cpu_mark) / max(measured, 1) if cpu_mark is not None else float('nan'):.3f} ms/batch"
+          f"{planner_line}",
+          flush=True)
 
     if prof is not None:
         ka = prof.key_averages()
@@ -189,6 +219,22 @@ def run(args):
         n_kernels = sum(1 for ev in prof.events() if ev.device_type == torch.autograd.DeviceType.CUDA)
         cuda_total = sum(ev.self_device_time_total for ev in ka) / 1e3
         cpu_total = sum(ev.self_cpu_time_total for ev in ka) / 1e3
+        # GPU busy time: the union of every device event's interval (kernels
+        # and copies; overlapping streams counted once).
+        iv = sorted((ev.time_range.start, ev.time_range.end) for ev in prof.events()
+                    if ev.device_type == torch.autograd.DeviceType.CUDA
+                    and not ev.name.startswith("ProfilerStep"))   # a step annotation, not device work
+        busy, cur_s, cur_e = 0.0, None, None
+        for s0, e0 in iv:
+            if cur_e is None or s0 > cur_e:
+                if cur_e is not None:
+                    busy += cur_e - cur_s
+                cur_s, cur_e = s0, e0
+            else:
+                cur_e = max(cur_e, e0)
+        if cur_e is not None:
+            busy += cur_e - cur_s
+        print(f"GPU busy (union of device intervals) = {busy / 1e3 / (args.profile_steps * args.backprop_every):.3f} ms/batch")
         print(f"PROFILE over {args.profile_steps} optimizer steps ({args.profile_steps * args.backprop_every} batches): "
               f"device kernels={n_kernels} ({n_kernels / (args.profile_steps * args.backprop_every):.0f}/batch), "
               f"self device time={cuda_total:.1f} ms, self cpu time={cpu_total:.1f} ms")
@@ -288,6 +334,7 @@ def main():
     ap.add_argument("--profile_warm", type=int, default=2)
     ap.add_argument("--profile_steps", type=int, default=4)
     ap.add_argument("--trace")
+    ap.add_argument("--planner", action="store_true", help="plan batches ahead (bita/fast/planner.py)")
     ap.add_argument("--log_every", type=int, default=0)
     ap.add_argument("--compare", nargs=2)
     args = ap.parse_args()

@@ -121,28 +121,49 @@ def _capacity_for(n_live: int) -> int:
     return max(MIN_ROWS, int(n_live * 1.5) + min(1 << 15, MIN_ROWS))
 
 
-class MessagePool:
-    """Pending raw messages: a device row pool plus host metadata.
+class PoolMeta:
+    """The HOST bookkeeping of a MessagePool, numpy only.
 
-    Row 0 is reserved and stays zero: it is what padded positions gather, as
-    the reference padded with zeros. Node v's pending messages are pool rows
-    [start[v], start[v] + cnt[v]) in the reference's insertion order.
-    """
+    Which pool rows hold which node's pending messages, with their peers and
+    times; where the next write goes; when the pool grows or compacts. None
+    of it depends on a model value -- only on the batches written, the nodes
+    cleared and the detach points -- so the batch planner (fast/planner.py)
+    runs its own PoolMeta ahead of the trainer and computes the same row
+    layout. MessagePool is a PoolMeta plus the device rows: the device work
+    happens in the _dev_* hooks, called where the host layout changes, so
+    the two run one definition of every layout decision.
 
-    def __init__(self, n_nodes: int, width: int, device, capacity: int = None):
-        self.width = width
-        self.device = device
+    `_held` (MessagePool: overlay.active) says rows written since the last
+    detach are held with autograd history, which forbids compaction."""
+
+    def __init__(self, n_nodes: int, capacity: int = None):
         self.n_nodes = n_nodes
         self.cnt = np.zeros(n_nodes, dtype=np.int64)
         self.n_live = 0                  # == cnt.sum(), maintained incrementally
         self.start = np.zeros(n_nodes, dtype=np.int64)
+        self._held = False
         self._alloc(capacity or MIN_ROWS)
-        self.overlay = Overlay()
         self.live_row0 = self.cur        # rows >= live_row0 are in the overlay
+
+    # device hooks (no-ops here; MessagePool moves the device rows)
+    def _dev_alloc(self):
+        pass
+
+    def _dev_grow(self, cap):
+        pass
+
+    def _dev_compact(self, cap, n_live, old_rows):
+        pass
+
+    def _held_active(self) -> bool:
+        return self._held
+
+    def _release_held(self):
+        self._held = False
 
     def _alloc(self, capacity):
         self.capacity = int(capacity)
-        self.pool = torch.zeros(self.capacity, self.width, device=self.device)
+        self._dev_alloc()
         self.row_t = np.zeros(self.capacity, dtype=np.float64)
         self.row_peer = np.zeros(self.capacity, dtype=np.int64)
         self.cur = 1
@@ -159,31 +180,33 @@ class MessagePool:
         cap = self.capacity
         while cap - self.cur < need:
             cap = int(cap * 1.5) + need
-        pool = torch.zeros(cap, self.width, device=self.device)
-        pool[: self.cur] = self.pool[: self.cur]
-        self.pool = pool
+        self._dev_grow(cap)
         self.row_t = np.concatenate([self.row_t, np.zeros(cap - self.capacity)])
         self.row_peer = np.concatenate([self.row_peer, np.zeros(cap - self.capacity, np.int64)])
         self.capacity = cap
 
-    def compact(self):
-        """Keep only live rows. Only legal when no overlay chunk is held."""
-        assert not self.overlay.active
+    def live_rows(self):
+        """(nodes with pending messages, their counts, their rows in order)."""
         nodes = np.flatnonzero(self.cnt > 0)
         cnts = self.cnt[nodes]
         n_live = int(cnts.sum())
-        old_rows = np.repeat(self.start[nodes], cnts) + (
+        rows = np.repeat(self.start[nodes], cnts) + (
             np.arange(n_live) - np.repeat(np.cumsum(cnts) - cnts, cnts))
+        return nodes, cnts, rows
+
+    def compact(self):
+        """Keep only live rows. Only legal when no overlay chunk is held."""
+        assert not self._held_active()
+        nodes, cnts, old_rows = self.live_rows()
+        n_live = len(old_rows)
         cap = _capacity_for(n_live)
-        pool = torch.zeros(cap, self.width, device=self.device)
-        if n_live:
-            pool[1: 1 + n_live] = self.pool.index_select(0, upload(old_rows, self.device, torch.int64))
+        self._dev_compact(cap, n_live, old_rows)
         row_t = np.zeros(cap, np.float64)
         row_peer = np.zeros(cap, np.int64)
         row_t[1: 1 + n_live] = self.row_t[old_rows]
         row_peer[1: 1 + n_live] = self.row_peer[old_rows]
         self.start[nodes] = 1 + np.cumsum(cnts) - cnts
-        self.pool, self.row_t, self.row_peer, self.capacity = pool, row_t, row_peer, cap
+        self.row_t, self.row_peer, self.capacity = row_t, row_peer, cap
         self.cur = 1 + n_live
         self.live_row0 = self.cur
         self.n_live = n_live
@@ -193,48 +216,54 @@ class MessagePool:
         """The row order write() will use (callers may upload it early)."""
         return np.argsort(owners, kind="stable")
 
-    def write(self, owners: np.ndarray, peers: np.ndarray, times: np.ndarray, raw: torch.Tensor,
-              order: np.ndarray = None, order_g: torch.Tensor = None):
-        """Replace each owner's pending list with its rows of `raw`, in order.
+    @staticmethod
+    def write_pre(owners, peers, times, order):
+        """What write_meta derives from the batch alone (the planner computes
+        it ahead): times and peers in row order, np.unique of the owners."""
+        o_sorted = owners[order]
+        uniq, first, counts = np.unique(o_sorted, return_index=True, return_counts=True)
+        return times[order], peers[order], uniq, first, counts
 
-        `raw` rows are in the reference's append order (all source-side
-        messages, then all destination-side ones); a stable sort by owner
-        reproduces each node's list order.
-        """
+    def write_meta(self, owners, peers, times, order, pre=None) -> int:
+        """Host part of a write: make room (compact or grow), place the rows,
+        replace each owner's pending list. Returns the first row."""
         n = len(owners)
         if self.capacity - self.cur < n:
-            if not self.overlay.active and self.cur > (self.capacity >> 1):
+            if not self._held_active() and self.cur > (self.capacity >> 1):
                 self.compact()
             if self.capacity - self.cur < n:
                 self._grow(n)
-        if order is None:
-            order = self.write_order(owners)
-        if order_g is None:
-            order_g = upload(order, self.device, torch.int64)
-        o_sorted = owners[order]
+        if pre is None:
+            pre = self.write_pre(owners, peers, times, order)
+        t_sorted, p_sorted, uniq, first, counts = pre
         base = self.cur
         rows = slice(base, base + n)
-        self.row_t[rows] = times[order]
-        self.row_peer[rows] = peers[order]
-        uniq, first, counts = np.unique(o_sorted, return_index=True, return_counts=True)
+        self.row_t[rows] = t_sorted
+        self.row_peer[rows] = p_sorted
         self.start[uniq] = base + first
         self.n_live += int(counts.sum()) - int(self.cnt[uniq].sum())
         self.cnt[uniq] = counts
-        sorted_raw = raw.index_select(0, order_g)
-        with torch.no_grad():
-            self.pool[rows] = sorted_raw
-        if torch.is_grad_enabled() or self.overlay.active:
-            assert self.overlay.n == base - self.live_row0
-            self.overlay.append(sorted_raw)
         self.cur = base + n
+        return base
 
-    def clear(self, nodes: np.ndarray):
-        u = np.unique(nodes)
+    def write_host(self, owners, peers, times, grad: bool, order=None, pre=None) -> int:
+        """A write without device rows (the planner): write_meta plus
+        MessagePool.write's overlay rule (rows are held while grad is on, or
+        while rows are held)."""
+        if order is None:
+            order = self.write_order(owners)
+        base = self.write_meta(owners, peers, times, order, pre)
+        if grad or self._held:
+            self._held = True
+        return base
+
+    def clear(self, nodes: np.ndarray, uniq: np.ndarray = None):
+        u = np.unique(nodes) if uniq is None else uniq
         self.n_live -= int(self.cnt[u].sum())
         self.cnt[u] = 0
 
     def detach(self):
-        self.overlay.clear()
+        self._release_held()
         self.live_row0 = self.cur
         # Dead rows (consumed or superseded lists) are reclaimed here, at a
         # group boundary, where no overlay row is referenced by position. Once
@@ -244,6 +273,70 @@ class MessagePool:
         dead = self.cur - 1 - self.n_live
         if dead > max(self.n_live // 2, MIN_ROWS // 2):
             self.compact()
+
+    def state_check(self):
+        """What a plan records to prove the planner's pool is the trainer's."""
+        return (int(self.cur), int(self.n_live), int(self.capacity), int(self.live_row0))
+
+
+class MessagePool(PoolMeta):
+    """Pending raw messages: a device row pool plus host metadata (PoolMeta).
+
+    Row 0 is reserved and stays zero: it is what padded positions gather, as
+    the reference padded with zeros. Node v's pending messages are pool rows
+    [start[v], start[v] + cnt[v]) in the reference's insertion order.
+    """
+
+    def __init__(self, n_nodes: int, width: int, device, capacity: int = None):
+        self.width = width
+        self.device = device
+        self.overlay = Overlay()
+        super().__init__(n_nodes, capacity)
+
+    # ------------------------------------------------------ device hooks
+    def _dev_alloc(self):
+        self.pool = torch.zeros(self.capacity, self.width, device=self.device)
+
+    def _dev_grow(self, cap):
+        pool = torch.zeros(cap, self.width, device=self.device)
+        pool[: self.cur] = self.pool[: self.cur]
+        self.pool = pool
+
+    def _dev_compact(self, cap, n_live, old_rows):
+        pool = torch.zeros(cap, self.width, device=self.device)
+        if n_live:
+            pool[1: 1 + n_live] = self.pool.index_select(0, upload(old_rows, self.device, torch.int64))
+        self.pool = pool
+
+    def _held_active(self) -> bool:
+        return self.overlay.active
+
+    def _release_held(self):
+        self.overlay.clear()
+
+    # --------------------------------------------------------------- write
+    def write(self, owners: np.ndarray, peers: np.ndarray, times: np.ndarray, raw: torch.Tensor,
+              order: np.ndarray = None, order_g: torch.Tensor = None, pre=None):
+        """Replace each owner's pending list with its rows of `raw`, in order.
+
+        `raw` rows are in the reference's append order (all source-side
+        messages, then all destination-side ones); a stable sort by owner
+        reproduces each node's list order. `pre` is PoolMeta.write_pre's
+        result when the batch planner computed it.
+        """
+        n = len(owners)
+        if order is None:
+            order = self.write_order(owners)
+        base = self.write_meta(owners, peers, times, order, pre)
+        if order_g is None:
+            order_g = upload(order, self.device, torch.int64)
+        rows = slice(base, base + n)
+        sorted_raw = raw.index_select(0, order_g)
+        with torch.no_grad():
+            self.pool[rows] = sorted_raw
+        if torch.is_grad_enabled() or self.overlay.active:
+            assert self.overlay.n == base - self.live_row0
+            self.overlay.append(sorted_raw)
 
     # ---------------------------------------------------------------- read
     def gather(self, rows: np.ndarray, rows_g: torch.Tensor = None) -> torch.Tensor:
@@ -266,11 +359,8 @@ class MessagePool:
 
     # ---------------------------------------------------------- snapshots
     def snapshot(self):
-        nodes = np.flatnonzero(self.cnt > 0)
-        cnts = self.cnt[nodes]
-        n_live = int(cnts.sum())
-        rows = np.repeat(self.start[nodes], cnts) + (
-            np.arange(n_live) - np.repeat(np.cumsum(cnts) - cnts, cnts))
+        nodes, cnts, rows = self.live_rows()
+        n_live = len(rows)
         data = self.pool.index_select(0, upload(rows, self.device, torch.int64)).detach().clone() \
             if n_live else torch.zeros(0, self.width, device=self.device)
         return dict(nodes=nodes, cnts=cnts, data=data, t=self.row_t[rows].copy(),
