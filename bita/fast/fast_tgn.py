@@ -17,6 +17,7 @@ from torch.nn.utils.rnn import PackedSequence
 
 from modules.memory import Memory
 from fast.store import MemoryOverlay, MessagePool, upload, upload_many
+from fast.plan_host import bita_group, nbr_block
 
 
 # ------------------------------------------------------------------ memory
@@ -152,6 +153,34 @@ class _Batch:
         else:
             self.ef = torch.zeros((B, model.n_edge_features), device=dev)
         self.cache = {}
+        self.plan = None
+
+    @classmethod
+    def from_plan(cls, model, plan):
+        """The same attributes from a batch plan (fast/planner.py): host views
+        of the planned arrays, device views of its one uploaded buffer."""
+        bt = cls.__new__(cls)
+        h, d = plan.h, plan.d
+        bt.B = B = plan.B
+        ints = h["b_ints"]
+        bt.nodes = ints[: 3 * B]
+        bt.pos = bt.nodes[: 2 * B]
+        bt.write_order = ints[4 * B:]
+        g = d["b_ints"]
+        bt.nodes_g = g[: 3 * B]
+        bt.pos_g = g[: 2 * B]
+        bt.src_g, bt.dst_g = g[:B], g[B: 2 * B]
+        bt.eidx_g = g[3 * B: 4 * B]
+        bt.write_order_g = g[4 * B:]
+        if "b_ef" in d:
+            bt.ef = d["b_ef"]
+        elif model.edge_raw_features is not None:
+            bt.ef = model.edge_raw_features[bt.eidx_g]
+        else:
+            bt.ef = torch.zeros((B, model.n_edge_features), device=model.device)
+        bt.cache = {}
+        bt.plan = plan
+        return bt
 
 
 # ------------------------------------------------- stable-shape regions
@@ -180,83 +209,68 @@ class FastTGNMixin:
     """Mixed in front of TGN/ExtendedTGN by enable_fast_tgn()."""
 
     # ------------------------------------------------------------- BiTA
-    def _fast_bita(self, nodes_np):
+    def _fast_bita(self, nodes_np, plan=None):
         """BiTAAggregator.aggregate for the nodes in `nodes_np` with pending
-        messages: host-side grouping, one device gather, then the reference's
-        own module calls. Returns (to_update, h_bar, node_timestamps) or None.
+        messages: host-side grouping (fast/plan_host.bita_group, or the batch
+        plan's), one device gather, then the reference's own module calls.
+        Returns (to_update, h_bar, node_timestamps) or None.
         """
         agg = self.message_aggregator
         mem: FastMemory = self.memory
         pool = mem._pool
         dev = self.device
-        cand = np.unique(nodes_np)
-        to_update = cand[pool.cnt[cand] > 0]
-        n_nodes = len(to_update)
-        if n_nodes == 0:
-            return None
-        cnts = pool.cnt[to_update]
-        R = int(cnts.sum())
-        seg0 = np.cumsum(cnts) - cnts
-        node_pos = np.repeat(np.arange(n_nodes), cnts)
-        ins = np.arange(R) - np.repeat(seg0, cnts)
-        rows = np.repeat(pool.start[to_update], cnts) + ins          # insertion order
-        peer = pool.row_peer[rows]
-        t = pool.row_t[rows]
-        # Latest message time per node, over ALL its pending messages.
-        node_ts = np.maximum.reduceat(t, seg0)
-
-        # Edges in the reference's order: node ascending (np.unique), then
-        # peers in order of first appearance in the node's list (dict order).
-        o = np.lexsort((ins, peer, node_pos))
-        new_grp = np.ones(R, dtype=bool)
-        new_grp[1:] = (node_pos[o][1:] != node_pos[o][:-1]) | (peer[o][1:] != peer[o][:-1])
-        gid = np.cumsum(new_grp) - 1
-        first_ins = np.empty(R, dtype=np.int64)
-        first_ins[o] = ins[o][new_grp][gid]
-        # Within an edge: `sorted(seq, key=time)`, which is stable.
-        f = np.lexsort((ins, t, first_ins, node_pos))
-        np_f, fi_f = node_pos[f], first_ins[f]
-        new_e = np.ones(R, dtype=bool)
-        new_e[1:] = (np_f[1:] != np_f[:-1]) | (fi_f[1:] != fi_f[:-1])
-        eid = np.cumsum(new_e) - 1
-        estart = np.flatnonzero(new_e)
-        E = len(estart)
-        elen = np.diff(np.append(estart, R))
-        pos_in_e = np.arange(R) - estart[eid]
-        drop = np.maximum(elen - agg.max_seq_len, 0)                  # keep the last max_seq_len
-        keep = pos_in_e >= drop[eid]
-        klen = elen - drop
-        col = (pos_in_e - drop[eid])[keep]
-        L = int(klen.max())
-        idx = np.zeros((E, L), dtype=np.int64)                        # pool row 0 is all zeros
-        idx[eid[keep], col] = rows[f][keep]
-        times = np.zeros((E, L), dtype=np.float64)
-        times[eid[keep], col] = t[f][keep]
-        last_t = times[np.arange(E), klen - 1]
-        valid = np.arange(L)[None, :] < klen[:, None]
-        dt = ((np.maximum(last_t[:, None] - times, 0.0)) * valid).astype(np.float32)
-        owner = np_f[new_e]
-        counts = np.bincount(owner, minlength=n_nodes).astype(np.float32)
-
-        if getattr(self, "_bita_graph_on", False) and L <= _BITA_GRAPH_MAX_L:
-            return self._fast_bita_graphed(to_update, E, L, idx, klen, dt, last_t, owner, counts, node_ts)
-
-        level1 = self._fast_level < 2
+        graph_on = getattr(self, "_bita_graph_on", False)
+        planned = None
+        if plan is not None:
+            from fast.planner import VAR_NONE, VAR_EAGER, VAR_GRAPH, VAR_HOST
+            if plan.variant == VAR_NONE:
+                return None
+            E, L = plan.E, plan.L
+            want = VAR_HOST if self._fast_level < 2 else (
+                VAR_GRAPH if graph_on and L <= _BITA_GRAPH_MAX_L else VAR_EAGER)
+            if plan.variant != want:
+                raise RuntimeError(f"batch plan: BiTA layout {plan.variant}, this step needs {want}")
+            if want == VAR_GRAPH:
+                return self._fast_bita_graphed(None, E, L, None, None, None, None, None, None, None, planned=plan)
+            h = plan.h
+            if want == VAR_HOST:
+                res = (h["h_to_update"], E, L, h["h_idx"], h["h_klen"], h["h_dt"], h["h_last_t"],
+                       h["h_owner"], h["h_counts"], h["h_node_ts"])
+            else:
+                planned = plan
+        else:
+            res = bita_group(pool, nodes_np, agg.max_seq_len)
+            if res is None:
+                return None
+        C = agg.context_size
+        if planned is not None:
+            h, d = planned.h, planned.d
+            n_nodes = planned.n_upd
+            to_update, node_ts, idx = h["g_ints"][E:], h["g_f64"][E:], h["g_idx"]
+            level1 = False
+            n_groups = (E + C - 1) // C
+            ints, idx_g, lens_g, f32, f64, pad = d["g_ints"], d["g_idx"], d["g_lens"], d["g_f32"], d["g_f64"], d["g_pad"]
+        else:
+            to_update, E, L, idx, klen, dt, last_t, owner, counts, node_ts = res
+            n_nodes = len(to_update)
+            if graph_on and L <= _BITA_GRAPH_MAX_L:
+                return self._fast_bita_graphed(to_update, E, L, idx, klen, dt, last_t, owner, counts, node_ts)
+            level1 = self._fast_level < 2
         if level1:
             lengths = torch.tensor(klen, dtype=torch.long)
             lengths_sorted, sorted_idx = torch.sort(lengths, descending=True)   # as pack_padded_sequence
             unsorted_idx = torch.empty_like(sorted_idx)
             unsorted_idx[sorted_idx] = torch.arange(E)
             perm = np.concatenate([sorted_idx.numpy(), unsorted_idx.numpy()])
-        else:
+        elif planned is None:
             perm = np.zeros(0, np.int64)
-        C = agg.context_size
-        n_groups = (E + C - 1) // C
-        pad_np = np.ones(n_groups * C, dtype=bool)
-        pad_np[:E] = False
-        ints, idx_g, lens_g, f32, f64, pad = upload_many(
-            dev, np.concatenate([owner, to_update, perm]), idx, klen.astype(np.int32),
-            np.concatenate([dt.reshape(-1), counts]), np.concatenate([last_t, node_ts]), pad_np)
+        if planned is None:
+            n_groups = (E + C - 1) // C
+            pad_np = np.ones(n_groups * C, dtype=bool)
+            pad_np[:E] = False
+            ints, idx_g, lens_g, f32, f64, pad = upload_many(
+                dev, np.concatenate([owner, to_update, perm]), idx, klen.astype(np.int32),
+                np.concatenate([dt.reshape(-1), counts]), np.concatenate([last_t, node_ts]), pad_np)
         owner_g = ints[:E]
         to_update_g = ints[E: E + n_nodes]
         if level1:
@@ -291,9 +305,9 @@ class FastTGNMixin:
         h_bar = summed / counts_g.unsqueeze(1)
         return to_update, to_update_g, h_bar, node_ts, node_ts_g
 
-    def _fast_update_memory(self, nodes_np):
+    def _fast_update_memory(self, nodes_np, plan=None):
         mem: FastMemory = self.memory
-        res = self._fast_bita(nodes_np)
+        res = self._fast_bita(nodes_np, plan)
         if res is None:
             return
         if res[0] is _GRAPHED:              # level 4: the region already applied the memory updater
@@ -311,7 +325,7 @@ class FastTGNMixin:
         mem.fast_write(to_update, to_update_g, updated)
 
     # ------------------------------------------- BiTA as a graph (level 4)
-    def _fast_bita_graphed(self, to_update, E, L, idx, klen, dt, last_t, owner, counts, node_ts):
+    def _fast_bita_graphed(self, to_update, E, L, idx, klen, dt, last_t, owner, counts, node_ts, planned=None):
         """BiTA + the GRU memory updater for one batch as a replayed graph,
         on shapes padded to a few buckets:
 
@@ -332,27 +346,32 @@ class FastTGNMixin:
         mem: FastMemory = self.memory
         agg = self.message_aggregator
         dev = self.device
-        n_nodes = len(to_update)
-        assert (mem._lu[to_update] <= node_ts).all(), "Trying to update memory to time in the past"
         C = agg.context_size
         n_groups = (E + C - 1) // C
         E_pad = n_groups * C
         L_pad = max(8, 1 << (L - 1).bit_length())
         N_pad = 2 * self._graph_batch + 1
+        if planned is not None:
+            h, d = planned.h, planned.d
+            to_update, node_ts, idx_p = h["g_ints"][E_pad:], h["g_f64"][E:], h["g_idx"]
+            ints, idx_g, lens_g, f32, f64 = d["g_ints"], d["g_idx"], d["g_lens"], d["g_f32"], d["g_f64"]
+        n_nodes = len(to_update)
+        assert (mem._lu[to_update] <= node_ts).all(), "Trying to update memory to time in the past"
         assert n_nodes < N_pad
-        idx_p = np.zeros((E_pad, L_pad), np.int64)
-        idx_p[:E, :L] = idx
-        dt_p = np.zeros((E_pad, L_pad), np.float32)
-        dt_p[:E, :L] = dt
-        lens_p = np.zeros(E_pad, np.int32)
-        lens_p[:E] = klen
-        owner_p = np.full(E_pad, N_pad - 1, np.int64)
-        owner_p[:E] = owner
-        counts_p = np.ones(N_pad, np.float32)
-        counts_p[:n_nodes] = counts
-        ints, idx_g, lens_g, f32, f64 = upload_many(
-            dev, np.concatenate([owner_p, to_update]), idx_p, lens_p,
-            np.concatenate([dt_p.reshape(-1), counts_p]), np.concatenate([last_t, node_ts]))
+        if planned is None:
+            idx_p = np.zeros((E_pad, L_pad), np.int64)
+            idx_p[:E, :L] = idx
+            dt_p = np.zeros((E_pad, L_pad), np.float32)
+            dt_p[:E, :L] = dt
+            lens_p = np.zeros(E_pad, np.int32)
+            lens_p[:E] = klen
+            owner_p = np.full(E_pad, N_pad - 1, np.int64)
+            owner_p[:E] = owner
+            counts_p = np.ones(N_pad, np.float32)
+            counts_p[:n_nodes] = counts
+            ints, idx_g, lens_g, f32, f64 = upload_many(
+                dev, np.concatenate([owner_p, to_update]), idx_p, lens_p,
+                np.concatenate([dt_p.reshape(-1), counts_p]), np.concatenate([last_t, node_ts]))
         owner_g = ints[:E_pad]
         to_update_g = ints[E_pad:]
         dt_g = f32[: E_pad * L_pad].view(E_pad, L_pad)
@@ -414,8 +433,11 @@ class FastTGNMixin:
         mem: FastMemory = self.memory
         B = bt.B
         m = mem.fast_read(bt.pos, bt.pos_g)
-        lu = mem._lu[bt.pos]
-        delta, = upload_many(self.device, np.where(lu > 0, bt.ts2 - lu, 0.0).astype(np.float32))
+        if bt.plan is not None:
+            delta = bt.plan.d["delta"]
+        else:
+            lu = mem._lu[bt.pos]
+            delta, = upload_many(self.device, np.where(lu > 0, bt.ts2 - lu, 0.0).astype(np.float32))
         te_s = self.time_encoder(delta[:B].unsqueeze(1)).view(B, -1)
         te_d = self.time_encoder(delta[B:].unsqueeze(1)).view(B, -1)
         src_msg = torch.cat([m[:B], m[B:], bt.ef, te_s], dim=1)
@@ -465,25 +487,22 @@ class FastTGNMixin:
         if "nbr" not in c or c["n_neighbors"] != n_neighbors:
             for key in ("nf_src", "src_time", "ef_n_host"):
                 c.pop(key, None)
-            neighbors, edge_idxs, edge_times = em.neighbor_finder.get_temporal_neighbor(
-                bt.nodes, bt.ts3, n_neighbors=n_neighbors)
-            deltas = (bt.ts3[:, None] - edge_times).astype(np.float32)
-            mask = neighbors == 0
-            invalid = mask.all(axis=1, keepdims=True)
-            mask_fixed = mask.copy()
-            mask_fixed[invalid[:, 0], 0] = False
-            nbr = neighbors.reshape(-1).astype(np.int64)
             n = len(bt.nodes)
-            all_nodes = np.concatenate([bt.nodes, nbr])
-            host_edges = _host_edge_array(em.edge_features)
-            extra = () if host_edges is None else (
-                np.take(host_edges, edge_idxs.astype(np.int64), axis=0),)
-            ints, deltas_g, mask_g, invalid_g, *ef_n = upload_many(
-                dev, np.concatenate([all_nodes, edge_idxs.reshape(-1).astype(np.int64)]),
-                deltas, mask_fixed, invalid, *extra)
-            c.update(n_neighbors=n_neighbors, nbr=nbr, all_nodes=all_nodes,
-                     all_g=ints[: all_nodes.size], nbr_g=ints[n: all_nodes.size],
-                     eidx_n_g=ints[all_nodes.size:].view(n, -1),
+            m = n + n * n_neighbors                       # [nodes ; neighbours]
+            plan = bt.plan
+            if plan is not None and plan.k == n_neighbors:
+                ints_h, d = plan.h["n_ints"], plan.d
+                ints, deltas_g, mask_g, invalid_g = d["n_ints"], d["n_deltas"], d["n_mask"], d["n_invalid"]
+                ef_n = [d["n_ef"]] if "n_ef" in d else []
+            else:
+                host_edges = _host_edge_array(em.edge_features)
+                ints_h, deltas, mask_fixed, invalid, ef_n_h = nbr_block(
+                    em.neighbor_finder, bt.nodes, bt.ts3, n_neighbors, host_edges)
+                extra = () if ef_n_h is None else (ef_n_h,)
+                ints, deltas_g, mask_g, invalid_g, *ef_n = upload_many(
+                    dev, ints_h, deltas, mask_fixed, invalid, *extra)
+            c.update(n_neighbors=n_neighbors, nbr=ints_h[n:m], all_nodes=ints_h[:m],
+                     all_g=ints[:m], nbr_g=ints[n:m], eidx_n_g=ints[m:].view(n, -1),
                      deltas_g=deltas_g, mask_g=mask_g, invalid_g=invalid_g)
             if ef_n:
                 c["ef_n_host"] = ef_n[0]
@@ -509,12 +528,33 @@ class FastTGNMixin:
         return cache[name]
 
     # ------------------------------------------------------------- steps
+    def _fast_store(self, bt: _Batch):
+        """clear_messages(pos), then store this batch's messages."""
+        pool = self.memory._pool
+        plan = bt.plan
+        if plan is None:
+            self.memory.clear_messages(bt.pos)
+            pool.write(bt.pos, bt.peers, bt.ts2, self._fast_raw_messages(bt),
+                       order=bt.write_order, order_g=bt.write_order_g)
+            return
+        h = plan.h
+        pool.clear(bt.pos, uniq=h["uniq"])
+        pool.write(bt.pos, None, None, self._fast_raw_messages(bt), order=bt.write_order,
+                   order_g=bt.write_order_g, pre=(h["t_sorted"], h["p_sorted"], h["uniq"], h["first"], h["counts"]))
+
+    def _check_plan(self, plan):
+        got = self.memory._pool.state_check()
+        if got != tuple(plan.state):
+            raise RuntimeError(f"batch plan {plan.batch}: the planner's message pool {tuple(plan.state)} "
+                               f"is not the trainer's {got} (cur, n_live, capacity, live_row0); "
+                               "the plan would address the wrong rows")
+
     def _fast_cte(self, bt: _Batch, n_neighbors):
         B = bt.B
-        self._fast_update_memory(bt.pos)
-        self.memory.clear_messages(bt.pos)
-        self.memory._pool.write(bt.pos, bt.peers, bt.ts2, self._fast_raw_messages(bt),
-                                order=bt.write_order, order_g=bt.write_order_g)
+        if bt.plan is not None:
+            self._check_plan(bt.plan)
+        self._fast_update_memory(bt.pos, bt.plan)
+        self._fast_store(bt)
         emb = self._fast_embedding(bt, n_neighbors)
         return emb[:B], emb[B: 2 * B], emb[2 * B:]
 
@@ -555,7 +595,7 @@ class FastTGNMixin:
 
     # ------------------------------------------------- training losses
     def fast_batch_losses(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs,
-                          labels, edge_criterion, category_criterion, n_neighbors=20):
+                          labels, edge_criterion, category_criterion, n_neighbors=20, plan=None):
         """One training batch's (edge loss, category loss, (pos_prob, neg_prob,
         category_logits)), computed exactly as bita/train.py computes them from
         compute_edge_probabilities_and_categories:
@@ -565,8 +605,17 @@ class FastTGNMixin:
         Level 3 runs the fixed-shape part (graph-attention embedding, both
         heads, both losses) as a replayed CUDA graph (bita/fast/graphs.py);
         every other case runs it eagerly. The returned probabilities/logits
-        are read-only and valid until the next batch in the same slot."""
-        bt = _Batch(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs)
+        are read-only and valid until the next batch in the same slot.
+
+        `plan` (fast/planner.py) replaces the batch arrays, the labels and
+        every value-independent host computation; the batch arguments are
+        then ignored (pass None)."""
+        if plan is not None:
+            bt = _Batch.from_plan(self, plan)
+            labels_g = plan.d["labels"]
+        else:
+            bt = _Batch(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs)
+            labels_g = None
         dev = self.device
         B = bt.B
         region = self._graph_region_ok(bt, edge_criterion, category_criterion)
@@ -582,22 +631,25 @@ class FastTGNMixin:
             pos_label = torch.ones(B, dtype=torch.float, device=dev)
             neg_label = torch.zeros(B, dtype=torch.float, device=dev)
             edge_loss = edge_criterion(pos.squeeze(-1), pos_label) + edge_criterion(neg.squeeze(-1), neg_label)
-            cat_loss = category_criterion(logits, upload(np.asarray(labels), dev, torch.long))
+            if labels_g is None:
+                labels_g = upload(np.asarray(labels), dev, torch.long)
+            cat_loss = category_criterion(logits, labels_g)
             return edge_loss, cat_loss, (pos, neg, logits)
         # memory update + message store exactly as _fast_cte, then the region
+        if plan is not None:
+            self._check_plan(plan)
         self._bita_graph_on = self._fast_level >= 4
         try:
-            self._fast_update_memory(bt.pos)
+            self._fast_update_memory(bt.pos, plan)
         finally:
             self._bita_graph_on = False
-        self.memory.clear_messages(bt.pos)
-        self.memory._pool.write(bt.pos, bt.peers, bt.ts2, self._fast_raw_messages(bt),
-                                order=bt.write_order, order_g=bt.write_order_g)
+        self._fast_store(bt)
         c = self._fast_nbr(bt, n_neighbors)
         rows = self.memory.fast_read(c["all_nodes"], c["all_g"])
         host = "ef_n_host" in c
-        inputs = (rows, bt.nodes_g, c["nbr_g"], c["deltas_g"], c["mask_g"], c["invalid_g"],
-                  upload(np.asarray(labels), dev, torch.long),
+        if labels_g is None:
+            labels_g = upload(np.asarray(labels), dev, torch.long)
+        inputs = (rows, bt.nodes_g, c["nbr_g"], c["deltas_g"], c["mask_g"], c["invalid_g"], labels_g,
                   bt.ef if host else bt.eidx_g, c["ef_n_host"] if host else c["eidx_n_g"])
         slot = self._graph_slot((B, n_neighbors, host), region, inputs)
         pos, neg, logits, edge_loss, cat_loss = slot(*inputs)
