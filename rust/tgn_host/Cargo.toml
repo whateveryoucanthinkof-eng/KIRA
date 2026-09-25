@@ -1,0 +1,18 @@
+[package]
+name = "tgn_host"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side hot loops of the TGN training step, bit-exact with their numpy versions (bita/utils/tgn_host.py)"
+
+# No dependencies on purpose: a plain C-ABI cdylib that bita/utils/tgn_host.py
+# loads with ctypes. Nothing to install on the Python side.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

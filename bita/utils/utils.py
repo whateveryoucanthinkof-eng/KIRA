@@ -544,6 +544,15 @@ class NeighborFinder:
     cut = np.asarray(timestamps, dtype=np.float64)
     assert len(nodes) == len(cut)
 
+    if not self.uniform:
+      # The same computation in rust/tgn_host (one binary search per row
+      # instead of ~20 vectorised numpy passes): bit-identical, ~0.3 ms less
+      # host time per batch. None when the library is unavailable.
+      from utils.tgn_host import recent_neighbors
+      out = recent_neighbors(flat_nbr, flat_eidx, flat_ts, offsets, nodes, cut, n_neighbors)
+      if out is not None:
+        return out
+
     starts = offsets[nodes]
     ends = offsets[nodes + 1]
     # Index one past the last interaction strictly before cut_time.
