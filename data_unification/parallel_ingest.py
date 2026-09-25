@@ -468,11 +468,25 @@ def _code_hash_worker(repo: str) -> Tuple[str, List[str]]:
 
 
 def parse_code_hash() -> Tuple[str, List[str]]:
-    """(hash, files) of the parsing code, measured in a clean spawn process so
-    whatever the caller happens to have imported does not leak in."""
+    """(hash, files) of the parsing code, measured in a FRESH interpreter.
+
+    Not a multiprocessing spawn: a spawned child re-imports the caller's main
+    script, so called from bita/train.py the hash covered train.py and all it
+    imports, and never matched the key the warm stage wrote (the encoder would
+    silently re-parse everything). `python -c` imports nothing but the parse
+    chain, whoever calls it; tests/test_ingest_cache.py pins that.
+    """
+    import subprocess
+    import sys
     repo = os.path.realpath(str(Path(__file__).resolve().parents[1]))
-    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as ex:
-        return ex.submit(_code_hash_worker, repo).result()
+    code = ("import json, sys; sys.path.insert(0, %r); "
+            "from data_unification.parallel_ingest import _code_hash_worker as w; "
+            "print(json.dumps(w(%r)))" % (repo, repo))
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    out = subprocess.run([sys.executable, "-c", code], cwd=repo, env=env,
+                         capture_output=True, text=True, check=True).stdout
+    h, files = json.loads(out.strip().splitlines()[-1])
+    return h, files
 
 
 def _input_fingerprint(kind: str, path: str, pcap_label_dir: Optional[str]) -> list:

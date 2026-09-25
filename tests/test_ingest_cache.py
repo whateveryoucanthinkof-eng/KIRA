@@ -156,3 +156,24 @@ def test_code_hash_ignores_modules_with_relative_file(monkeypatch):
     repo = str(Path(__file__).resolve().parents[1])
     h, files = pi._code_hash_worker(repo)
     assert "_classes.py" not in files and h
+
+
+def test_code_hash_is_the_same_whoever_calls_it(tmp_path):
+    """Called from bita/train.py, a spawn-based hash re-imported train.py and
+    hashed it too, so the encoder's keys never matched the warm stage's."""
+    import subprocess
+    import sys
+    repo = Path(__file__).resolve().parents[1]
+    caller = tmp_path / "caller_main.py"
+    caller.write_text(
+        "import sys, json\n"
+        f"sys.path[:0] = [{str(repo)!r}, {str(repo / 'bita')!r}]\n"
+        "import bita.train  # a heavy main script with many repo imports\n"
+        "from data_unification.parallel_ingest import parse_code_hash\n"
+        "print(json.dumps(parse_code_hash()))\n")
+    out = subprocess.run([sys.executable, str(caller)], capture_output=True, text=True,
+                         check=True, cwd=str(repo)).stdout.strip().splitlines()[-1]
+    h_train, files_train = json.loads(out)
+    h_here, files_here = pi.parse_code_hash()
+    assert h_train == h_here
+    assert not any(f.startswith(("bita/", "scripts/")) for f in files_train)
