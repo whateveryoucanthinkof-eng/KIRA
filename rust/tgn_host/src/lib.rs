@@ -7,6 +7,11 @@
 //! version emulates), then the n most recent interactions right-aligned, zeros
 //! where there are fewer. Pure integer/copy work: the output equals the numpy
 //! version bit for bit (tests/test_tgn_host_rust.py).
+//!
+//! `plan` holds the batch planner's kernels (BiTA grouping, the neighbour
+//! block); see plan.rs.
+
+pub mod plan;
 
 /// Returns 0 on success, -1 if a node id is outside the offsets table.
 ///

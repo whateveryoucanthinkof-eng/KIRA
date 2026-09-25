@@ -126,11 +126,13 @@ def run(args):
                        record_shapes=False)
         prof.start()
     t_start, t_mark, mark_batch = time.time(), None, None
+    cpu_mark = None           # process CPU time, all threads (the CUDA autograd backward runs on its own thread) from t_mark: host cost of the loop
     rates = []
     for k in range(0, num_batch, args.backprop_every):
         if k >= args.warm_batches and t_mark is None:
             torch.cuda.synchronize()
             t_mark, mark_batch = time.time(), k
+            cpu_mark = time.process_time()
         loss, cat_total = 0.0, 0.0
         optimizer.zero_grad()
         for j in range(args.backprop_every):
@@ -171,6 +173,7 @@ def run(args):
             torch.cuda.synchronize()
             rates.append((k, (k - mark_batch) / (time.time() - t_mark)))
             print(f"batch {k}: {rates[-1][1]:.2f} batch/s", flush=True)
+    cpu_end = time.process_time()
     guard.flush()
     torch.cuda.synchronize()
     t_end = time.time()
@@ -180,7 +183,9 @@ def run(args):
     rate = measured / (t_end - t_mark) if t_mark else float("nan")
     print(f"mode={args.mode} level={args.level} batches={num_batch} measured={measured} "
           f"rate={rate:.2f} batch/s total_wall={t_end - t_start:.1f}s "
-          f"peak_gpu_mem={torch.cuda.max_memory_allocated() / 2**20:.0f} MiB", flush=True)
+          f"peak_gpu_mem={torch.cuda.max_memory_allocated() / 2**20:.0f} MiB "
+          f"host_cpu={1e3 * (cpu_end - cpu_mark) / max(measured, 1) if cpu_mark is not None else float('nan'):.3f} ms/batch",
+          flush=True)
 
     if prof is not None:
         ka = prof.key_averages()
@@ -189,6 +194,22 @@ def run(args):
         n_kernels = sum(1 for ev in prof.events() if ev.device_type == torch.autograd.DeviceType.CUDA)
         cuda_total = sum(ev.self_device_time_total for ev in ka) / 1e3
         cpu_total = sum(ev.self_cpu_time_total for ev in ka) / 1e3
+        # GPU busy time: the union of every device event's interval (kernels
+        # and copies; overlapping streams counted once).
+        iv = sorted((ev.time_range.start, ev.time_range.end) for ev in prof.events()
+                    if ev.device_type == torch.autograd.DeviceType.CUDA
+                    and not ev.name.startswith("ProfilerStep"))   # a step annotation, not device work
+        busy, cur_s, cur_e = 0.0, None, None
+        for s0, e0 in iv:
+            if cur_e is None or s0 > cur_e:
+                if cur_e is not None:
+                    busy += cur_e - cur_s
+                cur_s, cur_e = s0, e0
+            else:
+                cur_e = max(cur_e, e0)
+        if cur_e is not None:
+            busy += cur_e - cur_s
+        print(f"GPU busy (union of device intervals) = {busy / 1e3 / (args.profile_steps * args.backprop_every):.3f} ms/batch")
         print(f"PROFILE over {args.profile_steps} optimizer steps ({args.profile_steps * args.backprop_every} batches): "
               f"device kernels={n_kernels} ({n_kernels / (args.profile_steps * args.backprop_every):.0f}/batch), "
               f"self device time={cuda_total:.1f} ms, self cpu time={cpu_total:.1f} ms")
