@@ -449,9 +449,13 @@ def _code_hash_worker(repo: str) -> Tuple[str, List[str]]:
     import sys
     for m in _PARSE_ENTRY_MODULES:
         importlib.import_module(m)
-    files = sorted({os.path.realpath(mod.__file__) for mod in list(sys.modules.values())
-                    if getattr(mod, "__file__", None)
-                    and os.path.realpath(mod.__file__).startswith(repo + os.sep)})
+    # Absolute, existing files only: some extension modules carry a bare
+    # relative __file__ (torch._classes has "_classes.py"), which realpath
+    # would resolve against the cwd -- i.e. into the repo -- as a phantom file.
+    files = sorted({os.path.realpath(f) for f in
+                    (getattr(mod, "__file__", None) for mod in list(sys.modules.values()))
+                    if f and os.path.isabs(f) and os.path.isfile(f)
+                    and os.path.realpath(f).startswith(repo + os.sep)})
     # The Rust PCAP parser is not a Python module; its sources and the glue
     # module (loaded by path) are hashed explicitly.
     files += [os.path.realpath(f) for f in _pcap_fast_sources()]

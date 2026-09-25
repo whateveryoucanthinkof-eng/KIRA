@@ -142,3 +142,17 @@ def test_cached_parts_survive_loading(corpus, tmp_path):
     n_files = sum(1 for _ in Path(cache).rglob("*.npy"))
     _load(corpus, 4, cache=str(cache))
     assert sum(1 for _ in Path(cache).rglob("*.npy")) == n_files
+
+
+def test_code_hash_ignores_modules_with_relative_file(monkeypatch):
+    """torch._classes has __file__ == "_classes.py"; resolved against the cwd
+    (the repo) it was taken for a repo module and the hash crashed."""
+    import sys
+    import types
+    fake = types.ModuleType("fake_relative")
+    fake.__file__ = "_classes.py"
+    monkeypatch.setitem(sys.modules, "fake_relative", fake)
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    repo = str(Path(__file__).resolve().parents[1])
+    h, files = pi._code_hash_worker(repo)
+    assert "_classes.py" not in files and h

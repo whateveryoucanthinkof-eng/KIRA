@@ -261,7 +261,7 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=None, help="work directory (default: a temp dir)")
     ap.add_argument("--keep", action="store_true", help="keep the corpus and outputs")
     ap.add_argument("--epochs", type=int, default=2)
-    ap.add_argument("--stages", default="preflight,compare,seeds,downstream,summary")
+    ap.add_argument("--stages", default="preflight,warm,train,summary")
     a = ap.parse_args()
 
     work = a.out or Path(tempfile.mkdtemp(prefix="cyberworld_dryrun_"))
@@ -287,6 +287,8 @@ def main() -> int:
         # synthetic traffic, or its code path would go untested.
         "PLAN_DOWNSTREAM_EXTRA": f"--epochs {a.epochs} --allow-noncredible-branch-b",
         "MIN_FREE_GB": "1",
+        # Its own cache: synthetic captures must never land in the real one.
+        "INGEST_CACHE": (out / ".ingest_cache").as_posix(),
     })
     if not shutil.which("systemd-run"):
         env["ALLOW_UNCAPPED"] = "1"
