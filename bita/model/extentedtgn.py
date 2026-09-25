@@ -154,7 +154,13 @@ class ExtendedTGN(TGN):
         memory = None
         time_diffs = None
         if self.use_memory:
-            memory = self.memory.get_memory(list(range(self.n_nodes)))
+            # Every row, as a differentiable copy. This was get_memory(list(range(n_nodes))):
+            # a Python list of EVERY node id built and converted on every batch --
+            # ~3M ints per batch at a third of the PCAP corpus, which made the step
+            # O(nodes) and ran training at ~1 batch/s. clone() gives the same values
+            # and the same gradient (an all-rows gather backpropagates as a scatter-add
+            # into zeros); tests/test_memory_full_read_is_clone.py pins both.
+            memory = self.memory.memory.clone()
             last_update = self.memory.last_update
             time_diffs = (
                 torch.from_numpy(timestamps).double().to(self.device)
