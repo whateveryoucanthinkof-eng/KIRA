@@ -54,13 +54,15 @@ _COLS = ("u", "i", "ts", "lbl", "edge")
 # the Python packet -> flow -> host-window path (rust/pcap_fast/EXPERIMENT.md),
 # ~12x faster. Its columns are built with the same numpy code the reference
 # uses, and every Rust-parsed day is checked against the Python reference on a
-# sample (its first _PARITY_FILES host files) before it is used.
+# sample (its first host file plus its largest, _PARITY_FILES in all) before it is used.
 
 #: "rust" (default) or "python". Anything else is an error.
 PCAP_PARSER_ENV = "CYBERWORLD_PCAP_PARSER"
 #: Host files per day re-parsed through the Python reference as a parity
 #: check; CYBERWORLD_PCAP_PARITY_FILES overrides, 0 disables it.
 _PARITY_FILES = 2
+#: Largest host file the parity sample will pick (bytes).
+_PARITY_MAX_BYTES = int(1.5 * 2**30)
 
 _REPO = Path(__file__).resolve().parents[1]
 _PCAP_FAST_DIR = _REPO / "rust" / "pcap_fast"
@@ -283,12 +285,26 @@ def _compare_parity(day: str, files: List[str], ref: tuple, got: tuple) -> None:
 
 def _pcap_parity_sample(fast, day_dir: Path, dw, day: str, window_seconds: float,
                         edge_dim: int, workdir: Path, n_files: int) -> dict:
-    """Parse the day's first `n_files` host files with BOTH parsers and demand
+    """Parse `n_files` of the day's host files (the first and the largest) with BOTH parsers and demand
     bit-identical columns. The reference runs unmodified on a mini-day: a
     directory of the same name holding symlinks to those files, labelled from
     the day's own (already derived) attack windows."""
     from data_unification.pcap_bridge import iter_day_records
-    files = fast._captures(day_dir)[0][:n_files]
+    # The first host file plus the LARGEST ones: the first files of a day are
+    # 1-17 MB (<0.03% of it) and exercise little; the largest carry the dense
+    # traffic (floods, many flows per window) where a port is likeliest to
+    # diverge. Kept in the day's own file order, which the merge depends on.
+    # Capped at _PARITY_MAX_BYTES each: the largest files run to 18 GB, which
+    # the ~20-60 MB/s reference needs up to 15 min for, longer than Rust takes
+    # for the whole day.
+    every = fast._captures(day_dir)[0]
+    chosen = set(every[:1])
+    for f in sorted((f for f in every if f.stat().st_size <= _PARITY_MAX_BYTES),
+                    key=lambda f: (-f.stat().st_size, f.name)):
+        if len(chosen) >= n_files:
+            break
+        chosen.add(f)
+    files = [f for f in every if f in chosen]
     root = Path(workdir) / f".parity-{Path(day_dir).name}-{os.getpid()}"
     shutil.rmtree(root, ignore_errors=True)
     mini = root / Path(day_dir).name / "pcap"

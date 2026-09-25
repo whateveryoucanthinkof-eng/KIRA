@@ -163,3 +163,4 @@ Desktop.ini
 
 # Regenerable from scripts/make_parity_fixture.py; 21MB of replayed capture.
 captures/parity_states.jsonl
+.claude/worktrees/
