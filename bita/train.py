@@ -917,9 +917,24 @@ def load_and_preprocess_unified_dataset(
     # The octets are what buys inductive generalisation: an unseen host in a
     # /24 the model has already seen arrives close to its neighbours in feature
     # space. See data_unification/ip_features.py.
-    from data_unification.ip_features import build_node_feature_matrix_from_pairs
-    node_features = build_node_feature_matrix_from_pairs(
-        (nid, ip) for (_cap, ip), nid in node_to_id.items())
+    #
+    # Built here row by row rather than through
+    # build_node_feature_matrix_from_pairs, which first materialises a list of
+    # every (id, ip) pair (~65 B per node, ~0.6 GB at ~9M nodes) on top of the
+    # id map. Same rows, same zero padding row 0, same ablation mask.
+    from data_unification.ip_features import (IP_FEATURE_DIM, ip_node_features,
+                                              node_ablation_mask)
+    node_features = np.zeros(((max(node_to_id.values()) if node_to_id else 0) + 1,
+                              IP_FEATURE_DIM), dtype=np.float32)
+    for (_cap, ip), nid in node_to_id.items():
+        node_features[nid] = ip_node_features(ip)
+    _mask = node_ablation_mask()
+    if _mask is not None:
+        node_features *= _mask
+    del node_to_id
+    # Its 2^20-entry cache holds ~0.5 GB of tuples for the rest of the run;
+    # entries are pure functions of the address, so dropping them is free.
+    ip_node_features.cache_clear()
     if node_features.shape[1] != edge_features.shape[1]:
         raise ValueError(
             f"node feature width {node_features.shape[1]} != edge feature width "
@@ -1280,8 +1295,14 @@ def train(args):
     _node_group = None
     if "capture" in graph_df.columns:
         _node_group = np.full(int(max(graph_df.u.max(), graph_df.i.max())) + 1, -1, dtype=np.int64)
-        _node_group[graph_df.u.values] = graph_df["capture"].values
-        _node_group[graph_df.i.values] = graph_df["capture"].values
+        # In chunks, u then i as before: the int16 -> int64 cast of a whole
+        # column was a transient 8 B per edge.
+        _u, _i, _c = graph_df.u.values, graph_df.i.values, graph_df["capture"].values
+        for _a in range(0, len(_c), CHUNK):
+            _node_group[_u[_a:_a + CHUNK]] = _c[_a:_a + CHUNK]
+        for _a in range(0, len(_c), CHUNK):
+            _node_group[_i[_a:_a + CHUNK]] = _c[_a:_a + CHUNK]
+        del _u, _i, _c
     train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations, node_group=_node_group)
     val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=0, node_group=_node_group)
     # Inductive negatives: with per-capture pools, the new-node edges' own
