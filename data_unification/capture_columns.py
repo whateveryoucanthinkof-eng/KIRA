@@ -537,6 +537,19 @@ def _build_subprocess(spec: ColumnSpec, out_dir: Path, log_prefix: str = "",
                            f"see the lines above")
 
 
+@contextmanager
+def _entry_lock(entry: Path):
+    """Exclusive, cross-process lock for one cache entry (an flock on a sidecar file)."""
+    import fcntl
+    lock = entry.with_name(f".{entry.name}.lock")
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def iter_capture_columns(
     specs: Sequence[ColumnSpec],
     *,
@@ -577,17 +590,25 @@ def iter_capture_columns(
 
     def build(i: int) -> Path:
         spec, entry = specs[i], entries[i]
-        tmp = entry.with_name(f".tmp-{entry.name}-{os.getpid()}")
-        t = time.time()
-        if workers > 0:
-            _build_subprocess(spec, tmp, log_prefix=f"  [parse {spec.name}] ", procs=procs)
-        else:
-            shutil.rmtree(tmp, ignore_errors=True)
-            build_columns(spec, tmp)
-        shutil.rmtree(entry, ignore_errors=True)
-        os.rename(tmp, entry)
-        print(f"[capture columns] parsed {spec.dataset}/{spec.name} in {time.time() - t:.0f}s",
-              flush=True)
+        # One builder per entry across PROCESSES: the plan's lanes run Branch A
+        # side by side on one cache. Without the lock a second builder
+        # finishing the same capture rmtree'd the first's committed entry while
+        # the first was still loading it (FileNotFoundError on a column file,
+        # found by the two-lane dry run). A committed entry is never replaced.
+        with _entry_lock(entry):
+            if cache_dir is not None and _is_committed(entry):
+                return entry
+            tmp = entry.with_name(f".tmp-{entry.name}-{os.getpid()}")
+            t = time.time()
+            if workers > 0:
+                _build_subprocess(spec, tmp, log_prefix=f"  [parse {spec.name}] ", procs=procs)
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
+                build_columns(spec, tmp)
+            shutil.rmtree(entry, ignore_errors=True)   # only ever a damaged, uncommitted leftover
+            os.rename(tmp, entry)
+            print(f"[capture columns] parsed {spec.dataset}/{spec.name} in {time.time() - t:.0f}s",
+                  flush=True)
         return entry
 
     pool = ThreadPoolExecutor(max_workers=workers) if workers > 0 and todo else None
