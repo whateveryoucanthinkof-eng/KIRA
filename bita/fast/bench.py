@@ -80,12 +80,17 @@ def build(args, device):
 def run(args):
     device = torch.device("cuda:0")
     torch.backends.cudnn.benchmark = False
+    if args.deterministic:
+        # Makes the REFERENCE reproducible (its index_add_ uses atomics), so a
+        # bit-identity claim is testable at all.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
     B = build(args, device)
     tgn, train_data = B["tgn"], B["train_data"]
     if args.mode == "fast":
         from fast import enable_fast_tgn
         enable_fast_tgn(tgn, level=args.level)
-    optimizer = torch.optim.Adam([p for p in tgn.parameters() if p.requires_grad], lr=1e-4, weight_decay=1e-5)
+    optimizer = torch.optim.Adam([p for p in tgn.parameters() if p.requires_grad], lr=args.lr, weight_decay=1e-5)
     num_instance = len(train_data.sources)
     num_batch_epoch = math.ceil(num_instance / args.batch_size)
     guard = TrainingGuard("encoder", [tgn], optimizer, mode="max", patience=3, step_back_after=2,
@@ -256,6 +261,8 @@ def main():
     ap.add_argument("--dump")
     ap.add_argument("--dump_outputs", type=int, default=64)
     ap.add_argument("--val", action="store_true")
+    ap.add_argument("--deterministic", action="store_true")
+    ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--val_limit", type=int, default=0)
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--profile_warm", type=int, default=2)
