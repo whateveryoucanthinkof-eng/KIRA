@@ -115,6 +115,27 @@ class _Batch:
         self.cache = {}
 
 
+# ------------------------------------------------- stable-shape regions
+# Pure functions of their inputs, so level 2 can hand them to torch.compile.
+def _attention_core(layer, src_mem, nf_src, nbr_mem, nf_nbr, src_time, ef_n, edge_time_emb, mask, invalid):
+    """GraphAttentionEmbedding (1 layer) + TemporalAttentionLayer.forward,
+    minus the neighbour lookup: [src_mem+nf ; t] attends over
+    [nbr_mem+nf ; edge feats ; t(dt)] with the padding mask already fixed up
+    (all-padding rows unmask slot 0) and those rows zeroed afterwards."""
+    n, k = mask.shape
+    src_feat = src_mem + nf_src
+    nbr_emb = (nbr_mem + nf_nbr).view(n, k, -1)
+    query = torch.cat([src_feat.unsqueeze(1), src_time], dim=2).permute(1, 0, 2)
+    key = torch.cat([nbr_emb, ef_n, edge_time_emb], dim=2).permute(1, 0, 2)
+    attn, _ = layer.multi_head_target(query=query, key=key, value=key, key_padding_mask=mask)
+    attn = attn.squeeze(0).masked_fill(invalid, 0)
+    return layer.merger(attn, src_feat)
+
+
+def _transformer_core(transformer, grouped, pad):
+    return transformer(grouped, src_key_padding_mask=pad)
+
+
 # -------------------------------------------------------------------- model
 class FastTGNMixin:
     """Mixed in front of TGN/ExtendedTGN by enable_fast_tgn()."""
@@ -183,10 +204,12 @@ class FastTGNMixin:
         unsorted_idx = torch.empty_like(sorted_idx)
         unsorted_idx[sorted_idx] = torch.arange(E)
 
-        ints = upload(np.concatenate([owner, sorted_idx.numpy(), unsorted_idx.numpy(), to_update]), dev, torch.int64)
+        ints = upload(np.concatenate([owner, sorted_idx.numpy(), unsorted_idx.numpy(), to_update, klen]),
+                      dev, torch.int64)
         owner_g = ints[:E]
         sorted_g, unsorted_g = ints[E: 2 * E], ints[2 * E: 3 * E]
-        to_update_g = ints[3 * E:]
+        to_update_g = ints[3 * E: 3 * E + n_nodes]
+        lens_g = ints[3 * E + n_nodes:].to(torch.int32)
         f32 = upload(np.concatenate([dt.reshape(-1), counts]), dev)
         dt_g = f32[: E * L].view(E, L)
         counts_g = f32[E * L:]
@@ -199,9 +222,13 @@ class FastTGNMixin:
         if m.shape[-1] != agg.message_dim:
             raise ValueError(f"BiTA expects {agg.message_dim}-D messages, got {m.shape[-1]}.")
         x = m + agg.time_encoder(dt_g)
-        x = x.index_select(0, sorted_g)
-        data, batch_sizes = torch._VF._pack_padded_sequence(x, lengths_sorted, True)
-        _, h_n = agg.bigru(PackedSequence(data, batch_sizes, sorted_g, unsorted_g))
+        if self._fast_level >= 2:
+            from fast.triton_gru import bigru_final_states
+            h_n = bigru_final_states(agg.bigru, x, lens_g)
+        else:
+            x = x.index_select(0, sorted_g)
+            data, batch_sizes = torch._VF._pack_padded_sequence(x, lengths_sorted, True)
+            _, h_n = agg.bigru(PackedSequence(data, batch_sizes, sorted_g, unsorted_g))
         z_temp = torch.cat([h_n[0], h_n[1]], dim=-1)
         e = agg.W_e(z_temp)
         order = torch.argsort(last_t_g)
@@ -212,8 +239,8 @@ class FastTGNMixin:
         pad_np = np.ones(n_groups * C, dtype=bool)
         pad_np[:E] = False
         pad = upload(pad_np, dev)
-        zc = agg.transformer(grouped.view(n_groups, C, agg.d_trans),
-                             src_key_padding_mask=pad.view(n_groups, C))
+        zc = self._fast_fn("transformer", _transformer_core)(
+            agg.transformer, grouped.view(n_groups, C, agg.d_trans), pad.view(n_groups, C))
         z_ctx = torch.empty_like(e)
         z_ctx[order] = zc.reshape(n_groups * C, agg.d_trans)[:E]
         summed = torch.zeros(n_nodes, agg.d_trans, device=dev, dtype=z_ctx.dtype).index_add_(0, owner_g, z_ctx)
@@ -284,15 +311,29 @@ class FastTGNMixin:
             if te_frozen:
                 c["src_time"], c["edge_time_emb"] = src_time, edge_time_emb
 
-        src_feat = mem.fast_read(bt.nodes, bt.nodes_g) + c["nf_src"]
-        nbr_emb = (mem.fast_read(c["nbr"], c["nbr_g"]) + c["nf_nbr"]).view(n, n_neighbors, -1)
+        return self._fast_fn("attention", _attention_core)(
+            em.attention_models[0], mem.fast_read(bt.nodes, bt.nodes_g), c["nf_src"],
+            mem.fast_read(c["nbr"], c["nbr_g"]), c["nf_nbr"], src_time, c["ef_n"], edge_time_emb,
+            c["mask_g"], c["invalid_g"])
 
-        layer = em.attention_models[0]
-        query = torch.cat([src_feat.unsqueeze(1), src_time], dim=2).permute(1, 0, 2)
-        key = torch.cat([nbr_emb, c["ef_n"], edge_time_emb], dim=2).permute(1, 0, 2)
-        attn, _ = layer.multi_head_target(query=query, key=key, value=key, key_padding_mask=c["mask_g"])
-        attn = attn.squeeze(0).masked_fill(c["invalid_g"], 0)
-        return layer.merger(attn, src_feat)
+    def _fast_fn(self, name, fn):
+        """`fn`, or with CYBERWORLD_FAST_TGN_COMPILE=1 a torch.compile'd copy.
+
+        Measured on CTU-13 scenario 7 it is SLOWER (45 vs 62 batch/s eager;
+        6.6 with mode=reduce-overhead, whose CUDA graphs re-record as shapes
+        change), so it is off by default and kept only for experiments."""
+        import os
+        if os.environ.get("CYBERWORLD_FAST_TGN_COMPILE", "") not in ("1", "true", "True"):
+            return fn
+        cache = self.__dict__.setdefault("_fast_compiled", {})
+        if name not in cache:
+            import torch._inductor.config as inductor_config
+            # Random ops (dropout) lowered to the same eager aten calls, so a
+            # compiled region draws exactly the masks the reference draws.
+            inductor_config.fallback_random = True
+            mode = os.environ.get("CYBERWORLD_FAST_TGN_COMPILE_MODE") or None
+            cache[name] = torch.compile(fn, dynamic=False, mode=mode)
+        return cache[name]
 
     # ------------------------------------------------------------- steps
     def _fast_cte(self, bt: _Batch, n_neighbors):
@@ -380,7 +421,7 @@ def _check_supported(tgn):
     return problems
 
 
-def enable(tgn):
+def enable(tgn, level: int = 2):
     from modules.embedding_module import GraphAttentionEmbedding
     problems = _check_supported(tgn)
     if problems:
@@ -388,6 +429,7 @@ def enable(tgn):
     cls = type(tgn)
     if not isinstance(tgn, FastTGNMixin):
         tgn.__class__ = type("Fast" + cls.__name__, (FastTGNMixin, cls), {})
+    tgn._fast_level = int(level)
     tgn._fast_ga1 = isinstance(tgn.embedding_module, GraphAttentionEmbedding) and tgn.n_layers == 1
     if not isinstance(tgn.memory, FastMemory):
         tgn.memory.__class__ = FastMemory

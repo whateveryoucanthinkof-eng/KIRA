@@ -17,6 +17,9 @@ def fast_tgn_requested(flag: bool = False) -> bool:
     return bool(flag) or os.environ.get("CYBERWORLD_FAST_TGN", "") in ("1", "true", "True")
 
 
-def enable_fast_tgn(tgn, level: int = 99):
+def enable_fast_tgn(tgn, level: int = 2):
+    """level 1: eager re-expression (forward bit-identical to the reference).
+    level 2: + the BiTA BiGRU as Triton kernels (fp32-rounding-level; the
+             reference's cuDNN GRU computes its weight grads in TF32)."""
     from fast.fast_tgn import enable
-    return enable(tgn)
+    return enable(tgn, level=level)
