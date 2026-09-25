@@ -81,9 +81,11 @@ def test_the_default_weight_brings_the_terms_into_range():
 def test_both_loss_terms_are_logged_separately():
     """A swamped auxiliary task must be visible in the log, not inferred."""
     src = open("bita/train.py").read()
-    assert "m_edge_loss" in src and "m_cat_loss" in src
-    assert "edge {np.mean(m_edge_loss)" in src, "edge loss is not in the epoch line"
-    assert "cat {np.mean(m_cat_loss)" in src, "category loss is not in the epoch line"
+    # The per-term accumulators became m_loss.edge / m_loss.cat when the
+    # training step stopped syncing every batch (losses stay on the GPU until
+    # logged); what matters is that both terms still reach the epoch line.
+    assert "edge {np.mean(m_loss.edge)" in src, "edge loss is not in the epoch line"
+    assert "cat {np.mean(m_loss.cat)" in src, "category loss is not in the epoch line"
 
 
 def test_weight_one_restores_the_previous_behaviour():

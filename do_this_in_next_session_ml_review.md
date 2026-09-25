@@ -86,3 +86,14 @@ as an ML engineer before trusting any metric from the run on branch v5.5o.
 
 - `DATA/logs`: Windows `.evtx` host event logs per host per day (1.8 GB), not used anywhere.
   They are a possible host-activity signal alongside the network graph.
+
+## 7. Found while finishing the optimisation work
+
+- **Resume doesn't save the validation samplers' RNG** (found by the batch-planner
+  work). After a crash-resume, validation negatives restart from their seed, so validation
+  metrics differ slightly from an uninterrupted run (ctu7: AUC 0.9211 vs 0.9215).
+  Final weights are unaffected.
+- **Serving tests fail on a stale saved checkpoint.** `test_serving_replay_isolation`,
+  `test_control_backend`, `test_topology_service` and `test_site_config` load
+  `saved_models/bita_bigru_transformer-unified_final.pth`, which is feature schema 1.0.0
+  while the tree is 2.0.0. Promote the new encoder, or regenerate the fixture.
