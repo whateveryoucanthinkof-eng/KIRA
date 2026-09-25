@@ -57,3 +57,12 @@ inputs.
 3. Relaunch with `./final_runner.sh`. The level isn't part of the resume fingerprint,
    so the encoders continue from their checkpoints.
 4. Watch the first validation peak. If the GPU runs out of memory, switch back to level 3.
+
+## Status log
+
+- **2026-09-25 ~17:20 IST:** the level-4 production test started. The plan was relaunched with
+  level 4 plus the planner, resuming from epoch 1 (level-2/3 weights; the level isn't in
+  the resume fingerprint). The test is epoch 2 plus its validation. Check `nvidia-smi` and the
+  watchdog's GPU MEMORY alerts, and grep the encoder logs for `OutOfMemoryError` or
+  `illegal memory access`. Pass → keep level 4. Fail → set level 3 in
+  `~/.config/cyberworld/plan_env.sh` and rerun `./final_runner.sh`.
