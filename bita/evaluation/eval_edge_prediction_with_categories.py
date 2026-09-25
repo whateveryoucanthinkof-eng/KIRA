@@ -54,8 +54,10 @@ def eval_edge_prediction_with_categories(
         )
 
         pred_categories = torch.argmax(category_logits, dim=1).cpu().numpy()
-        all_true_labels.extend(categories_batch)
-        all_pred_labels.extend(pred_categories)
+        # Arrays, not .extend(): a list of numpy scalars is ~40 B per edge,
+        # twice over -- ~1.6 GB across a 20M-edge validation split.
+        all_true_labels.append(np.array(categories_batch))
+        all_pred_labels.append(pred_categories)
         all_category_logits.append(category_logits.cpu().numpy())
         all_pos_scores.append(pos_score.cpu().numpy())
         all_neg_scores.append(neg_score.cpu().numpy())
@@ -74,8 +76,9 @@ def eval_edge_prediction_with_categories(
             total_category_loss += cat_loss.item()
 
     # Aggregate
-    y_true = np.array(all_true_labels)
-    y_pred = np.array(all_pred_labels)
+    # Same values and dtypes np.array(list of the scalars) produced.
+    y_true = np.concatenate(all_true_labels) if all_true_labels else np.array([])
+    y_pred = np.concatenate(all_pred_labels) if all_pred_labels else np.array([])
     category_logits = np.concatenate(all_category_logits)
     pos_scores = np.concatenate(all_pos_scores)
     neg_scores = np.concatenate(all_neg_scores)

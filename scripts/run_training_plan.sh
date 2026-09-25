@@ -9,6 +9,11 @@
 #   preflight   every capture present and correctly named (scripts/check_datasets.py)
 #   dryrun      the whole plan on a tiny synthetic corpus (scripts/dry_run_plan.py);
 #               SKIP_DRY_RUN=1 to skip it
+#   warm        parse every encoder capture once into the ingest cache
+#               (scripts/warm_ingest_cache.py), so no encoder parses and
+#               encoders run side by side never parse the same day twice
+#   train       compare + seeds + downstream as LANES parallel lanes (LANES=1:
+#               the sequential order below). Each lane is its own capped job.
 #   compare     encoder (TGN memory on, 10 most-recent neighbours) + Branch A,
 #               with and without IP-identity features, seed 42, scheme
 #               cross_year_ctu: train on CIC-2018 PCAP + CTU-13, tune on
@@ -42,6 +47,13 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 # Spill stores, per-epoch checkpoints and resume points all land under OUT.
 # A full disk kills a run mid-epoch, so preflight refuses to start below this.
 MIN_FREE_GB="${MIN_FREE_GB:-50}"
+# Parsed captures, keyed by their input files + parse code (data_unification/
+# parallel_ingest.py). Reused by every encoder run and across plan runs.
+INGEST_CACHE="${INGEST_CACHE:-$OUT/.ingest_cache}"
+INGEST_WORKERS="${INGEST_WORKERS:-8}"
+# Independent training chains run at once. Each lane's jobs get MEM_MAX, so
+# LANES x MEM_MAX must fit the machine: keep LANES=1 unless measured.
+LANES="${LANES:-1}"
 
 SCHEME=cross_year_ctu
 CHOSEN_IP=cross_network            # decided in advance; see analysis 30, "winner"
@@ -55,7 +67,8 @@ SEEDS_EXTRA=(123 2024)             # with 42 from `compare`: cyberworld_v4.confi
 # PLAN_ENCODER_EXTRA / PLAN_BRANCH_A_EXTRA / PLAN_DOWNSTREAM_EXTRA are appended
 # to each stage's arguments (later flags win). scripts/dry_run_plan.py uses
 # them to run this exact plan on a tiny synthetic corpus.
-ENCODER_ARGS="--use_memory --n_degree 10 --n_epoch 50 --patience 3 --step_back_after 2 ${PLAN_ENCODER_EXTRA:-}"
+ENCODER_ARGS="--use_memory --n_degree 10 --n_epoch 50 --patience 3 --step_back_after 2 \
+--ingest_workers $INGEST_WORKERS --ingest_cache $INGEST_CACHE ${PLAN_ENCODER_EXTRA:-}"
 BRANCH_A_ARGS="--architecture paper --risk-objective soft_bce --risk-target hazard \
 --epochs 15 --patience 3 --step-back-after 2 --operating-point-criterion budgeted_f1 --alert-budget 2.0 \
 --spill-dir $OUT/.spill --num-workers $NUM_WORKERS ${PLAN_BRANCH_A_EXTRA:-}"
@@ -90,6 +103,23 @@ preflight() {
     "$PYTHON" scripts/check_datasets.py --scheme "$SCHEME" \
         --pcap-root "$PCAP_ROOT" --cic2018-csv-dir "$CIC2018_CSV_DIR" \
         --cic2017-dir "$CIC2017_DIR" --ctu-dir "$CTU_DIR"
+    # PCAP days are parsed by the Rust port (rust/pcap_fast) unless
+    # CYBERWORLD_PCAP_PARSER=python. Build it here (a no-op when current); a
+    # missing binary would silently make ingest ~12x slower.
+    if [ "${CYBERWORLD_PCAP_PARSER:-rust}" != python ]; then
+        if command -v cargo >/dev/null 2>&1; then
+            (cd rust/pcap_fast && nice cargo build --release -q -j4) || {
+                echo "[plan] cargo build of rust/pcap_fast failed" >&2; exit 2; }
+        elif [ ! -x rust/pcap_fast/target/release/pcap_fast ]; then
+            echo "[plan] rust/pcap_fast is not built and cargo is not available." >&2
+            echo "[plan] Build it (cd rust/pcap_fast && cargo build --release), or set CYBERWORLD_PCAP_PARSER=python." >&2
+            exit 2
+        fi
+        # Fails loudly if numpy is not the version Rust parity was verified on.
+        "$PYTHON" -c "from data_unification.parallel_ingest import pcap_parser_choice as c; p = c(); print('[plan] PCAP parser:', p); raise SystemExit(p != 'rust')" || {
+            echo "[plan] the Rust PCAP parser is not usable (see above); set CYBERWORLD_PCAP_PARSER=python to run on the reference parser." >&2
+            exit 2; }
+    fi
     mkdir -p "$OUT"
     local free_gb
     free_gb=$(df -Pk "$OUT" | awk 'NR==2 {printf "%d", $4/1048576}')
@@ -101,6 +131,13 @@ preflight() {
     fi
     echo "[plan] out=$OUT mem_max=$MEM_MAX scheme=$SCHEME chosen_ip=$CHOSEN_IP"
     echo "[plan] preflight ok"
+}
+
+warm() {
+    echo "[plan] warm: parsing encoder captures into $INGEST_CACHE"
+    capped "$PYTHON" scripts/warm_ingest_cache.py --cache "$INGEST_CACHE" \
+        --workers "$INGEST_WORKERS" --ctu-dir "$CTU_DIR" --pcap-root "$PCAP_ROOT" \
+        --cic2018-csv-dir "$CIC2018_CSV_DIR" --split-scheme "$SCHEME" --splits train
 }
 
 comparison() {  # seed ip-flags...
@@ -144,6 +181,41 @@ downstream() {
         --spill-dir "$OUT/.spill" --num-workers "$NUM_WORKERS" \
         ${PLAN_DOWNSTREAM_EXTRA:-} \
         2>&1 | tee "$OUT/downstream/downstream.log"
+}
+
+train() {
+    # Every chain below is independent except downstream, which needs the
+    # seed-42 chosen-IP encoder, so it follows it in the same lane. A step whose
+    # output exists is skipped, so the final compare/seeds calls only re-run
+    # the summaries once the lanes have trained everything.
+    if [ "$LANES" -le 1 ]; then
+        compare; seeds; downstream; return
+    fi
+    local other_ip=full
+    [ "$CHOSEN_IP" = full ] && other_ip=cross_network
+    local -a lane_b=("42 $other_ip")
+    for s in "${SEEDS_EXTRA[@]}"; do lane_b+=("$s $CHOSEN_IP"); done
+    echo "[plan] train: $LANES lanes"
+    ( echo "[plan] lane A: seed 42 $CHOSEN_IP, then downstream"
+      comparison 42 --ip-variants "$CHOSEN_IP" && downstream ) &
+    local pid_a=$!
+    local -a pids=()
+    local lane=0
+    for job in "${lane_b[@]}"; do
+        # Round-robin the remaining chains over LANES-1 lanes.
+        if [ "${#pids[@]}" -ge $((LANES - 1)) ]; then
+            wait "${pids[0]}" || { echo "[plan] a lane failed" >&2; kill "$pid_a" 2>/dev/null; exit 1; }
+            pids=("${pids[@]:1}")
+        fi
+        set -- $job
+        ( echo "[plan] lane: seed $1 $2"; comparison "$1" --ip-variants "$2" ) &
+        pids+=($!)
+    done
+    local rc=0
+    for p in "${pids[@]}"; do wait "$p" || rc=1; done
+    wait "$pid_a" || rc=1
+    [ "$rc" = 0 ] || { echo "[plan] a lane failed; see its logs" >&2; exit 1; }
+    compare; seeds
 }
 
 summary() {
@@ -205,10 +277,12 @@ stage="${1:-all}"
 case "$stage" in
     preflight)  preflight ;;
     dryrun)     dryrun ;;
+    warm)       preflight; warm ;;
+    train)      preflight; warm; train ;;
     compare)    preflight; compare ;;
     seeds)      seeds ;;
     downstream) downstream ;;
     summary)    summary ;;
-    all)        preflight; dryrun; compare; seeds; downstream; summary ;;
-    *) echo "usage: $0 [preflight|dryrun|compare|seeds|downstream|summary|all]" >&2; exit 2 ;;
+    all)        preflight; dryrun; warm; train; summary ;;
+    *) echo "usage: $0 [preflight|dryrun|warm|train|compare|seeds|downstream|summary|all]" >&2; exit 2 ;;
 esac
