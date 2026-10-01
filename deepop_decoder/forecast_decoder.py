@@ -451,6 +451,7 @@ class DeepOPForecastDecoder(nn.Module):
         return_probs: bool = False,
         continuity_bonus: Optional[float] = None,
         observed_sequence: Optional[torch.Tensor] = None,
+        decode_names: bool = True,
     ) -> Any:
         """
         Autoregressive sequence generation conditioned on h_future and optional observed_token.
@@ -558,6 +559,14 @@ class DeepOPForecastDecoder(nn.Module):
         # Exclude initial prefix (<BOS>)
         pred_tokens = curr_tokens[:, prefix_len:]
         decoded_names = []
+        # `decode_names=False` skips the per-sample decode (one `.cpu()` sync
+        # per sample) for callers that only use the tokens -- validation scores
+        # 1.46M+ samples per epoch and discarded every name. The tokens are the
+        # same either way; the names come back as None.
+        if not decode_names:
+            if return_probs:
+                return pred_tokens, None, all_attack_probs, all_token_probs
+            return pred_tokens, None
         for b in range(B):
             sample_tokens = []
             for t_idx in pred_tokens[b].cpu().numpy():
@@ -569,6 +578,8 @@ class DeepOPForecastDecoder(nn.Module):
 
         return pred_tokens, decoded_names
 
+
+from cyberworld_v4.device_hist import device_hist  # noqa: E402
 
 class DeepOPTokenScorer:
     """Streaming DeepOP token metrics with information-matched baselines.
@@ -644,20 +655,30 @@ class DeepOPTokenScorer:
         pred_tf:      [B, K] teacher-forced argmax, or None
         pred_free:    [B, K] free-running generation, or None
         """
+        self.update_device(target, input_tokens, obs_token, pred_tf=pred_tf, pred_free=pred_free)
+        self.update_host(target, has_free=pred_free is not None)
+
+    def update_host(self, target, has_free: bool):
+        """The host-side half of `update`: counts that depend on shapes only."""
+        self._n += int(target.numel())
+        if has_free:
+            self._have_free = True
+
+    def update_device(self, target, input_tokens, obs_token, pred_tf=None, pred_free=None):
+        """The device-side half of `update`: in-place accumulator updates only,
+        no host effect -- so it can be replayed as part of a CUDA graph."""
         V = self.V
         t = target.reshape(-1)
-        self._n += int(t.numel())
-        self._tgt_hist += torch.bincount(t, minlength=V)
+        self._tgt_hist += device_hist(t, V)      # bincount syncs on CUDA
 
         if pred_tf is not None:
             pf = pred_tf.reshape(-1)
             self._hit_tf += (pf == t).sum()
-            self._conf_tf += torch.bincount(t * V + pf, minlength=V * V)
+            self._conf_tf += device_hist(t * V + pf, V * V)
         if pred_free is not None:
-            self._have_free = True
             pr = pred_free.reshape(-1)
             self._hit_free += (pr == t).sum()
-            self._conf_free += torch.bincount(t * V + pr, minlength=V * V)
+            self._conf_free += device_hist(t * V + pr, V * V)
 
         obs = obs_token.reshape(-1)
         # free-running persistence: one observation, held for the whole horizon
@@ -741,7 +762,7 @@ class DeepOPTokenScorer:
 
 
 def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=None,
-                          support=None):
+                          support=None, support_index=None):
     """Both losses from one forward pass, because only one of them is comparable.
 
     `train_deepop_live` optimises `cross_entropy(..., label_smoothing=0.04)`
@@ -774,11 +795,23 @@ def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=
     it makes the gap WORSE, not better. "val is only 0.14 above train" was the
     flattering reading.
 
+    `support_index` is `support.nonzero()` computed once by the caller (a
+    non-empty LongTensor of class ids, ascending). Same columns, same order,
+    same values as the boolean mask, without the two host-device syncs the
+    mask costs on every call (`bool(sup.any())` and the masked select) -- which
+    also makes the loss capturable in a CUDA graph. Takes precedence over
+    `support`.
+
     Returns (loss_to_backprop, plain_ce_detached).
     """
     V = logits.shape[-1]
     flat, tgt = logits.reshape(-1, V), target.reshape(-1)
-    if support is None or weight is not None:
+    if support_index is not None and weight is None:
+        logp = F.log_softmax(flat, dim=-1)
+        nll_t = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
+        nll_u = -logp.index_select(1, support_index).mean(dim=1)
+        smoothed = ((1.0 - label_smoothing) * nll_t + label_smoothing * nll_u).mean()
+    elif support is None or weight is not None:
         smoothed = F.cross_entropy(flat, tgt, weight=weight, label_smoothing=label_smoothing)
     else:
         # Smooth over the tokens that can actually occur, not the whole
@@ -866,10 +899,12 @@ def evaluate_forecast_rigor(
             pred_tf = decoder.forward(h_b, inp_b).argmax(dim=-1)
             free_b, _ = decoder.forecast_sequence(
                 h_b, max_steps=K, observed_token=obs_b,
-                repetition_penalty=repetition_penalty, continuity_bonus=1.0)
+                repetition_penalty=repetition_penalty, continuity_bonus=1.0,
+                decode_names=False)
             free_nb, _ = decoder.forecast_sequence(
                 h_b, max_steps=K, observed_token=obs_b,
-                repetition_penalty=repetition_penalty, continuity_bonus=0.0)
+                repetition_penalty=repetition_penalty, continuity_bonus=0.0,
+                decode_names=False)
             scorer.update(tgt_b, inp_b, obs_b, pred_tf=pred_tf, pred_free=free_b)
             scorer_nobonus.update(tgt_b, inp_b, obs_b, pred_tf=pred_tf, pred_free=free_nb)
 

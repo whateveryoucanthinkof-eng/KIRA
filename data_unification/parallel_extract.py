@@ -61,6 +61,8 @@ def _worker_init(tgne: Optional[str], extractor_kw: dict, threads: int, repo: st
     else:
         from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
         tgn = build_or_load_tgne_ta(checkpoint_path=tgne)
+    from data_unification.fast_extract import enable_fast_extraction
+    enable_fast_extraction(tgn)      # bit-identical, ~2x (data_unification/fast_extract.py)
     _WORKER["ex"] = HostTrajectoryExtractor(tgne_ta_model=tgn, **extractor_kw)
 
 
@@ -93,6 +95,7 @@ def extract_parallel(
     part_dir: Path,
     workers: int,
     threads_per_worker: int = 1,
+    exposure_for=None,
 ) -> Iterator[Tuple[Any, dict]]:
     """Extract `items` = (key, CaptureColumns, namespace) in worker processes.
 
@@ -101,6 +104,10 @@ def extract_parallel(
     the caller sees what the serial loop would have produced. Yields
     (key, info) after each capture is appended. `extractor` supplies the
     settings the workers copy; it must support the columnar path.
+
+    `exposure_for(key)`, if given, returns the counter dict a capture's
+    neighbour-exposure counts are added to (default: the extractor's own) --
+    for one call that fills several splits' builders and reports per split.
     """
     why = extractor.columns_unsupported_reason()
     if why:
@@ -125,9 +132,9 @@ def extract_parallel(
                 pending.append((key, out, fut))
                 # Bound the parts waiting on disk: drain finished heads first.
                 while pending and (pending[0][2].done() or len(pending) > 2 * workers):
-                    yield _merge(pending.pop(0), builder_for, extractor)
+                    yield _merge(pending.pop(0), builder_for, extractor, exposure_for)
             while pending:
-                yield _merge(pending.pop(0), builder_for, extractor)
+                yield _merge(pending.pop(0), builder_for, extractor, exposure_for)
         finally:
             for _k, out, fut in pending:
                 fut.cancel()
@@ -135,14 +142,15 @@ def extract_parallel(
                 shutil.rmtree(out, ignore_errors=True)
 
 
-def _merge(item, builder_for, extractor) -> Tuple[Any, dict]:
+def _merge(item, builder_for, extractor, exposure_for=None) -> Tuple[Any, dict]:
     key, out, fut = item
     info = fut.result()
     b = builder_for(key)
     t = time.time()
     b.append_part(out, window_idx_offset=b.next_window_base())
     shutil.rmtree(out, ignore_errors=True)
+    target = exposure_for(key) if exposure_for is not None else extractor._exposure
     for k in _COUNTERS:
-        extractor._exposure[k] += int(info["exposure"][k])
+        target[k] += int(info["exposure"][k])
     info["merge_seconds"] = time.time() - t
     return key, info

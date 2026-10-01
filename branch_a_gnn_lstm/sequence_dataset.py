@@ -371,3 +371,85 @@ class LazyHostSequenceDataset(Dataset):
         if len(t) < self.seq_len:
             t = np.concatenate([np.full(self.seq_len - len(t), t[0] if len(t) else 0.0), t])
         return np.ascontiguousarray(t, dtype=np.float32)
+
+    # -- batched access ------------------------------------------------------
+    #
+    # `__getitem__` above builds one sample at a time: a memmap gather of up to
+    # `seq_len` rows scattered across the feature block (one disk read per row
+    # when the block is bigger than page cache), five tensor constructions and
+    # a dict, then the DataLoader collates 128 of those. `gather_batch` builds
+    # the same collated batch in a handful of vectorised numpy operations, and
+    # reads features from a host-major copy of the block in which a sample is
+    # one contiguous slice (data_unification/host_major.py). Same samples,
+    # same order, same bytes: tests/test_branch_a_batched_loader.py.
+
+    def enable_batched(self, host_major: "bool | None" = None, spill_dir=None):
+        """Precompute what `gather_batch` needs. Call before DataLoader workers fork.
+
+        `host_major` None means "when the feature block is a memmap" -- a
+        block held in RAM gains nothing from the copy but would double its memory.
+        """
+        from data_unification.host_major import host_major_for
+        st = self.store
+        self._flat, self._base, self._feats_hm = host_major_for(
+            st, self._rows, host_major=host_major, spill_dir=spill_dir)
+        benign = TECH_TO_IDX.get("Benign", 0)
+        self._grad_of_cat = np.array([GRADATION_LEVELS.get(c, 0) for c in st.categories] or [0],
+                                     dtype=np.int64)
+        self._tech_of_code = np.array([TECH_TO_IDX.get(t, benign) for t in st.techniques] or [benign],
+                                      dtype=np.int64)
+        self._benign = benign
+        self._batched_ready = True
+        return self
+
+    def gather_batch(self, indices):
+        """The default-collated batch of `[self[i] for i in indices]`, built at once."""
+        if not hasattr(self, "_flat"):
+            self.enable_batched(host_major=False)
+        st, L = self.store, self.seq_len
+        idx = np.asarray(indices, dtype=np.int64)
+        h = self._host_idx[idx].astype(np.int64)
+        end = self._pos[idx].astype(np.int64)
+        start = np.maximum(self._lo[idx].astype(np.int64), end - L)
+        b = self._base[h]
+        first = (b + start)[:, None]
+        p = (b + end)[:, None] - L + np.arange(L, dtype=np.int64)       # [B, L] flat positions
+        valid = p >= first
+        if not valid.all():
+            # left padding: point at the first real row (its time is what the
+            # padded t_history slots repeat); its features are zeroed below
+            p = np.where(valid, p, first)
+        rows = self._flat[p]                                          # store rows, [B, L]
+        if self._feats_hm is not None:
+            x = np.asarray(self._feats_hm[p])
+        else:
+            x = np.asarray(st.feats[rows])
+        if not valid.all():
+            x[~valid] = 0.0
+        x = np.ascontiguousarray(x, dtype=np.float32)
+
+        w = np.asarray(st.window_idx)[rows].astype(np.float64)
+        t_hist = np.ascontiguousarray((w - w[:, -1:]) * self._window_seconds, dtype=np.float32)
+
+        tgt = self._flat[b + end]                                     # target rows
+        tlo = np.asarray(st.tech_off)[tgt]
+        has = np.asarray(st.tech_off)[tgt + 1] > tlo
+        tech = np.full(len(idx), self._benign, dtype=np.int64)
+        if has.any():
+            tech[has] = self._tech_of_code[np.asarray(st.tech_flat)[tlo[has]].astype(np.int64)]
+        grad = self._grad_of_cat[np.asarray(st.cat_id)[tgt].astype(np.int64)]
+        risk = np.asarray(st.risk_score)[tgt].astype(np.float32)
+        return {
+            "features": torch.from_numpy(x),
+            "risk": torch.from_numpy(risk),
+            "technique": torch.from_numpy(tech),
+            "gradation": torch.from_numpy(grad),
+            "host_ip": [self.hosts[int(k)] for k in h],
+            "window_idx": torch.from_numpy(np.asarray(st.window_idx)[tgt].astype(np.int64)),
+            "t_history": torch.from_numpy(t_hist),
+        }
+
+
+# Generic pieces, shared with Branch B and DeepOP (data_unification/host_major.py).
+from data_unification.host_major import (  # noqa: E402
+    BatchedView as BatchedSequenceView, PermutationBatchSampler, collate_prebatched)

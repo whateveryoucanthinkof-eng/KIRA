@@ -62,6 +62,9 @@ from deepop_decoder.train_cwa_decoder import (
     CWASequenceDataset, LazyCWADataset, create_cwa_training_samples,
 )
 from cyberworld_v4.config import get_contract
+from cyberworld_v4.device_hist import device_hist
+from cyberworld_v4.graphed_step import GraphedBody, GraphedLoss, WholeStepGraph, graphs_enabled
+from data_unification.host_major import batched_loader, unpack_batch
 
 
 def _strided(gen, stride: int, want=None):
@@ -218,6 +221,199 @@ def _loader_kwargs(device, num_workers: int):
     return kw
 
 
+#: Set by main() from --legacy-loader: per-sample __getitem__ + default collate.
+LEGACY_LOADER = False
+
+
+def _make_loader(ds, batch_size, shuffle, device, num_workers):
+    """The loader policy for Branch B, DeepOP and the rollout precompute.
+
+    Batched by default: each batch is one vectorised `gather_batch` over a
+    host-major copy of the feature block (data_unification/host_major.py)
+    instead of `batch_size` per-sample gathers of scattered memmap rows. Same
+    batches, same order, same RNG draws as DataLoader(ds, shuffle=...):
+    tests/test_branch_b_deepop_batched_loader.py.
+    """
+    lk = _loader_kwargs(device, num_workers)
+    base = getattr(ds, "base", ds)
+    if LEGACY_LOADER or not hasattr(ds, "gather_batch"):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, **lk)
+    if not getattr(base, "_batched_ready", False):
+        t = time.time()
+        base.enable_batched(spill_dir=os.environ.get("CYBERWORLD_SPILL_DIR"))
+        print(f"  batched loader ready in {time.time() - t:.1f}s (host-major features: "
+              f"{getattr(base, '_feats_hm', None) is not None})", flush=True)
+    # one buffer per batch (host_major.pack_batch); the loops unpack_batch it
+    return batched_loader(ds, batch_size, shuffle, pack=True, **lk)
+
+
+def _guard_step_fn(guard):
+    """The guard's sync-free step when it can be used (TrainingGuard.
+    backward_step_deferred: same decisions and weights bit for bit), else the
+    syncing one. CYBERWORLD_GUARD_SYNC=1 forces the latter."""
+    return guard.backward_step_deferred if guard.deferred_supported() else guard.backward_step
+
+
+def _accumulate_ok(ok, acc_pairs, nb):
+    """Add each (accumulator, value) for a step the guard took; count it in `nb`.
+
+    `ok` is a bool (synchronous step) or a device bool (deferred step). For a
+    skipped step this adds exactly 0.0 and 0, as the old `continue` did."""
+    if ok is True:
+        for acc, v in acc_pairs:
+            acc += v
+        nb += 1
+    else:
+        for acc, v in acc_pairs:
+            acc += torch.where(ok, v, torch.zeros((), device=v.device, dtype=v.dtype))
+        nb += ok.to(nb.dtype)
+
+
+# --------------------------------------------------------------- validation
+#
+# Each validation batch is a forward pass plus in-place updates of a few
+# device accumulators. The bodies below are exactly what the training loops
+# ran inline; they are replayed as CUDA graphs (cyberworld_v4/graphed_step.
+# GraphedBody) because a validation batch, like a training step, is many tiny
+# kernels whose launch cost exceeded their GPU time. Host-side counters (batch
+# and token counts) are kept outside the bodies: a graph replays device work
+# only. Same kernels, same order: identical accumulators.
+
+def _bb_val_body(wdt, risk, K, step_offset):
+    def body(acc, h, target, target_risk, t_hist, t_fut):
+        pred = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut)
+        pred_risk, _ = risk.forward_trajectory(pred)
+        _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
+        acc["resid_hist"] += device_hist((_rb.view(-1, K) + step_offset).reshape(-1),
+                                         K * FORECAST_RISK_BINS)
+        acc["v_sum"] += (F.mse_loss(pred, target) + risk.risk_loss(pred_risk, target_risk)).double().sum()
+        # persistence: repeat the last observed step across the horizon
+        _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
+        acc["mse_model"] += F.mse_loss(pred, target).double()
+        acc["mse_persist"] += F.mse_loss(_last, target).double()
+        acc["bce_model"] += F.binary_cross_entropy(pred_risk, target_risk).double()
+        acc["risk_mae_model"] += (pred_risk - target_risk).abs().double().mean()
+        acc["risk_sum"] += target_risk.double().mean()
+    return body
+
+
+def validate_branch_b(wdt, risk, loader, device, K):
+    """Branch B's validation pass: the accumulators the epoch summary reads."""
+    z = lambda: torch.zeros((), device=device, dtype=torch.float64)
+    acc = {"v_sum": z(), "mse_model": z(), "mse_persist": z(), "bce_model": z(),
+           "risk_mae_model": z(), "risk_sum": z(),
+           # per-step |risk residual| histograms for the forecast's conformal band
+           "resid_hist": torch.zeros(K * FORECAST_RISK_BINS, device=device, dtype=torch.long)}
+    step_offset = (torch.arange(K, device=device) * FORECAST_RISK_BINS).view(1, K)
+    run = GraphedBody(_bb_val_body(wdt, risk, K, step_offset), acc,
+                      enabled=(str(device) == "cuda" and graphs_enabled()))
+    nblk = (str(device) == "cuda")
+    vn = risk_n = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = unpack_batch(batch, device)
+            h = batch["h_history"].to(device, non_blocking=nblk)
+            target = batch["h_future"].to(device, non_blocking=nblk)
+            target_risk = batch["risk_future"].to(device, non_blocking=nblk)
+            t_hist = batch["t_history"].to(device, non_blocking=nblk) if "t_history" in batch else None
+            t_fut = batch["t_future"].to(device, non_blocking=nblk) if "t_future" in batch else None
+            run(h, target, target_risk, t_hist, t_fut)
+            vn += 1
+            risk_n += 1
+    return {**acc, "vn": vn, "risk_n": risk_n, "graphed_batches": run.n_graphed}
+
+
+class _ScorerView:
+    """A DeepOPTokenScorer's accumulators taken from a dict, so a graph body
+    can update either the scorer's own tensors or warm-up copies of them."""
+
+    def __init__(self, V, acc):
+        self.V = V
+        for k in _SCORER_KEYS:
+            setattr(self, k, acc["sc" + k])
+
+
+_SCORER_KEYS = ("_tgt_hist", "_hit_tf", "_conf_tf", "_hit_free", "_conf_free",
+                "_hit_persist_free", "_hit_persist_fed")
+
+
+def _dp_val_body(decoder, V, with_scorer):
+    def body(acc, hv, inp, tgt, obs_seq, obs):
+        logits = decoder(hv, inp, obs_tokens=obs_seq)
+        acc["v_sum"] += F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1)).double().sum()
+        pred = logits.argmax(dim=-1)
+        if with_scorer:
+            _free, _ = decoder.forecast_sequence(
+                hv, max_steps=hv.shape[1], observed_token=obs, observed_sequence=obs_seq,
+                continuity_bonus=0.0, decode_names=False)
+            DeepOPTokenScorer.update_device(_ScorerView(V, acc), tgt, inp, obs,
+                                            pred_tf=pred, pred_free=_free)
+        flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
+        acc["hit_model"] += (flat_p == flat_t).sum()
+        acc["conf"] += device_hist(flat_t * V + flat_p, V * V)
+        acc["tgt_hist"] += device_hist(flat_t, V)
+        # persistence: the last token actually observed, repeated
+        acc["hit_persist"] += (obs.unsqueeze(1).expand_as(tgt) == tgt).sum()
+    return body
+
+
+def validate_deepop(decoder, wdt, loader, device, vocab):
+    """DeepOP's validation pass: the accumulators the epoch summary reads."""
+    V = vocab.vocab_size
+    nblk = (str(device) == "cuda")
+    try:
+        scorer = DeepOPTokenScorer(V, device=device)
+    except Exception as _e:
+        print(f"  token scorer unavailable: {_e}", flush=True); scorer = None
+    acc = {"v_sum": torch.zeros((), device=device, dtype=torch.float64),
+           "hit_model": torch.zeros((), device=device, dtype=torch.long),
+           "hit_persist": torch.zeros((), device=device, dtype=torch.long),
+           "conf": torch.zeros(V * V, device=device, dtype=torch.long),
+           "tgt_hist": torch.zeros(V, device=device, dtype=torch.long)}
+    if scorer is not None:
+        acc.update({"sc" + k: getattr(scorer, k) for k in _SCORER_KEYS})
+    run = GraphedBody(_dp_val_body(decoder, V, scorer is not None), acc,
+                      enabled=(str(device) == "cuda" and graphs_enabled()))
+    vn = tok_total = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = unpack_batch(batch, device)
+            hv = batch["h_future"].to(device, non_blocking=nblk)
+            if "h_rollout" in batch:
+                hv = batch["h_rollout"].to(device, non_blocking=nblk)
+            elif wdt is not None and "h_history" in batch:
+                _th = batch["t_history"].to(device, non_blocking=nblk) if "t_history" in batch else None
+                _tf = batch["t_future"].to(device, non_blocking=nblk) if "t_future" in batch else None
+                hv = wdt.rollout(batch["h_history"].to(device, non_blocking=nblk), K=hv.shape[1],
+                                 t_history=_th, t_future=_tf).detach()
+            tgt = batch["target_tokens"].to(device, non_blocking=nblk)
+            obs_seq = batch["obs_tokens"].to(device, non_blocking=nblk)
+            inp = batch["input_tokens"].to(device, non_blocking=nblk)
+            obs = batch.get("obs_token")
+            if obs is None:
+                # never produced by LazyCWADataset; kept for hand-built batches
+                _eager_dp_val_no_obs(decoder, V, acc, hv, inp, tgt, obs_seq)
+            else:
+                obs = obs.to(device, non_blocking=nblk)
+                run(hv, inp, tgt, obs_seq, obs)
+                if scorer is not None:
+                    scorer.update_host(tgt, has_free=True)
+            vn += 1
+            tok_total += int(tgt.numel())
+    return {**acc, "vn": vn, "tok_total": tok_total, "scorer": scorer,
+            "graphed_batches": run.n_graphed}
+
+
+def _eager_dp_val_no_obs(decoder, V, acc, hv, inp, tgt, obs_seq):
+    logits = decoder(hv, inp, obs_tokens=obs_seq)
+    acc["v_sum"] += F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1)).double().sum()
+    pred = logits.argmax(dim=-1)
+    flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
+    acc["hit_model"] += (flat_p == flat_t).sum()
+    acc["conf"] += device_hist(flat_t * V + flat_p, V * V)
+    acc["tgt_hist"] += device_hist(flat_t, V)
+
+
 def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 3, risk_target: str = "severity",
                         lr: float = 1e-3, step_back_after: int = 2, clip_norm: float = 1.0,
                         resume: "ResumePoint | None" = None):
@@ -230,8 +426,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     val_ds = LazyHostRolloutDataset(val_traj, T=_c.history_steps, K=_c.forecast_steps)
     print(f"Branch B samples: train={len(train_ds)} val={len(val_ds)}", flush=True)
     _lk = _loader_kwargs(device, num_workers)
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, **_lk)
-    val_loader = DataLoader(val_ds, batch_size=128, **_lk)
+    train_loader = _make_loader(train_ds, 128, True, device, num_workers)
+    val_loader = _make_loader(val_ds, 128, False, device, num_workers)
     # World state = the full enriched tensor (TGNE latent + host attributes),
     # the same s(t) Branch A reads. Its width is the store's.
     d_state = int(train_traj.feats.shape[1])
@@ -251,7 +447,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                           patience=patience, step_back_after=step_back_after,
                           warmup_steps=default_warmup_steps(_nb_total),
                           clip_norm=clip_norm or None,
-                          log=lambda m: print(m, flush=True))
+                          log=lambda m: print(m, flush=True),
+                          graph_undo=(str(device) == "cuda" and graphs_enabled()))
     first_epoch = 0
     _rp = resume.load() if resume is not None else None
     if _rp is not None:
@@ -260,6 +457,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         best, best_epoch, best_state = _rp["best"], _rp["best_epoch"], _rp["best_state"]
         _history[:] = _rp["history"]
         first_epoch = epochs if guard.should_stop() else _rp["done_epochs"]
+    _graphed = None
     for epoch in range(first_epoch, epochs):
         wdt.train(); risk.train()
         # Accumulated on device and read once per epoch: a `.item()` per batch
@@ -267,8 +465,21 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         # loss was previously not tracked at all here, so an epoch reported
         # nothing until validation finished.
         _tr_sum = torch.zeros((), device=device, dtype=torch.float64); _nb = 0
+        _nb_dev = torch.zeros((), device=device, dtype=torch.long); _k = 0
+        _step = _guard_step_fn(guard)
+        if _graphed is None:
+            def _bb_loss(h_, target_, target_risk_, t_hist_, t_fut_):
+                pred_ = wdt.rollout(h_, K=_c.forecast_steps, t_history=t_hist_, t_future=t_fut_)
+                pred_risk_, _ = risk.forward_trajectory(pred_)
+                loss_ = sum((0.9 ** k) * F.mse_loss(pred_[:, k], target_[:, k])
+                            for k in range(_c.forecast_steps))
+                return loss_ + risk.risk_loss(pred_risk_, target_risk_)
+            _graphed = GraphedLoss(_bb_loss, [wdt, risk],
+                                   enabled=(str(device) == "cuda" and graphs_enabled()))
         _t0 = time.time()
         for batch in train_loader:
+            _k += 1
+            batch = unpack_batch(batch, device)
             h = batch["h_history"].to(device, non_blocking=_nblk)
             target = batch["h_future"].to(device, non_blocking=_nblk)
             target_risk = batch["risk_future"].to(device, non_blocking=_nblk)
@@ -282,6 +493,21 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             t_hist = batch["t_history"].to(device, non_blocking=_nblk) if "t_history" in batch else None
             t_fut = batch["t_future"].to(device, non_blocking=_nblk) if "t_future" in batch else None
             optimizer.zero_grad(set_to_none=True)
+            if t_hist is not None and t_fut is not None:
+                # forward + loss + backward replayed as a CUDA graph (cyberworld_v4/
+                # graphed_step.py): identical losses and weights, a fraction of the
+                # launch overhead. Same computation as the eager lines below.
+                loss = _graphed(h, target, target_risk, t_hist, t_fut)
+                _ok = _step(loss)
+                if _ok is False:
+                    continue
+                _accumulate_ok(_ok, [(_tr_sum, loss.detach().double().sum())], _nb_dev)
+                if _k % 2000 == 0:
+                    _el = time.time() - _t0; _r = _k / max(_el, 1e-9)
+                    print(f"  Branch B epoch={epoch+1} batch={_k}/{_nb_total} "
+                          f"({100.0*_k/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
+                          f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m", flush=True)
+                continue
             pred = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut)
             pred_risk, _ = risk.forward_trajectory(pred)
             loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
@@ -298,14 +524,21 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             # Huber(beta=0.1) 0.216 against a zero baseline of 0.230 -- only
             # Huber beats it.
             loss = loss + risk.risk_loss(pred_risk, target_risk)
-            if not guard.backward_step(loss):
+            _ok = _step(loss)
+            if _ok is False:
                 continue
-            _tr_sum += loss.detach().double().sum(); _nb += 1
-            if _nb % 2000 == 0:
-                _el = time.time() - _t0; _r = _nb / max(_el, 1e-9)
-                print(f"  Branch B epoch={epoch+1} batch={_nb}/{_nb_total} "
-                      f"({100.0*_nb/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
-                      f"eta={(_nb_total-_nb)/max(_r,1e-9)/60:.1f}m", flush=True)
+            _accumulate_ok(_ok, [(_tr_sum, loss.detach().double().sum())], _nb_dev)
+            if _k % 2000 == 0:
+                _el = time.time() - _t0; _r = _k / max(_el, 1e-9)
+                print(f"  Branch B epoch={epoch+1} batch={_k}/{_nb_total} "
+                      f"({100.0*_k/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
+                      f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m", flush=True)
+        guard.flush()
+        _nb = int(_nb_dev)
+        if _graphed is not None and (_graphed.enabled or _graphed.error):
+            print(f"  cuda graph: {_graphed.n_graphed} graphed steps of {_k}"
+                  + (f" ({_graphed.error})" if _graphed.error else ""), flush=True)
+            _graphed.n_graphed = 0
         wdt.eval(); risk.eval()
         # Validation, measured against baselines that cost nothing to beat.
         #
@@ -317,39 +550,13 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         # with its best validation at epoch 1 -- consistent either with a model
         # that converged instantly or with one that never learned anything, and
         # nothing reported could tell those apart.
-        _v_sum = torch.zeros((), device=device, dtype=torch.float64); _vn = 0
-        _mse_model = torch.zeros((), device=device, dtype=torch.float64)
-        _mse_persist = torch.zeros((), device=device, dtype=torch.float64)
-        _bce_model = torch.zeros((), device=device, dtype=torch.float64)
-        _risk_mae_model = torch.zeros((), device=device, dtype=torch.float64)
-        _risk_sum = torch.zeros((), device=device, dtype=torch.float64)
-        _risk_n = 0
-        # Per-step |risk residual| histograms for the forecast's conformal band
-        # (see _forecast_risk_conformal). One bincount per batch, on device.
         _K = _c.forecast_steps
-        _resid_hist = torch.zeros(_K * FORECAST_RISK_BINS, device=device, dtype=torch.long)
-        _step_offset = (torch.arange(_K, device=device) * FORECAST_RISK_BINS).view(1, _K)
-        with torch.no_grad():
-            for batch in val_loader:
-                h=batch["h_history"].to(device, non_blocking=_nblk)
-                target=batch["h_future"].to(device, non_blocking=_nblk)
-                target_risk=batch["risk_future"].to(device, non_blocking=_nblk)
-                t_hist=batch["t_history"].to(device, non_blocking=_nblk) if "t_history" in batch else None
-                t_fut=batch["t_future"].to(device, non_blocking=_nblk) if "t_future" in batch else None
-                pred=wdt.rollout(h,K=_c.forecast_steps,t_history=t_hist,t_future=t_fut); pred_risk,_=risk.forward_trajectory(pred)
-                _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
-                _resid_hist += torch.bincount((_rb.view(-1, _K) + _step_offset).reshape(-1),
-                                              minlength=_K * FORECAST_RISK_BINS)
-                _v_sum += (F.mse_loss(pred,target)+risk.risk_loss(pred_risk,target_risk)).double().sum()
-                _vn += 1
-                # persistence: repeat the last observed step across the horizon
-                _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
-                _mse_model += F.mse_loss(pred, target).double()
-                _mse_persist += F.mse_loss(_last, target).double()
-                _bce_model += F.binary_cross_entropy(pred_risk, target_risk).double()
-                _risk_mae_model += (pred_risk - target_risk).abs().double().mean()
-                _risk_sum += target_risk.double().mean()
-                _risk_n += 1
+        _va = validate_branch_b(wdt, risk, val_loader, device, _K)
+        _v_sum, _vn = _va["v_sum"], _va["vn"]
+        _mse_model, _mse_persist = _va["mse_model"], _va["mse_persist"]
+        _bce_model, _risk_mae_model = _va["bce_model"], _va["risk_mae_model"]
+        _risk_sum, _risk_n, _resid_hist = _va["risk_sum"], _va["risk_n"], _va["resid_hist"]
+        print(f"  validation: {_va['graphed_batches']} of {_va['vn']} batches as a cuda graph", flush=True)
         score=float((_v_sum/max(_vn,1)).item())
         _trl=float((_tr_sum/max(_nb,1)).item())
         _n = max(_risk_n, 1)
@@ -523,6 +730,13 @@ class _WithRollout(torch.utils.data.Dataset):
         d["h_rollout"] = torch.from_numpy(np.ascontiguousarray(self.cache[i]))
         return d
 
+    def gather_batch(self, indices):
+        """`default_collate([self[i] for i in indices])`, from the base's gather_batch."""
+        d = self.base.gather_batch(indices)
+        d["h_rollout"] = torch.from_numpy(np.ascontiguousarray(
+            self.cache[np.asarray(indices, dtype=np.int64)]))
+        return d
+
 
 def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_workers=3):
     """Run the frozen Branch-B rollout once and memmap the result.
@@ -545,6 +759,8 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
             "live, so the rollout is not a function of its input and every "
             "epoch would otherwise see a different conditioning signal")
 
+    if not (LEGACY_LOADER or not hasattr(ds, "gather_batch") or not hasattr(ds, "_host_idx")):
+        return _precompute_rollouts_unique(wdt, ds, device, spill_dir, label, K, batch, num_workers)
     n = len(ds)
     # The rollout has the width of its input: 27 for the world state
     # s(t) = [TGNE ; attributes], not the bare 12-D embedding. A hard-coded 12
@@ -558,11 +774,14 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
     except OSError:
         pass
 
-    loader = DataLoader(ds, batch_size=batch, shuffle=False,
-                        num_workers=num_workers, pin_memory=(str(device) == "cuda"))
+    loader = (DataLoader(ds, batch_size=batch, shuffle=False,
+                         num_workers=num_workers, pin_memory=(str(device) == "cuda"))
+              if LEGACY_LOADER or not hasattr(ds, "gather_batch")
+              else _make_loader(ds, batch, False, device, num_workers))
     t0, done = time.time(), 0
     with torch.no_grad():
         for b in loader:
+            b = unpack_batch(b, device)
             _nb = (str(device) == "cuda")
             h = b["h_history"].to(device, non_blocking=_nb)
             # Same real elapsed times Branch B is trained with, so the cached
@@ -582,6 +801,122 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
           f"{(time.time()-t0)/60:.1f}m ({cache.nbytes/2**30:.2f} GiB, unlinked)",
           flush=True)
     return cache
+
+
+class _RolloutCache:
+    """Rollout rows plus a per-sample map: sample i's rollout is rows[map[i]]."""
+
+    def __init__(self, rows, idx_map):
+        self.rows, self.map = rows, idx_map
+        self.nbytes = rows.nbytes + idx_map.nbytes
+
+    def __len__(self):
+        return len(self.map)
+
+    def __getitem__(self, i):
+        return self.rows[self.map[i]]
+
+
+class _Indexed:
+    """`ds` restricted to the sample indices `idx`, for gather_batch loaders."""
+
+    _batched_ready = True          # delegates to `ds`, prepared by the caller
+
+    def __init__(self, ds, idx):
+        self.ds, self.idx = ds, np.asarray(idx, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.idx)
+
+    def __getitem__(self, j):
+        return self.ds[int(self.idx[j])]
+
+    def gather_batch(self, js):
+        return self.ds.gather_batch(self.idx[np.asarray(js, dtype=np.int64)])
+
+
+def _precompute_rollouts_unique(wdt, ds, device, spill_dir, label, K, batch, num_workers):
+    """_precompute_rollouts without computing (or storing) any window twice.
+
+    DeepOP's training set lists every window with an attack token twice (the
+    2x oversampling), so the cache computed and stored those rollouts twice:
+    at full scale the cache is ~0.5 KB per sample, tens of GB on disk.
+
+    Bit-identical to the original, which ran samples 0..n-1 in batches of
+    `batch` and a final partial batch of r = n % batch. Measured on the WDT
+    (tests/test_rollout_cache_unique.py): a sample's rollout does not depend
+    on WHICH samples share its batch at batch size 1024, but it can depend on
+    the batch SIZE (777, 64 and 1 differ by up to 4e-6). So:
+
+      * the full-batch region's distinct windows run in batches of exactly
+        `batch` -- the last one padded with repeats, discarded -- as before;
+      * the original final partial batch runs as it was: same samples, same
+        order, same size;
+      * each sample (duplicates included) maps to its row.
+    """
+    if not getattr(ds, "_batched_ready", False):
+        ds.enable_batched(spill_dir=os.environ.get("CYBERWORLD_SPILL_DIR"))
+    n = len(ds)
+    r = n % batch
+    full = n - r
+    d = int(ds[0]["h_history"].shape[-1])
+    key = (ds._host_idx[:full].astype(np.int64) << 32) | ds._pos[:full].astype(np.int64)
+    _u, first, inv = np.unique(key, return_index=True, return_inverse=True)
+    del key, _u
+    order = np.argsort(first, kind="stable")       # distinct windows in first-occurrence order
+    rank = np.empty(len(order), dtype=np.int64)
+    rank[order] = np.arange(len(order))
+    uniq = first[order]
+    nu = len(uniq)
+    pad = (-nu) % batch
+    todo = np.concatenate([uniq, np.repeat(uniq[-1:], pad)]) if nu else uniq
+    path = os.path.join(spill_dir or tempfile.gettempdir(),
+                        f"rollout_{label}_{os.getpid()}.f32")
+    rows = np.memmap(path, dtype=np.float32, mode="w+", shape=(max(nu + r, 1), K, d))
+    try:
+        os.unlink(path)          # reclaimed when the mapping is dropped
+    except OSError:
+        pass
+    t0, done = time.time(), 0
+    nb = (str(device) == "cuda")
+
+    def run(idx, dst):
+        nonlocal done
+        if len(idx) == 0:
+            return
+        put = dst
+        for b in _make_loader(_Indexed(ds, idx), batch, False, device, num_workers):
+            b = unpack_batch(b, device)
+            h = b["h_history"].to(device, non_blocking=nb)
+            t_h = b["t_history"].to(device, non_blocking=nb) if "t_history" in b else None
+            t_f = b["t_future"].to(device, non_blocking=nb) if "t_future" in b else None
+            out = wdt.rollout(h, K=K, t_history=t_h, t_future=t_f).detach().float().cpu().numpy()
+            keep = min(len(out), dst + (nu if dst == 0 else r) - put)
+            rows[put:put + keep] = out[:keep]
+            put += keep
+            done += len(out)
+            if done % (batch * 200) == 0:
+                rate = done / max(time.time() - t0, 1e-9)
+                print(f"  rollout cache [{label}] {done:,}/{len(todo) + r:,} "
+                      f"{rate:,.0f} samples/s", flush=True)
+
+    # The original made ONE DataLoader pass, and creating a DataLoader iterator
+    # draws its base seed from torch's global RNG. Two passes here would draw
+    # twice and shift every later draw (DeepOP's shuffle order): restore the
+    # state afterwards and make the original's single draw.
+    rng = torch.get_rng_state()
+    with torch.no_grad():
+        run(todo, 0)
+        run(np.arange(full, n), nu)
+    torch.set_rng_state(rng)
+    torch.empty((), dtype=torch.int64).random_()
+    rows.flush()
+    idx_map = np.concatenate([rank[inv], nu + np.arange(r, dtype=np.int64)])
+    idx_map = idx_map.astype(np.int32 if nu + r < 2 ** 31 else np.int64)
+    print(f"  rollout cache [{label}]: {n:,} samples, {nu + r:,} distinct rollouts computed "
+          f"in {(time.time()-t0)/60:.1f}m ({rows.nbytes/2**30:.2f} GiB instead of "
+          f"{n * K * d * 4 / 2**30:.2f}, unlinked)", flush=True)
+    return _RolloutCache(rows, idx_map)
 
 
 #: Probability of dropping each observed technique from DeepOP's encoder input
@@ -637,8 +972,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             num_workers=num_workers))
 
     _lk=_loader_kwargs(device,num_workers)
-    train_loader=DataLoader(train_ds,batch_size=64,shuffle=True,**_lk)
-    val_loader=DataLoader(val_ds,batch_size=64,**_lk)
+    train_loader=_make_loader(train_ds,64,True,device,num_workers)
+    val_loader=_make_loader(val_ds,64,False,device,num_workers)
     # DeepOP as published: encoder over the observed technique sequence,
     # causal-window decoder (h=6, n_cw=3). Conditioned on the full world state.
     d_state=int(train_traj.feats.shape[1])
@@ -651,6 +986,9 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
     _base_ds = getattr(train_ds, "base", train_ds)
     _hist = np.asarray(_base_ds.target_token_histogram())
     _support = torch.as_tensor(_hist > 0, dtype=torch.bool, device=device)
+    # the same support as class ids, computed once (see smoothed_and_plain_ce)
+    _support_idx = (torch.as_tensor(np.flatnonzero(_hist > 0), dtype=torch.long, device=device)
+                    if (_hist > 0).any() else None)
     print(f"DeepOP label-smoothing support: {int(_support.sum())} of {len(_hist)} "
           f"tokens occur as a target", flush=True)
 
@@ -659,7 +997,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                           patience=patience, step_back_after=step_back_after,
                           warmup_steps=default_warmup_steps(_nb_total),
                           clip_norm=clip_norm or None,
-                          log=lambda m: print(m, flush=True))
+                          log=lambda m: print(m, flush=True),
+                          graph_undo=(str(device) == "cuda" and graphs_enabled()))
     first_epoch = 0
     _rp = resume.load() if resume is not None else None
     if _rp is not None:
@@ -668,14 +1007,30 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         best, best_epoch = _rp["best"], _rp["best_epoch"]
         _history[:] = _rp["history"]
         first_epoch = epochs if guard.should_stop() else _rp["done_epochs"]
+    _graphed = None
     for epoch in range(first_epoch, epochs):
         decoder.train()
         # On-device accumulation: `loss.item()` per batch synced the host to
         # the GPU on every step and defeated the worker prefetch queue.
         _tr_sum=torch.zeros((),device=device,dtype=torch.float64)
         _tr_plain=torch.zeros((),device=device,dtype=torch.float64); _nb=0
+        _nb_dev=torch.zeros((),device=device,dtype=torch.long); _k=0
+        _step=_guard_step_fn(guard)
+        if _graphed is None:
+            def _dp_loss(h_aug_, inp_, tgt_, obs_seq_):
+                logits_ = decoder(h_aug_, inp_, obs_tokens=obs_seq_)
+                l_, p_ = smoothed_and_plain_ce(logits_, tgt_, label_smoothing=0.04,
+                                               support=_support, support_index=_support_idx)
+                return l_, p_.detach()
+            # the whole step (forward, loss, backward, clip, guard checks and
+            # snapshot) as one CUDA graph: TrainingGuard.deferred_step_graphed
+            _graphed = WholeStepGraph(_dp_loss, [decoder],
+                                      enabled=(str(device) == "cuda" and graphs_enabled()
+                                               and guard.deferred_supported()))
         _t0=time.time()
         for batch in train_loader:
+            _k+=1
+            batch = unpack_batch(batch, device)
             h=batch["h_future"].to(device,non_blocking=_nblk)
             inp=batch["input_tokens"].to(device,non_blocking=_nblk)
             tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
@@ -693,22 +1048,35 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                 step_sigma=torch.linspace(0.015,0.055,steps=h.shape[1],device=device).unsqueeze(0).unsqueeze(-1)
                 h_aug=h+torch.randn_like(h)*step_sigma
             obs_seq=_drop_observed(batch["obs_tokens"].to(device,non_blocking=_nblk),vocab,OBS_TOKEN_DROPOUT)
-            optimizer.zero_grad(set_to_none=True); logits=decoder(h_aug,inp,obs_tokens=obs_seq)
+            optimizer.zero_grad(set_to_none=True)
+            # forward + loss + backward as a CUDA graph (cyberworld_v4/graphed_step.py);
+            # the observed-token dropout above stays eager, so its RNG draws are unchanged.
             # Train used smoothed CE while validation used plain CE, so the two
             # printed numbers were different functions and their gap was not a
             # generalisation gap. Identity: L_smooth = 0.96*plain + 0.04*U with
             # U >= ln(10), which put the real degradation at >= 0.2087 nats
             # against a printed 0.1404. Both are now reported.
-            loss, _plain = smoothed_and_plain_ce(logits, tgt, label_smoothing=0.04,
-                                                 support=_support)
-            if not guard.backward_step(loss):
+            if _graphed.enabled:
+                loss, _ok = guard.deferred_step_graphed(_graphed, [h_aug, inp, tgt, obs_seq])
+            else:
+                loss = _graphed.eager([h_aug, inp, tgt, obs_seq])
+                _ok = _step(loss)
+            _plain = _graphed.last_extras[0]
+            if _ok is False:
                 continue
-            _tr_sum+=loss.detach().double().sum(); _tr_plain+=_plain.detach().double().sum(); _nb+=1
-            if _nb % 2000 == 0:
-                _el=time.time()-_t0; _r=_nb/max(_el,1e-9)
-                print(f"  DeepOP epoch={epoch+1} batch={_nb}/{_nb_total} "
-                      f"({100.0*_nb/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
-                      f"eta={(_nb_total-_nb)/max(_r,1e-9)/60:.1f}m",flush=True)
+            _accumulate_ok(_ok, [(_tr_sum, loss.detach().double().sum()),
+                                 (_tr_plain, _plain.detach().double().sum())], _nb_dev)
+            if _k % 2000 == 0:
+                _el=time.time()-_t0; _r=_k/max(_el,1e-9)
+                print(f"  DeepOP epoch={epoch+1} batch={_k}/{_nb_total} "
+                      f"({100.0*_k/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
+                      f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m",flush=True)
+        guard.flush()
+        _nb=int(_nb_dev)
+        if _graphed is not None and (_graphed.enabled or _graphed.error):
+            print(f"  cuda graph: {_graphed.n_graphed} graphed steps of {_k}"
+                  + (f" ({_graphed.error})" if _graphed.error else ""), flush=True)
+            _graphed.n_graphed = 0
         decoder.eval()
         # Validation against the two predictors that require no model at all.
         #
@@ -720,53 +1088,10 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         # sitting on the class prior. Token accuracy, macro F1 over the tokens
         # actually present, and both baselines are reported together.
         V = vocab.vocab_size
-        _v_sum=torch.zeros((),device=device,dtype=torch.float64); _vn=0
-        _hit_model = torch.zeros((), device=device, dtype=torch.long)
-        _hit_persist = torch.zeros((), device=device, dtype=torch.long)
-        _tok_total = 0
-        _conf = torch.zeros(V * V, device=device, dtype=torch.long)
-        try:
-            _scorer = DeepOPTokenScorer(V, device=device)
-        except Exception as _e:
-            print(f"  token scorer unavailable: {_e}", flush=True); _scorer = None
-        _tgt_hist = torch.zeros(V, device=device, dtype=torch.long)
-        with torch.no_grad():
-            for batch in val_loader:
-                hv=batch["h_future"].to(device,non_blocking=_nblk)
-                if "h_rollout" in batch:
-                    hv=batch["h_rollout"].to(device,non_blocking=_nblk)
-                elif wdt is not None and "h_history" in batch:
-                    _th=batch["t_history"].to(device,non_blocking=_nblk) if "t_history" in batch else None
-                    _tf=batch["t_future"].to(device,non_blocking=_nblk) if "t_future" in batch else None
-                    hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1],
-                                   t_history=_th, t_future=_tf).detach()
-                tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
-                obs_seq=batch["obs_tokens"].to(device,non_blocking=_nblk)
-                logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk),obs_tokens=obs_seq)
-                _v_sum+=F.cross_entropy(logits.reshape(-1,V),tgt.reshape(-1)).double().sum()
-                _vn+=1
-                pred = logits.argmax(dim=-1)
-                if _scorer is not None:
-                    _obs = batch.get("obs_token")
-                    if _obs is not None:
-                        _free, _ = decoder.forecast_sequence(
-                            hv, max_steps=hv.shape[1],
-                            observed_token=_obs.to(device, non_blocking=_nblk),
-                            observed_sequence=obs_seq,
-                            continuity_bonus=0.0)
-                        _scorer.update(tgt, batch["input_tokens"].to(device, non_blocking=_nblk),
-                                       _obs.to(device, non_blocking=_nblk),
-                                       pred_tf=pred, pred_free=_free)
-                flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
-                _hit_model += (flat_p == flat_t).sum()
-                _tok_total += int(flat_t.numel())
-                _conf += torch.bincount(flat_t * V + flat_p, minlength=V * V)
-                _tgt_hist += torch.bincount(flat_t, minlength=V)
-                # persistence: the last token actually observed, repeated
-                obs = batch.get("obs_token")
-                if obs is not None:
-                    obs = obs.to(device, non_blocking=_nblk)
-                    _hit_persist += (obs.unsqueeze(1).expand_as(tgt) == tgt).sum()
+        _va = validate_deepop(decoder, wdt, val_loader, device, vocab)
+        _v_sum, _vn, _hit_model, _hit_persist = _va["v_sum"], _va["vn"], _va["hit_model"], _va["hit_persist"]
+        _tok_total, _conf, _tgt_hist, _scorer = _va["tok_total"], _va["conf"], _va["tgt_hist"], _va["scorer"]
+        print(f"  validation: {_va['graphed_batches']} of {_va['vn']} batches as a cuda graph", flush=True)
         score=float((_v_sum/max(_vn,1)).item())
         _tt = max(_tok_total, 1)
         acc = float(_hit_model.item()) / _tt
@@ -1053,14 +1378,23 @@ def main():
     parser.add_argument("--extract-workers",type=int,default=3,
                         help="Captures extracted at once, each in its own CPU process "
                              "(data_unification/parallel_extract.py); 1 = in this process")
+    parser.add_argument("--legacy-loader",action="store_true",
+                        help="Per-sample __getitem__ + default collate (the pre-2026-10 "
+                             "loaders). The default batched loaders yield bit-identical "
+                             "batches in the same order; this is a fallback.")
     parser.add_argument("--num-workers",type=int,default=4,
                         help="DataLoader worker processes; 0 loads in the main "
                              "process and serialises loading with GPU compute.")
-    args=parser.parse_args(); random.seed(42); np.random.seed(42); torch.manual_seed(42)
+    args=parser.parse_args()
+    global LEGACY_LOADER
+    LEGACY_LOADER = bool(args.legacy_loader)
+    random.seed(42); np.random.seed(42); torch.manual_seed(42)
     import time
     t0=time.time()
 
     tgn=build_or_load_tgne_ta(checkpoint_path=str(args.tgne))
+    from data_unification.fast_extract import enable_fast_extraction
+    enable_fast_extraction(tgn)   # serial extraction paths; workers do the same
     extractor=HostTrajectoryExtractor(
         tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds,
         spill_dir=str(args.spill_dir) if args.spill_dir else None)
@@ -1183,7 +1517,7 @@ def main():
     dp_out = args.out_dir / "deepop" / "cwa_forecast_decoder.pt"
     # Crash recovery. Kept until the whole run finishes, so a crash in DeepOP
     # does not retrain a Branch B that had already finished.
-    _fp = run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers"))
+    _fp = run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers", "legacy_loader"))
     _log = lambda m: print(m, flush=True)
     bb_resume = ResumePoint(bb_out.with_name(bb_out.stem + "_resume.pt"), {**_fp, "stage": "'branch_b'"},
                             enabled=not args.no_resume, log=_log)

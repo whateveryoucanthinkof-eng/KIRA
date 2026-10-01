@@ -59,6 +59,7 @@ def upload_many(device, *arrays):
     Returns device tensors (views into one byte buffer) with each array's
     dtype and shape. Offsets are 8-byte aligned so every dtype can be viewed.
     """
+    device = torch.device(device)        # callers may pass "cpu" (streaming extraction)
     arrs = [np.ascontiguousarray(a) for a in arrays]
     offs, total = [], 0
     for a in arrs:

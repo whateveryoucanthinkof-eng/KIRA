@@ -68,6 +68,7 @@ class TrainingGuard:
         max_nonfinite_frac: float = 0.01,
         min_delta: float = 1e-4,
         log: Callable[[str], None] = print,
+        graph_undo: Optional[bool] = None,
     ):
         if mode not in ("max", "min"):
             raise ValueError(f"mode must be 'max' or 'min', got {mode!r}")
@@ -103,6 +104,18 @@ class TrainingGuard:
         self._best_state: Optional[Dict[str, Any]] = None
         self._pending = None            # a deferred step whose outcome is not read yet
         self._snap = None
+        #: Replay the deferred step's snapshot copy and its where-undo as two
+        #: CUDA graphs (one launch each instead of one per tensor). Same
+        #: kernels on the same tensors: bit-identical. Re-captured whenever the
+        #: tensors move (e.g. a step-back reloads the optimizer state).
+        #: Off by default: measured on the encoder at full scale (one guard step
+        #: per 8 batches there) it gained nothing -- 365.9/394.7 batch/s off vs
+        #: 361.4/365.9 on -- so the encoder is left exactly as it was. The
+        #: downstream trainers, which step every batch, pass it explicitly.
+        if graph_undo is None:
+            graph_undo = False
+        self.graph_undo = bool(graph_undo)
+        self._undo_graphs = None
         self._reset_epoch_stats()
         self._apply_lr()
 
@@ -263,13 +276,21 @@ class TrainingGuard:
                 live += [q, st["exp_avg"], st["exp_avg_sq"]]
                 stepped.append(st["step"])
         snap = self._snapshot_buffers(live)
-        with torch.no_grad():
-            torch._foreach_copy_(snap, live)
+        graphs = self._graphs_for(live, snap) if self.graph_undo else None
+        if graphs is not None:
+            graphs["snap"].replay()
+        else:
+            with torch.no_grad():
+                torch._foreach_copy_(snap, live)
         self._apply_lr()
         opt.step()
-        with torch.no_grad():
-            for x, y in zip(live, snap):
-                torch.where(ok, x, y, out=x)
+        if graphs is not None:
+            graphs["ok"].copy_(ok)
+            graphs["undo"].replay()
+        else:
+            with torch.no_grad():
+                for x, y in zip(live, snap):
+                    torch.where(ok, x, y, out=x)
         out = torch.stack([ok.to(norm.dtype), norm.detach()])
         host = torch.empty(2, dtype=out.dtype, pin_memory=True)
         host.copy_(out, non_blocking=True)
@@ -277,6 +298,103 @@ class TrainingGuard:
         ev.record()
         self._pending = (host, ev, stepped)
         return ok
+
+    def deferred_step_graphed(self, whole, args):
+        """backward_step_deferred with the forward, loss, backward, gradient
+        clipping, the finite checks and the snapshot replayed as ONE CUDA graph
+        (`whole`: cyberworld_v4.graphed_step.WholeStepGraph).
+
+        The same kernels in the same order as the eager deferred step, so the
+        same decisions, counters and weights bit for bit
+        (tests/test_graphed_step.py). The optimizer step stays eager -- Adam's
+        bias correction is computed on the host from its step count -- and the
+        undo is the graph_undo graph. Falls back to computing the loss eagerly
+        and calling backward_step_deferred whenever the graph cannot be used:
+        the first step of an epoch, another batch shape, no optimizer state yet.
+
+        Returns (loss, ok) as backward_step_deferred's caller would see them.
+        """
+        self._resolve()
+        live = None
+        if self.n_grad != 0 and whole.usable(args):
+            live, stepped = self._graph_live(whole)
+        if live is None or not whole.ensure(args, live, self._snapshot_buffers(live), self,
+                                            {live[i] for i in range(0, len(live), 3)}):
+            loss = whole.eager(args)
+            return loss, self.backward_step_deferred(loss)
+        self.n_steps += 1
+        whole.replay(args)
+        loss, norm, ok = whole.loss, whole.norm, whole.ok
+        snap = self._snapshot_buffers(live)
+        graphs = self._graphs_for(live, snap)
+        self._apply_lr()
+        self.optimizer.step()
+        if graphs is not None:
+            graphs["ok"].copy_(ok)
+            graphs["undo"].replay()
+        else:
+            with torch.no_grad():
+                for x, y in zip(live, snap):
+                    torch.where(ok, x, y, out=x)
+        out = torch.stack([ok.to(norm.dtype), norm.detach()])
+        host = torch.empty(2, dtype=out.dtype, pin_memory=True)
+        host.copy_(out, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self._pending = (host, ev, stepped)
+        return loss, ok
+
+    def _graph_live(self, whole):
+        """(live, stepped) for the parameters the graph gives gradients to, in
+        optimizer order -- what backward_step_deferred collects from `.grad`."""
+        opt = self.optimizer
+        # Before the first capture: the parameters that have Adam state are the
+        # ones that have received gradients. The capture verifies the graph
+        # gives gradients to exactly these.
+        want = whole.grad_params or {q for g in opt.param_groups for q in g["params"]
+                                     if "exp_avg" in opt.state.get(q, {})}
+        if not want:
+            return None, None
+        live, stepped = [], []
+        for g in opt.param_groups:
+            for q in g["params"]:
+                if q not in want:
+                    continue
+                st = opt.state.get(q)
+                if not st or "exp_avg" not in st:
+                    return None, None
+                live += [q, st["exp_avg"], st["exp_avg_sq"]]
+                stepped.append(st["step"])
+        return live, stepped
+
+    def _graphs_for(self, live, snap):
+        """{"snap", "undo", "ok"}: the snapshot copy and the undo as CUDA graphs,
+        keyed by the tensors' addresses. None if capture is not possible."""
+        key = tuple(x.data_ptr() for x in live) + tuple(y.data_ptr() for y in snap)
+        g = self._undo_graphs
+        if g is not None and g["key"] == key:
+            return g
+        try:
+            ok_static = torch.zeros((), dtype=torch.bool, device=live[0].device)
+            side = torch.cuda.Stream(device=live[0].device)
+            side.wait_stream(torch.cuda.current_stream(live[0].device))
+            gs, gu = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+            # capture records, it does not execute: no tensor is modified here
+            with torch.no_grad():
+                # thread_local: the DataLoader's pin-memory thread may make CUDA
+                # calls meanwhile (see cyberworld_v4/graphed_step.thread_local_capture)
+                with torch.cuda.graph(gs, stream=side, capture_error_mode="thread_local"):
+                    torch._foreach_copy_(snap, live)
+                with torch.cuda.graph(gu, stream=side, capture_error_mode="thread_local"):
+                    for x, y in zip(live, snap):
+                        torch.where(ok_static, x, y, out=x)
+            torch.cuda.current_stream(live[0].device).wait_stream(side)
+        except Exception as e:                       # stay eager
+            self.graph_undo = False
+            self.log(f"[{self.name}] guard graphs unavailable ({type(e).__name__}: {e}); eager undo")
+            return None
+        self._undo_graphs = {"key": key, "snap": gs, "undo": gu, "ok": ok_static}
+        return self._undo_graphs
 
     def _snapshot_buffers(self, live):
         key = [(x.shape, x.dtype, x.device) for x in live]

@@ -43,7 +43,12 @@ cd "$REPO"
 OUT="${OUT:-results/training_plan}"
 MEM_MAX="${MEM_MAX:-17G}"
 PYTHON="${PYTHON:-python}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+# DataLoader workers for Branch A / B / DeepOP. 8, not 4: at full scale the
+# batched loader reads a host-major memmap bigger than page cache, and more
+# workers keep more of those reads in flight. Measured (77.5M-row store, 11 GB
+# cgroup like the production trainer): 4 -> 414, 8 -> 532, 12 -> 540 batch/s.
+# Worker count never changes the batches or their order.
+NUM_WORKERS="${NUM_WORKERS:-8}"
 # Spill stores, per-epoch checkpoints and resume points all land under OUT.
 # A full disk kills a run mid-epoch, so preflight refuses to start below this.
 MIN_FREE_GB="${MIN_FREE_GB:-50}"

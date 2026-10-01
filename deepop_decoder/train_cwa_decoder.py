@@ -517,10 +517,15 @@ class LazyCWADataset(Dataset):
             # 2x oversample any window containing a non-Benign step, matching
             # create_cwa_training_samples' anti-collapse duplication.
             cats = store.cat_id[rows]
-            active = np.array(
-                [bool((cats[i:i + self.K] != benign_cat).any()) for i in starts],
-                dtype=bool,
-            ) if benign_cat is not None else np.zeros(len(starts), bool)
+            # any(cats[i:i+K] != Benign) for every start, from one cumulative
+            # sum -- the per-start Python loop this replaces cost minutes at
+            # ~80M windows. Integer counts, so exactly the same booleans.
+            if benign_cat is not None:
+                _c = np.zeros(n + 1, dtype=np.int64)
+                np.cumsum(cats != benign_cat, out=_c[1:])
+                active = (_c[starts + self.K] - _c[starts]) > 0
+            else:
+                active = np.zeros(len(starts), bool)
             sel = np.concatenate([starts, starts[active]]) if self.oversample else starts
             host_idx.append(np.full(len(sel), hi, dtype=np.int32))
             pos.append(sel)
@@ -552,32 +557,63 @@ class LazyCWADataset(Dataset):
         and macro-F1 must be averaged over classes with support or those six
         contribute free zeros.
         """
-        st = self.store
-        n_rows = int(len(st.cat_id))
-        # (category, first technique) -> token, memoised: there are a handful
-        # of distinct pairs, not 28M.
-        first_tech = np.where(
-            st.tech_off[1:n_rows + 1] > st.tech_off[:n_rows],
-            st.tech_flat[np.minimum(st.tech_off[:n_rows], max(len(st.tech_flat) - 1, 0))],
-            -1,
-        ).astype(np.int64)
-        cats = np.asarray(st.cat_id[:n_rows], dtype=np.int64)
-        key = cats * (len(st.techniques) + 1) + (first_tech + 1)
-        uniq, inv = np.unique(key, return_inverse=True)
-        lut = np.empty(len(uniq), dtype=np.int64)
-        for j, k in enumerate(uniq):
-            c = int(k) // (len(st.techniques) + 1)
-            t = int(k) % (len(st.techniques) + 1) - 1
-            lut[j] = self.vocab.encode(st.categories[c],
-                                       st.techniques[t] if t >= 0 else "None")
-        row_tok = lut[inv]
-
+        row_tok = self._row_tokens()
         hist = np.zeros(self.vocab.vocab_size, dtype=np.int64)
-        for host_i, i in zip(self._host_idx, self._pos):
-            rows = st._rows_by_host[self.hosts[int(host_i)]]
-            hist += np.bincount(row_tok[rows[int(i):int(i) + self.K]],
+        if len(self._pos) == 0:
+            return hist
+        # Every sample's K target rows, counted in chunks of samples. The
+        # per-sample Python loop this replaces ran ~80M iterations at full
+        # scale, three times per run. Integer counts: identical.
+        flat, base = self._flat_base()
+        ar = np.arange(self.K, dtype=np.int64)
+        for c0 in range(0, len(self._pos), 1 << 21):
+            hi = self._host_idx[c0:c0 + (1 << 21)].astype(np.int64)
+            pos = base[hi] + self._pos[c0:c0 + (1 << 21)].astype(np.int64)
+            hist += np.bincount(row_tok[flat[pos[:, None] + ar]].ravel(),
                                 minlength=self.vocab.vocab_size)
         return hist
+
+    def _flat_base(self):
+        if not hasattr(self, "_flat"):
+            from data_unification.host_major import flat_row_order
+            self._flat, self._base = flat_row_order(
+                [self.store._rows_by_host[h] for h in self.hosts])
+        return self._flat, self._base
+
+    def _row_tokens(self) -> np.ndarray:
+        """The vocab token of every store row, `self._token(row)` for all rows at once.
+
+        `vocab.encode` is a function of (category, first technique) only, so it
+        is evaluated once per distinct pair and broadcast.
+        """
+        if getattr(self, "_row_tok", None) is not None:
+            return self._row_tok
+        st = self.store
+        n_rows = int(len(st.cat_id))
+        nt = len(st.techniques) + 1
+        # One encode per (category, technique-or-None) pair -- a few hundred --
+        # then a table lookup per row, in chunks so the peak stays small (an
+        # np.unique over 77M int64 keys peaked at several GB).
+        lut = np.empty(max(1, len(st.categories)) * nt, dtype=np.int64)
+        for c in range(len(st.categories)):
+            for t in range(-1, nt - 1):
+                lut[c * nt + t + 1] = self.vocab.encode(
+                    st.categories[c], st.techniques[t] if t >= 0 else "None")
+        dt = np.int16 if (lut.size == 0 or (lut.min() >= -2 ** 15 and lut.max() < 2 ** 15)) else np.int64
+        lut = lut.astype(dt)
+        out = np.empty(n_rows, dtype=dt)
+        tech_off = np.asarray(st.tech_off)
+        tech_flat = np.asarray(st.tech_flat)
+        for r0 in range(0, n_rows, 1 << 22):
+            r1 = min(n_rows, r0 + (1 << 22))
+            lo, hi = tech_off[r0:r1], tech_off[r0 + 1:r1 + 1]
+            first = np.full(r1 - r0, -1, dtype=np.int64)
+            has = hi > lo
+            if has.any():
+                first[has] = tech_flat[lo[has]]
+            out[r0:r1] = lut[np.asarray(st.cat_id[r0:r1], dtype=np.int64) * nt + first + 1]
+        self._row_tok = out
+        return self._row_tok
 
     def __len__(self):
         return int(len(self._pos))
@@ -641,6 +677,75 @@ class LazyCWADataset(Dataset):
             if len(t_h) < self.T:        # padded steps repeat the first real one's time
                 t_h = np.concatenate([np.repeat(t_h[:1], self.T - len(t_h)), t_h])
             t_f = np.asarray(w[fut], dtype=np.float64) - w0
+            out["t_history"] = torch.from_numpy(
+                np.ascontiguousarray(t_h * self._window_seconds, dtype=np.float32))
+            out["t_future"] = torch.from_numpy(
+                np.ascontiguousarray(t_f * self._window_seconds, dtype=np.float32))
+        return out
+
+    # -- batched access ------------------------------------------------------
+    #
+    # The default-collated batch of `[self[i] for i in indices]`, built with a
+    # few vectorised gathers: features from the host-major copy of the block
+    # (data_unification/host_major.py), tokens from a per-row token table
+    # instead of ~21 `vocab.encode` calls per sample.
+    # tests/test_branch_b_deepop_batched_loader.py pins bit-identity.
+
+    def enable_batched(self, host_major=None, spill_dir=None):
+        from data_unification.host_major import host_major_for
+        rows = [self.store._rows_by_host[h] for h in self.hosts]
+        self._flat, self._base, self._feats_hm = host_major_for(
+            self.store, rows, host_major=host_major, spill_dir=spill_dir)
+        self._row_tokens()
+        self._batched_ready = True
+        return self
+
+    def _feats_at(self, p):
+        if getattr(self, "_feats_hm", None) is not None:
+            return np.asarray(self._feats_hm[p])
+        return np.asarray(self.store.feats[self._flat[p]])
+
+    def gather_batch(self, indices):
+        if not hasattr(self, "_feats_hm"):
+            self.enable_batched(host_major=False)
+        st, K, T, n_obs, V = self.store, self.K, self.T, self.n_obs, self.vocab
+        flat, tok = self._flat, self._row_tok
+        idx = np.asarray(indices, dtype=np.int64)
+        b = self._base[self._host_idx[idx].astype(np.int64)]
+        i = self._pos[idx].astype(np.int64)
+        bi = (b + i)[:, None]
+        pf = bi + np.arange(K, dtype=np.int64)                 # the K target rows (always real)
+        tok_f = tok[flat[pf]].astype(np.int64)
+        bos = np.full((len(idx), 1), V.bos_idx, dtype=np.int64)
+        # observed sequence: [PAD]*(n_obs-m) + [BOS] + tokens of the m = min(i, n_obs)
+        # rows before i (observed_sequence_tokens)
+        m = np.minimum(i, n_obs)[:, None]
+        col = np.arange(n_obs + 1, dtype=np.int64)[None, :]
+        po = bi - n_obs - 1 + col
+        lead = n_obs - m
+        val = tok[flat[np.maximum(po, b[:, None])]].astype(np.int64)
+        obs_seq = np.where(col < lead, V.pad_idx, np.where(col == lead, V.bos_idx, val))
+        prev = tok[flat[np.maximum(b + i - 1, b)]].astype(np.int64)
+        out = {
+            "h_future": torch.from_numpy(np.ascontiguousarray(self._feats_at(pf), dtype=np.float32)),
+            "input_tokens": torch.from_numpy(np.ascontiguousarray(
+                np.concatenate([bos, tok_f[:, :-1]], axis=1))),
+            "target_tokens": torch.from_numpy(np.ascontiguousarray(tok_f)),
+            "obs_token": torch.from_numpy(np.where(i > 0, prev, V.bos_idx).astype(np.int64)),
+            "obs_tokens": torch.from_numpy(np.ascontiguousarray(obs_seq, dtype=np.int64)),
+        }
+        if T > 0:
+            if (i < 1).any():
+                raise AssertionError(f"T={T}>0 window at i=0 has no history; the first_i "
+                                     f"guard in __init__ was bypassed")
+            # rows[max(0, i-T):i], left-padded by repeating the first
+            ph = np.maximum(bi - T + np.arange(T, dtype=np.int64), b[:, None])
+            out["h_history"] = torch.from_numpy(
+                np.ascontiguousarray(self._feats_at(ph), dtype=np.float32))
+            w = np.asarray(st.window_idx)
+            w0 = w[flat[b + i - 1]].astype(np.float64)[:, None]
+            t_h = w[flat[ph]].astype(np.float64) - w0
+            t_f = w[flat[pf]].astype(np.float64) - w0
             out["t_history"] = torch.from_numpy(
                 np.ascontiguousarray(t_h * self._window_seconds, dtype=np.float32))
             out["t_future"] = torch.from_numpy(

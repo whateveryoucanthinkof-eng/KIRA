@@ -618,7 +618,7 @@ class MultiTaskLSTM(nn.Module):
             # technique prediction by construction.
             p = torch.softmax(tech_logits, dim=-1)
             level_p = p.new_zeros(p.shape[0], self.num_gradations).index_add_(
-                1, self._tech_level.to(p.device), p)
+                1, self._tech_level_on(p.device), p)
             grad_logits = torch.log(level_p.clamp_min(1e-12))
 
         return {
@@ -630,6 +630,18 @@ class MultiTaskLSTM(nn.Module):
             "attention_weights": attn_weights,
             "context": context,
         }
+
+    def _tech_level_on(self, device) -> torch.Tensor:
+        """`self._tech_level` on `device`, copied once rather than every forward.
+
+        `.to(cuda)` of a pageable CPU tensor was a synchronous host-to-device
+        copy on every training step (and cannot be recorded in a CUDA graph).
+        Same values; the CPU original is kept for anything that reads it."""
+        cached = getattr(self, "_tech_level_dev", None)
+        if cached is None or cached.device != torch.device(device):
+            cached = self._tech_level.to(device)
+            self._tech_level_dev = cached
+        return cached
 
     # -- construction from a checkpoint ------------------------------------
     def arch_config(self) -> Dict[str, Any]:
@@ -663,10 +675,14 @@ class MultiTaskLSTM(nn.Module):
         nothing and applying it would be a silent change to what the currently
         served model outputs.
         """
-        if float(self.temperature_fitted) <= 0.0:
-            return torch.ones((), device=self.temperature.device,
-                              dtype=self.temperature.dtype)
-        return self.temperature.clamp(min=1e-3)
+        # Selected on the device. `float(self.temperature_fitted)` was a
+        # host-device sync, and forward + compute_loss read this twice per
+        # training step. Same values: 1.0 exactly when unfitted (<= 0), the
+        # clamped T otherwise (a NaN flag compares False either way); always
+        # 0-dim (T is one element).
+        t = self.temperature.reshape(())
+        return torch.where(self.temperature_fitted.reshape(()) <= 0.0,
+                           torch.ones_like(t), t.clamp(min=1e-3))
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):

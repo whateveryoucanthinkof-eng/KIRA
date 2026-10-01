@@ -159,7 +159,8 @@ def deepop_on_store(decoder, wdt, store, vocab, device, train_token_counts, T: i
             obs = b["obs_token"].to(device)
             pred, _ = decoder.forecast_sequence(
                 h_fut, max_steps=K, observed_token=obs,
-                observed_sequence=b["obs_tokens"].to(device), continuity_bonus=0.0)
+                observed_sequence=b["obs_tokens"].to(device), continuity_bonus=0.0,
+                decode_names=False)
             tgt = b["target_tokens"].to(device)
             np.add.at(cm, (tgt.reshape(-1).cpu().numpy(), pred.reshape(-1).cpu().numpy()), 1)
             hit_persist += int((obs.unsqueeze(1).expand_as(tgt) == tgt).sum())

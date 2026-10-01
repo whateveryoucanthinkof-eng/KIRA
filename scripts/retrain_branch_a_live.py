@@ -26,6 +26,9 @@ from branch_a_gnn_lstm.sequence_dataset import (
     HostSequenceDataset,
     create_host_sequence_samples,
     LazyHostSequenceDataset,
+    BatchedSequenceView,
+    PermutationBatchSampler,
+    collate_prebatched,
 )
 from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
@@ -34,6 +37,8 @@ from data_unification.split_policy import is_cross_year
 from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingGuard,
                                           default_warmup_steps, run_fingerprint)
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
+from cyberworld_v4.graphed_step import GraphedBody, WholeStepGraph, graphs_enabled
+from data_unification.host_major import batched_loader, unpack_batch
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
@@ -839,6 +844,9 @@ def _warn_if_head_collapsed(metrics, where):
               flush=True)
 
 
+from cyberworld_v4.device_hist import device_hist as _hist  # noqa: E402  (no CUDA sync)
+
+
 def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
               risk_positive_above=0.0, collect_logits=False):
     """Validation pass.
@@ -898,82 +906,91 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     # the only caller and it runs once.
     keep_logits, keep_labels = [], []
 
+    # The per-batch work below is pure device work on the accumulators above;
+    # it is replayed as a CUDA graph (cyberworld_v4/graphed_step.GraphedBody):
+    # the same kernels in the same order, so the accumulators are identical.
+    # The batch / element counters are host-side and stay outside the body; the
+    # calibration pass (collect_logits) copies logits to the host per batch and
+    # runs eagerly.
+    acc = {"loss_sum": loss_sum, "abs_err_sum": abs_err_sum, "conf_hist": conf_hist,
+           "pos_hist": pos_hist, "neg_hist": neg_hist, "brier_sum": brier_sum,
+           "prob_sum": prob_sum, "resid_hist": resid_hist, "confusion": confusion,
+           "grad_correct": grad_correct, "grad_confusion": grad_confusion,
+           **{"ts_" + k: v for k, v in task_sums.items()}}
+    has_grad = {}
+
+    def body(a, x, t_hist, risk_t, tech_t, grad_t):
+        targets = {"risk": risk_t, "technique": tech_t, "gradation": grad_t}
+        predictions = model(x, t_history=t_hist)
+        loss, parts = model.compute_loss(predictions, targets)
+        a["loss_sum"] += loss.detach().double().sum()
+        # Per-task losses and their learned weights. Without these the
+        # total is uninterpretable: the 2026-09-21 run reported a
+        # validation loss of 0.66 against a test loss of 26.36 with no way
+        # to see that two of the three weights had saturated at exp(3)=20
+        # and were multiplying everything.
+        for _k in task_sums:
+            _v = parts.get(_k)
+            if _v is not None:
+                a["ts_" + _k] += _v.double().reshape(())
+        err = (predictions["risk_score"] - targets["risk"]).abs()
+        a["abs_err_sum"] += err.double().sum()
+        _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
+        a["resid_hist"] += _hist(_rb.reshape(-1), RISK_BINS)
+
+        # Risk as a probability: AUC, Brier and calibration, accumulated
+        # from a fixed histogram so 1.02M samples cost O(bins) memory and
+        # no host-device sync. `risk_positive_above` is the cut that makes a
+        # window positive (> 0 for severity, >= exp(-1) for the hazard target).
+        _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
+        _y = (targets["risk"] > risk_positive_above).reshape(-1)
+        a["brier_sum"] += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
+        _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
+        a["pos_hist"] += _hist(_b, RISK_BINS, _y.long())
+        a["neg_hist"] += _hist(_b, RISK_BINS, (~_y).long())
+        # Sum of the predicted probabilities per bin, so ECE can use each
+        # bin's ACTUAL mean confidence rather than its nominal centre.
+        a["conf_hist"] += _hist(_b, RISK_BINS, _p.double())
+        a["prob_sum"] += _p.double().sum()
+
+        pred_t = predictions["technique_logits"].argmax(dim=-1)
+        # No separate hit counter: the confusion matrix's trace IS the
+        # number correct.
+        a["confusion"] += _hist(tech_t * C + pred_t, C * C)
+
+        has_grad["v"] = "gradation_logits" in predictions
+        if has_grad["v"]:
+            pred_g = predictions["gradation_logits"].argmax(dim=-1)
+            a["grad_correct"] += (pred_g == grad_t).sum()
+            a["grad_confusion"] += _hist(grad_t * G + pred_g, G * G)
+        return predictions
+
+    run = GraphedBody(body, acc, enabled=(str(device) == "cuda" and not collect_logits
+                                          and graphs_enabled()))
     with torch.no_grad():
         for batch in loader:
+            batch = unpack_batch(batch, device)
             x = batch["features"].to(device, non_blocking=non_blocking)
-            targets = {
-                "risk": batch["risk"].to(device, non_blocking=non_blocking),
-                "technique": batch["technique"].to(device, non_blocking=non_blocking),
-                "gradation": batch["gradation"].to(device, non_blocking=non_blocking),
-            }
+            r_t = batch["risk"].to(device, non_blocking=non_blocking)
+            tc_t = batch["technique"].to(device, non_blocking=non_blocking)
+            g_t = batch["gradation"].to(device, non_blocking=non_blocking)
             # Real elapsed time between the history steps -- see
             # MultiTaskLSTM.time_proj. Validation must see what training sees.
             t_hist = (batch["t_history"].to(device, non_blocking=non_blocking)
                       if "t_history" in batch else None)
-            predictions = model(x, t_history=t_hist)
-            loss, parts = model.compute_loss(predictions, targets)
-            loss_sum += loss.detach().double().sum()
-            # Per-task losses and their learned weights. Without these the
-            # total is uninterpretable: the 2026-09-21 run reported a
-            # validation loss of 0.66 against a test loss of 26.36 with no way
-            # to see that two of the three weights had saturated at exp(3)=20
-            # and were multiplying everything.
-            for _k, _acc in task_sums.items():
-                _v = parts.get(_k)
-                if _v is not None:
-                    _acc += _v.double().reshape(())
-            nb += 1
-            err = (predictions["risk_score"] - targets["risk"]).abs()
-            abs_err_sum += err.double().sum()
-            n_risk += int(err.numel())
-            _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-            resid_hist += torch.bincount(_rb.reshape(-1), minlength=RISK_BINS)
-
-            # Risk as a probability: AUC, Brier and calibration, accumulated
-            # from a fixed histogram so 1.02M samples cost O(bins) memory and
-            # no host-device sync. MAE alone cannot judge this head -- on a
-            # target that is 0 for 82.5% of samples the MAE-optimal constant
-            # is 0, so a well-fit head can still "lose" to predicting nothing.
-            # Which windows count as positive for AUC / Brier / ECE / the
-            # operating point. With the severity target the event is "this is
-            # an attack window", i.e. risk > 0. With the hazard target
-            # (exp(-dt/tau)) risk > 0 degenerates to "this host is attacked at
-            # SOME later point", which discards the timing the hazard exists
-            # to carry; the operationally meaningful event there is "an attack
-            # occurs within one forecast horizon", i.e. hazard >= exp(-1).
-            # `risk_positive_above` carries whichever the caller means.
-            _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
-            _y = (targets["risk"] > risk_positive_above).reshape(-1)
-            brier_sum += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
-            _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-            pos_hist += torch.bincount(_b[_y], minlength=RISK_BINS)
-            neg_hist += torch.bincount(_b[~_y], minlength=RISK_BINS)
-            # Sum of the predicted probabilities per bin, so ECE can use each
-            # bin's ACTUAL mean confidence rather than its nominal centre.
-            conf_hist += torch.bincount(_b, weights=_p.double(), minlength=RISK_BINS)
-            prob_sum += _p.double().sum()
-
-            pred_t = predictions["technique_logits"].argmax(dim=-1)
-            true_t = targets["technique"]
-            # No separate hit counter: the confusion matrix's trace IS the
-            # number correct, so accumulating it twice bought one more
-            # device tensor and an extra `.item()` sync at the end.
-            confusion += torch.bincount(true_t * C + pred_t, minlength=C * C)
-
-            if "gradation_logits" in predictions:
-                pred_g = predictions["gradation_logits"].argmax(dim=-1)
-                true_g = targets["gradation"]
-                grad_correct += (pred_g == true_g).sum()
-                grad_total += int(true_g.numel())
-                grad_confusion += torch.bincount(true_g * G + pred_g,
-                                                 minlength=G * G)
-
             if collect_logits:
+                predictions = body(acc, x, t_hist, r_t, tc_t, g_t)
                 _raw = predictions.get("technique_logits_raw")
                 if _raw is None:
                     _raw = predictions["technique_logits"]
                 keep_logits.append(_raw.detach().float().cpu())
-                keep_labels.append(true_t.detach().cpu())
+                keep_labels.append(tc_t.detach().cpu())
+            else:
+                run(x, t_hist, r_t, tc_t, g_t)
+            nb += 1
+            n_risk += int(r_t.numel())
+            if has_grad.get("v"):
+                grad_total += int(g_t.numel())
 
     cm = confusion.reshape(C, C).cpu().numpy()
     tech = _metrics_from_confusion(cm)
@@ -1277,6 +1294,16 @@ def main():
                              "this corpus has one window, so the default drops a lot "
                              "and says so).")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-cuda-graph", action="store_true",
+                        help="Run the training step's forward/backward eagerly instead of "
+                             "replaying it as a CUDA graph (cyberworld_v4/graphed_step.py; "
+                             "bit-identical, ~2.7x less host time per step). Also "
+                             "CYBERWORLD_CUDA_GRAPH=0.")
+    parser.add_argument("--legacy-loader", action="store_true",
+                        help="Per-sample __getitem__ + default collate (the pre-2026-10 "
+                             "loader). The default batched loader yields bit-identical "
+                             "batches in the same order from a host-major feature copy "
+                             "(tests/test_branch_a_batched_loader.py); this is a fallback.")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -1339,6 +1366,8 @@ def main():
               flush=True)
     import time
     tgn = build_or_load_tgne_ta(checkpoint_path=str(args.tgne) if args.tgne else None)
+    from data_unification.fast_extract import enable_fast_extraction
+    enable_fast_extraction(tgn)   # serial extraction paths; workers do the same
     # Contract-bound (v4). Previously 2.0s / seq_len=5 hardcoded, which matched
     # the v3 contract by coincidence rather than by construction. Under v4 this
     # produces history_steps=15, so it yields a v4 checkpoint, not a v3 one.
@@ -1400,11 +1429,19 @@ def main():
         from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
         from data_unification.label_filter import (
             format_unresolved_report, merge_unresolved_reports)
-        shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
         widx_base = 0
         total_recs = 0
         coverage: List[dict] = []
-        if _cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1:
+        if label in _prebuilt:
+            # Already extracted, together with the other splits, by
+            # _extract_all_splits; its neighbour-exposure counts become the
+            # extractor's, to be reported (and reset) below as before.
+            shared, total_recs, coverage, extractor._exposure = _prebuilt.pop(label)
+        else:
+            shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+        if label in _done_labels:
+            pass
+        elif _cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1:
             # Captures are independent (memory and host ids reset per capture),
             # so extract several at once and append them in capture order:
             # the same store -- see data_unification/parallel_extract.py.
@@ -1506,6 +1543,54 @@ def main():
               f"{summary['zero_fraction_after']:.4f} | {summary}", flush=True)
 
     import gc
+    _prebuilt: Dict[str, Any] = {}
+    _done_labels = set()
+
+    def _extract_all_splits():
+        """Extract train, val and test through ONE parallel queue.
+
+        Split by split, the extraction workers idled at the end of every
+        split (a split's last big PCAP days run alone). One queue keeps them
+        busy. Each split's captures still reach that split's builder in
+        capture order, with the same window offsets, and each split keeps its
+        own neighbour-exposure counts, so every store is the one the
+        split-by-split loop builds (data_unification/parallel_extract.py).
+        CYBERWORLD_EXTRACT_ONE_QUEUE=0 restores split by split.
+        """
+        from data_unification.parallel_extract import extract_parallel
+        from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
+        splits = (("train", list(train_files)), ("val", list(val_files)), ("test", list(test_files)))
+        builders = {l: TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+                    for l, _ in splits}
+        expo = {l: dict.fromkeys(extractor._exposure, 0) for l, _ in splits}
+        cov = {l: [] for l, _ in splits}
+        recs = {l: 0 for l, _ in splits}
+        jobs = [(l, i, f, len(fs)) for l, fs in splits for i, f in enumerate(fs)]
+
+        def _items():
+            for n, (f, _r, cols, cv) in enumerate(_iter_capture_inputs([j[2] for j in jobs])):
+                cov[jobs[n][0]].append(cv)
+                yield n, cols, capture_namespace(f)
+        t = time.time()
+        for n, info in extract_parallel(
+                _items(), extractor=extractor, builder_for=lambda k: builders[jobs[k][0]],
+                exposure_for=lambda k: expo[jobs[k][0]],
+                tgne=str(args.tgne) if args.tgne else None,
+                part_dir=Path(args.spill_dir) / "parts_all", workers=args.extract_workers):
+            l, i, f, n_l = jobs[n]
+            recs[l] += info["n_records"]
+            print(f"  [{l} {i+1}/{n_l}] {f.label}: {info['n_records']} recs, "
+                  f"store={builders[l]._n} snaps, extract {info['seconds']:.1f}s "
+                  f"(in a worker), merge {info['merge_seconds']:.1f}s", flush=True)
+        print(f"extraction of all splits (one queue, {args.extract_workers} workers): "
+              f"{time.time() - t:.1f}s", flush=True)
+        for l, _ in splits:
+            _prebuilt[l] = (builders[l], recs[l], cov[l], expo[l])
+            _done_labels.add(l)
+
+    if (_cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1
+            and os.environ.get("CYBERWORLD_EXTRACT_ONE_QUEUE", "1") not in ("0", "false", "False")):
+        _extract_all_splits()
     t0 = time.time()
     train_store = _store_per_capture(train_files, "train")
     _apply_risk_target(train_store, "train")
@@ -1579,18 +1664,28 @@ def main():
     _loader_kw = dict(num_workers=args.num_workers, pin_memory=(device == "cuda"))
     if args.num_workers > 0:
         _loader_kw.update(persistent_workers=True, prefetch_factor=4)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        **_loader_kw,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        **_loader_kw,
-    )
+    def _make_loader(ds, shuffle):
+        """One loader policy for train, validation and test.
+
+        The batched path builds each batch with one vectorised gather from a
+        host-major copy of the feature block (data_unification/host_major.py)
+        instead of 128 per-sample memmap gathers, each of which was ~13 random
+        disk reads at full scale. Same batches, same order, same RNG draws as
+        DataLoader(ds, shuffle=...): tests/test_branch_a_batched_loader.py.
+        """
+        if args.legacy_loader:
+            return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, **_loader_kw)
+        if not hasattr(ds, "_flat"):
+            _t = time.time()
+            ds.enable_batched(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+            print(f"  batched loader ready in {time.time() - _t:.1f}s "
+                  f"(host-major features: {ds._feats_hm is not None})", flush=True)
+        # One buffer per batch (host_major.pack_batch): one shared-memory
+        # handle, one pin, one host-to-device copy; the loops unpack_batch it.
+        return batched_loader(ds, args.batch_size, shuffle, pack=True, **_loader_kw)
+
+    train_loader = _make_loader(train_ds, shuffle=True)
+    val_loader = _make_loader(val_ds, shuffle=False)
 
     # Per-class focal alpha, computed from the TRAINING split only.
     #
@@ -1669,7 +1764,8 @@ def main():
         warmup_steps=(args.warmup_steps if args.warmup_steps is not None
                       else default_warmup_steps(_n_train_batches)),
         clip_norm=args.clip_norm or None,
-        log=lambda m: print(m, flush=True))
+        log=lambda m: print(m, flush=True),
+        graph_undo=(device == "cuda" and graphs_enabled() and not args.no_cuda_graph))
     if args.eval_only:
         # Re-score an existing checkpoint without retraining.
         #
@@ -1694,8 +1790,7 @@ def main():
         # collapsed head, a distribution shift between capture days, or a
         # checkpoint picked on an outlier epoch, so both are printed side by
         # side with the same metric set.
-        _tl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                         **_loader_kw)
+        _tl = _make_loader(test_ds, shuffle=False)
         _fits = None
         for _name, _ldr in (("validation", val_loader), ("held-out test", _tl)):
             # Logits are collected on validation only: that is the split a
@@ -1779,7 +1874,7 @@ def main():
     # Crash recovery (cyberworld_v4/training_guard.ResumePoint). Extraction
     # re-runs on a restart; the finished epochs do not.
     resume = ResumePoint(args.output.with_name(args.output.stem + "_resume.pt"),
-                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers")),
+                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers", "legacy_loader", "no_cuda_graph")),
                          enabled=not args.no_resume, log=lambda m: print(m, flush=True))
     first_epoch = 1
     _rp = resume.load()
@@ -1793,6 +1888,7 @@ def main():
         if guard.should_stop():
             first_epoch = args.epochs + 1    # it had already stopped; just finish
 
+    _graphed_loss = None
     for epoch in range(first_epoch, args.epochs + 1):
         model.train()
         # Loss is accumulated as a GPU tensor and read once at the end of the
@@ -1803,9 +1899,40 @@ def main():
         # batches.
         _nb = 0
         _loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        # Steps taken, counted on the device: with the deferred guard step the
+        # verdict of a step is a device bool, read by the guard one step later.
+        _nb_dev = torch.zeros((), device=device, dtype=torch.long)
+        _k = 0
+        # "no step taken yet this epoch" (the old `_nb == 0`). Until the first
+        # successful step the guard steps synchronously and returns a Python
+        # bool, so this is known on the host exactly when the old test was.
+        _stepped = False
         _t_epoch = time.time()
         _non_blocking = (device == "cuda")
+        # No host-device sync per step (TrainingGuard.backward_step_deferred):
+        # the step is taken on the device and undone there if the loss or the
+        # gradient is not finite. Same decisions, counters and weights bit for
+        # bit (tests/test_training_guard_one_sync.py); CYBERWORLD_GUARD_SYNC=1
+        # restores the syncing step.
+        _guard_step = (guard.backward_step_deferred if guard.deferred_supported()
+                       else guard.backward_step)
+        # forward + loss + backward replayed as a CUDA graph for full batches
+        # (built once, on the first one); identical losses and weights.
+        if _graphed_loss is None:
+            def _train_loss(x_, t_, risk_, tech_, grad_):
+                p_ = model(x_, t_history=t_)
+                return model.compute_loss(
+                    p_, {"risk": risk_, "technique": tech_, "gradation": grad_})[0]
+            # The whole step -- forward, loss, backward, clipping, the guard's
+            # finite checks and snapshot -- as one CUDA graph
+            # (TrainingGuard.deferred_step_graphed); the optimizer step stays eager.
+            _graphed_loss = WholeStepGraph(
+                _train_loss, [model],
+                enabled=(device == "cuda" and not args.no_cuda_graph and graphs_enabled()
+                         and guard.deferred_supported()))
         for batch in train_loader:
+            _k += 1
+            batch = unpack_batch(batch, device)
             x = batch["features"].to(device, non_blocking=_non_blocking)
             targets = {
                 "risk": batch["risk"].to(device, non_blocking=_non_blocking),
@@ -1817,7 +1944,7 @@ def main():
             # steps 2 s apart and fifteen spread over hours looked identical.
             t_hist = (batch["t_history"].to(device, non_blocking=_non_blocking)
                       if "t_history" in batch else None)
-            if _nb == 0:
+            if not _stepped:
                 # Once per epoch, before the step: do the tasks fight over the
                 # shared LSTM? Measured instead of assumed (see
                 # MultiTaskLSTM.task_gradient_conflict); writes no .grad.
@@ -1828,26 +1955,49 @@ def main():
                       f"cos(tech,grad)={_c3['tech_vs_grad']:+.3f} "
                       f"dominant={_conflict['dominant_task']}", flush=True)
             optimizer.zero_grad(set_to_none=True)
-            predictions = model(x, t_history=t_hist)
-            loss, _ = model.compute_loss(predictions, targets)
+            if t_hist is not None and _graphed_loss.enabled:
+                loss, _ok = guard.deferred_step_graphed(
+                    _graphed_loss, [x, t_hist, targets["risk"], targets["technique"],
+                                    targets["gradation"]])
+            else:
+                predictions = model(x, t_history=t_hist)
+                loss, _ = model.compute_loss(predictions, targets)
+                _ok = None
             # backward + clip + step. A non-finite loss is skipped and counted,
             # never stepped on; the guard turns a run of them into a step back.
-            if not guard.backward_step(loss):
+            if _ok is None:
+                _ok = _guard_step(loss)
+            if _ok is False:
                 continue
             # Keep the log-variances in range in the saved weights too: a step
             # can leave one epsilon outside the bound, and that is the value a
-            # checkpoint written this epoch would record.
+            # checkpoint written this epoch would record. (After a step the
+            # device undid, the weights are the previous, already-projected
+            # ones, and the clamp leaves them unchanged.)
             model.uncertainty_loss.project_()
-            _loss_sum += loss.detach().double().sum()
-            _nb += 1
-            if args.log_every and _nb % args.log_every == 0:
+            _stepped = True
+            if _ok is True:
+                _loss_sum += loss.detach().double().sum()
+                _nb_dev += 1
+            else:
+                # adds exactly 0.0 / 0 for a skipped step, as `continue` did
+                _loss_sum += torch.where(_ok, loss.detach().double().sum(),
+                                         torch.zeros((), device=device, dtype=torch.float64))
+                _nb_dev += _ok.to(torch.long)
+            if args.log_every and _k % args.log_every == 0:
                 _el = time.time() - _t_epoch
-                _rate = _nb / max(_el, 1e-9)
-                _eta = (_n_train_batches - _nb) / max(_rate, 1e-9)
-                print(f"  epoch={epoch} batch={_nb}/{_n_train_batches} "
-                      f"({100.0 * _nb / max(_n_train_batches, 1):.1f}%) "
+                _rate = _k / max(_el, 1e-9)
+                _eta = (_n_train_batches - _k) / max(_rate, 1e-9)
+                print(f"  epoch={epoch} batch={_k}/{_n_train_batches} "
+                      f"({100.0 * _k / max(_n_train_batches, 1):.1f}%) "
                       f"{_rate:.1f} batch/s elapsed={_el / 60:.1f}m "
                       f"eta={_eta / 60:.1f}m", flush=True)
+        guard.flush()
+        _nb = int(_nb_dev)
+        if _graphed_loss is not None and (_graphed_loss.enabled or _graphed_loss.error):
+            print(f"  cuda graph: {_graphed_loss.n_graphed} whole steps graphed of {_k}"
+                  + (f" ({_graphed_loss.error})" if _graphed_loss.error else ""), flush=True)
+            _graphed_loss.n_graphed = 0
 
         metrics = _evaluate(model, val_loader, device,
                             num_techniques=len(TECHNIQUE_VOCAB),
@@ -1997,8 +2147,7 @@ def main():
     ckpt["risk_conformal"] = fits.get("risk_conformal")
     ckpt["validation_metrics_at_fit"] = slim(_val_metrics)
 
-    test_loader = DataLoader(test_ds,
-                             batch_size=args.batch_size, shuffle=False, **_loader_kw)
+    test_loader = _make_loader(test_ds, shuffle=False)
     test_metrics = _evaluate(model, test_loader, device,
                              num_techniques=len(TECHNIQUE_VOCAB),
                              risk_positive_above=risk_positive_above)
