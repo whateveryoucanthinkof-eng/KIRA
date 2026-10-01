@@ -19,10 +19,24 @@ export interface SystemStatus {
   // Sensor blind spots (control_backend/capture_accounting.py). Cumulative
   // since the sensor started; nonzero means some windows were scored on a
   // partial capture or never scored at all.
-  sensorKernelDrops: number; // frames the kernel dropped before capture saw them
-  incompleteWindows: number; // windows built while the kernel was dropping
-  windowsMissed: number; // windows the sensor never delivered
+  sensorKernelDrops?: number; // frames the kernel dropped before capture saw them
+  incompleteWindows?: number; // windows built while the kernel was dropping
+  windowsMissed?: number; // windows the sensor never delivered
+  // Model availability (schema.py:SystemStatusEvent). Without loadable
+  // checkpoints the backend still runs; model_error says why.
+  model_loaded?: boolean;
+  model_error?: string | null;
+  contract?: TemporalContract | null;
   [key: string]: any; // Allow raw backend fields (network_online, ml_active, etc.)
+}
+
+/** schema.py:TemporalContractInfo — what the timeline is laid out on. */
+export interface TemporalContract {
+  window_seconds: number;
+  history_steps: number;
+  forecast_steps: number;
+  forecast_step_seconds: number;
+  source: "checkpoints" | "config";
 }
 
 export interface TelemetryPoint {
@@ -85,15 +99,17 @@ export interface PredictionResult {
   stage_probabilities?: Record<string, number> | null;
   technique_confidence?: number | null;
   stage_provenance?: Record<string, string>;
-  // Provenance (schema.py:PredictionData, spec 21/41). `risk` and
-  // `predicted_stage` are always the model's. The advisory rule layer, when
-  // enabled, reports its own opinion alongside and never replaces them.
+  // Provenance (schema.py:PredictionData, spec 21/41). `risk` and the
+  // technique are always the model's. The advisory rule layer, when enabled,
+  // reports its own opinion alongside and never replaces them.
   ml_risk?: number | null;
   ml_technique?: string | null;
   rule_risk?: number | null;
   rule_technique?: string | null;
   rules_applied?: boolean | null;
   risk_source?: string;
+  /** Kill-chain lane of the model's technique (control_backend/tactics.py). */
+  tactic_lane?: string | null;
   // A recorded block/isolation is not enforced by the console. The model keeps
   // scoring real traffic; "traffic_persists" means the block is not working.
   mitigation_status?: "recorded_quiet" | "traffic_persists" | null;
@@ -114,10 +130,16 @@ export interface ForecastPoint {
   // True horizon of this step, in SECONDS, straight from the backend
   // (schema.py:ForecastPoint.horizon_seconds). Steps are window_seconds apart.
   horizonSeconds: number;
+  /** Kill-chain lane of this step (tactic_lane on the wire). */
   predictedStage?: string | null;
+  /** The DeepOP token itself, e.g. "Impact.T1498". */
+  technique?: string | null;
   predicted: number;
   upperBound: number;
   lowerBound: number;
+  /** True when the bounds are the backend's conformal band; false when the
+   * checkpoint carries none and the bounds collapse onto the forecast. */
+  banded?: boolean;
   confidence: number;
 }
 
@@ -175,13 +197,22 @@ export interface Topology {
   lastUpdated: string;
 }
 
+/** /api/site (control_backend/site_config.py:as_public_dict), plus display fields. */
 export interface SiteInfo {
+  /** Display name — `display_name` on the wire. */
   name: string;
-  location: string;
-  timezone: string;
-  subnet: string;
-  externalIp: string;
-  description: string;
+  location?: string;
+  timezone?: string;
+  subnet?: string;
+  externalIp?: string;
+  description?: string;
+  site_id?: string;
+  lab_mode?: boolean;
+  enterprise_cidrs?: string[];
+  external_cidrs?: string[];
+  zones?: Record<string, string[]>;
+  assets_of_interest?: { ip: string; name?: string; role?: string }[];
+  sensor?: { mode?: string; interface?: string | null; container?: string | null };
 }
 
 export interface CommandResult {

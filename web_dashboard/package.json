@@ -7,19 +7,27 @@
     "dev": "vite",
     "demo": "vite --mode demo",
     "build": "vite build",
+    "build:demo": "vite build --mode demo --outDir dist-demo --emptyOutDir",
+    "demo:prod": "vite build --mode demo --outDir dist-demo --emptyOutDir && vite preview --outDir dist-demo --port 8444 --strictPort",
     "preview": "vite preview",
     "format": "oxfmt"
   },
   "dependencies": {
+    "@react-three/drei": "10.7.8",
+    "@react-three/fiber": "9.8.0",
+    "@react-three/postprocessing": "3.1.2",
+    "postprocessing": "6.39.5",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "recharts": "^3.10.1"
+    "recharts": "^3.10.1",
+    "three": "0.186.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@types/three": "0.186.0",
     "@vitejs/plugin-react": "^6.0.0",
     "oxfmt": "^0.2.0",
     "tailwindcss": "^4.0.0",

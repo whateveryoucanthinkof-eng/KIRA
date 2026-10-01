@@ -6,7 +6,7 @@
  * claim, stated in one line: here is how far the intrusion has actually got,
  * and here is where the model says it goes next.
  *
- * Lanes are the real ordering from `correlation/causal_edge_scorer.py:TACTIC_ORDER`
+ * Lanes are the real ordering from `correlation/causal_edge_scorer.py:19`
  * TACTIC_ORDER. Stage assignment comes off the wire — `predicted_stage` on
  * PredictionData for the present, and on each ForecastPoint for the rollout.
  *
@@ -18,20 +18,15 @@ import type { ForecastPoint } from "../api/types";
 import { Micro, sevColor, sevFromRisk } from "../design/primitives";
 import { FORECAST, OBSERVED } from "../design/charts";
 
-/** correlation/causal_edge_scorer.py:TACTIC_ORDER */
-const LANES = [
-  { key: "Recon", label: "Recon" },
-  { key: "InitialAccess", label: "Access" },
-  { key: "Execution", label: "Exec" },
-  { key: "C2", label: "C2" },
-  { key: "LateralMovement", label: "Lateral" },
-  { key: "Exfiltration", label: "Exfil" },
-  { key: "Impact", label: "Impact" },
-];
+import { LANES as ALL_LANES } from "../design/lanes";
+
+/** control_backend/tactics.py:LANES, with the strip's short labels. */
+const LANES = ALL_LANES.map((l) => ({ key: l.key, label: l.short, dev: l.dev }));
 
 type Cell = {
   key: string;
   label: string;
+  dev?: boolean;
   state: "done" | "now" | "forecast" | "idle";
   technique: string | null;
   horizon: string | null;
@@ -70,7 +65,8 @@ export default function KillChain({
     if (idx > nowIdx) forecastAt.set(k, f);
   }
 
-  const cells: Cell[] = LANES.map((lane, i) => {
+  const cells: Cell[] = LANES.map((lane, i): Cell => {
+    if (lane.dev) return { key: lane.key, label: lane.label, dev: true, state: "idle", technique: null, horizon: null, risk: null };
     if (nowIdx >= 0 && i === nowIdx) {
       return {
         key: lane.key,
@@ -119,7 +115,7 @@ export default function KillChain({
           const fc = c.state === "forecast";
 
           return (
-            <div key={c.key} style={{ minWidth: 0 }}>
+            <div key={c.key} style={{ minWidth: 0 }} className={c.dev ? "is-udev" : undefined} title={c.dev ? "Under development: no deployed head emits this stage yet." : undefined}>
               {/* Lane label */}
               <div
                 className="t-micro"
@@ -160,6 +156,7 @@ export default function KillChain({
                     {c.technique}
                   </div>
                 )}
+                {c.dev && !compact && <div className="t-data-s" style={{ color: "var(--paper-600)" }}>in dev</div>}
                 {c.horizon && (
                   <div
                     className="t-data-s"

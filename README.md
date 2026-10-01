@@ -173,7 +173,8 @@ the forecast step was coarsened to 30 s. The serving adapter refuses to load the
 
 - **OS**: Linux (Fedora / RHEL / Ubuntu / Debian)
 - **Python**: 3.10+
-- **Node.js**: v18+ and `npm` (required to build the web dashboard)
+- **Node.js**: v20+ and `npm` to build the web dashboard — on `PATH`, or inside a toolbox named by
+  `CYBERWORLD_NPM_TOOLBOX` (default `claude-dev`). The launcher builds the UI itself when needed.
 - **For Lab Mode**: Podman (or Docker) + Containerlab ≥ 0.50, `iproute2` / `tc`
 - **For live capture**: `CAP_NET_RAW` (or root) on the mirror interface; promiscuous mode often required
 
@@ -195,12 +196,13 @@ the forecast step was coarsened to 30 s. The serving adapter refuses to load the
    pip install -r requirements.txt
    ```
 
-3. **Install Frontend dependencies:**
-   Build the React SOC dashboard.
+3. **Frontend:** nothing to do by hand. `run_dashboard.py` installs the UI's dependencies and builds
+   it on first run, and rebuilds whenever its sources change. To do it manually:
    ```bash
    cd web_dashboard
-   npm install
-   npm run build
+   npm ci
+   npm run build        # the console      -> dist/
+   npm run build:demo   # the demo dashboard -> dist-demo/
    cd ..
    ```
 
@@ -233,7 +235,7 @@ Minimal fields: `enterprise_cidrs`, `sensor.interface`, `topology.node_ttl_sec` 
 
 ## Quickstart
 
-### A. SOC dashboard (recommended)
+### A. SOC console — K.I.R.A. (recommended)
 
 ```bash
 # Lab profile
@@ -241,9 +243,24 @@ python run_dashboard.py --site containerlab-enterprise
 
 # Local SPAN (needs privileges on the mirror NIC)
 sudo -E python run_dashboard.py --site local-default --interface eth1
+
+# Replay a capture through the real sensor path
+python run_dashboard.py --site local-default --replay captures/live.pcap
 ```
 
-Opens `http://localhost:8000` (builds `web_dashboard` if `dist/` is missing).
+Opens `http://localhost:8000`. This is the real console: real traffic, real models, Containerlab
+controls, and no attack buttons — attacks are run against the lab from outside it. Without trained
+checkpoints it still runs (sensor, topology, lab controls) and says **Models not loaded**.
+
+### Demo dashboard — only to see the UI
+
+```bash
+python run_dashboard.py --demo
+```
+
+Opens `http://localhost:8443`: the same UI on sample data, with no backend, sensor or models, and
+in-app attack-scenario buttons. Nothing on it is a model output, and the header says **DEMO DATA**.
+Use the console above for anything real. Panel-by-panel sources: `docs/DASHBOARD_INTEGRATION.md`.
 
 **Lab UI flow:** START NETWORK → START SENSOR → START ML  
 
@@ -356,8 +373,9 @@ CYBERWORLD_API_TOKEN=... python run_dashboard.py --host 0.0.0.0   # or bring you
 With a token set, every request and the WebSocket must carry it (`Authorization: Bearer`, or open
 `/?token=…` once, which sets an HttpOnly cookie).
 
-`npm run demo` runs the UI on scripted fixtures (`web_dashboard/src/api/mock.ts`) with no backend. Every
-page shows a **DEMO DATA** banner in that mode so it cannot be mistaken for the live system.
+`python run_dashboard.py --demo` (or `npm run demo` for a dev server) runs the UI on scripted fixtures
+(`web_dashboard/src/api/mock.ts`) with no backend. The header shows **DEMO DATA** in that mode so it
+cannot be mistaken for the live system, and the live build contains none of those fixtures.
 
 ---
 
@@ -377,10 +395,11 @@ Stated here so nobody has to discover them.
   every new encoder. It makes training time-ordered (no batch shuffling) and serving stateful (memory
   is per session and cleared on reset). **The shipped encoder was trained with memory off**, which meant
   its BiTA aggregator never ran; it must be retrained to be a BiTA encoder at all.
-- **Campaign correlation is a heuristic and is not wired in.** `correlation/` links alerts with hand-set
-  kill-chain priors (every constant is in `causal_edge_scorer.HEURISTIC_PARAMS`; none were fitted). It is
-  bounded to the models' evidence horizon (history + forecast), splits campaigns on time gaps, and is not
-  called by the live backend. The dashboard's Campaign page is populated only by demo fixtures.
+- **Campaign correlation is a heuristic.** `correlation/` links alerts with hand-set kill-chain priors
+  (every constant is in `causal_edge_scorer.HEURISTIC_PARAMS`; none were fitted). It is bounded to the
+  models' evidence horizon (history + forecast) and splits campaigns on time gaps. The live backend runs
+  it over the scored windows (`control_backend/correlation_service.py`) to fill the Campaign and
+  Incidents pages; the payload labels it as heuristic.
 - **Branch B may not be learning.** Its first run flatlined at epoch 1. Retraining now records its skill
   against persistence (copying the last embedding forward) in the checkpoint, and DeepOP refuses to train
   on a Branch B that does not beat it. The shipped Branch B predates that check.
@@ -423,7 +442,8 @@ recorded mitigation does not hide ongoing traffic.
 | Lab buttons missing | `lab_mode: false` — expected for `local-default`. |
 | `start_network` rejected | Site is not Lab Mode — switch to `containerlab-enterprise`. |
 | No packets on tap | `podman exec clab-enterprise-sensor tcpdump -c 10 -ni eth_sensor` |
-| Frontend missing | `cd web_dashboard && npm install && npm run build` |
+| Frontend missing | `python run_dashboard.py --rebuild`, or `cd web_dashboard && npm ci && npm run build` |
+| "Models not loaded" in the header | No loadable checkpoints in `saved_models/`; the tooltip and Controls page give the reason. Retrain, then press Start Inference. |
 | Checkpoint errors | Ensure `saved_models/` and `bita/saved_models/` files exist |
 
 ---

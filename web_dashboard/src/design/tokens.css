@@ -10,18 +10,20 @@
      · No gradient except a flat-to-transparent chart area fill at <= 14%.
      · Colour is data-ink. If it does not encode risk, it is monochrome.
      · Machine output is mono. Human language is Space Grotesk.
-       Only Instrument Serif is permitted to be large.
+       Only the display face (Space Grotesk, Netra brand) is permitted to be large.
    ════════════════════════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap');
 
 :root {
-  /* ── Type faces ───────────────────────────────────────────────────────── */
-  --face-display: 'Instrument Serif', 'Times New Roman', serif;
-  --face-ui: 'Space Grotesk', 'Helvetica Neue', Arial, sans-serif;
-  --face-data: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  /* ── Type faces — Netra typography, used exactly ──────────────────────────
+     Display headlines: Space Grotesk (Netra's brand face — headlines, panel
+     titles, nav). UI text: Inter. Machine output: IBM Plex Mono.
+     Weights loaded: Space Grotesk 400/500/600/700, Inter 400/500,
+     IBM Plex Mono 400/500/600. */
+  --face-display: 'Space Grotesk', 'Helvetica Neue', Arial, sans-serif;
+  --face-ui: Inter, 'IBM Plex Sans', system-ui, 'Segoe UI', sans-serif;
+  --face-data: 'IBM Plex Mono', 'JetBrains Mono', ui-monospace, Consolas, monospace;
 
   /* ── Structure ────────────────────────────────────────────────────────── */
   --radius: 0;
@@ -33,40 +35,41 @@
   --s-8: 32px;
   --s-12: 48px;
 
-  --panel-pad: 16px;
-  --panel-head-h: 32px;
-  --rail-w: 216px;
-  --header-h: 56px;
+  --panel-pad: 12px;
+  --panel-head-h: 30px;
+  --rail-w: 190px;
+  --header-h: 46px;
 
-  /* ── INK — the default theme. Warm graphite, for night operations. ────── */
-  --ink-000: #0a0a09;
-  --ink-050: #121211;
-  --ink-100: #191918;
-  --ink-200: #232322;
-  --ink-300: #2b2b29;
+  /* ── INK — the default theme. Netra's lime-on-black surfaces. ─────────── */
+  --ink-000: #050706;
+  --ink-050: #050706;
+  --ink-100: #111312;
+  --ink-200: #161816;
+  --ink-300: #1B1E1B;
 
-  --rule-hair: #2c2c2a;
-  --rule-hard: #46453f;
+  --rule-hair: #222522;
+  --rule-hard: #292c29;
 
   --paper-000: #f2efe6;
   --paper-400: #a8a49a;
   --paper-600: #6e6b63;
 
-  /* ── Severity — data-ink only. Maps 1:1 to PredictionData.alert_level. ── */
-  --sev-nominal: #4f9d69;
-  --sev-warning: #c89331;
-  --sev-elevated: #c4643a;
-  --sev-critical: #c4362f;
+  /* ── Severity — identity ladder: green #00FF00, amber #FFC000, red #FF0000.
+     Maps 1:1 to PredictionData.alert_level. ── */
+  --sev-nominal: #00ff00;
+  --sev-warning: #ffc000;
+  --sev-elevated: #ffc000;
+  --sev-critical: #ff0000;
 
-  /* Observed data is WARM. Forecast data is COOL. The temperature split
-     carries the provenance, so no third accent hue is needed — and the
-     distinction survives greyscale, which a hue pair would not. */
-  --signal-observed: #d8cfae;
-  --signal-forecast: #7d8ca1;
+  /* Observed data is the #00FF00 identity. Forecast data is amber — the
+     temperature split carries the provenance, so no third accent hue is
+     needed — and the distinction survives greyscale. */
+  --signal-observed: #00ff00;
+  --signal-forecast: #ffc000;
 
   /* Chart area fills. The one sanctioned gradient use. */
-  --fill-observed: rgba(216, 207, 174, 0.1);
-  --fill-forecast: rgba(125, 140, 161, 0.12);
+  --fill-observed: rgba(0, 255, 0, 0.1);
+  --fill-forecast: rgba(255, 192, 0, 0.12);
 
   /* ── Composite rules ──────────────────────────────────────────────────── */
   --hair: 1px solid var(--rule-hair);
@@ -90,16 +93,16 @@
   --paper-400: #57544c;
   --paper-600: #86827a;
 
-  --sev-nominal: #2f7346;
-  --sev-warning: #96690f;
+  --sev-nominal: #00ff00;
+  --sev-warning: #8a6a00;
   --sev-elevated: #9c4520;
-  --sev-critical: #9c2019;
+  --sev-critical: #b30000;
 
-  --signal-observed: #5c5138;
-  --signal-forecast: #4a5a70;
+  --signal-observed: #00ff00;
+  --signal-forecast: #8a6a00;
 
-  --fill-observed: rgba(92, 81, 56, 0.12);
-  --fill-forecast: rgba(74, 90, 112, 0.12);
+  --fill-observed: rgba(0, 255, 0, 0.12);
+  --fill-forecast: rgba(138, 106, 0, 0.12);
 
   color-scheme: light;
 }
@@ -178,27 +181,27 @@ table {
 
 .t-display-xl {
   font-family: var(--face-display);
-  font-weight: 400;
+  font-weight: 700;
   font-size: 56px;
   line-height: 1;
-  letter-spacing: -0.02em;
+  letter-spacing: .01em;
   font-feature-settings: 'tnum' 1;
 }
 
 .t-display-l {
   font-family: var(--face-display);
-  font-weight: 400;
+  font-weight: 700;
   font-size: 32px;
   line-height: 1.1;
-  letter-spacing: -0.01em;
+  letter-spacing: .01em;
 }
 
 .t-display-m {
   font-family: var(--face-display);
-  font-weight: 400;
+  font-weight: 600;
   font-size: 22px;
   line-height: 1.15;
-  letter-spacing: -0.01em;
+  letter-spacing: .01em;
 }
 
 .t-micro {
@@ -313,8 +316,10 @@ table {
   }
 }
 
+/* backwards, not both: a filled end state keeps translateY(0) on the element,
+   which traps position: fixed descendants (the full-screen fallback) inside it. */
 .is-entering {
-  animation: enter var(--dur-quick) var(--ease) both;
+  animation: enter var(--dur-quick) var(--ease) backwards;
 }
 
 /* Traveling dash for an active attack path. Duration is set inline from the
@@ -414,4 +419,38 @@ table {
    panels. The tooltip is a sibling div, so clipping the surface is safe. */
 svg.recharts-surface {
   overflow: hidden;
+}
+
+/* ── Under development ────────────────────────────────────────────────────
+ * A slot the layout keeps for data no model produces yet (components/
+ * UnderDev.tsx). Muted, dashed, never coloured by severity: it is the absence
+ * of a reading, not a reading. */
+.udev {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1, 4px);
+  padding: 2px 6px;
+  border: 1px dashed var(--rule-hard);
+  color: var(--paper-600);
+  font-family: var(--face-ui);
+  font-weight: 500;
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.udev.is-block {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-height: 64px;
+  white-space: normal;
+  text-align: center;
+  background: repeating-linear-gradient(135deg, transparent 0 6px, color-mix(in srgb, var(--rule-hard) 22%, transparent) 6px 7px);
+}
+.is-udev {
+  opacity: 0.55;
+  border-style: dashed !important;
 }

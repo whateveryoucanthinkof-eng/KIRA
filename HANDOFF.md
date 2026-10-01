@@ -24,11 +24,12 @@ flows ──> TGNE encoder ──> Branch A   (risk / technique / stage, now)
 |---|---|
 | `data_unification/` | Adapters for CIC-2017/2018, CTU-13, PCAP; the 12-D edge features; `TrajectoryStore` (columnar host trajectories). Where data correctness lives. |
 | `scripts/` | Training entry points. `retrain_branch_a_live.py` and `retrain_future_models_live.py` are the two that matter. |
-| `control_backend/` | Live serving. `model_adapter.py` composes all four models and is what the dashboard calls. |
+| `control_backend/` | Live serving. `model_adapter.py` composes all four models and is what the dashboard calls. Starts without models (`get_model_adapter`). Also sends the evidence behind each verdict: `forecast_branches.py` (DeepOP top-3), `evidence.py` (flows, 27-D state), `correlation_service.py` (campaigns, incidents), `tactics.py` (kill-chain lanes). |
 | `correlation/` | Alert-trajectory linking. **Heuristic, not learned, not wired into serving.** Bounded to the 180 s evidence horizon. |
 | `cyberworld_v4/` | The **temporal contract** (2s windows / 15 history / 5 x 30s forecast) plus a separate scientific-benchmark track. `config.py` is authoritative — never hardcode these numbers. |
 | `tests/` | 686 tests. Run `python -m pytest tests/ -q` before any commit. |
-| `web_dashboard/`, `telemetry/`, `workloads/`, `nodes/` | Demo dashboard, live capture, traffic generators, lab topology. |
+| `web_dashboard/` | The **K.I.R.A.** SOC console (Cyber World's UI, wired to our backend). `python run_dashboard.py` = real console; `python run_dashboard.py --demo` = demo dashboard on sample data, only to see the UI. Panel-by-panel sources: `docs/DASHBOARD_INTEGRATION.md`. |
+| `telemetry/`, `workloads/`, `nodes/` | Live capture, traffic generators, lab topology. |
 | `world_model/` | A self-contained parallel track, not in the live pipeline. |
 
 ## Where things are
@@ -55,6 +56,12 @@ flows ──> TGNE encoder ──> Branch A   (risk / technique / stage, now)
 
 ## Caveats a newcomer will otherwise trip on
 
+- **The console shows "Under development" on purpose.** Branch hops/volume/per-branch risk, the TGNE
+  attention view, and the Execution / Lateral Movement lanes have no model behind them yet; the demo
+  fills them with sample values, the real console never does. See `docs/DASHBOARD_INTEGRATION.md`.
+- **The real console has no attack buttons.** Attacks run against the Containerlab range from outside;
+  the console arms external monitoring (display only) and watches. Scenario buttons exist only in the
+  demo build.
 - **The verdict is the model's.** The SOC rule layer is off by default (`CYBERWORLD_ENABLE_RULES=1` turns it on) and is advisory only; it never overwrites risk/technique/alert. ARM EXTERNAL and recorded mitigations are never scoring inputs. `tests/test_verdict_is_the_model.py` pins this.
 - **Models follow their papers** (BiTA, GNN-LSTM, DeepOP): see `docs/PAPER_CONFORMANCE.md`. Encoder memory is ON by default now; with it off, BiTA's aggregator never ran. Branch B and DeepOP use the 27-D state. The shipped checkpoints predate all of this and load via `from_checkpoint` in their legacy architectures.
 - **The horizon is 30 seconds of history, 150 seconds ahead** (10 s for the shipped checkpoints); older context only through encoder memory. Multi-day campaign reasoning is structurally impossible today. `correlation/` is now bounded to the 180 s evidence horizon and splits campaigns on time gaps.

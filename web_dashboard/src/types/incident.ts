@@ -1,11 +1,12 @@
 /**
  * Incident triage model.
  *
- * An incident is a correlated group of alerts on one host, carried through an
- * analyst workflow rather than left as a flat log line. The backend does not
- * own this concept yet — `control_backend/` emits predictions and events, and
- * `correlation/` assembles campaigns, but nothing assigns, acknowledges or
- * closes. This is the contract to serve against when it does.
+ * An incident is a correlated group of model alerts on one host
+ * (control_backend/correlation_service.py): it opens on a host's first alert,
+ * or on one more than the evidence horizon after its last. The server never
+ * acknowledges or closes one; it marks an incident contained only while an
+ * isolation is recorded for its host. Assignment, notes and status changes
+ * are the analyst's, held in the console.
  *
  * Status transitions are the standard SOC ladder:
  *   new → triaging → contained → closed
@@ -38,6 +39,31 @@ export interface Incident {
   campaignId: number | null;
   /** Analyst-visible audit trail. */
   notes: { at: number; text: string }[];
+}
+
+/**
+ * An analyst's edits on top of the stream. Status and assignee replace the
+ * stream's; notes are appended to its trail. `since` is the stream's alert
+ * count when the first edit was made — an incident whose count falls below it
+ * has restarted (the same host attacked again), and the old edits no longer
+ * apply to it.
+ */
+export interface IncidentEdit {
+  status?: IncidentStatus;
+  assignee?: string | null;
+  notes?: Incident["notes"];
+  since?: number;
+}
+
+/** The stream's incident with the analyst's edits applied, if they still belong to it. */
+export function applyEdit(i: Incident, e: IncidentEdit | undefined): Incident {
+  if (!e || (e.since != null && i.alertCount < e.since)) return i;
+  return {
+    ...i,
+    status: e.status ?? i.status,
+    assignee: e.assignee !== undefined ? e.assignee : i.assignee,
+    notes: e.notes?.length ? [...i.notes, ...e.notes].sort((a, b) => a.at - b.at) : i.notes,
+  };
 }
 
 /** Queue ordering: unresolved first, then severity, then most recent. */

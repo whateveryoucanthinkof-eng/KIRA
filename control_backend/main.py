@@ -28,7 +28,7 @@ from control_backend.event_broker import broker
 import model_contract
 from control_backend.lab_config import TOTAL_NODES, LAB_NAME_FILTER
 from control_backend.site_config import get_site_config
-from control_backend.schema import SystemStatusEvent, ModelMetadata, utc_now_iso
+from control_backend.schema import SystemStatusEvent, ModelMetadata, TemporalContractInfo, utc_now_iso
 from control_backend.telemetry_service import telemetry_service
 from control_backend.topology_service import topology_service
 
@@ -39,6 +39,11 @@ logger = logging.getLogger("antigravity.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     broker.set_loop(asyncio.get_running_loop())
+    # Load the models off the request path. Without checkpoints this records
+    # why (see model_adapter.get_model_adapter) and the console still runs.
+    from control_backend.model_adapter import get_model_adapter
+    import threading
+    threading.Thread(target=get_model_adapter, daemon=True, name="model-load").start()
     site = get_site_config()
     logger.info(
         "cyberworld SOC backend online — site=%s lab_mode=%s (discovery topology).",
@@ -198,28 +203,44 @@ async def get_system_status():
         ml_state = "stopped"
 
     ml_live = ml_state == "running"
-    # Report the contract the loaded checkpoints actually carry.
-    #
-    # These were literals -- history_steps=5, forecast_steps=8 -- which were
-    # the v3 values. After the v4 retrain the served models use history 15 /
-    # forecast 5, so /api/status was telling an operator the wrong temporal
-    # contract for the model that was answering their queries. The adapter
-    # already adopts the real values from the checkpoints in _adopt_contract
-    # and refuses to load if they disagree with each other, so it is the one
-    # source worth reporting.
-    from control_backend.model_adapter import model_adapter as _served
-    model_meta = ModelMetadata(
-        name="Antigravity-DualBranch-DeepOP",
-        version="3.3-SOC",
-        feature_count=model_contract.BRANCH_A_INPUT_DIM,
-        history_steps=_served.history_steps,
-        window_seconds=_served.window_seconds,
-        forecast_steps=_served.forecast_steps,
-        checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
-        threshold=_served.alert_threshold,
-        forecast_step_seconds=_served.step_seconds,
-        rules_enabled=_served.rules_enabled,
-    )
+    # Report the contract the loaded checkpoints actually carry; the adapter
+    # adopts it from them in _adopt_contract and refuses to load if they
+    # disagree with each other. Without models there is nothing loaded to
+    # describe: model_meta is None, model_error says why, and the timeline
+    # falls back to the configured contract.
+    from control_backend.model_adapter import get_model_adapter, model_load_error
+    from cyberworld_v4.config import get_contract
+    _served = get_model_adapter()
+    model_meta = None
+    if _served is not None:
+        model_meta = ModelMetadata(
+            name="Antigravity-DualBranch-DeepOP",
+            version="3.3-SOC",
+            feature_count=model_contract.BRANCH_A_INPUT_DIM,
+            history_steps=_served.history_steps,
+            window_seconds=_served.window_seconds,
+            forecast_steps=_served.forecast_steps,
+            checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
+            threshold=_served.alert_threshold,
+            forecast_step_seconds=_served.step_seconds,
+            rules_enabled=_served.rules_enabled,
+        )
+        contract = TemporalContractInfo(
+            window_seconds=_served.window_seconds,
+            history_steps=_served.history_steps,
+            forecast_steps=_served.forecast_steps,
+            forecast_step_seconds=_served.step_seconds,
+            source="checkpoints",
+        )
+    else:
+        c = get_contract()
+        contract = TemporalContractInfo(
+            window_seconds=c.window_seconds,
+            history_steps=c.history_steps,
+            forecast_steps=c.forecast_steps,
+            forecast_step_seconds=c.forecast_window_seconds,
+            source="config",
+        )
 
     now_iso = utc_now_iso()
     return SystemStatusEvent(
@@ -239,10 +260,13 @@ async def get_system_status():
         ml_status="live" if ml_live else "standby",
         workloads_active=workloads_running,
         attack_active=attack_running,
+        attack_armed=bool(telemetry_service.external_attack_armed),
         demo_active=False,
         active_command=active_cmd,
-        model_loaded=True,
+        model_loaded=_served is not None,
         model_meta=model_meta,
+        model_error=None if _served is not None else (model_load_error() or "Models are loading."),
+        contract=contract,
         lab_mode=site.lab_mode,
         site_id=site.site_id,
         topology_nodes=topo.stats.nodes,
@@ -326,8 +350,48 @@ def _get_replay_adapter():
     global _replay_adapter
     if _replay_adapter is None:
         from control_backend.model_adapter import AntigravityModelAdapter
-        _replay_adapter = AntigravityModelAdapter()
+        try:
+            _replay_adapter = AntigravityModelAdapter()
+        except Exception as e:
+            raise HTTPException(
+                503, f"Replay needs the trained models, which are not loaded: {type(e).__name__}: {e}"
+            ) from e
     return _replay_adapter
+
+
+#: Captures the Replay page offers as built-in samples (repo `captures/`).
+CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
+_REPLAY_SUFFIXES = (".pcap", ".pcapng", ".csv", ".binetflow")
+#: Flow rows returned per replayed window, so a 200-window report stays small.
+_REPLAY_FLOWS_PER_WINDOW = 100
+
+
+@app.get("/api/replay/samples")
+async def replay_samples():
+    """Real captures on disk the Replay page can analyse without an upload."""
+    out = []
+    if CAPTURES_DIR.is_dir():
+        for p in sorted(CAPTURES_DIR.iterdir()):
+            if p.is_file() and p.suffix.lower() in _REPLAY_SUFFIXES:
+                out.append({
+                    "id": p.name,
+                    "name": p.name,
+                    "label": p.stem.replace("_", " ").replace("-", " "),
+                    "kind": "csv" if p.suffix.lower() in (".csv", ".binetflow") else "pcap",
+                    "bytes": p.stat().st_size,
+                    "source": f"captures/{p.name}",
+                })
+    return out
+
+
+@app.post("/api/replay/samples/{name}")
+async def replay_sample(name: str, max_windows: int = 200):
+    """Analyse one of /api/replay/samples in place (no upload round trip)."""
+    path = (CAPTURES_DIR / name).resolve()
+    if path.parent != CAPTURES_DIR.resolve() or not path.is_file() \
+            or path.suffix.lower() not in _REPLAY_SUFFIXES:
+        raise HTTPException(404, f"No capture named {name!r} in captures/")
+    return _analyse_capture(path, path.suffix.lower(), name, max_windows)
 
 
 @app.post("/api/replay")
@@ -352,10 +416,6 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     """
     import tempfile
 
-    from control_backend.model_adapter import select_primary_target
-
-    replay_adapter = _get_replay_adapter()
-
     name = (file.filename or "upload").lower()
     suffix = Path(name).suffix
     if suffix not in (".pcap", ".pcapng", ".csv", ".binetflow", ""):
@@ -367,58 +427,88 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
 
     tmp = Path(tempfile.mkstemp(suffix=suffix or ".bin")[1])
     tmp.write_bytes(data)
-
     try:
-        # replay_adapter is private to this endpoint (see _get_replay_adapter),
-        # so forcing rules off and clearing history here can never affect the
-        # live tail worker's adapter or its state.
-        replay_adapter.rules_enabled = False
-        replay_adapter.reset_history()
-
-        if suffix in (".csv", ".binetflow"):
-            records = _parse_flow_file(tmp, suffix)
-            windows = _group_records_into_windows(records, replay_adapter.window_seconds)
-        else:
-            windows = _replay_pcap_windows(tmp, max_windows, replay_adapter.window_seconds)
-
-        results = []
-        for widx, flows in enumerate(windows[:max_windows]):
-            if not flows:
-                continue
-            target = select_primary_target(flows)
-            if not target:
-                continue
-            ev = replay_adapter.predict_window(target_ip=target, flows=flows, window_id=widx)
-            results.append({
-                "window": widx,
-                "target": target,
-                "risk": ev.prediction.risk,
-                "ml_risk": ev.prediction.ml_risk,
-                "risk_source": ev.prediction.risk_source,
-                "alert": ev.prediction.alert,
-                "stage": ev.prediction.predicted_stage,
-                "mitre_tactic": ev.prediction.mitre_tactic,
-                "mitre_technique": ev.prediction.mitre_technique,
-                "forecast": [
-                    {"horizon_seconds": f.horizon_seconds, "risk": f.risk} for f in ev.forecast
-                ],
-                "top_features": [
-                    {"feature": f.feature, "score": f.score, "group": f.group}
-                    for f in ev.explainability.top_features[:5]
-                ],
-            })
-
-        flagged = [r for r in results if r["alert"]]
-        return {
-            "filename": file.filename,
-            "kind": "csv" if suffix in (".csv", ".binetflow") else "pcap",
-            "windows_analyzed": len(results),
-            "flagged_windows": len(flagged),
-            "rules_disabled": True,
-            "results": results,
-        }
+        return _analyse_capture(tmp, suffix, file.filename, max_windows)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _analyse_capture(path: Path, suffix: str, filename: Optional[str], max_windows: int):
+    """Score a capture window by window on the private replay adapter."""
+    from control_backend.evidence import flow_records
+    from control_backend.model_adapter import select_primary_target
+
+    replay_adapter = _get_replay_adapter()
+    # replay_adapter is private to this endpoint (see _get_replay_adapter),
+    # so forcing rules off and clearing history here can never affect the
+    # live tail worker's adapter or its state.
+    replay_adapter.rules_enabled = False
+    replay_adapter.reset_history()
+
+    if suffix in (".csv", ".binetflow"):
+        records = _parse_flow_file(path, suffix)
+        windows = _group_records_into_windows(records, replay_adapter.window_seconds)
+    else:
+        windows = _replay_pcap_windows(path, max_windows, replay_adapter.window_seconds)
+
+    results = []
+    for widx, flows in enumerate(windows[:max_windows]):
+        if not flows:
+            continue
+        target = select_primary_target(flows)
+        if not target:
+            continue
+        ev = replay_adapter.predict_window(target_ip=target, flows=flows, window_id=widx)
+        results.append({
+            "window": widx,
+            "target": target,
+            "risk": ev.prediction.risk,
+            "ml_risk": ev.prediction.ml_risk,
+            "risk_source": ev.prediction.risk_source,
+            "alert": ev.prediction.alert,
+            "stage": ev.prediction.predicted_stage,
+            "tactic_lane": ev.prediction.tactic_lane,
+            "mitre_tactic": ev.prediction.mitre_tactic,
+            "mitre_technique": ev.prediction.mitre_technique,
+            "forecast": [
+                {"horizon_seconds": f.horizon_seconds, "risk": f.risk,
+                 "risk_lower": f.risk_lower, "risk_upper": f.risk_upper}
+                for f in ev.forecast
+            ],
+            "top_features": [
+                {"feature": f.feature, "score": f.score, "group": f.group}
+                for f in ev.explainability.top_features[:5]
+            ],
+            # Measured volume of the window, both directions.
+            "packets": int(sum(r.fwd_packets + r.bwd_packets for r in flows)),
+            "bytes": int(sum(r.fwd_bytes + r.bwd_bytes for r in flows)),
+            "flows": [
+                f.model_dump() for f in flow_records(
+                    [_record_dict(r) for r in flows], widx, target,
+                )[:_REPLAY_FLOWS_PER_WINDOW]
+            ],
+        })
+
+    flagged = [r for r in results if r["alert"]]
+    return {
+        "filename": filename,
+        "kind": "csv" if suffix in (".csv", ".binetflow") else "pcap",
+        "windows_analyzed": len(results),
+        "flagged_windows": len(flagged),
+        "rules_disabled": True,
+        "window_seconds": replay_adapter.window_seconds,
+        "threshold": replay_adapter.alert_threshold,
+        "results": results,
+    }
+
+
+def _record_dict(r) -> Dict[str, Any]:
+    return {
+        "src_ip": r.src_ip, "dst_ip": r.dst_ip, "src_port": r.src_port, "dst_port": r.dst_port,
+        "protocol": r.protocol, "start_time": r.start_time, "end_time": r.end_time,
+        "fwd_bytes": r.fwd_bytes, "bwd_bytes": r.bwd_bytes,
+        "fwd_packets": r.fwd_packets, "bwd_packets": r.bwd_packets,
+    }
 
 
 def _parse_flow_file(path: Path, suffix: str):

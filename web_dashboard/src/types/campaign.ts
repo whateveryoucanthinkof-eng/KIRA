@@ -1,16 +1,15 @@
 /**
  * Campaign / causal-graph view model.
  *
- * Mirrors the dataclasses in `correlation/`, which are implemented in Python
- * but not yet wired into `control_backend/` — `model_adapter.py` does not
- * import them. The console renders this shape today from demo fixtures; when
- * the correlation layer is exposed over the wire, these types are the contract
- * to serve against.
+ * Built live by control_backend/correlation_service.py, which runs the
+ * existing `correlation/` pipeline over the scored windows. That pipeline is
+ * heuristic — every parameter is hand-set, nothing is learned — and the
+ * payload says so in `method`.
  *
  *   Campaign      correlation/campaign_merge.py:AttackCampaign
  *   CampaignNode  correlation/graph_compaction.py:CompactedAlertNode
  *   Provenance    correlation/trajectory_assembler.py:Provenance
- *   lanes         correlation/causal_edge_scorer.py:TACTIC_ORDER
+ *   lanes         control_backend/tactics.py:LANES
  */
 
 export type Provenance = "OBSERVED" | "FORECAST";
@@ -55,4 +54,6 @@ export interface Campaign {
    * hardcoded in the view so the backend stays the source of truth.
    */
   lanes: string[];
+  /** How the campaign was assembled. */
+  method?: string;
 }

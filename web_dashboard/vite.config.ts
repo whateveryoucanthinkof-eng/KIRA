@@ -16,13 +16,14 @@ export default defineConfig(({ mode }) => {
       minify: !emitSourcemaps,
     },
     plugins: [
+      liveBuildDropsDemoFixtures(mode),
       react(),
       tailwindcss(),
       figmaSiteConfiguration({
-        title: 'cyberworld — Attack Forecasting',
+        title: 'K.I.R.A. — Kinetic Intrusion Risk Anticipator',
         description:
-          'Near-term network attack forecasting console. Live host graph and ATT&CK-aware risk trajectory from SPAN telemetry.',
-        icons: { icon: '/favicon.svg' },
+          'Network attack forecasting console. Live host graph, ATT&CK-aware risk trajectory and campaign reconstruction from SPAN telemetry.',
+        icons: { icon: '/kira-mark.png' },
       }),
       figmaErrorOverlayReplay(),
       figmaReactRefreshBoundaryFallback(),
@@ -30,18 +31,27 @@ export default defineConfig(({ mode }) => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, './src'),
+        '@': path.resolve(import.meta.dirname, './src'),
       },
     },
-    // Loopback by default; set FIGMA_DEV_SERVER_HOST to expose the dev server.
     server: {
-      host: process.env.FIGMA_DEV_SERVER_HOST || '127.0.0.1',
+      host: process.env.FIGMA_DEV_SERVER_HOST || '0.0.0.0',
       port: parseInt(process.env.PORT || '8443'),
       strictPort: true,
       watch: { ignored: ['**/.figma/**'] },
+      proxy: {
+        '/api': {
+          target: 'http://localhost:8000',
+          changeOrigin: true,
+        },
+        '/ws': {
+          target: 'ws://localhost:8000',
+          ws: true,
+        },
+      },
     },
     preview: {
-      host: process.env.FIGMA_DEV_SERVER_HOST || '127.0.0.1',
+      host: process.env.FIGMA_DEV_SERVER_HOST || '0.0.0.0',
       port: parseInt(process.env.PORT || '8443'),
     },
   }
@@ -295,6 +305,28 @@ function figmaReactRefreshBoundaryFallback(): Plugin {
         queueMicrotask(() => sendFullReload?.())
       }
 
+      return null
+    },
+  }
+}
+
+/**
+ * Keeps the demo fixtures out of every build except `--mode demo`.
+ *
+ * src/api/mock.ts is only ever called behind IS_DEMO, but a static import
+ * still bundles it. Outside demo mode its imports resolve to
+ * src/api/mock.live.ts, an inert stub with the same exports, so the real
+ * console's bundle carries no sample data at all.
+ */
+function liveBuildDropsDemoFixtures(mode: string): Plugin {
+  const stub = path.resolve(import.meta.dirname, 'src/api/mock.live.ts')
+  return {
+    name: 'kira-live-build-drops-demo-fixtures',
+    enforce: 'pre',
+    resolveId(source, importer) {
+      if (mode === 'demo' || !importer) return null
+      const target = path.resolve(path.dirname(importer), source)
+      if (target === path.resolve(import.meta.dirname, 'src/api/mock')) return stub
       return null
     },
   }

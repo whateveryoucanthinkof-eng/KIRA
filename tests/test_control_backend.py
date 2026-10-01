@@ -28,6 +28,19 @@ def client():
     return TestClient(app)
 
 
+def _models_unavailable_reason():
+    from control_backend import model_adapter as ma
+    return None if ma.get_model_adapter() is not None else ma.model_load_error()
+
+
+# These score through the real checkpoints. Until a retrain produces loadable
+# ones they are skipped with the loader's own reason, not silently.
+_requires_models = pytest.mark.skipif(
+    _models_unavailable_reason() is not None,
+    reason=f"trained models not loadable: {(_models_unavailable_reason() or '')[:200]}",
+)
+
+
 def test_01_api_status_endpoint(client):
     response = client.get("/api/status")
     assert response.status_code == 200
@@ -37,17 +50,29 @@ def test_01_api_status_endpoint(client):
     assert data["ml"] in ["stopped", "starting", "running", "stopping"]
     assert data["mode"] in ["STANDBY", "LIVE"]
     assert data["ml_status"] in ["standby", "live"]
+    _c = get_contract()
+    if not data["model_loaded"]:
+        # Without loadable checkpoints the backend still serves, says why, and
+        # hands the console the configured contract to lay its timeline on.
+        assert data["model_meta"] is None
+        assert data["model_error"]
+        assert data["contract"]["source"] == "config"
+        assert data["contract"]["forecast_steps"] == _c.forecast_steps
+        assert data["contract"]["forecast_step_seconds"] == _c.forecast_window_seconds
+        return
+    assert data["model_error"] is None
+    assert data["contract"]["source"] == "checkpoints"
     assert data["model_meta"]["name"] == "Antigravity-DualBranch-DeepOP"
     # Assert against the contract in force, not v3 literals. These read 5 and
     # 8 (v3 history/forecast) and went stale the moment the v4 retrain landed;
     # the adapter was right and the test was wrong.
-    _c = get_contract()
     assert data["model_meta"]["feature_count"] == 27
     assert data["model_meta"]["history_steps"] == _c.history_steps
     assert data["model_meta"]["window_seconds"] == _c.window_seconds
     assert data["model_meta"]["forecast_steps"] == _c.forecast_steps
 
 
+@_requires_models
 def test_02_dual_branch_adapter_smoke():
     adapter = AntigravityModelAdapter()
     flows = flows_from_span_dicts(
@@ -82,6 +107,7 @@ def test_02_dual_branch_adapter_smoke():
     assert len(adapter.feature_history) == 1
 
 
+@_requires_models
 def test_02b_adapter_scopes_live_features_to_target_host():
     target_flow = {
         "src_ip": "192.168.100.10",
@@ -121,6 +147,7 @@ def test_02b_adapter_scopes_live_features_to_target_host():
     assert mixed_event.prediction.predicted_stage == target_event.prediction.predicted_stage
 
 
+@_requires_models
 def test_02c_adapter_keeps_histories_per_target_host():
     flows = flows_from_span_dicts(
         [
@@ -189,6 +216,10 @@ def test_04_ml_standby_and_live_transition(client):
         telemetry_service.start_ml()
 
     telemetry_service.is_running = True
+    # The lifecycle under test is the service's, not the checkpoints': a stub
+    # adapter stands in so it runs whether or not trained models are on disk.
+    import types
+    telemetry_service.adapter = types.SimpleNamespace(reset_history=lambda: None)
     try:
         start_res = telemetry_service.start_ml()
         assert start_res["status"] == "started"
@@ -202,6 +233,23 @@ def test_04_ml_standby_and_live_transition(client):
     finally:
         telemetry_service.is_running = False
         telemetry_service.stop_ml()
+        telemetry_service.adapter = None
+
+
+def test_04b_start_ml_without_models_says_why(client):
+    """No loadable checkpoints: Start Inference refuses and names the cause."""
+    from control_backend import model_adapter as ma
+    from control_backend.telemetry_service import telemetry_service
+
+    if ma.get_model_adapter() is not None:
+        pytest.skip("trained models are loaded")
+    telemetry_service.is_running = True
+    try:
+        with pytest.raises(RuntimeError, match="models are not loaded"):
+            telemetry_service.start_ml()
+        assert telemetry_service.is_ml_active is False
+    finally:
+        telemetry_service.is_running = False
 
 
 def test_05_external_only_scenarios(client):

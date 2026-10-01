@@ -167,9 +167,17 @@ export function PanelBody({ children, style }: { children: ReactNode; style?: CS
    TYPE HELPERS
    ════════════════════════════════════════════════════════════════════════ */
 
-export function Micro({ children, style }: { children: ReactNode; style?: CSSProperties }) {
+export function Micro({
+  children,
+  style,
+  title,
+}: {
+  children: ReactNode;
+  style?: CSSProperties;
+  title?: string;
+}) {
   return (
-    <div className="t-micro" style={{ color: "var(--paper-600)", ...style }}>
+    <div className="t-micro" style={{ color: "var(--paper-600)", ...style }} title={title}>
       {children}
     </div>
   );
@@ -273,7 +281,7 @@ interface ReadoutProps {
   unit?: string;
   sub?: ReactNode;
   level?: unknown;
-  /** display: Instrument Serif hero numeral. data: mono KPI. */
+  /** display: Space Grotesk hero numeral (Netra headline face). data: mono KPI. */
   scale?: "hero" | "data";
 }
 

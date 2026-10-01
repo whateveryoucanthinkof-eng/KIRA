@@ -55,6 +55,11 @@ class TopologyService:
         self._windows_applied = 0
         self._site_override = site
         self._min_edge_bytes = 1  # Phase 5: collapse near-empty chatter
+        #: The sensor's clock: the `now` of the last applied window. Ages and
+        #: TTLs are measured on it, not on the wall clock, because a replayed
+        #: capture stamps flows with capture time -- against the wall clock
+        #: every replayed host was "hours old" and evicted on arrival.
+        self._clock: Optional[float] = None
 
     def _site(self) -> SiteConfig:
         return self._site_override or get_site_config()
@@ -64,6 +69,7 @@ class TopologyService:
             self._nodes.clear()
             self._edges.clear()
             self._windows_applied = 0
+            self._clock = None
 
     def apply_window(
         self,
@@ -108,6 +114,7 @@ class TopologyService:
                     edge.last_seen = max(edge.last_seen, seen)
 
             self._windows_applied += 1
+            self._clock = ts
             self._evict_locked(site, ts)
             return self._snapshot_locked(site, ts)
 
@@ -119,8 +126,9 @@ class TopologyService:
                     node.risk = float(max(0.0, min(1.0, risk)))
 
     def snapshot(self, now: Optional[float] = None) -> TopologyEvent:
+        """The graph as of `now`, else as of the sensor's last window."""
         site = self._site()
-        ts = float(now if now is not None else time.time())
+        ts = float(now if now is not None else (self._clock if self._clock is not None else time.time()))
         with self._lock:
             self._evict_locked(site, ts)
             return self._snapshot_locked(site, ts)

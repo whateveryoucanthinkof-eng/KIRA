@@ -9,13 +9,17 @@ runs TGNE-TA → Branch A / Branch B (WDT) / DeepOP CWA, and emits PredictionEve
 from datetime import datetime, timezone
 import logging
 import os
+import threading
 import time
 from typing import Dict, List, Optional, Any
 
 import numpy as np
 import torch
 
+from control_backend.evidence import state_vector
 from control_backend.forecast_band import forecast_band, forecast_band_halfwidths
+from control_backend.forecast_branches import decode_branches
+from control_backend.tactics import lane_of
 from control_backend.schema import (
     ModelMetadata,
     StateMetadata,
@@ -463,7 +467,14 @@ class AntigravityModelAdapter:
 
     def _explain(self, x_tensor: torch.Tensor,
                  t_history: Optional[torch.Tensor] = None) -> ExplainabilityPayload:
+        return self._explain_full(x_tensor, t_history)[0]
+
+    def _explain_full(self, x_tensor: torch.Tensor,
+                      t_history: Optional[torch.Tensor] = None):
         """Input x Gradient attribution for the prediction actually made.
+
+        Returns the dashboard payload and the normalised attribution of all
+        27 dimensions (the payload keeps only the top 8).
 
         Two defects this fixes:
 
@@ -541,7 +552,7 @@ class AntigravityModelAdapter:
             method="Input x Gradient Saliency",
             groups=groups,
             top_features=top_features,
-        )
+        ), attributions
 
     def _relative_times(self, times):
         """[1, history_steps] seconds relative to the latest window.
@@ -870,7 +881,10 @@ class AntigravityModelAdapter:
         else:
             mitigation_status = "recorded_quiet"
 
-        explain = self._explain(x_tensor, t_history)
+        explain, attributions = self._explain_full(x_tensor, t_history)
+        state_dims = state_vector(FEATURE_NAMES, FEATURE_GROUP_MAP, feature_vector, attributions)
+        branches = self._forecast_branches(
+            h_future, observed_seq, obs_token_tensor, lane_of(obs_technique))
         inf_ms = (time.perf_counter() - t0) * 1000.0
         now_ts = time.time()
 
@@ -883,6 +897,7 @@ class AntigravityModelAdapter:
                 if i < len(deepop_confidences)
                 else None,
                 predicted_stage=forecast_techniques[i],
+                tactic_lane=lane_of(forecast_techniques[i]),
                 **forecast_band(fut_risks[i], _hw, i),
             )
             for i in range(self.forecast_steps)
@@ -950,6 +965,7 @@ class AntigravityModelAdapter:
                 alert_level=self._alert_level(max(obs_risk, max_future)),
                 threshold=self.alert_threshold,
                 predicted_stage=obs_technique,
+                tactic_lane=lane_of(obs_technique),
                 mitre_tactic=mitre[0],
                 mitre_technique=mitre[1],
                 mitre_tactic_id=mitre[2],
@@ -990,7 +1006,28 @@ class AntigravityModelAdapter:
             focus_edges=focus_edges,
             target_ip=target_ip or None,
             throughput=round(float(throughput), 2),
+            state_vector=state_dims,
+            branches=branches,
         )
+
+    def _forecast_branches(self, h_future, observed_seq, obs_token_tensor, current_lane):
+        """DeepOP's top-3 continuations (forecast_branches.py), or None.
+
+        None when the decoder is not a real module (test stubs) or decoding
+        fails: the alternatives are an extra view and must never cost the
+        verdict.
+        """
+        if not isinstance(getattr(self, "deepop", None), torch.nn.Module):
+            return None
+        try:
+            return decode_branches(
+                self.deepop, self.vocab, h_future, observed_seq, obs_token_tensor,
+                steps=self.forecast_steps, step_seconds=self.step_seconds,
+                current_lane=current_lane,
+            )
+        except Exception:
+            logger.exception("forecast branches failed; serving without them")
+            return None
 
     @staticmethod
     def _focus_binding(
@@ -1068,6 +1105,45 @@ def flows_from_span_dicts(raw_flows: List[Dict[str, Any]]) -> List[UnifiedFlowRe
 # access (PEP 562) rather than at import. Importing this module for its helpers
 # or its class used to load all four checkpoints as a side effect.
 _singleton: Optional[AntigravityModelAdapter] = None
+#: Why the last load attempt failed, or None. Kept so the backend can run
+#: without models -- sensor, topology and lab controls still work -- and say
+#: why inference is unavailable instead of failing to start at all.
+_load_error: Optional[str] = None
+_load_lock = threading.Lock()
+
+
+def get_model_adapter(retry: bool = False) -> Optional[AntigravityModelAdapter]:
+    """The serving adapter, or None when the checkpoints cannot be loaded.
+
+    A failed load is remembered and not re-attempted on every status poll;
+    `retry=True` (used when the operator presses Start Inference) tries again,
+    so checkpoints dropped into saved_models/ are picked up without a restart.
+    """
+    global _singleton, _load_error
+    if _singleton is not None:
+        return _singleton
+    if _load_error is not None and not retry:
+        return None
+    # Status polls, the sensor's tail thread and Start Inference can all ask
+    # first; one load, not three concurrent ones.
+    with _load_lock:
+        if _singleton is not None:
+            return _singleton
+        if _load_error is not None and not retry:
+            return None
+        try:
+            _singleton = AntigravityModelAdapter()
+            _load_error = None
+        except Exception as e:  # any load failure: missing, stale or mismatched checkpoints
+            _load_error = f"{type(e).__name__}: {e}"
+            logger.error("Models not loaded; inference unavailable. %s", _load_error)
+            return None
+        return _singleton
+
+
+def model_load_error() -> Optional[str]:
+    """The reason the models are not loaded, or None if they are (or were never tried)."""
+    return _load_error
 
 
 def __getattr__(name: str):
