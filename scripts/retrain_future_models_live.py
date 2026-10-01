@@ -1001,12 +1001,27 @@ def _precompute_rollouts_unique(wdt, ds, device, spill_dir, label, K, batch, num
 #: experiment (Section 4.4, Fig. 7) removes a fraction of the observed
 #: techniques to simulate detection failure; this trains against the same.
 OBS_TOKEN_DROPOUT = 0.1
+#: Probability of REPLACING an observed technique with another real token.
+#: Branch A's errors at serve time are mostly substitutions -- an attack
+#: window read as Benign, or the wrong technique -- not omissions, and dropout
+#: alone only ever showed DeepOP clean-or-missing history.
+OBS_TOKEN_SUBSTITUTION = 0.1
 
 
-def _drop_observed(obs, vocab, p: float):
+def _drop_observed(obs, vocab, p: float, p_sub: float = OBS_TOKEN_SUBSTITUTION):
+    if p <= 0.0 and p_sub <= 0.0:
+        return obs
+    special = torch.tensor([vocab.pad_idx, vocab.bos_idx, vocab.eos_idx], device=obs.device)
+    droppable = ~torch.isin(obs, special)
+    if p_sub > 0.0:
+        real = torch.tensor([i for i in range(vocab.vocab_size)
+                             if i not in (vocab.pad_idx, vocab.bos_idx, vocab.eos_idx)],
+                            device=obs.device)
+        sub = (torch.rand(obs.shape, device=obs.device) < p_sub) & droppable
+        repl = real[torch.randint(0, len(real), obs.shape, device=obs.device)]
+        obs = torch.where(sub, repl, obs)
     if p <= 0.0:
         return obs
-    droppable = (obs != vocab.pad_idx) & (obs != vocab.bos_idx)
     drop = (torch.rand(obs.shape, device=obs.device) < p) & droppable
     return obs.masked_fill(drop, vocab.pad_idx)
 

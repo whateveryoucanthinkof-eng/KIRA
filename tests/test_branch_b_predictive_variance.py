@@ -107,3 +107,27 @@ def test_padded_future_steps_are_masked_out_of_the_loss():
     from branch_b_world_model.infiltration_head import InfiltrationRiskHead
     r = InfiltrationRiskHead.risk_loss(torch.zeros(2, 3), tgt[..., 0] / 100, weight=valid)
     assert float(r) == 0.0
+
+
+def test_deepop_observed_tokens_see_substitutions_not_only_omissions():
+    """Serving feeds DeepOP Branch A's PREDICTED history, whose errors are
+    mostly wrong tokens. Training corrupts the ground-truth history the same
+    way; special tokens are never touched."""
+    import importlib.util
+    from deepop_decoder.joint_vocab import get_joint_vocab
+    spec = importlib.util.spec_from_file_location("rfml3", ROOT / "scripts" / "retrain_future_models_live.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    v = get_joint_vocab(network_observable_only=True)
+    benign = v.encode("Benign", None)
+    obs = torch.full((4000, 16), benign, dtype=torch.long)
+    obs[:, :2] = v.pad_idx
+    obs[:, 2] = v.bos_idx
+    torch.manual_seed(0)
+    out = m._drop_observed(obs, v, 0.1, 0.1)
+    body = out[:, 3:]
+    assert torch.equal(out[:, :3], obs[:, :3])
+    pad = (body == v.pad_idx).float().mean().item()
+    sub = ((body != benign) & (body != v.pad_idx)).float().mean().item()
+    assert 0.07 < pad < 0.13 and 0.05 < sub < 0.13
+    assert not ((body == v.bos_idx) | (body == v.eos_idx)).any()
