@@ -278,6 +278,12 @@ class AntigravityModelAdapter:
         self._warn_if_not_credible(ckpt, "branch_b")
         self.wdt.load_state_dict(ckpt["wdt_state_dict"])
         self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
+        # Branch B's forecast risk has its own calibration; its checkpoint
+        # carries a threshold fitted on its own validation scores. None ->
+        # fall back to Branch A's (the previous behaviour, for old checkpoints).
+        _bop = ckpt.get("operating_point") or {}
+        self.future_alert_threshold = (float(_bop["alert_threshold"])
+                                       if _bop.get("fitted") else None)
         self.wdt.eval()
         self.risk_head.eval()
         self.forecast_risk_halfwidths = forecast_band_halfwidths(ckpt)
@@ -897,7 +903,10 @@ class AntigravityModelAdapter:
             obs_technique,
             ("Unknown", obs_technique, "TA0000", "Model-predicted technique"),
         )
-        alert = obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
+        fut_thr = (self.future_alert_threshold
+                   if getattr(self, "future_alert_threshold", None) is not None
+                   else self.alert_threshold)
+        alert = obs_risk >= self.alert_threshold or max_future >= fut_thr
 
         # Early warning: how far ahead the FORECAST first crosses the threshold.
         # This used to be the constant forecast_steps * window_seconds on every
@@ -911,7 +920,7 @@ class AntigravityModelAdapter:
             lead_time = 0.0
         else:
             for k, r in enumerate(fut_risks):
-                if r >= self.alert_threshold:
+                if r >= fut_thr:
                     lead_time = (k + 1) * step_s
                     break
 

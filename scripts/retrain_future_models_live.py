@@ -325,7 +325,7 @@ def _bb_variance_loss(pred, logvar, target, valid=None):
 _Z90 = 1.6448536269514722
 
 
-def _bb_val_body(wdt, risk, K, step_offset):
+def _bb_val_body(wdt, risk, K, step_offset, positive_above=0.0):
     def body(acc, h, target, target_risk, t_hist, t_fut, valid):
         pred, logv = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut, return_logvar=True)
         _v = valid.unsqueeze(-1).double()
@@ -338,6 +338,11 @@ def _bb_val_body(wdt, risk, K, step_offset):
         _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
         acc["resid_hist"] += device_hist((_rb.view(-1, K) + step_offset).reshape(-1),
                                          K * FORECAST_RISK_BINS, valid.reshape(-1).long())
+        _sb = (pred_risk.clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long().reshape(-1)
+        _pos = (target_risk > positive_above).reshape(-1)
+        _vl = valid.reshape(-1) > 0
+        acc["op_pos"] += device_hist(_sb, FORECAST_RISK_BINS, (_pos & _vl).long())
+        acc["op_neg"] += device_hist(_sb, FORECAST_RISK_BINS, (~_pos & _vl).long())
         # Every metric over REAL future steps only: padded steps repeat the
         # last state, which persistence predicts perfectly by construction.
         _w = valid.double()
@@ -355,7 +360,35 @@ def _bb_val_body(wdt, risk, K, step_offset):
     return body
 
 
-def validate_branch_b(wdt, risk, loader, device, K):
+def fit_forecast_operating_point(pos_hist, neg_hist) -> dict:
+    """Branch B's own alert threshold: max F1 over its forecast risk scores on
+    validation (real future steps; positive = the same event Branch A's
+    threshold is fitted to). Serving used Branch A's threshold for these
+    scores, though the two heads are calibrated independently."""
+    ph = np.asarray(pos_hist, dtype=np.float64)
+    nh = np.asarray(neg_hist, dtype=np.float64)
+    P, N = ph.sum(), nh.sum()
+    if P <= 0 or N <= 0:
+        return {"fitted": False, "reason": f"validation has {int(P)} positive and {int(N)} "
+                                           f"negative forecast steps; a threshold needs both"}
+    tp = np.cumsum(ph[::-1])[::-1]
+    fp = np.cumsum(nh[::-1])[::-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prec = np.where(tp + fp > 0, tp / np.maximum(tp + fp, 1), 0.0)
+        rec = tp / P
+        f1 = np.where(prec + rec > 0, 2 * prec * rec / np.maximum(prec + rec, 1e-12), 0.0)
+    rate = (tp + fp) / (P + N)
+    usable = (rate > 0) & (rate < 1)
+    if not usable.any():
+        return {"fitted": False, "reason": "the forecast risk head emits a constant"}
+    b = int(np.argmax(np.where(usable, f1, -1.0)))
+    bins = len(ph)
+    return {"fitted": True, "alert_threshold": b / (bins - 1), "precision": float(prec[b]),
+            "recall": float(rec[b]), "f1": float(f1[b]),
+            "fpr": float(fp[b] / N), "criterion": "max F1, validation, real steps"}
+
+
+def validate_branch_b(wdt, risk, loader, device, K, positive_above=0.0):
     """Branch B's validation pass: the accumulators the epoch summary reads."""
     z = lambda: torch.zeros((), device=device, dtype=torch.float64)
     acc = {"v_sum": z(), "mse_model": z(), "mse_persist": z(), "bce_model": z(),
@@ -363,10 +396,14 @@ def validate_branch_b(wdt, risk, loader, device, K):
            # the predictive distribution: mean NLL, and per-step coverage of the
            # nominal 90% interval (calibrated <=> ~0.90 at every step)
            "nll_model": z(), "cov90_by_step": torch.zeros(K, device=device, dtype=torch.float64),
+           # forecast risk scores of positive / negative real steps, for the
+           # head's OWN operating point (fit_forecast_operating_point)
+           "op_pos": torch.zeros(FORECAST_RISK_BINS, device=device, dtype=torch.long),
+           "op_neg": torch.zeros(FORECAST_RISK_BINS, device=device, dtype=torch.long),
            # per-step |risk residual| histograms for the forecast's conformal band
            "resid_hist": torch.zeros(K * FORECAST_RISK_BINS, device=device, dtype=torch.long)}
     step_offset = (torch.arange(K, device=device) * FORECAST_RISK_BINS).view(1, K)
-    run = GraphedBody(_bb_val_body(wdt, risk, K, step_offset), acc,
+    run = GraphedBody(_bb_val_body(wdt, risk, K, step_offset, positive_above), acc,
                       enabled=(str(device) == "cuda" and graphs_enabled()))
     nblk = (str(device) == "cuda")
     vn = risk_n = 0
@@ -622,7 +659,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         # that converged instantly or with one that never learned anything, and
         # nothing reported could tell those apart.
         _K = _c.forecast_steps
-        _va = validate_branch_b(wdt, risk, val_loader, device, _K)
+        _va = validate_branch_b(wdt, risk, val_loader, device, _K,
+                                positive_above=(math.exp(-1.0) - 1e-6 if risk_target == "hazard" else 0.0))
         _v_sum, _vn = _va["v_sum"], _va["vn"]
         _mse_model, _mse_persist = _va["mse_model"], _va["mse_persist"]
         _bce_model, _risk_mae_model = _va["bce_model"], _va["risk_mae_model"]
@@ -672,12 +710,14 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             # Fitted from THIS epoch's validation residuals, so the band always
             # belongs to the weights saved beside it.
             _conf = _forecast_risk_conformal(_resid_hist.view(_K, FORECAST_RISK_BINS).cpu().numpy())
+            _op = fit_forecast_operating_point(_va["op_pos"].cpu().numpy(), _va["op_neg"].cpu().numpy())
+            print(f"  forecast risk operating point: {_op}", flush=True)
             for _k, _c_k in enumerate(_conf["by_step"], start=1):
                 print(f"  forecast risk band step {_k}: "
                       + (f"+/-{_c_k['half_width']:.4f} (empirical {_c_k['empirical_coverage']:.3f}, "
                          f"n={_c_k['n']:,})" if _c_k["fitted"] else f"NOT FITTED -- {_c_k['reason']}"),
                       flush=True)
-            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf},output)
+            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf,"operating_point":_op},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
         if resume is not None:
             resume.save(epoch + 1, wdt=wdt.state_dict(), risk=risk.state_dict(),

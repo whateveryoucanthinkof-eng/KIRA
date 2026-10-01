@@ -131,3 +131,20 @@ def test_deepop_observed_tokens_see_substitutions_not_only_omissions():
     sub = ((body != benign) & (body != v.pad_idx)).float().mean().item()
     assert 0.07 < pad < 0.13 and 0.05 < sub < 0.13
     assert not ((body == v.bos_idx) | (body == v.eos_idx)).any()
+
+
+def test_branch_b_fits_its_own_operating_point():
+    import importlib.util
+    import numpy as np
+    spec = importlib.util.spec_from_file_location("rfml4", ROOT / "scripts" / "retrain_future_models_live.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    B = m.FORECAST_RISK_BINS
+    pos = np.zeros(B, np.int64); neg = np.zeros(B, np.int64)
+    pos[int(0.7 * (B - 1))] = 90; pos[int(0.2 * (B - 1))] = 10
+    neg[int(0.1 * (B - 1))] = 900; neg[int(0.75 * (B - 1))] = 5
+    op = m.fit_forecast_operating_point(pos, neg)
+    # above the benign mass, at or below the lowest positive: all 100 caught, 5 false
+    assert op["fitted"] and 0.1 < op["alert_threshold"] <= 0.2
+    assert op["recall"] == 1.0 and abs(op["fpr"] - 5 / 905) < 1e-12
+    assert not m.fit_forecast_operating_point(pos, np.zeros(B))["fitted"]
