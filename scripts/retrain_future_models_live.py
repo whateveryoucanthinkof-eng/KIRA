@@ -1633,7 +1633,7 @@ def main():
         # functions, and using it in main() raised NameError after a 40-minute
         # extraction had already been paid for.
         _hc = get_contract()
-        _tau = _hc.forecast_steps * _hc.window_seconds
+        _tau = hazard_tau_seconds()
         for _nm, _st in (("train", train_traj), ("val", val_traj)):
             _info = _st.use_hazard_target(_tau)
             print(f"risk target [{_nm}]: severity -> hazard(tau={_tau}s) | "
@@ -1690,6 +1690,12 @@ def main():
     dp_resume.clear()
 
 
+def hazard_tau_seconds() -> float:
+    """The hazard target's decay scale: the contract's forecast horizon
+    (forecast_steps x forecast_window_seconds), the same as Branch A's."""
+    return float(get_contract().forecast_seconds)
+
+
 def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
     """Score the best Branch B / DeepOP checkpoints ONCE on all of CIC-2017.
 
@@ -1728,7 +1734,13 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
         del recs
         gc.collect()
     test_store = b.finalize()
-    out = {"split_scheme": "cross_year", "test_snapshots": int(test_store.n_snapshots)}
+    if args.risk_target == "hazard":
+        # The models were trained and selected on the hazard target; scoring
+        # them against the extraction-time SEVERITY column (this store was
+        # never converted) compared two different quantities.
+        test_store.use_hazard_target(hazard_tau_seconds())
+    out = {"split_scheme": "cross_year", "test_snapshots": int(test_store.n_snapshots),
+           "risk_target": args.risk_target}
 
     if bb_out.exists():
         ck = torch.load(bb_out, map_location=device, weights_only=False)

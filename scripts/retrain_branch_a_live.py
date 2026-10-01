@@ -1282,8 +1282,8 @@ def main():
                              "a measured A/B, not a silent default.")
     parser.add_argument("--hazard-tau", type=float, default=None,
                         help="Decay scale for --risk-target hazard, in seconds. "
-                             "Default forecast_steps * window_seconds (= 10.0s "
-                             "under v4), so a host exactly one forecast horizon "
+                             "Default: the contract's forecast horizon, forecast_steps x "
+                             "forecast_window_seconds (= 150 s), so a host exactly one forecast horizon "
                              "from an attack scores exp(-1) = 0.368 -- which is "
                              "also the cut that defines the positive class for "
                              "AUC/Brier/the operating point under this target.")
@@ -1657,8 +1657,13 @@ def main():
 
     # tau defaults to the horizon the model is actually asked about, so a host
     # exactly one forecast horizon from an attack scores exp(-1) = 0.368.
+    # forecast_seconds = forecast_steps x forecast_window_seconds (150 s), the
+    # horizon serving forecasts over. This was forecast_steps x window_seconds
+    # = 10 s, left from the single-scale contract: the target asked "attack
+    # within ~10 s", nearly a nowcast at 2 s windows, while the console reports
+    # risk at 30..150 s.
     hazard_tau = (args.hazard_tau if args.hazard_tau is not None
-                  else _c.forecast_steps * _c.window_seconds)
+                  else _c.forecast_seconds)
     #: The cut that makes a window "positive" for AUC / Brier / ECE / the
     #: operating point. For the severity target, any non-zero score means the
     #: window contains attack traffic. For the hazard target, `> 0` would mean
