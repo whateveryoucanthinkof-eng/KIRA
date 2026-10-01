@@ -37,7 +37,7 @@ from data_unification.split_policy import is_cross_year
 from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingGuard,
                                           default_warmup_steps, run_fingerprint)
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
-from cyberworld_v4.graphed_step import WholeStepGraph, graphs_enabled
+from cyberworld_v4.graphed_step import GraphedBody, WholeStepGraph, graphs_enabled
 from data_unification.host_major import batched_loader, unpack_batch
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
@@ -906,82 +906,91 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     # the only caller and it runs once.
     keep_logits, keep_labels = [], []
 
+    # The per-batch work below is pure device work on the accumulators above;
+    # it is replayed as a CUDA graph (cyberworld_v4/graphed_step.GraphedBody):
+    # the same kernels in the same order, so the accumulators are identical.
+    # The batch / element counters are host-side and stay outside the body; the
+    # calibration pass (collect_logits) copies logits to the host per batch and
+    # runs eagerly.
+    acc = {"loss_sum": loss_sum, "abs_err_sum": abs_err_sum, "conf_hist": conf_hist,
+           "pos_hist": pos_hist, "neg_hist": neg_hist, "brier_sum": brier_sum,
+           "prob_sum": prob_sum, "resid_hist": resid_hist, "confusion": confusion,
+           "grad_correct": grad_correct, "grad_confusion": grad_confusion,
+           **{"ts_" + k: v for k, v in task_sums.items()}}
+    has_grad = {}
+
+    def body(a, x, t_hist, risk_t, tech_t, grad_t):
+        targets = {"risk": risk_t, "technique": tech_t, "gradation": grad_t}
+        predictions = model(x, t_history=t_hist)
+        loss, parts = model.compute_loss(predictions, targets)
+        a["loss_sum"] += loss.detach().double().sum()
+        # Per-task losses and their learned weights. Without these the
+        # total is uninterpretable: the 2026-09-21 run reported a
+        # validation loss of 0.66 against a test loss of 26.36 with no way
+        # to see that two of the three weights had saturated at exp(3)=20
+        # and were multiplying everything.
+        for _k in task_sums:
+            _v = parts.get(_k)
+            if _v is not None:
+                a["ts_" + _k] += _v.double().reshape(())
+        err = (predictions["risk_score"] - targets["risk"]).abs()
+        a["abs_err_sum"] += err.double().sum()
+        _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
+        a["resid_hist"] += _hist(_rb.reshape(-1), RISK_BINS)
+
+        # Risk as a probability: AUC, Brier and calibration, accumulated
+        # from a fixed histogram so 1.02M samples cost O(bins) memory and
+        # no host-device sync. `risk_positive_above` is the cut that makes a
+        # window positive (> 0 for severity, >= exp(-1) for the hazard target).
+        _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
+        _y = (targets["risk"] > risk_positive_above).reshape(-1)
+        a["brier_sum"] += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
+        _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
+        a["pos_hist"] += _hist(_b, RISK_BINS, _y.long())
+        a["neg_hist"] += _hist(_b, RISK_BINS, (~_y).long())
+        # Sum of the predicted probabilities per bin, so ECE can use each
+        # bin's ACTUAL mean confidence rather than its nominal centre.
+        a["conf_hist"] += _hist(_b, RISK_BINS, _p.double())
+        a["prob_sum"] += _p.double().sum()
+
+        pred_t = predictions["technique_logits"].argmax(dim=-1)
+        # No separate hit counter: the confusion matrix's trace IS the
+        # number correct.
+        a["confusion"] += _hist(tech_t * C + pred_t, C * C)
+
+        has_grad["v"] = "gradation_logits" in predictions
+        if has_grad["v"]:
+            pred_g = predictions["gradation_logits"].argmax(dim=-1)
+            a["grad_correct"] += (pred_g == grad_t).sum()
+            a["grad_confusion"] += _hist(grad_t * G + pred_g, G * G)
+        return predictions
+
+    run = GraphedBody(body, acc, enabled=(str(device) == "cuda" and not collect_logits
+                                          and graphs_enabled()))
     with torch.no_grad():
         for batch in loader:
             batch = unpack_batch(batch, device)
             x = batch["features"].to(device, non_blocking=non_blocking)
-            targets = {
-                "risk": batch["risk"].to(device, non_blocking=non_blocking),
-                "technique": batch["technique"].to(device, non_blocking=non_blocking),
-                "gradation": batch["gradation"].to(device, non_blocking=non_blocking),
-            }
+            r_t = batch["risk"].to(device, non_blocking=non_blocking)
+            tc_t = batch["technique"].to(device, non_blocking=non_blocking)
+            g_t = batch["gradation"].to(device, non_blocking=non_blocking)
             # Real elapsed time between the history steps -- see
             # MultiTaskLSTM.time_proj. Validation must see what training sees.
             t_hist = (batch["t_history"].to(device, non_blocking=non_blocking)
                       if "t_history" in batch else None)
-            predictions = model(x, t_history=t_hist)
-            loss, parts = model.compute_loss(predictions, targets)
-            loss_sum += loss.detach().double().sum()
-            # Per-task losses and their learned weights. Without these the
-            # total is uninterpretable: the 2026-09-21 run reported a
-            # validation loss of 0.66 against a test loss of 26.36 with no way
-            # to see that two of the three weights had saturated at exp(3)=20
-            # and were multiplying everything.
-            for _k, _acc in task_sums.items():
-                _v = parts.get(_k)
-                if _v is not None:
-                    _acc += _v.double().reshape(())
-            nb += 1
-            err = (predictions["risk_score"] - targets["risk"]).abs()
-            abs_err_sum += err.double().sum()
-            n_risk += int(err.numel())
-            _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-            resid_hist += _hist(_rb.reshape(-1), RISK_BINS)
-
-            # Risk as a probability: AUC, Brier and calibration, accumulated
-            # from a fixed histogram so 1.02M samples cost O(bins) memory and
-            # no host-device sync. MAE alone cannot judge this head -- on a
-            # target that is 0 for 82.5% of samples the MAE-optimal constant
-            # is 0, so a well-fit head can still "lose" to predicting nothing.
-            # Which windows count as positive for AUC / Brier / ECE / the
-            # operating point. With the severity target the event is "this is
-            # an attack window", i.e. risk > 0. With the hazard target
-            # (exp(-dt/tau)) risk > 0 degenerates to "this host is attacked at
-            # SOME later point", which discards the timing the hazard exists
-            # to carry; the operationally meaningful event there is "an attack
-            # occurs within one forecast horizon", i.e. hazard >= exp(-1).
-            # `risk_positive_above` carries whichever the caller means.
-            _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
-            _y = (targets["risk"] > risk_positive_above).reshape(-1)
-            brier_sum += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
-            _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-            pos_hist += _hist(_b, RISK_BINS, _y.long())
-            neg_hist += _hist(_b, RISK_BINS, (~_y).long())
-            # Sum of the predicted probabilities per bin, so ECE can use each
-            # bin's ACTUAL mean confidence rather than its nominal centre.
-            conf_hist += _hist(_b, RISK_BINS, _p.double())
-            prob_sum += _p.double().sum()
-
-            pred_t = predictions["technique_logits"].argmax(dim=-1)
-            true_t = targets["technique"]
-            # No separate hit counter: the confusion matrix's trace IS the
-            # number correct, so accumulating it twice bought one more
-            # device tensor and an extra `.item()` sync at the end.
-            confusion += _hist(true_t * C + pred_t, C * C)
-
-            if "gradation_logits" in predictions:
-                pred_g = predictions["gradation_logits"].argmax(dim=-1)
-                true_g = targets["gradation"]
-                grad_correct += (pred_g == true_g).sum()
-                grad_total += int(true_g.numel())
-                grad_confusion += _hist(true_g * G + pred_g, G * G)
-
             if collect_logits:
+                predictions = body(acc, x, t_hist, r_t, tc_t, g_t)
                 _raw = predictions.get("technique_logits_raw")
                 if _raw is None:
                     _raw = predictions["technique_logits"]
                 keep_logits.append(_raw.detach().float().cpu())
-                keep_labels.append(true_t.detach().cpu())
+                keep_labels.append(tc_t.detach().cpu())
+            else:
+                run(x, t_hist, r_t, tc_t, g_t)
+            nb += 1
+            n_risk += int(r_t.numel())
+            if has_grad.get("v"):
+                grad_total += int(g_t.numel())
 
     cm = confusion.reshape(C, C).cpu().numpy()
     tech = _metrics_from_confusion(cm)
