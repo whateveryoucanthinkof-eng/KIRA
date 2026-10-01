@@ -7,10 +7,8 @@
  * that floors risk at 0.40 would contaminate it. So `risk` on a replay row is
  * pure model output — `rules_disabled` is always true.
  *
- * `packets`, `bytes` and `flows` are not returned by the endpoint yet. It holds
- * each window's flows while scoring (`windows[widx]` in `replay_file`) and
- * sends only the scores. The demo populates them; against a live backend they
- * are absent and the DVR's volume trace and flow stream say so.
+ * `packets`, `bytes` and `flows` are measured from each window's flow records
+ * (control_backend/main.py:_analyse_capture); flows are capped per window.
  */
 
 import type { FlowRecord } from "./evidence";
@@ -37,11 +35,13 @@ export interface ReplayRow {
   mitre_technique: string | null;
   forecast: ReplayForecastPoint[];
   top_features: ReplayFeature[];
-  /** Packets in the window, both directions. Not sent by `/api/replay` yet. */
+  /** Kill-chain lane of `stage` (control_backend/tactics.py). */
+  tactic_lane?: string | null;
+  /** Packets in the window, both directions. */
   packets?: number;
-  /** Bytes in the window, both directions. Not sent by `/api/replay` yet. */
+  /** Bytes in the window, both directions. */
   bytes?: number;
-  /** The window's flow records, first-packet order. Not sent by `/api/replay` yet. */
+  /** The window's flow records, first-packet order (capped). */
   flows?: FlowRecord[];
 }
 
@@ -53,5 +53,23 @@ export interface ReplayReport {
   flagged_windows: number;
   /** Always true — the rule layer is forced off for offline analysis. */
   rules_disabled: boolean;
+  /** Seconds per window the capture was scored on. */
+  window_seconds?: number;
+  /** The alert threshold the windows were scored against. */
+  threshold?: number;
   results: ReplayRow[];
+}
+
+/** A built-in capture the Replay page can analyse without an upload. */
+export interface ReplaySample {
+  id: string;
+  /** Filename on disk. */
+  name: string;
+  label: string;
+  kind: "pcap" | "csv";
+  bytes: number;
+  /** Windows in the capture, when known before parsing (demo fixtures). */
+  windows: number | null;
+  source: string;
+  note: string;
 }

@@ -11,7 +11,8 @@ import KillChain from "../components/KillChain";
 import AttackPath from "../components/AttackPath";
 import StateInspector from "../components/StateInspector";
 import FlowTable from "../components/FlowTable";
-import { clockTime } from "../design/time";
+import { clockTime, ahead } from "../design/time";
+import { isInternal } from "../design/site";
 
 /**
  * Investigation — prediction and campaign on one surface.
@@ -65,7 +66,7 @@ export default function Investigation({
   const risk = n(prediction?.risk);
   const level = prediction?.alert_level ?? sevFromRisk(risk, threshold);
   const latestWindow = envelope?.state?.window_id ?? null;
-  const attacker = (envelope?.focus_ips ?? []).find((ip) => !ip.startsWith("10.")) ?? null;
+  const attacker = (envelope?.focus_ips ?? []).find((ip) => !isInternal(ip)) ?? null;
 
   /* ── H_hat trajectory: 90 observed windows, NOW, then the K-step rollout ── */
   const series = useMemo(
@@ -81,7 +82,7 @@ export default function Investigation({
           })),
           ...(prediction ? [{ t: "NOW", observed: risk, forecast: risk, band: [risk, risk] as [number, number] }] : []),
           ...forecast.map((f) => ({
-            t: `+${f.horizonSeconds}s`,
+            t: `${ahead(f.horizonSeconds)}`,
             observed: undefined as number | undefined,
             forecast: f.predicted / 100,
             band: [f.lowerBound / 100, f.upperBound / 100] as [number, number],
@@ -117,7 +118,7 @@ export default function Investigation({
           <Panel flush>
             <PanelHead
               title="Kill chain"
-              note={last ? `observed → +${last.horizonSeconds}s forecast` : undefined}
+              note={last ? `observed → ${ahead(last.horizonSeconds)} forecast` : undefined}
               aside={prediction?.predicted_stage ? <Chip level={level}>{prediction.predicted_stage}</Chip> : undefined}
             />
             <PanelBody>
@@ -156,7 +157,7 @@ export default function Investigation({
                 </Data>
                 {peak && (
                   <Data size="s" color="var(--paper-600)" style={{ display: "block" }}>
-                    at +{peak.horizonSeconds}s
+                    at {ahead(peak.horizonSeconds)}
                   </Data>
                 )}
               </div>
@@ -167,14 +168,14 @@ export default function Investigation({
                 </Data>
                 {last && (
                   <Data size="s" color="var(--paper-600)" style={{ display: "block" }}>
-                    at +{last.horizonSeconds}s
+                    at {ahead(last.horizonSeconds)}
                   </Data>
                 )}
               </div>
               <div>
                 <Micro>Hazard onset</Micro>
                 <Data size="l" color={onset ? "var(--sev-warning)" : "var(--paper-600)"}>
-                  {onset ? `+${onset.horizonSeconds}s` : risk >= threshold ? "active" : "none"}
+                  {onset ? `${ahead(onset.horizonSeconds)}` : risk >= threshold ? "active" : "none"}
                 </Data>
                 <Data size="s" color="var(--paper-600)" style={{ display: "block" }}>
                   {onset ? "forecast crosses θ" : risk >= threshold ? "already above θ" : "within horizon"}
@@ -197,7 +198,7 @@ export default function Investigation({
                     {prediction && <NowLine x="NOW" />}
                     {onset && (
                       <ReferenceLine
-                        x={`+${onset.horizonSeconds}s`}
+                        x={`${ahead(onset.horizonSeconds)}`}
                         stroke="var(--sev-warning)"
                         strokeDasharray="2 3"
                         label={{

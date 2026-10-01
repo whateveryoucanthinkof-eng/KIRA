@@ -16,6 +16,7 @@ import type { AttentionMatrix as Matrix, SaliencyTerm } from "../types/attention
 import { Chip, Empty, Micro } from "../design/primitives";
 import { OBSERVED } from "../design/charts";
 import { blip, useSound } from "../design/sound";
+import UnderDev from "./UnderDev";
 
 type Cell = [number, number];
 
@@ -128,9 +129,10 @@ export default function AttentionMatrix({ matrix, focus }: { matrix: Matrix | nu
     return (
       <div className="am" ref={rootRef}>
         <div ref={gridRef} className="am-empty">
-          <Empty hint="The adapter extracts the TGNE embedding but does not forward the attention layer's weights over the event bus.">
-            Attention weights not streamed
-          </Empty>
+          <UnderDev block title="docs/DASHBOARD_INTEGRATION.md — TGNE attention extraction">
+            Under development — the TGNE attention layer's weights are computed on every window but not yet read out
+            to the console
+          </UnderDev>
         </div>
       </div>
     );

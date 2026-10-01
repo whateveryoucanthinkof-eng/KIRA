@@ -512,6 +512,9 @@ class LiveTelemetryService:
                             >= float(getattr(self.adapter, "alert_threshold", 0.65) or 0.65) * 100.0
                             else "stopped"
                         ),
+                        # Operator's ARM EXTERNAL state, unambiguous: `attack`
+                        # above is "the model is alerting" on this bus.
+                        "attack_armed": bool(self.external_attack_armed),
                         "ml": "running" if self.is_ml_active else "stopped",
                         "network_online": True,
                         "sensor_active": self.is_running,

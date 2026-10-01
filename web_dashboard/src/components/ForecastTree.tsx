@@ -7,6 +7,10 @@
  * Escalation is critical, a pivot is warning, a back-off is muted — the
  * severity palette, nothing else. Every branch is forecast, so every branch is
  * dashed; the most likely one carries moving traffic.
+ *
+ * Branches come from DeepOP (control_backend/forecast_branches.py). Hops,
+ * volume and per-branch risk are not predicted by any model yet: they arrive
+ * null and are marked under development rather than drawn.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -14,7 +18,10 @@ import type { PredictionResult } from "../api/types";
 import type { ForecastBranch } from "../types/forecast";
 import { Empty, sevColor, sevFromRisk } from "../design/primitives";
 import { OBSERVED } from "../design/charts";
-import { HORIZON_SECONDS } from "../types/timeline";
+import { FORECAST_STEP_SECONDS, HORIZON_SECONDS } from "../types/timeline";
+import { ahead } from "../design/time";
+import UnderDev from "./UnderDev";
+import { isInternal } from "../design/site";
 
 const KIND_COLOUR: Record<ForecastBranch["kind"], string> = {
   escalation: "var(--sev-critical)",
@@ -68,8 +75,8 @@ export default function ForecastTree({
   if (!branches || !branches.length) {
     return (
       <div ref={ref} className="ft">
-        <Empty hint="The backend forwards the rollout's risk and stage per step, not its competing continuations.">
-          Branch rollout not streamed
+        <Empty hint="DeepOP's competing continuations appear once Branch B and DeepOP are loaded and inference is live.">
+          No forecast branches yet
         </Empty>
       </div>
     );
@@ -98,8 +105,9 @@ export default function ForecastTree({
       const c1x = x0 + (xe - x0) * 0.5;
       const c2x = x0 + (xe - x0) * 0.5;
       const d = `M ${x0} ${yc} C ${c1x} ${yc}, ${c2x} ${ye}, ${xe} ${ye}`;
-      const hops = b.hops.map((hop, i) => {
-        const t = (i + 1) / b.hops.length;
+      const hopList = b.hops ?? [];
+      const hops = hopList.map((hop, i) => {
+        const t = (i + 1) / hopList.length;
         return { ...hop, x: cubic(x0, c1x, c2x, xe, t), y: cubic(yc, yc, ye, ye, t) };
       });
       return { b, xe, ye, d, hops };
@@ -114,11 +122,11 @@ export default function ForecastTree({
         <svg width={w} height={h} className="ft-svg" aria-hidden>
           {/* Time axis: NOW to the end of the horizon. */}
           <line x1={x0} x2={xMax} y1={axisY} y2={axisY} stroke="var(--rule-hard)" strokeWidth={1} shapeRendering="crispEdges" />
-          {[0, 4, 8, 12, 16].map((s) => (
+          {Array.from({ length: Math.round(HORIZON_SECONDS / FORECAST_STEP_SECONDS) + 1 }, (_, i) => i * FORECAST_STEP_SECONDS).map((s) => (
             <g key={s}>
               <line x1={xAt(s)} x2={xAt(s)} y1={top - 8} y2={axisY + 4} stroke="var(--rule-hair)" strokeWidth={1} shapeRendering="crispEdges" />
               <text x={xAt(s)} y={axisY + 16} textAnchor="middle" fill="var(--paper-600)" fontSize={10} fontFamily="var(--face-data)">
-                {s === 0 ? "NOW" : `+${s}s`}
+                {s === 0 ? "NOW" : ahead(s)}
               </text>
             </g>
           ))}
@@ -136,7 +144,7 @@ export default function ForecastTree({
                 strokeDasharray="3 3"
               />
               <text x={xAt(futureSeconds) + 6} y={top - 2} fill="var(--paper-000)" fontSize={10} fontFamily="var(--face-data)">
-                t +{futureSeconds}s
+                t {ahead(futureSeconds)}
               </text>
             </g>
           )}
@@ -228,7 +236,9 @@ export default function ForecastTree({
               </div>
               <div className="ft-label">{b.label}</div>
               <div className="ft-meta">
-                {b.technique !== "—" ? `${b.technique} · ` : ""}+{b.horizon_seconds}s · → {b.hops[b.hops.length - 1]?.name ?? "—"}
+                {b.technique !== "—" ? `${b.technique} · ` : ""}
+                {ahead(b.horizon_seconds)}
+                {b.hops?.length ? ` · → ${b.hops[b.hops.length - 1].name}` : ""}
               </div>
             </div>
           ))}
@@ -255,17 +265,41 @@ export default function ForecastTree({
                 <dt>confidence</dt>
                 <dd>{hovered.b.confidence.toFixed(3)}</dd>
                 <dt>eta</dt>
-                <dd>+{hovered.b.horizon_seconds}s</dd>
+                <dd>{ahead(hovered.b.horizon_seconds)}</dd>
+                {hovered.b.path?.length ? (
+                  <>
+                    <dt>steps</dt>
+                    <dd>{hovered.b.path.map((st) => (st.tactic_lane === "Benign" ? "benign" : st.technique ?? st.tactic_lane)).join(" → ")}</dd>
+                  </>
+                ) : null}
                 <dt>path</dt>
-                <dd>{hovered.b.hops.map((hp) => hp.name).join(" → ")}</dd>
+                <dd>
+                  {hovered.b.hops ? (
+                    hovered.b.hops.map((hp) => hp.name).join(" → ")
+                  ) : (
+                    <UnderDev title="No model predicts which hosts a branch passes through; forecasts are per host." />
+                  )}
+                </dd>
                 <dt>targets</dt>
-                <dd>{hovered.b.hops.filter((hp) => hp.ip.startsWith("10.")).map((hp) => hp.ip).join(", ") || "—"}</dd>
+                <dd>
+                  {hovered.b.hops ? (
+                    hovered.b.hops.filter((hp) => isInternal(hp.ip)).map((hp) => hp.ip).join(", ") || "—"
+                  ) : (
+                    <UnderDev title="No model predicts which hosts a branch passes through." />
+                  )}
+                </dd>
                 <dt>packets</dt>
-                <dd>{hovered.b.packets.toLocaleString()}</dd>
+                <dd>{hovered.b.packets != null ? hovered.b.packets.toLocaleString() : <UnderDev title="No model forecasts traffic volume." />}</dd>
                 <dt>volume</dt>
-                <dd>{fmtBytes(hovered.b.bytes)}</dd>
+                <dd>{hovered.b.bytes != null ? fmtBytes(hovered.b.bytes) : <UnderDev title="No model forecasts traffic volume." />}</dd>
                 <dt>peak risk</dt>
-                <dd style={{ color: sevColor(sevFromRisk(hovered.b.peak_risk, threshold)) }}>{hovered.b.peak_risk.toFixed(3)}</dd>
+                <dd style={hovered.b.peak_risk != null ? { color: sevColor(sevFromRisk(hovered.b.peak_risk, threshold)) } : undefined}>
+                  {hovered.b.peak_risk != null ? (
+                    hovered.b.peak_risk.toFixed(3)
+                  ) : (
+                    <UnderDev title="Branch B rolls out one future, so no branch has its own risk curve." />
+                  )}
+                </dd>
               </dl>
             </div>
           )}

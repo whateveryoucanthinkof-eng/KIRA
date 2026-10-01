@@ -38,6 +38,7 @@ import type { Topology, TopologyNode } from "../api/types";
 import type { PredictionEnvelope } from "../types/live";
 import type { Campaign } from "../types/campaign";
 import type { FlowRecord } from "../types/evidence";
+import { dmzAnchor, hasZones, isInternal, siteName, zoneCidrs, zoneOfIp, type ZoneKey } from "../design/site";
 
 /* ════════════════════════════════════════════════════════════════════════
    Viewport palette — fixed, not theme-driven. The void stays a void in PAPER.
@@ -67,14 +68,17 @@ function hdr(hex: string, k: number): THREE.Color {
    Layout
    ════════════════════════════════════════════════════════════════════════ */
 
-type ZoneKey = "external" | "dmz" | "servers" | "users";
 
-const ZONES: { key: ZoneKey; label: string; cidr: string; y: number }[] = [
-  { key: "external", label: "External", cidr: "192.168.100.0/24", y: 4.5 },
-  { key: "dmz", label: "DMZ", cidr: "10.0.3.0/24", y: 1.5 },
-  { key: "servers", label: "Servers", cidr: "10.0.2.0/24", y: -1.5 },
-  { key: "users", label: "Users", cidr: "10.0.1.0/24", y: -4.5 },
+/** The console's bands, top to bottom. Hosts are placed by the site's zones (design/site.ts). */
+const ZONES: { key: ZoneKey; label: string; y: number }[] = [
+  { key: "external", label: "External", y: 4.5 },
+  { key: "dmz", label: "DMZ", y: 1.5 },
+  { key: "servers", label: "Servers", y: -1.5 },
+  { key: "users", label: "Users", y: -4.5 },
 ];
+
+/** A site that declares no zones has one internal band. */
+const zoneLabel = (z: (typeof ZONES)[number]) => (z.key === "users" && !hasZones() ? "Internal" : z.label);
 
 const LAYER_R = 7.2;
 
@@ -90,11 +94,8 @@ type Host = TopologyNode & {
 
 function zoneOf(n: Host): ZoneKey {
   if (n.zone === "external" || n.zone === "dmz" || n.zone === "servers" || n.zone === "users") return n.zone;
-  const ip = n.ip ?? n.id;
-  if (ip.startsWith("10.0.3.")) return "dmz";
-  if (ip.startsWith("10.0.2.")) return "servers";
-  if (ip.startsWith("10.0.1.")) return "users";
-  return "external";
+  // The site's declared zones (config/sites/*.yaml), not the lab's subnets.
+  return zoneOfIp(n.ip ?? n.id);
 }
 
 const isCore = (n: Host) => n.tier !== "background";
@@ -111,7 +112,7 @@ function layout(nodes: Host[], attacker: string | null): Map<string, THREE.Vecto
   ZONES.forEach((z, zi) => {
     const inZone = nodes.filter((n) => zoneOf(n) === z.key).sort(byAddr);
     const centre =
-      inZone.find((n) => n.id === attacker) ?? (z.key === "dmz" ? inZone.find((n) => n.ip === "10.0.3.10") : undefined);
+      inZone.find((n) => n.id === attacker) ?? (z.key === "dmz" ? inZone.find((n) => n.ip === dmzAnchor()) : undefined);
     const core = inZone.filter((n) => n !== centre && isCore(n));
     const bg = inZone.filter((n) => n !== centre && !isCore(n));
 
@@ -1067,7 +1068,7 @@ export default function Network3D({ topology, envelope, campaign, flows, selecte
 
   const nodes = (topology?.nodes ?? []) as Host[];
   const focus = useMemo(() => new Set(envelope?.focus_ips ?? []), [envelope]);
-  const attacker = useMemo(() => [...focus].find((ip) => !ip.startsWith("10.")) ?? null, [focus]);
+  const attacker = useMemo(() => [...focus].find((ip) => !isInternal(ip)) ?? null, [focus]);
   const latestWindow = envelope?.state?.window_id ?? null;
 
   const targets = useMemo(() => layout(nodes, attacker), [nodes, attacker]);
@@ -1251,9 +1252,9 @@ export default function Network3D({ topology, envelope, campaign, flows, selecte
         {ZONES.map((z) => (
           <div key={z.key} className="n3-anchor" ref={anchorRef(`zone:${z.key}`)}>
             <div className="n3-zone">
-              {z.label}
+              {zoneLabel(z)}
               <span>
-                {z.cidr} · {counts[z.key]}
+                {zoneCidrs(z.key)} · {counts[z.key]}
               </span>
             </div>
           </div>
@@ -1315,7 +1316,7 @@ export default function Network3D({ topology, envelope, campaign, flows, selecte
 
       {full && situation && (
         <div className="n3-hud n3-strip" style={{ borderTopColor: levelColour(situation.level) }}>
-          <span className="n3-strip-site">HQ-CORE · Enterprise segment</span>
+          <span className="n3-strip-site">{siteName()}</span>
           <span className="n3-strip-level" style={{ color: levelColour(situation.level) }}>
             {String(situation.level ?? "NOMINAL").toUpperCase()}
           </span>

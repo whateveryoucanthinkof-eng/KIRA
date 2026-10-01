@@ -13,8 +13,9 @@
  * neighbour's memory. Contributions sum from the baseline logit to the cell's
  * logit.
  *
- * Not yet on /ws: the adapter extracts the TGNE embedding but not the
- * layer's weights. The demo stream carries this shape.
+ * Not yet on /ws (under development): the encoder computes these weights on
+ * every window, but serving does not read them out yet — see
+ * docs/DASHBOARD_INTEGRATION.md. The demo stream carries this shape.
  */
 
 export type AttentionRole = "external" | "dmz" | "server" | "workstation";

@@ -200,7 +200,7 @@ export default function StateInspector({
             })}
           </div>
         ) : (
-          <Empty hint="The backend computes all 27 attributions and forwards the top 8 over the event bus.">Full vector not streamed</Empty>
+          <Empty hint="All 27 dimensions and their attributions arrive with each scored window once inference is live.">No state vector yet</Empty>
         )}
       </div>
 

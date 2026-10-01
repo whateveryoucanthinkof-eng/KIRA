@@ -200,7 +200,7 @@ export default function FlowTable({ flows, flowsInWindow, latestWindow, names = 
             hint={
               flows.length
                 ? "No flow matches the current filter."
-                : "Flow records are written by the sensor per window but not yet forwarded over the event bus."
+                : "The sensor's flow records arrive with each scored window once inference is live."
             }
           >
             {flows.length ? "No matches" : "No flow evidence"}

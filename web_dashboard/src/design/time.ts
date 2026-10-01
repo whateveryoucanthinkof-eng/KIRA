@@ -16,3 +16,11 @@ export function clockTime(value: number | string | Date): string {
   const d = value instanceof Date ? value : new Date(value);
   return Number.isNaN(d.getTime()) ? "Invalid Date" : HMS.format(d);
 }
+
+/** A horizon ahead of now: "+30s", "+2.5m". */
+export function ahead(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "";
+  if (seconds < 120) return `+${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)}s`;
+  const m = seconds / 60;
+  return `+${Number.isInteger(m) ? m : m.toFixed(1)}m`;
+}

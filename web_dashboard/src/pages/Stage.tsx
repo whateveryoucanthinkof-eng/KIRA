@@ -26,6 +26,8 @@ import AttentionMatrix from "../components/AttentionMatrix";
 import ScrubDock from "../components/ScrubDock";
 import StateInspector from "../components/StateInspector";
 import Boundary, { hasWebGL } from "../components/Boundary";
+import { ahead } from "../design/time";
+import { IS_DEMO } from "../env";
 
 const Network3D = lazy(() => import("../components/Network3D"));
 
@@ -77,7 +79,7 @@ function Trajectory({
         forecast: i === history.length - 1 ? p.risk : undefined,
       })),
       ...forecast.map((f) => ({
-        t: `+${f.horizonSeconds}s`,
+        t: `${ahead(f.horizonSeconds)}`,
         forecast: f.predicted / 100,
         band: [f.lowerBound / 100, f.upperBound / 100] as [number, number],
       })),
@@ -116,10 +118,10 @@ function Trajectory({
           <NowLine x={last.label} />
           {futureSeconds != null && (
             <ReferenceLine
-              x={`+${futureSeconds}s`}
+              x={`${ahead(futureSeconds)}`}
               stroke="var(--paper-000)"
               strokeDasharray="3 3"
-              label={{ value: `t +${futureSeconds}s`, position: "insideTopRight", fill: "var(--paper-000)", fontSize: 10, fontFamily: "var(--face-data)" }}
+              label={{ value: `t ${ahead(futureSeconds)}`, position: "insideTopRight", fill: "var(--paper-000)", fontSize: 10, fontFamily: "var(--face-data)" }}
             />
           )}
         </ComposedChart>
@@ -189,7 +191,7 @@ export default function Stage({
   playing: boolean;
   onCursor: (c: Cursor) => void;
   onPlaying: (p: boolean) => void;
-  onEmulate: (kind: "c2" | "lateral" | "contain") => void;
+  onEmulate: (kind: "c2" | "flood" | "contain") => void;
 }) {
   const [mode, setModeState] = useState<Mode>(() => {
     try {
@@ -266,16 +268,22 @@ export default function Stage({
               ))}
             </div>
             <div className="st-head-end">
-              {/* Adversary emulation: drives workloads/attacker_scenario.py stages. */}
-              <span className="emu" role="group" aria-label="Adversary emulation">
-                <span className="emu-label">Emulate</span>
-                <button className="emu-btn" onClick={() => onEmulate("c2")} title="attacker_scenario: C2 beaconing">
-                  C2 surge
-                </button>
-                <button className="emu-btn" onClick={() => onEmulate("lateral")} title="attacker_scenario: lateral pivot">
-                  Lateral
-                </button>
-                <button className="emu-btn is-contain" onClick={() => onEmulate("contain")} title="Isolate the primary target">
+              {/* Demo build: scenario buttons steer the sample stream. The real
+                  console never launches traffic, so it keeps only Contain,
+                  which records an isolation through /api/mitigate. */}
+              <span className="emu" role="group" aria-label={IS_DEMO ? "Demo scenarios" : "Response"}>
+                <span className="emu-label">{IS_DEMO ? "Emulate" : "Respond"}</span>
+                {IS_DEMO && (
+                  <>
+                    <button className="emu-btn" onClick={() => onEmulate("c2")} title="Demo scenario: C2 beaconing">
+                      C2 surge
+                    </button>
+                    <button className="emu-btn" onClick={() => onEmulate("flood")} title="Demo scenario: volumetric flood">
+                      Flood
+                    </button>
+                  </>
+                )}
+                <button className="emu-btn is-contain" onClick={() => onEmulate("contain")} title="Record an isolation of the primary target">
                   Contain
                 </button>
               </span>

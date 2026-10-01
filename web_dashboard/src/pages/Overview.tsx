@@ -8,6 +8,7 @@ import { Btn, Chip, Empty, Meter, Micro, PanelHead, Square, sevColor, sevFromRis
 import { FORECAST, Grid, Legend, NowLine, OBSERVED, RISK_BAND_COLORS, splitRisk, ThresholdLine, Tip, TimeAxis, ValueAxis } from "../design/charts";
 import { Num } from "../design/motion";
 import Storyline from "../components/Storyline";
+import { ahead } from "../design/time";
 
 /**
  * Mission control.
@@ -150,21 +151,21 @@ function Ahead({
             No early warning this window
             <em>
               {peak
-                ? `forecast peak ${(peak.predicted / 100).toFixed(3)} at +${peak.horizonSeconds}s · ${peak.predicted / 100 >= threshold ? "over" : "under"} θ`
+                ? `forecast peak ${(peak.predicted / 100).toFixed(3)} at ${ahead(peak.horizonSeconds)} · ${peak.predicted / 100 >= threshold ? "over" : "under"} θ`
                 : "the rollout arrives with the next scored window"}
             </em>
           </span>
         </div>
       )}
       {next && (
-        <div className="ov2-next" title={next.hops.map((h) => h.name).join(" → ")}>
+        <div className="ov2-next" title={(next.hops ?? []).map((h) => h.name).join(" → ") || undefined}>
           <Micro>
             Next · branch {next.id} {(next.probability * 100).toFixed(0)}%
           </Micro>
           <b>{next.label}</b>
           <span>
             {next.technique !== "—" ? `${next.technique} · ` : ""}
-            {next.stage} · +{next.horizon_seconds}s
+            {next.stage} · {ahead(next.horizon_seconds)}
           </span>
         </div>
       )}
@@ -225,7 +226,7 @@ function Trajectory({ history, forecast, threshold }: { history: LivePoint[]; fo
         forecast: i === history.length - 1 ? p.risk : undefined,
       })),
       ...forecast.map((f) => ({
-        t: `+${f.horizonSeconds}s`,
+        t: `${ahead(f.horizonSeconds)}`,
         forecast: f.predicted / 100,
         band: [f.lowerBound / 100, f.upperBound / 100] as [number, number],
       })),
@@ -384,7 +385,7 @@ export default function Overview({
           <div className="ov2-panel">
             <PanelHead
               title="Risk · observed → forecast"
-              note={`${history.length} windows · +${forecast.length ? forecast[forecast.length - 1].horizonSeconds : 0}s rollout`}
+              note={`${history.length} windows · ${ahead(forecast.length ? forecast[forecast.length - 1].horizonSeconds : 0)} rollout`}
               aside={
                 <Legend
                   items={[

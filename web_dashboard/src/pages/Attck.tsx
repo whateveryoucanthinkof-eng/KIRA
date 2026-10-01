@@ -7,7 +7,10 @@ import type { PredictionEnvelope } from "../types/live";
 import { Chip, Micro, Panel, PanelHead, sevColor, sevFromRisk } from "../design/primitives";
 import { FORECAST, Legend, OBSERVED } from "../design/charts";
 import { clockTime } from "../design/time";
-import { HORIZON_SECONDS, WINDOW_SECONDS } from "../types/timeline";
+import { FORECAST_STEP_SECONDS, FORECAST_STEPS, HORIZON_SECONDS, WINDOW_SECONDS } from "../types/timeline";
+import { ahead } from "../design/time";
+import UnderDev from "../components/UnderDev";
+import { isInternal, assetName } from "../design/site";
 
 /**
  * ATT&CK coverage matrix.
@@ -22,7 +25,7 @@ import { HORIZON_SECONDS, WINDOW_SECONDS } from "../types/timeline";
  * Cell state is live. Observed cells fill warm from OBSERVED campaign nodes;
  * the technique in progress carries the verdict's severity and a ticking
  * frame; forecast cells hatch cool from the rollout and its branches. Each
- * card carries its activation probability across the +16s horizon, the
+ * card carries its activation probability across the forecast horizon, the
  * vector path threads the observed techniques in the order they happened,
  * and a card opens an inspector with the flows that are its evidence.
  */
@@ -32,6 +35,8 @@ interface Tech {
   name: string;
   /** Which head can emit it. */
   heads: string;
+  /** No deployed head emits it: drawn, marked under development, never lit. */
+  dev?: boolean;
 }
 
 const MATRIX: { tactic: string; id: string; techniques: Tech[] }[] = [
@@ -64,7 +69,9 @@ const MATRIX: { tactic: string; id: string; techniques: Tech[] }[] = [
   {
     tactic: "Lateral Movement",
     id: "TA0008",
-    techniques: [{ id: "T1021", name: "Remote Services", heads: "correlation" }],
+    // Neither Branch A's 14 classes nor DeepOP's joint vocabulary has a
+    // lateral-movement token (do_this_in_next_session_ml_review.md §8).
+    techniques: [{ id: "T1021", name: "Remote Services", heads: "no head yet", dev: true }],
   },
   {
     tactic: "Command and Control",
@@ -101,7 +108,8 @@ const VOCAB = new Set(ALL.map((t) => t.id));
 /** Stage to the techniques a rollout step implies, for forecast shading. */
 const STAGE_TECHNIQUES: Record<string, string[]> = {
   Recon: ["T1595", "T1046"],
-  InitialAccess: ["T1190", "T1189", "T1110"],
+  CredentialAccess: ["T1110"],
+  InitialAccess: ["T1190", "T1189"],
   Execution: ["T1204"],
   LateralMovement: ["T1021"],
   C2: ["T1071", "T1071.001", "T1568.001"],
@@ -134,12 +142,14 @@ function branchCell(b: ForecastBranch): string | null {
   return STAGE_TECHNIQUES[b.stage]?.[0] ?? null;
 }
 
-/** Rises through 0.5 a second before the expected milestone. */
+/** Rises through 0.5 half a forecast step before the expected milestone. */
 function rise(t: number, at: number): number {
-  return 1 / (1 + Math.exp(-(t - at + 1) / 1.2));
+  const s = FORECAST_STEP_SECONDS;
+  return 1 / (1 + Math.exp(-(t - at + s / 2) / (s * 0.6)));
 }
 
-const SAMPLES = Array.from({ length: HORIZON_SECONDS / WINDOW_SECONDS + 1 }, (_, i) => i * WINDOW_SECONDS);
+/** Now plus each forecast step. A function: the contract arrives with /api/status. */
+const samples = () => Array.from({ length: FORECAST_STEPS + 1 }, (_, i) => i * FORECAST_STEP_SECONDS);
 
 function fmtBytes(n: number): string {
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
@@ -192,7 +202,8 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
     for (const f of forecast) for (const t of STAGE_TECHNIQUES[f.predictedStage ?? ""] ?? []) project(t, f.predicted / 100);
     for (const b of branches ?? []) {
       const c = b.kind === "backoff" ? null : branchCell(b);
-      if (c) project(c, b.peak_risk);
+      // No model gives a branch its own risk (Branch B rolls out one future).
+      if (c) project(c, b.peak_risk ?? 0);
     }
 
     let obs = 0;
@@ -209,7 +220,7 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
     const m = new Map<string, number[]>();
     const backoff = (branches ?? []).find((b) => b.kind === "backoff");
     for (const t of ALL) {
-      const series = SAMPLES.map((s) => {
+      const series = samples().map((s) => {
         if (t.id === now) {
           const base = Number(prediction?.technique_confidence ?? 0.6);
           return base * (1 - (backoff ? backoff.probability * rise(s, backoff.horizon_seconds) : 0));
@@ -299,7 +310,7 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
   const open = pinned ?? hover;
   const tech = open ? (ALL.find((t) => t.id === open) ?? null) : null;
   const openState: CellState = open ? (states.get(open) ?? "idle") : "idle";
-  const nameOf = (ip: string) => topology?.nodes.find((n) => n.ip === ip)?.label ?? (ip.startsWith("10.") ? ip : "external");
+  const nameOf = (ip: string) => topology?.nodes.find((n) => n.ip === ip)?.label ?? (isInternal(ip) ? (assetName(ip) ?? ip) : "external");
 
   const inspector = useMemo(() => {
     if (!tech) return null;
@@ -316,7 +327,7 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
 
     const hosts = new Set<string>(nodes.map((n) => n.host_ip));
     if (tech.id === now) for (const ip of envelope?.focus_ips ?? []) hosts.add(ip);
-    if (branch) for (const hp of branch.hops) hosts.add(hp.ip);
+    if (branch) for (const hp of branch.hops ?? []) hosts.add(hp.ip);
 
     const latestWindow = envelope?.state?.window_id ?? null;
     const evidence =
@@ -393,7 +404,7 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
                               : state === "forecast"
                                 ? FORECAST
                                 : "var(--rule-hard)";
-                        const cls = ["at-cell", `is-${state}`, t.id === pinned && "is-pinned", t.id === hover && "is-hover"].filter(Boolean).join(" ");
+                        const cls = ["at-cell", `is-${state}`, t.dev && "is-udev", t.id === pinned && "is-pinned", t.id === hover && "is-hover"].filter(Boolean).join(" ");
                         return (
                           <button
                             key={t.id}
@@ -420,7 +431,11 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
                               )}
                             </span>
                             <span className="at-cell-name">{t.name}</span>
-                            <Spark values={activation.get(t.id) ?? []} colour={state === "active" ? colour : FORECAST} />
+                            {t.dev ? (
+                              <UnderDev title="No deployed head emits this technique yet." />
+                            ) : (
+                              <Spark values={activation.get(t.id) ?? []} colour={state === "active" ? colour : FORECAST} />
+                            )}
                           </button>
                         );
                       })}
@@ -493,7 +508,7 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
                   <div className="at-hosts">
                     {inspector.hosts.length ? (
                       inspector.hosts.map((ip) => (
-                        <span key={ip} className={ip.startsWith("10.") ? "at-host" : "at-host is-external"}>
+                        <span key={ip} className={isInternal(ip) ? "at-host" : "at-host is-external"}>
                           {nameOf(ip)} <em>{ip}</em>
                         </span>
                       ))
@@ -533,7 +548,11 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
                     <div className="at-note">
                       Not yet observed.{" "}
                       {inspector.branch
-                        ? `Branch ${inspector.branch.id} puts it at +${inspector.branch.horizon_seconds}s with ${(inspector.branch.probability * 100).toFixed(0)}% of the forecast mass — ${inspector.branch.packets.toLocaleString()} packets, ${fmtBytes(inspector.branch.bytes)} if it plays out.`
+                        ? `Branch ${inspector.branch.id} puts it at ${ahead(inspector.branch.horizon_seconds)} with ${(inspector.branch.probability * 100).toFixed(0)}% of the forecast mass${
+                            inspector.branch.packets != null && inspector.branch.bytes != null
+                              ? ` — ${inspector.branch.packets.toLocaleString()} packets, ${fmtBytes(inspector.branch.bytes)} if it plays out.`
+                              : "."
+                          }`
                         : "The rollout reaches this stage inside the horizon."}
                     </div>
                   ) : (
@@ -553,7 +572,7 @@ export default function Attck({ prediction, forecast, campaign, branches, flows,
 
           <div className="at-caption">
             Only techniques the deployed heads can emit are listed — the 14-class Branch A vocabulary and the DeepOP token set, not ATT&CK as a
-            whole. Sparklines: activation probability across the +16s horizon.
+            whole. Sparklines: activation probability across the {ahead(HORIZON_SECONDS)} horizon.
           </div>
         </Panel>
       </div>

@@ -11,6 +11,7 @@ import { Chip, Empty, Micro, Panel, PanelHead, Readout, Square, sevColor, sevFro
 import { FORECAST, OBSERVED } from "../design/charts";
 import { clockTime } from "../design/time";
 import { sendMitigate } from "../api/adapter";
+import { isInternal, assetName } from "../design/site";
 
 /**
  * Incident war room.
@@ -246,10 +247,10 @@ export default function Incidents({
 
   /* ── The live picture, for the incident the stream is still working ── */
   const live = selected != null && selected.campaignId != null && campaign != null && campaign.campaign_id === selected.campaignId;
-  const nameOf = (ip: string) => topology?.nodes.find((n) => n.ip === ip)?.label ?? (ip.startsWith("10.") ? ip : "external");
+  const nameOf = (ip: string) => topology?.nodes.find((n) => n.ip === ip)?.label ?? (isInternal(ip) ? (assetName(ip) ?? ip) : "external");
   const attacker =
-    (envelope?.focus_ips ?? []).find((ip) => !ip.startsWith("10.")) ??
-    (branches ?? []).flatMap((b) => b.hops).find((h) => !h.ip.startsWith("10."))?.ip ??
+    (envelope?.focus_ips ?? []).find((ip) => !isInternal(ip)) ??
+    (branches ?? []).flatMap((b) => b.hops ?? []).find((h) => !isInternal(h.ip))?.ip ??
     null;
   const contained = selected ? selected.status === "contained" || selected.status === "closed" : false;
   const threshold = Number(prediction?.threshold ?? 0.65);
@@ -286,15 +287,15 @@ export default function Incidents({
       out.push({ ip: n.host_ip, name: nameOf(n.host_ip), role: "downstream", state: "reached", fact: `${n.technique_id} observed · ${n.hit_count} hits` });
     }
     for (const b of [...(branches ?? [])].filter((b) => b.kind !== "backoff").sort((a, c) => c.probability - a.probability)) {
-      for (const h of b.hops) {
-        if (seen.has(h.ip) || !h.ip.startsWith("10.")) continue;
+      for (const h of b.hops ?? []) {
+        if (seen.has(h.ip) || !isInternal(h.ip)) continue;
         seen.add(h.ip);
         out.push({
           ip: h.ip,
           name: h.name,
           role: "downstream",
           state: "at-risk",
-          fact: `branch ${b.id} · peak ${b.peak_risk.toFixed(2)}`,
+          fact: b.peak_risk != null ? `branch ${b.id} · peak ${b.peak_risk.toFixed(2)}` : `branch ${b.id}`,
           probability: b.probability,
           eta: b.horizon_seconds,
           technique: b.technique !== "—" ? b.technique : undefined,
@@ -336,7 +337,7 @@ export default function Incidents({
           at: b.horizon_seconds,
           kind: "forecast",
           title: `${Math.round(b.probability * 100)}% · ${b.label}`,
-          detail: `${b.technique !== "—" ? `${b.technique} · ` : ""}${b.hops.map((h) => h.name).join(" → ")}`,
+          detail: `${b.technique !== "—" ? `${b.technique} · ` : ""}${(b.hops ?? []).map((h) => h.name).join(" → ")}`,
         });
       }
     }

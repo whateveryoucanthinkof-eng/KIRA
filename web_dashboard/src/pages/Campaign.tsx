@@ -11,6 +11,8 @@ import { FORECAST, Legend, OBSERVED } from "../design/charts";
 import { Num } from "../design/motion";
 import { clockTime } from "../design/time";
 import { sendMitigate } from "../api/adapter";
+import { isInternal, assetName } from "../design/site";
+import { LANES, TECHNIQUE_NAMES } from "../design/lanes";
 
 /**
  * Campaign dossier.
@@ -44,30 +46,9 @@ const LANE_LABEL_H = 28;
 const GUTTER = 112;
 const CARD_H = 42;
 
-/** Short lane names, so seven fit side by side on a small screen. */
-const LANE_SHORT: Record<string, string> = {
-  Recon: "Recon",
-  InitialAccess: "Initial access",
-  Execution: "Execution",
-  C2: "C2",
-  LateralMovement: "Lateral",
-  Exfiltration: "Exfiltration",
-  Impact: "Impact",
-};
+/** Short lane names, so every lane fits side by side on a small screen. */
+const LANE_SHORT: Record<string, string> = Object.fromEntries(LANES.map((l) => [l.key, l.key === "CredentialAccess" ? "Credentials" : l.label]));
 
-const CODENAMES = ["CRIMSON SPIDER", "GLASS HERON", "COLD ANVIL", "PALE LANTERN", "IRON TIDE"];
-
-const TECHNIQUE_NAMES: Record<string, string> = {
-  T1046: "Service Discovery",
-  T1110: "Brute Force",
-  T1190: "Exploit Public App",
-  T1071: "App Layer Protocol",
-  T1021: "Remote Services",
-  T1005: "Local Data",
-  T1020: "Automated Exfil",
-  T1498: "Network DoS",
-  T1595: "Active Scanning",
-};
 
 function hhmmss(epochSeconds: number): string {
   try {
@@ -116,7 +97,7 @@ export default function Campaign({
 
   const threshold = Number(prediction?.threshold ?? 0.65);
   const risk = Number(prediction?.risk ?? 0);
-  const nameOf = (ip: string) => topology?.nodes.find((n) => n.ip === ip)?.label ?? (ip.startsWith("10.") ? ip : "external");
+  const nameOf = (ip: string) => topology?.nodes.find((n) => n.ip === ip)?.label ?? (isInternal(ip) ? (assetName(ip) ?? ip) : "external");
 
   const layout = useMemo(() => {
     if (!campaign) return null;
@@ -162,8 +143,10 @@ export default function Campaign({
   const forecastNodes = campaign.nodes.filter((n) => n.provenance === "FORECAST");
 
   /* ── Who, when, how fast ─────────────────────────────────────────── */
-  const codename = CODENAMES[(campaign.campaign_id - 1) % CODENAMES.length];
-  const attacker = (envelope?.focus_ips ?? []).find((ip) => !ip.startsWith("10.")) ?? (branches ?? []).flatMap((b) => b.hops).find((h) => !h.ip.startsWith("10."))?.ip ?? null;
+  // A reference, not a codename: nothing in the pipeline attributes a
+  // campaign to an actor, so it is not given an actor-style name.
+  const codename = `campaign ${String(campaign.campaign_id).padStart(4, "0")}`;
+  const attacker = (envelope?.focus_ips ?? []).find((ip) => !isInternal(ip)) ?? (branches ?? []).flatMap((b) => b.hops ?? []).find((h) => !isInternal(h.ip))?.ip ?? null;
   const firstSeen = observed.length ? Math.min(...observed.map((n) => n.start_time)) : campaign.start_time;
   const since = Math.round(firstSeen - campaign.end_time);
   const minutes = Math.max(1 / 60, (campaign.end_time - firstSeen) / 60);
@@ -193,7 +176,7 @@ export default function Campaign({
   const order = [...campaign.nodes].sort((a, b) => lanes.indexOf(a.coarse_category) - lanes.indexOf(b.coarse_category) || a.node_id - b.node_id);
   const pulseRank = new Map(order.map((n, i) => [n.node_id, i]));
   const probabilityOf = (n: CampaignNode): number => {
-    const b = (branches ?? []).find((x) => x.kind !== "backoff" && (x.technique === n.technique_id || (x.stage === n.coarse_category && x.hops.some((h) => h.ip === n.host_ip))));
+    const b = (branches ?? []).find((x) => x.kind !== "backoff" && (x.technique === n.technique_id || (x.stage === n.coarse_category && (x.hops ?? []).some((h) => h.ip === n.host_ip))));
     return b ? b.probability : n.mean_confidence;
   };
   const statusOf = (n: CampaignNode): NodeStatus => {
@@ -207,7 +190,7 @@ export default function Campaign({
   const assets = (() => {
     const out: { ip: string; name: string; state: "compromised" | "reached" | "at-risk" | "contained"; value: number; label: string; nodes: CampaignNode[] }[] = [];
     for (const ip of campaign.involved_hosts) {
-      if (!ip.startsWith("10.")) continue;
+      if (!isInternal(ip)) continue;
       const nodes = campaign.nodes.filter((n) => n.host_ip === ip);
       const seen = nodes.filter((n) => n.provenance === "OBSERVED");
       if (seen.length) {
@@ -227,8 +210,8 @@ export default function Campaign({
       }
     }
     for (const b of (branches ?? []).filter((x) => x.kind !== "backoff")) {
-      for (const h of b.hops) {
-        if (!h.ip.startsWith("10.") || out.some((a) => a.ip === h.ip)) continue;
+      for (const h of b.hops ?? []) {
+        if (!isInternal(h.ip) || out.some((a) => a.ip === h.ip)) continue;
         out.push({ ip: h.ip, name: h.name, state: contained ? "contained" : "at-risk", value: b.probability, label: contained ? "averted" : `${Math.round(b.probability * 100)}% at risk`, nodes: [] });
       }
     }
@@ -237,7 +220,7 @@ export default function Campaign({
   })();
 
   /* ── Neutralisation ──────────────────────────────────────────────── */
-  const isolateHosts = reachedHosts.filter((ip) => ip.startsWith("10."));
+  const isolateHosts = reachedHosts.filter((ip) => isInternal(ip));
   const campaignId = campaign.campaign_id;
 
   function neutralize() {
@@ -252,7 +235,7 @@ export default function Campaign({
         window.setTimeout(() => {
           setPulse(i + 1);
           // Each host is isolated as the pulse first reaches it.
-          if (n.provenance === "OBSERVED" && order.findIndex((m) => m.host_ip === n.host_ip) === i && n.host_ip.startsWith("10.")) {
+          if (n.provenance === "OBSERVED" && order.findIndex((m) => m.host_ip === n.host_ip) === i && isInternal(n.host_ip)) {
             void sendMitigate({ action: "ISOLATE_HOST", target: n.host_ip } as never);
           }
         }, step * (i + 1))
@@ -272,7 +255,7 @@ export default function Campaign({
         onToast({
           id: `neu${Date.now()}`,
           level: "nominal",
-          title: `Operation ${codename.toLowerCase()} neutralised`,
+          title: `${codename[0].toUpperCase()}${codename.slice(1)} neutralised`,
           body: `${isolateHosts.length} hosts isolated${attacker ? ` · ${attacker}/32 blocked` : ""} · ${bound.length} incidents contained`,
         });
       }, step * (order.length + 1))
@@ -289,7 +272,7 @@ export default function Campaign({
         <div className="cm-dossier-main">
           <div className="cm-title">
             <span className="cm-id">CAMPAIGN-{String(campaign.campaign_id).padStart(2, "0")}</span>
-            <h2>Operation {codename.toLowerCase()}</h2>
+            <h2>{codename[0].toUpperCase() + codename.slice(1)}</h2>
             <span className={`cm-status is-${status.level}`}>{status.label}</span>
           </div>
           <div className="cm-facts">
@@ -632,7 +615,7 @@ export default function Campaign({
 
       {/* ── Confirmation ─────────────────────────────────────────────── */}
       {confirm && (
-        <Sheet title={`Neutralize operation ${codename.toLowerCase()}`} onDismiss={() => setConfirm(false)}>
+        <Sheet title={`Neutralize ${codename}`} onDismiss={() => setConfirm(false)}>
           <div className="cm-confirm">
             <p>
               Isolate every host this campaign has reached and block its source. Each step goes through <code>/api/mitigate</code>, the same

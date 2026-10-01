@@ -260,6 +260,7 @@ async def get_system_status():
         ml_status="live" if ml_live else "standby",
         workloads_active=workloads_running,
         attack_active=attack_running,
+        attack_armed=bool(telemetry_service.external_attack_armed),
         demo_active=False,
         active_command=active_cmd,
         model_loaded=_served is not None,
@@ -496,6 +497,7 @@ def _analyse_capture(path: Path, suffix: str, filename: Optional[str], max_windo
         "flagged_windows": len(flagged),
         "rules_disabled": True,
         "window_seconds": replay_adapter.window_seconds,
+        "threshold": replay_adapter.alert_threshold,
         "results": results,
     }
 

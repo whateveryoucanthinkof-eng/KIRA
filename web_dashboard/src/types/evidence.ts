@@ -1,23 +1,17 @@
 /**
  * Evidence-level view models: the raw flows behind a verdict, and the full
- * state vector the models actually read.
+ * state vector the models actually read. Both arrive on every scored window:
  *
- * Both exist in the pipeline today but are not yet forwarded over /ws:
- *
- *   FlowRecord   telemetry/state/state_builder.py writes up to 256 flow dicts
- *                per 2.0s window to the JSONL stream; flag counts come from
- *                telemetry/flow/flow_table.py (syn_count, ack_count, …), which
- *                aggregates the per-packet flags parsed in
- *                telemetry/capture/sniffer.py.
- *   StateDim     control_backend/model_adapter.py:_explain() computes
- *                Input x Gradient over all 27 dims of the last timestep, then
- *                sends only the top 8. This carries all 27.
- *
- * The demo stream populates both. Against a live backend the fields are
- * absent and the panels say so rather than rendering empty tables.
+ *   FlowRecord   control_backend/evidence.py:flow_records — the sensor's
+ *                per-window flow export (telemetry/flow/flow_table.py, up to
+ *                256 per 2 s window), TCP flag counts included, direction
+ *                from the site's CIDRs. `on_path` marks flows touching the
+ *                scored host.
+ *   StateDim     control_backend/model_adapter.py:_explain_full — Input x
+ *                Gradient over all 27 dims of the last timestep.
  */
 
-export type FlowProtocol = "TCP" | "UDP" | "ICMP";
+export type FlowProtocol = "TCP" | "UDP" | "ICMP" | "OTHER";
 
 /** TCP flag counts across all packets in the flow (flow_table.py). */
 export interface FlowFlags {

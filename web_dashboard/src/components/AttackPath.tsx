@@ -2,6 +2,7 @@ import type { Campaign, CampaignNode } from "../types/campaign";
 import type { FlowRecord } from "../types/evidence";
 import type { Topology } from "../api/types";
 import { Data, Meter, Micro, Square, sevColor, sevFromRisk } from "../design/primitives";
+import { hasZones, zoneOfIp, type ZoneKey } from "../design/site";
 
 /**
  * Attack path — the campaign read as a chain of hosts rather than a graph.
@@ -31,15 +32,12 @@ interface Link {
   forecast: boolean;
 }
 
-const ZONE_OF: Record<string, string> = {
-  "10.0.3.": "DMZ",
-  "10.0.2.": "Servers",
-  "10.0.1.": "Users",
-};
+const ZONE_LABEL: Record<ZoneKey, string> = { dmz: "DMZ", servers: "Servers", users: "Users", external: "External" };
 
+/** The site's zone for a host (design/site.ts), not the lab's subnets. */
 function zoneOf(ip: string): string {
-  for (const [prefix, zone] of Object.entries(ZONE_OF)) if (ip.startsWith(prefix)) return zone;
-  return "External";
+  const z = zoneOfIp(ip);
+  return z === "users" && !hasZones() ? "Internal" : ZONE_LABEL[z];
 }
 
 function fmtBytes(n: number): string {

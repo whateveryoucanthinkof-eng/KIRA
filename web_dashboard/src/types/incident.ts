@@ -1,11 +1,12 @@
 /**
  * Incident triage model.
  *
- * An incident is a correlated group of alerts on one host, carried through an
- * analyst workflow rather than left as a flat log line. The backend does not
- * own this concept yet — `control_backend/` emits predictions and events, and
- * `correlation/` assembles campaigns, but nothing assigns, acknowledges or
- * closes. This is the contract to serve against when it does.
+ * An incident is a correlated group of model alerts on one host
+ * (control_backend/correlation_service.py): it opens on a host's first alert,
+ * or on one more than the evidence horizon after its last. The server never
+ * acknowledges or closes one; it marks an incident contained only while an
+ * isolation is recorded for its host. Assignment, notes and status changes
+ * are the analyst's, held in the console.
  *
  * Status transitions are the standard SOC ladder:
  *   new → triaging → contained → closed

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { uploadReplay, analyseSample } from "../api/adapter";
-import { REPLAY_SAMPLES, type ReplaySample } from "../api/mock";
+import { uploadReplay, analyseSample, fetchReplaySamples } from "../api/adapter";
+import type { ReplaySample } from "../types/replay";
 import type { ReplayReport, ReplayRow } from "../types/replay";
 import { BarRow, Btn, Chip, Field, Micro, PanelHead, Readout, sevColor, sevFromRisk } from "../design/primitives";
 import { FORECAST, Legend } from "../design/charts";
 import DvrTimeline, { fmtClock, fmtRate, type Keyframe } from "../components/DvrTimeline";
 import FlowStream from "../components/FlowStream";
 import { WINDOW_SECONDS } from "../types/timeline";
+import { ahead } from "../design/time";
 
 /**
  * Offline capture analysis, played back as a DVR.
@@ -22,6 +23,7 @@ import { WINDOW_SECONDS } from "../types/timeline";
  */
 
 const ACCEPT = ".pcap,.pcapng,.csv,.binetflow";
+/** Fallback alert cut, used only when a report carries no threshold. */
 const THRESHOLD = 0.65;
 const SPEEDS = [1, 2, 4, 8] as const;
 type Speed = (typeof SPEEDS)[number];
@@ -58,13 +60,14 @@ function keyframesOf(rows: ReplayRow[], threshold: number): Keyframe[] {
       if (firstAlert < 0) firstAlert = i;
       lastAlert = i;
     }
-    const key = r.mitre_technique ?? (r.stage !== "Benign" ? r.stage : null);
+    const lane = r.tactic_lane ?? r.stage;
+    const key = r.mitre_technique ?? (lane !== "Benign" ? lane : null);
     if (key && !seen.has(key)) {
       seen.add(key);
       out.push({
         index: i,
         tag: techId(key) ?? key,
-        label: `${r.stage} · ${key}`,
+        label: `${lane} · ${key}`,
         color: sevColor(sevFromRisk(r.risk, threshold)),
       });
     }
@@ -249,7 +252,10 @@ export default function Replay() {
     return () => cancelAnimationFrame(raf);
   }, [playing, dir, speed, n, seek]);
 
-  const keyframes = useMemo(() => keyframesOf(rows, THRESHOLD), [rows]);
+  // The alert cut the replay was scored against: Branch A's fitted
+  // operating point, not a constant.
+  const threshold = report?.threshold ?? THRESHOLD;
+  const keyframes = useMemo(() => keyframesOf(rows, threshold), [rows, threshold]);
   const cur = n ? Math.max(0, Math.min(n - 1, Math.floor(pos))) : 0;
   const atEnd = n > 0 && pos >= n - 2e-3;
 
@@ -357,7 +363,7 @@ export default function Replay() {
   }
 
   const row = rows[cur];
-  const level = sevFromRisk(row.risk, THRESHOLD);
+  const level = sevFromRisk(row.risk, threshold);
   const total = n ? (rows[n - 1].window + 1) * WINDOW_SECONDS : 0;
   const tNow = row.window * WINDOW_SECONDS + (pos - cur) * WINDOW_SECONDS;
   const peakIdx = rows.reduce((b, r, i) => (r.risk > rows[b].risk ? i : b), 0);
@@ -393,7 +399,7 @@ export default function Replay() {
         </div>
         <div className="rp-cap-stat">
           <Micro>Peak</Micro>
-          <b style={{ color: sevColor(sevFromRisk(peak.risk, THRESHOLD)) }}>{peak.risk.toFixed(3)}</b>
+          <b style={{ color: sevColor(sevFromRisk(peak.risk, threshold)) }}>{peak.risk.toFixed(3)}</b>
           <em>
             W {pad3(peak.window)} · {fmtClock(peak.window * WINDOW_SECONDS)}
           </em>
@@ -482,7 +488,7 @@ export default function Replay() {
                   { color: "var(--sev-warning)", label: "≥ θ", fill: true },
                   { color: "var(--sev-critical)", label: "critical", fill: true },
                   ...(rows.some((r) => r.packets != null) ? [{ color: "var(--paper-600)", label: "packets / s" }] : []),
-                  { color: "var(--sev-critical)", label: `threshold ${THRESHOLD.toFixed(2)}`, dashed: true },
+                  { color: "var(--sev-critical)", label: `threshold ${threshold.toFixed(2)}`, dashed: true },
                 ]}
               />
             }
@@ -491,7 +497,7 @@ export default function Replay() {
             rows={rows}
             keyframes={keyframes}
             pos={pos}
-            threshold={THRESHOLD}
+            threshold={threshold}
             windowSeconds={WINDOW_SECONDS}
             onSeek={seek}
             onScrub={onScrub}
@@ -511,7 +517,7 @@ export default function Replay() {
               ) : undefined
             }
           />
-          <FlowStream rows={rows} pos={pos} threshold={THRESHOLD} windowSeconds={WINDOW_SECONDS} />
+          <FlowStream rows={rows} pos={pos} threshold={threshold} windowSeconds={WINDOW_SECONDS} />
         </div>
       </div>
 
@@ -529,12 +535,12 @@ export default function Replay() {
               value={row.risk.toFixed(3)}
               scale="hero"
               level={level}
-              sub={row.alert ? `over ${THRESHOLD.toFixed(2)} · alert raised` : `under ${THRESHOLD.toFixed(2)}`}
+              sub={row.alert ? `over ${threshold.toFixed(2)} · alert raised` : `under ${threshold.toFixed(2)}`}
             />
           </div>
           <div className="rp-insp">
             <Field label="Target" value={row.target} />
-            <Field label="Stage" value={row.stage} />
+            <Field label="Stage" value={row.tactic_lane ?? row.stage} />
             <Field
               label="Technique"
               value={<span title={row.mitre_technique ?? undefined}>{row.mitre_technique ?? "—"}</span>}
@@ -547,7 +553,7 @@ export default function Replay() {
           {row.forecast.length > 0 && (
             <>
               <PanelHead title="Rollout" note={`+${row.forecast[0].horizon_seconds} to +${row.forecast[row.forecast.length - 1].horizon_seconds} s`} />
-              <Rollout points={row.forecast} threshold={THRESHOLD} />
+              <Rollout points={row.forecast} threshold={threshold} />
             </>
           )}
 
@@ -602,11 +608,11 @@ function Rollout({ points, threshold }: { points: { horizon_seconds: number; ris
         <line x1={0} x2={W} y1={H - threshold * H} y2={H - threshold * H} stroke="var(--sev-critical)" strokeDasharray="4 4" opacity={0.7} vectorEffect="non-scaling-stroke" />
       </svg>
       <div className="rp-roll-foot">
-        <span>+{points[0].horizon_seconds}s</span>
+        <span>{ahead(points[0].horizon_seconds)}</span>
         <span style={{ color: sevColor(sevFromRisk(peak.risk, threshold)) }}>
-          peak {peak.risk.toFixed(3)} at +{peak.horizon_seconds}s
+          peak {peak.risk.toFixed(3)} at {ahead(peak.horizon_seconds)}
         </span>
-        <span>+{points[points.length - 1].horizon_seconds}s</span>
+        <span>{ahead(points[points.length - 1].horizon_seconds)}</span>
       </div>
     </div>
   );
@@ -633,6 +639,17 @@ function Intake({
   onFile: (f: File) => void;
   onSample: (s: ReplaySample) => void;
 }) {
+  // Live: the captures on this machine. Demo: the fixtures.
+  const [samples, setSamples] = useState<ReplaySample[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetchReplaySamples()
+      .then((s) => alive && setSamples(s))
+      .catch(() => alive && setSamples([]));
+    return () => {
+      alive = false;
+    };
+  }, []);
   return (
     <div className="rp is-intake">
       <div
@@ -693,7 +710,10 @@ function Intake({
           <span>one click · the same analysis path as a dropped file</span>
         </div>
         <div className="rp-samples">
-          {REPLAY_SAMPLES.map((s) => {
+          {samples != null && !samples.length && (
+            <span className="rp-sample-note">No captures in the repo's captures/ folder. Drop a .pcap or .csv to analyse it.</span>
+          )}
+          {(samples ?? []).map((s) => {
             const active = parsing?.name === s.name;
             return (
               <button
@@ -708,7 +728,8 @@ function Intake({
                 </span>
                 <span className="rp-sample-file">{s.name}</span>
                 <span className="rp-sample-meta">
-                  {fmtBytes(s.bytes)} · {s.windows} windows · {fmtClock(s.windows * WINDOW_SECONDS)}
+                  {fmtBytes(s.bytes)}
+                  {s.windows != null ? ` · ${s.windows} windows · ${fmtClock(s.windows * WINDOW_SECONDS)}` : ""}
                 </span>
                 <span className="rp-sample-note">{s.note}</span>
                 <span className="rp-sample-src">{active ? (parsing?.result ? "Analysed" : "Parsing…") : s.source}</span>

@@ -16,7 +16,8 @@ import Stage from "./pages/Stage";
 import Palette, { type PaletteItem } from "./components/Palette";
 import { Toasts, Shortcuts, useHotkeys, useAlertToasts, type Toast } from "./components/Feedback";
 import { fetchStatus, fetchSite, fetchTopology, connectWebSocket, sendCommand, sendMitigate } from "./api/adapter";
-import { seedFrames, seedLog, seedEvents, seedIncidents, applyDemoTrigger } from "./api/mock";
+import { seedFrames, seedLog, seedEvents, seedIncidents } from "./api/mock";
+import { normalizePrediction } from "./api/normalize";
 import { IS_DEMO } from "./env";
 import { Enter } from "./design/motion";
 import type { Campaign as CampaignData } from "./types/campaign";
@@ -24,7 +25,8 @@ import type { Incident, IncidentEdit } from "./types/incident";
 import type { FlowRecord, StateDim } from "./types/evidence";
 import type { ForecastBranch } from "./types/forecast";
 import type { AttentionMatrix } from "./types/attention";
-import { HORIZON_SECONDS, WINDOW_SECONDS, type Cursor, type Frame } from "./types/timeline";
+import { FORECAST_STEP_SECONDS, HORIZON_SECONDS, WINDOW_SECONDS, setContract, type Cursor, type Frame } from "./types/timeline";
+import { setSite as setSiteGeometry } from "./design/site";
 import type {
   SystemStatus,
   ForecastPoint,
@@ -35,7 +37,7 @@ import type {
   SiteInfo,
 } from "./api/types";
 import type { LivePoint, PredictionEnvelope, Theme } from "./types/live";
-import { clockTime } from "./design/time";
+import { ahead, clockTime } from "./design/time";
 import { chime } from "./design/sound";
 
 const PAGE_TITLES: Record<Page, string> = {
@@ -103,15 +105,22 @@ function parseWindow(p: Record<string, any>) {
     ? p.forecast.map((f: Record<string, any>) => {
         const risk = num(f.risk) * 100;
         const conf = num(f.confidence, 0.5);
+        // The band is the backend's split-conformal interval on risk
+        // (control_backend/forecast_band.py), fitted on validation. When the
+        // checkpoint carries none, there is no band: the bounds collapse onto
+        // the forecast rather than being invented from the decoder's
+        // confidence, which is a token probability, not a risk interval.
+        const banded = f.risk_lower != null && f.risk_upper != null;
         return {
           timestamp: new Date(base + num(f.horizon_seconds) * 1000).toISOString(),
           horizonSeconds: num(f.horizon_seconds),
-          predictedStage: f.predicted_stage ?? null,
+          // Lane for the kill chain; the DeepOP token itself as technique.
+          predictedStage: f.tactic_lane ?? f.predicted_stage ?? null,
+          technique: f.predicted_stage ?? null,
           predicted: risk,
-          // Half-width grows as confidence decays with horizon — the shape a
-          // conformal radius has.
-          lowerBound: Math.max(0, risk - (1 - conf) * 40),
-          upperBound: Math.min(100, risk + (1 - conf) * 40),
+          lowerBound: banded ? num(f.risk_lower) * 100 : risk,
+          upperBound: banded ? num(f.risk_upper) * 100 : risk,
+          banded,
           confidence: conf,
         };
       })
@@ -173,12 +182,13 @@ function toFrame(seq: number, w: ParsedWindow, topology: Topology | null): Frame
   };
 }
 
+/** Demo scenario names for the console log (pages/Controls.tsx:SCENARIOS). */
 const SCENARIO_LOG: Record<ScenarioId, string> = {
   recon: "RECON_BURST",
-  probe: "WEB_PROBE_STORM",
-  exploit: "EXPLOIT_SIMULATION",
-  c2: "MIXED_ATTACK_BURSTS (C2)",
-  lateral: "LATERAL_PIVOT_STORM",
+  probe: "CREDENTIAL_STUFFING",
+  exploit: "EXPLOIT_ATTEMPT",
+  c2: "C2_BEACONING",
+  flood: "VOLUMETRIC_FLOOD",
 };
 
 /** Replay runs at twice the stream's rate, so it catches up with live. */
@@ -200,7 +210,7 @@ export default function App() {
   const [frames, setFrames] = useState<Frame[]>(() =>
     IS_DEMO
       ? (seedFrames(HISTORY)
-          .map(({ payload, topology }) => toFrame(++frameSeq.current, parseWindow(payload as Record<string, any>), topology))
+          .map(({ payload, topology }) => toFrame(++frameSeq.current, parseWindow(normalizePrediction(payload)), topology))
           .filter(Boolean) as Frame[])
       : []
   );
@@ -303,9 +313,22 @@ export default function App() {
 
   /* ── Backend ───────────────────────────────────────────────────────── */
 
+  /** A status from REST or the bus. Bus pushes carry only the live counters,
+   * so they are merged over the last full status rather than replacing it
+   * (which would drop model_loaded, model_meta and the contract). */
+  const applyStatus = useCallback((s: SystemStatus) => {
+    if (s.contract) setContract(s.contract);
+    setStatus((prev) => (prev ? { ...prev, ...s } : s));
+  }, []);
+
   useEffect(() => {
-    fetchStatus().then(setStatus).catch(console.warn);
-    fetchSite().then(setSite).catch(console.warn);
+    fetchStatus().then(applyStatus).catch(console.warn);
+    fetchSite()
+      .then((s) => {
+        setSiteGeometry(s);
+        setSite(s);
+      })
+      .catch(console.warn);
     fetchTopology().then(setTopology).catch(console.warn);
 
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -329,7 +352,7 @@ export default function App() {
           /* onClose drives reconnection */
         },
 
-        onSystemStatus: setStatus,
+        onSystemStatus: applyStatus,
 
         onTopologyUpdate: (t: Topology) => {
           setTopology(t);
@@ -425,7 +448,7 @@ export default function App() {
           pushLog(`[${nowIso()}] cmd  INFO: completed ${d.command}`);
           pushEvent({ severity: "info", category: "COMMAND", source: d.command, message: `Command completed: ${d.command}` });
 
-          fetchStatus().then(setStatus).catch(() => {});
+          fetchStatus().then(applyStatus).catch(() => {});
 
           if (d.command === "reset_environment" || d.command === "stop_network" || d.command === "stop_attack") {
             setAttackEvents([]);
@@ -471,36 +494,7 @@ export default function App() {
       clearTimeout(reconnectTimer);
       wsRef.current?.close();
     };
-  }, [pushEvent, pushLog]);
-
-  /* ── Demo trigger bridge ───────────────────────────────────────────── */
-
-  // Demo only: a fake attack command in the terminal (see scripts/demo_attack.sh)
-  // curls the Vite bridge (vite.config.ts:demoTriggerBridge), which pushes a
-  // stage here over SSE. Lets an intrusion be driven from off-camera instead of
-  // from the UI. Inert against a live backend, where /__demo/stream is 404.
-  useEffect(() => {
-    if (!IS_DEMO) return;
-    let es: EventSource | undefined;
-    try {
-      es = new EventSource("/__demo/stream");
-      es.addEventListener("trigger", (e) => {
-        let stage = "";
-        try {
-          stage = String(JSON.parse((e as MessageEvent).data)?.stage ?? "");
-        } catch {
-          return;
-        }
-        if (!stage) return;
-        applyDemoTrigger(stage);
-        pushLog(`[${nowIso()}] emu  INFO: terminal trigger → ${stage}`);
-        pushEvent({ severity: "info", category: "COMMAND", source: "terminal", message: `Adversary emulation triggered: ${stage}` });
-      });
-    } catch {
-      /* EventSource unavailable — the console still works from the UI. */
-    }
-    return () => es?.close();
-  }, [pushEvent, pushLog]);
+  }, [pushEvent, pushLog, applyStatus]);
 
   /* ── Time travel ───────────────────────────────────────────────────── */
 
@@ -526,7 +520,7 @@ export default function App() {
         }
       } else if (c.kind === "future") {
         if (c.seconds >= HORIZON_SECONDS) setPlaying(false);
-        else setCursor({ kind: "future", seconds: Math.min(HORIZON_SECONDS, c.seconds + WINDOW_SECONDS) });
+        else setCursor({ kind: "future", seconds: Math.min(HORIZON_SECONDS, c.seconds + FORECAST_STEP_SECONDS) });
       } else {
         setPlaying(false);
       }
@@ -570,7 +564,7 @@ export default function App() {
     replaying
       ? { label: `Replay · t −${(liveIdx - viewIdx) * WINDOW_SECONDS}s`, onLive: goLive }
       : cursor.kind === "future"
-        ? { label: `Forecast · t +${cursor.seconds}s`, onLive: goLive }
+        ? { label: `Forecast · t ${ahead(cursor.seconds)}`, onLive: goLive }
         : null;
   const viewStatus =
     replaying && status && view.prediction?.alert_level
@@ -588,10 +582,12 @@ export default function App() {
         pushLog(`[${nowIso()}] ctrl INFO: containment — isolate ${target ?? "primary target"}`);
         return;
       }
-      // The demo stream jumps the scenario to the stage; a live lab runs the
-      // attacker script, which always starts from stage 1.
-      void sendCommand(IS_DEMO ? `emulate_${kind}` : "start_attack");
-      pushLog(`[${nowIso()}] emu  INFO: attacker_scenario → ${SCENARIO_LOG[kind]}`);
+      // Attack scenarios exist only in the demo build: the real console never
+      // launches traffic. Lab attacks run outside the console, against the
+      // Containerlab range, and the console watches for them.
+      if (!IS_DEMO) return;
+      void sendCommand(`emulate_${kind}`);
+      pushLog(`[${nowIso()}] emu  INFO: demo scenario → ${SCENARIO_LOG[kind]}`);
     },
     [envelope, goLive, pushLog]
   );

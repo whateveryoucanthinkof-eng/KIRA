@@ -3,19 +3,29 @@
  * loaded by `npm run demo`). Dispatched from `adapter.ts`; never reached in a
  * live build.
  *
- * These emit the REAL wire shapes from `control_backend/schema.py`
- * (PredictionEvent, TopologyEvent, SystemStatusEvent) so the console renders
- * offline exactly as it does against the backend. Vocabularies are the
- * project's own:
+ * DEMO DATA. This is the demo dashboard (`python run_dashboard.py --demo`),
+ * there only so the console can be seen without a backend, a sensor or trained
+ * models. Nothing here is a model output.
  *
- *   techniques      branch_a_gnn_lstm/sequence_dataset.py:TECHNIQUE_VOCAB
- *   MITRE mapping   control_backend/model_adapter.py:TECHNIQUE_TO_MITRE
- *   host attributes data_unification/host_attributes.py
- *   feature groups  control_backend/model_adapter.py (group map)
- *   kill-chain      correlation/causal_edge_scorer.py:TACTIC_ORDER
- *   campaign shape  correlation/campaign_merge.py:AttackCampaign
- *   alert nodes     correlation/graph_compaction.py:CompactedAlertNode
- *   zones + assets  config/sites/containerlab-enterprise.yaml
+ * It emits the backend's exact wire shapes (control_backend/schema.py:
+ * PredictionEvent, TopologyEvent, SystemStatusEvent), and the prediction
+ * stream goes through the same normalisation as the real socket
+ * (src/api/normalize.ts). It follows what our models can actually produce:
+ *
+ *   temporal contract  cyberworld_v4/config.py — 2 s windows, 5 forecast steps
+ *                      of 30 s (150 s horizon), 15-step history
+ *   techniques         branch_a_gnn_lstm/sequence_dataset.py:TECHNIQUE_VOCAB
+ *   forecast tokens    deepop_decoder/joint_vocab.py ("Impact.T1498")
+ *   kill-chain lanes   control_backend/tactics.py:LANES
+ *   risk               the model's only: the rule layer is off, as it is by
+ *                      default in the backend, and never lifts `risk`
+ *   forecast band      risk_lower / risk_upper, as forecast_band.py sends it
+ *   zones + assets     config/sites/containerlab-enterprise.yaml
+ *
+ * Fields the real backend sends as null because no model produces them yet
+ * (branch hops and volume, per-branch peak risk, TGNE attention) ARE filled
+ * here, so the full layout can be seen; the real dashboard marks them
+ * "Under development". See docs/DASHBOARD_INTEGRATION.md.
  *
  * Nothing here uses Math.random: every value is a deterministic function of
  * the window index, so the scenario replays identically on every recording.
@@ -28,6 +38,9 @@ import type { Incident } from "../types/incident";
 import type { FlowFlags, FlowProtocol, FlowRecord, StateDim } from "../types/evidence";
 import type { ForecastBranch } from "../types/forecast";
 import type { AttentionMatrix, AttentionRole, SaliencyTerm } from "../types/attention";
+import type { ReplaySample } from "../types/replay";
+import { LANE_KEYS } from "../design/lanes";
+import { normalizePrediction } from "./normalize";
 
 /* ── Site (config/sites/containerlab-enterprise.yaml) ──────────────────── */
 
@@ -85,15 +98,30 @@ const THRESHOLD = 0.65;
  */
 const PHASES = [
   { until: 14, stage: "Recon", technique: "T1046", risk: [0.45, 0.75], label: "T1046 Network Service Discovery", tactic: "Reconnaissance", tacticId: "TA0043", desc: "Sweeping the DMZ for reachable services." },
-  { until: 26, stage: "InitialAccess", technique: "T1110", risk: [0.55, 0.80], label: "T1110 Brute Force", tactic: "Credential Access", tacticId: "TA0006", desc: "Repeated authentication attempts against the exposed web host." },
+  { until: 26, stage: "CredentialAccess", technique: "T1110", risk: [0.55, 0.80], label: "T1110 Brute Force", tactic: "Credential Access", tacticId: "TA0006", desc: "Brute force authentication" },
   { until: 38, stage: "InitialAccess", technique: "T1190", risk: [0.78, 0.92], label: "T1190 Exploit Public-Facing Application", tactic: "Initial Access", tacticId: "TA0001", desc: "Exploit attempts against the public-facing application." },
   { until: 50, stage: "C2", technique: "T1071", risk: [0.86, 0.95], label: "T1071 Application Layer Protocol", tactic: "Command and Control", tacticId: "TA0011", desc: "Beaconing consistent with application-layer command and control." },
   { until: RECOVERY_STEP, stage: "Impact", technique: "T1498", risk: [0.92, 0.98], label: "T1498 Network Denial of Service", tactic: "Impact", tacticId: "TA0040", desc: "Volumetric flood against the target host." },
   { until: CYCLE, stage: "Benign", technique: "Benign", risk: [0.1, 0.03], label: "Benign", tactic: "—", tacticId: "—", desc: "Traffic returned to baseline after mitigation." },
 ];
 
-/** correlation/causal_edge_scorer.py:TACTIC_ORDER */
-const LANES = ["Recon", "InitialAccess", "Execution", "C2", "LateralMovement", "Exfiltration", "Impact"];
+/** control_backend/tactics.py:LANES */
+const LANES = LANE_KEYS;
+
+/** DeepOP token for a lane (deepop_decoder/joint_vocab.py:NETWORK_MACRO_TECHNIQUES). */
+const LANE_TOKEN: Record<string, string> = {
+  Recon: "Recon.T1595",
+  CredentialAccess: "CredentialAccess.T1110",
+  InitialAccess: "InitialAccess.T1190",
+  C2: "C2.T1071",
+  Exfiltration: "Exfiltration.T1005",
+  Impact: "Impact.T1498",
+  Benign: "Benign.None",
+};
+
+/** Seconds per forecast step and steps, as cyberworld_v4/config.py serves them. */
+const STEP_S = 30;
+const K = 5;
 
 /**
  * Campaign skeleton. A node is OBSERVED once the scenario reaches its `at`
@@ -102,10 +130,12 @@ const LANES = ["Recon", "InitialAccess", "Execution", "C2", "LateralMovement", "
  */
 const CAMPAIGN_NODES: (Omit<CampaignNode, "provenance" | "start_time" | "end_time"> & { at: number })[] = [
   { node_id: 0, host_ip: TARGET, coarse_category: "Recon", technique_id: "T1046", hit_count: 41, max_risk_score: 0.22, mean_confidence: 0.74, at: 4 },
-  { node_id: 1, host_ip: TARGET, coarse_category: "InitialAccess", technique_id: "T1110", hit_count: 188, max_risk_score: 0.52, mean_confidence: 0.81, at: 16 },
+  { node_id: 1, host_ip: TARGET, coarse_category: "CredentialAccess", technique_id: "T1110", hit_count: 188, max_risk_score: 0.52, mean_confidence: 0.81, at: 16 },
   { node_id: 2, host_ip: TARGET, coarse_category: "InitialAccess", technique_id: "T1190", hit_count: 23, max_risk_score: 0.78, mean_confidence: 0.86, at: 28 },
   { node_id: 3, host_ip: TARGET, coarse_category: "C2", technique_id: "T1071", hit_count: 64, max_risk_score: 0.91, mean_confidence: 0.9, at: 40 },
-  { node_id: 4, host_ip: "10.0.2.40", coarse_category: "LateralMovement", technique_id: "T1021", hit_count: 12, max_risk_score: 0.83, mean_confidence: 0.77, at: 46 },
+  // A second host beaconing out: what the models CAN say about spread. No head
+  // emits lateral movement itself (do_this_in_next_session_ml_review.md §8).
+  { node_id: 4, host_ip: "10.0.2.40", coarse_category: "C2", technique_id: "T1071.001", hit_count: 12, max_risk_score: 0.83, mean_confidence: 0.77, at: 46 },
   { node_id: 5, host_ip: "10.0.2.50", coarse_category: "Exfiltration", technique_id: "T1005", hit_count: 7, max_risk_score: 0.88, mean_confidence: 0.71, at: 52 },
   { node_id: 6, host_ip: TARGET, coarse_category: "Impact", technique_id: "T1498", hit_count: 2104, max_risk_score: 0.96, mean_confidence: 0.94, at: 54 },
 ];
@@ -115,42 +145,47 @@ const CAMPAIGN_NODES: (Omit<CampaignNode, "provenance" | "start_time" | "end_tim
  * from the present, with the path each would take through the lab. Keyed by
  * PHASES index; the C2 phase splits once the lateral hop is observed.
  */
-type BranchTemplate = Omit<ForecastBranch, "id" | "probability" | "peak_risk" | "hops"> & { p: number; hops: string[] };
+type BranchTemplate = Omit<ForecastBranch, "id" | "probability" | "peak_risk" | "hops" | "packets" | "bytes"> & {
+  p: number;
+  hops: string[];
+  packets: number;
+  bytes: number;
+};
 
 const BRANCHES: BranchTemplate[][] = [
   [
-    { kind: "escalation", label: "Brute-force the exposed web login", stage: "InitialAccess", technique: "T1110", p: 0.62, confidence: 0.71, horizon_seconds: 6, hops: [ATTACKER, TARGET], packets: 9_800, bytes: 1_900_000 },
-    { kind: "pivot", label: "Probe the VPN gateway", stage: "InitialAccess", technique: "T1595", p: 0.26, confidence: 0.58, horizon_seconds: 10, hops: [ATTACKER, "10.0.3.30"], packets: 3_100, bytes: 610_000 },
-    { kind: "backoff", label: "Scan ends without follow-up", stage: "Benign", technique: "—", p: 0.12, confidence: 0.66, horizon_seconds: 4, hops: [ATTACKER], packets: 420, bytes: 61_000 },
+    { kind: "escalation", label: "Escalates to credential access", stage: "CredentialAccess", technique: "T1110", p: 0.62, confidence: 0.71, horizon_seconds: 60, hops: [ATTACKER, TARGET], packets: 9_800, bytes: 1_900_000 },
+    { kind: "pivot", label: "Continues as reconnaissance", stage: "Recon", technique: "T1595", p: 0.26, confidence: 0.58, horizon_seconds: 90, hops: [ATTACKER, "10.0.3.30"], packets: 3_100, bytes: 610_000 },
+    { kind: "backoff", label: "Returns to benign traffic", stage: "Benign", technique: "—", p: 0.12, confidence: 0.66, horizon_seconds: 30, hops: [ATTACKER], packets: 420, bytes: 61_000 },
   ],
   [
-    { kind: "escalation", label: "Exploit the public-facing application", stage: "InitialAccess", technique: "T1190", p: 0.66, confidence: 0.76, horizon_seconds: 6, hops: [ATTACKER, TARGET], packets: 12_600, bytes: 3_400_000 },
-    { kind: "pivot", label: "Reuse harvested credentials on the VPN", stage: "InitialAccess", technique: "T1110", p: 0.23, confidence: 0.61, horizon_seconds: 12, hops: [ATTACKER, "10.0.3.30", "10.0.2.20"], packets: 2_400, bytes: 520_000 },
-    { kind: "backoff", label: "Account lockout ends the attempt", stage: "Benign", technique: "—", p: 0.11, confidence: 0.69, horizon_seconds: 4, hops: [ATTACKER], packets: 380, bytes: 52_000 },
+    { kind: "escalation", label: "Escalates to initial access", stage: "InitialAccess", technique: "T1190", p: 0.66, confidence: 0.76, horizon_seconds: 60, hops: [ATTACKER, TARGET], packets: 12_600, bytes: 3_400_000 },
+    { kind: "pivot", label: "Continues as credential access", stage: "CredentialAccess", technique: "T1110", p: 0.23, confidence: 0.61, horizon_seconds: 90, hops: [ATTACKER, "10.0.3.30", "10.0.2.20"], packets: 2_400, bytes: 520_000 },
+    { kind: "backoff", label: "Returns to benign traffic", stage: "Benign", technique: "—", p: 0.11, confidence: 0.69, horizon_seconds: 30, hops: [ATTACKER], packets: 380, bytes: 52_000 },
   ],
   [
-    { kind: "escalation", label: "Establish C2 from the web host", stage: "C2", technique: "T1071", p: 0.7, confidence: 0.82, horizon_seconds: 6, hops: [TARGET, ATTACKER], packets: 6_200, bytes: 940_000 },
-    { kind: "pivot", label: "Pivot to the application tier", stage: "LateralMovement", technique: "T1021", p: 0.21, confidence: 0.64, horizon_seconds: 12, hops: [TARGET, "10.0.2.40"], packets: 4_100, bytes: 1_300_000 },
-    { kind: "backoff", label: "Exploit fails, session drops", stage: "Benign", technique: "—", p: 0.09, confidence: 0.7, horizon_seconds: 4, hops: [TARGET, ATTACKER], packets: 310, bytes: 44_000 },
+    { kind: "escalation", label: "Escalates to command and control", stage: "C2", technique: "T1071", p: 0.7, confidence: 0.82, horizon_seconds: 60, hops: [TARGET, ATTACKER], packets: 6_200, bytes: 940_000 },
+    { kind: "pivot", label: "Continues as initial access", stage: "InitialAccess", technique: "T1190", p: 0.21, confidence: 0.64, horizon_seconds: 90, hops: [ATTACKER, TARGET], packets: 4_100, bytes: 1_300_000 },
+    { kind: "backoff", label: "Returns to benign traffic", stage: "Benign", technique: "—", p: 0.09, confidence: 0.7, horizon_seconds: 30, hops: [TARGET, ATTACKER], packets: 310, bytes: 44_000 },
   ],
   [
-    { kind: "escalation", label: "Exfiltrate via HTTP POST over the C2 channel", stage: "Exfiltration", technique: "T1020", p: 0.74, confidence: 0.84, horizon_seconds: 8, hops: ["10.0.2.50", TARGET, ATTACKER], packets: 18_400, bytes: 22_600_000 },
-    { kind: "pivot", label: "Lateral movement to the identity server", stage: "LateralMovement", technique: "T1021", p: 0.19, confidence: 0.69, horizon_seconds: 12, hops: [TARGET, "10.0.2.40", "10.0.2.20"], packets: 5_300, bytes: 2_100_000 },
-    { kind: "backoff", label: "Beacon backs off", stage: "Benign", technique: "—", p: 0.07, confidence: 0.72, horizon_seconds: 4, hops: [TARGET, ATTACKER], packets: 300, bytes: 45_000 },
+    { kind: "escalation", label: "Escalates to exfiltration", stage: "Exfiltration", technique: "T1005", p: 0.74, confidence: 0.84, horizon_seconds: 60, hops: ["10.0.2.50", TARGET, ATTACKER], packets: 18_400, bytes: 22_600_000 },
+    { kind: "pivot", label: "Continues as command and control", stage: "C2", technique: "T1071", p: 0.19, confidence: 0.69, horizon_seconds: 90, hops: [TARGET, "10.0.2.40"], packets: 5_300, bytes: 2_100_000 },
+    { kind: "backoff", label: "Returns to benign traffic", stage: "Benign", technique: "—", p: 0.07, confidence: 0.72, horizon_seconds: 30, hops: [TARGET, ATTACKER], packets: 300, bytes: 45_000 },
   ],
   [
-    { kind: "escalation", label: "Sustain the flood against the web tier", stage: "Impact", technique: "T1498", p: 0.64, confidence: 0.9, horizon_seconds: 4, hops: [ATTACKER, TARGET], packets: 142_000, bytes: 88_000_000 },
-    { kind: "pivot", label: "Exfiltrate under cover of the flood", stage: "Exfiltration", technique: "T1020", p: 0.24, confidence: 0.66, horizon_seconds: 10, hops: ["10.0.2.50", TARGET, ATTACKER], packets: 16_900, bytes: 19_800_000 },
-    { kind: "backoff", label: "Flood subsides", stage: "Benign", technique: "—", p: 0.12, confidence: 0.63, horizon_seconds: 6, hops: [ATTACKER, TARGET], packets: 2_200, bytes: 310_000 },
+    { kind: "pivot", label: "Continues as impact", stage: "Impact", technique: "T1498", p: 0.64, confidence: 0.9, horizon_seconds: 30, hops: [ATTACKER, TARGET], packets: 142_000, bytes: 88_000_000 },
+    { kind: "pivot", label: "Continues as exfiltration", stage: "Exfiltration", technique: "T1005", p: 0.24, confidence: 0.66, horizon_seconds: 90, hops: ["10.0.2.50", TARGET, ATTACKER], packets: 16_900, bytes: 19_800_000 },
+    { kind: "backoff", label: "Returns to benign traffic", stage: "Benign", technique: "—", p: 0.12, confidence: 0.63, horizon_seconds: 60, hops: [ATTACKER, TARGET], packets: 2_200, bytes: 310_000 },
   ],
   [
-    { kind: "backoff", label: "Contained — no onward activity", stage: "Benign", technique: "—", p: 0.86, confidence: 0.81, horizon_seconds: 4, hops: [TARGET], packets: 0, bytes: 0 },
-    { kind: "escalation", label: "Re-entry through the web tier", stage: "InitialAccess", technique: "T1190", p: 0.1, confidence: 0.44, horizon_seconds: 14, hops: [ATTACKER, TARGET], packets: 7_400, bytes: 1_800_000 },
-    { kind: "pivot", label: "Dormant foothold on the app tier", stage: "LateralMovement", technique: "T1021", p: 0.04, confidence: 0.38, horizon_seconds: 16, hops: ["10.0.2.40", "10.0.2.20"], packets: 900, bytes: 210_000 },
+    { kind: "backoff", label: "Returns to benign traffic", stage: "Benign", technique: "—", p: 0.86, confidence: 0.81, horizon_seconds: 30, hops: [TARGET], packets: 0, bytes: 0 },
+    { kind: "escalation", label: "Escalates to initial access", stage: "InitialAccess", technique: "T1190", p: 0.1, confidence: 0.44, horizon_seconds: 120, hops: [ATTACKER, TARGET], packets: 7_400, bytes: 1_800_000 },
+    { kind: "escalation", label: "Escalates to command and control", stage: "C2", technique: "T1071", p: 0.04, confidence: 0.38, horizon_seconds: 150, hops: ["10.0.2.40", ATTACKER], packets: 900, bytes: 210_000 },
   ],
 ];
 
-/** Once the pivot to srv-app is observed, the identity-server branch firms up. */
+/** Once srv-app is seen beaconing too, the C2 branch firms up. */
 const LATERAL_OBSERVED = 46;
 
 const HOST_NAMES: Record<string, string> = { [ATTACKER]: "external" };
@@ -160,7 +195,7 @@ function branchesAt(step: number, w: ReturnType<typeof windowState>): ForecastBr
   let templates = BRANCHES[w.i];
   if (w.i === 3 && s >= LATERAL_OBSERVED) {
     templates = templates.map((t) =>
-      t.kind === "escalation" ? { ...t, p: 0.58 } : t.kind === "pivot" ? { ...t, p: 0.34, horizon_seconds: 8 } : { ...t, p: 0.08 }
+      t.kind === "escalation" ? { ...t, p: 0.58 } : t.kind === "pivot" ? { ...t, p: 0.34, horizon_seconds: 60 } : { ...t, p: 0.08 }
     );
   }
   const raw = templates.map((t, k) => Math.max(0.01, t.p + wobble(step, 40 + k) * 0.02));
@@ -176,12 +211,24 @@ function branchesAt(step: number, w: ReturnType<typeof windowState>): ForecastBr
             ? Math.min(0.99, Math.max(w.maxFuture, 0.3) + 0.04)
             : Math.min(0.97, Math.max(w.maxFuture, 0.25) * 0.9);
       const scale = 1 + wobble(step, 50 + k) * 0.04;
+      const firstLane = t.kind === "backoff" ? "Benign" : t.stage;
       return {
         kind: t.kind,
         label: t.label,
         stage: t.stage,
         technique: t.technique,
         probability: raw[k] / total,
+        probability_raw: Number((raw[k] * 0.9).toFixed(4)),
+        path: Array.from({ length: K }, (_, j) => {
+          const at = (j + 1) * STEP_S;
+          const lane = at >= t.horizon_seconds ? firstLane : w.p.stage === "Benign" ? "Benign" : w.p.stage;
+          return {
+            horizon_seconds: at,
+            tactic_lane: lane,
+            technique: lane === "Benign" ? null : (LANE_TOKEN[lane]?.split(".")[1] ?? null),
+            probability: Number(Math.max(0.3, t.confidence - j * 0.04).toFixed(4)),
+          };
+        }),
         confidence: Math.min(0.99, t.confidence + wobble(step, 60 + k) * 0.015),
         horizon_seconds: t.horizon_seconds,
         hops: t.hops.map((ip) => ({ ip, name: name(ip) })),
@@ -371,16 +418,22 @@ const GROUP_OF: Record<string, string> = {
   byte_rate: "Rate", packet_rate: "Rate",
 };
 
+/** control_backend/main.py:get_system_status — model_meta, as it reports a loaded model. */
 const MODEL_META = {
-  name: "K.I.R.A. dual-branch + DeepOP",
-  version: "1.1.0-live-retrained",
+  name: "Antigravity-DualBranch-DeepOP",
+  version: "3.3-SOC",
   feature_count: 27,
-  history_steps: 5,
+  history_steps: 15,
   window_seconds: 2.0,
-  forecast_steps: 8,
-  checkpoint: "saved_models/branch_a/branch_a_lstm.pt",
+  forecast_steps: K,
+  forecast_step_seconds: STEP_S,
+  checkpoint: "host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
   threshold: THRESHOLD,
+  rules_enabled: false,
 };
+
+/** schema.py:TemporalContractInfo */
+const CONTRACT = { window_seconds: 2.0, history_steps: 15, forecast_steps: K, forecast_step_seconds: STEP_S, source: "checkpoints" };
 
 /* ── deterministic helpers ─────────────────────────────────────────────── */
 
@@ -421,16 +474,13 @@ function windowState(step: number) {
   const base = lerp(p.risk[0], p.risk[1], t);
   const risk = Math.max(0, Math.min(0.99, base + wobble(step, 1) * 0.02));
 
-  // The SOC rule layer engages once external traffic is present — mirrors
-  // model_adapter.py:585, so the provenance strip has something honest to show.
-  // ml_risk stays the discounted model output (lower), while the rule layer
-  // asserts roughly the phase risk, so the shown risk tracks the stage's real
-  // severity band — the colour ladder (amber → red) matches the kill chain
-  // rather than being pinned just under the critical line by the discount.
-  const mlRisk = Math.max(0, Math.min(0.99, risk * (hot ? 0.72 : 1) + wobble(step, 3) * 0.03));
-  const rulesApplied = hot && risk > 0.35;
-  const ruleRisk = rulesApplied ? Math.min(0.98, Math.max(risk + 0.02, mlRisk)) : null;
-  const shown = rulesApplied && ruleRisk != null ? Math.max(mlRisk, ruleRisk) : mlRisk;
+  // `risk` is the model's output and nothing else moves it: the rule layer is
+  // off by default in the backend and, when on, only reports an opinion
+  // beside it (control_backend/model_adapter.py:advisory_rule_opinion).
+  const mlRisk = risk;
+  const ruleRisk: number | null = null;
+  const rulesApplied = false;
+  const shown = risk;
 
   const flows = Math.round(hot ? 260 + shown * 1700 : 240 + wobble(step, 13) * 40);
   const packets = Math.round(hot ? 900 + shown * 14_000 : 700 + wobble(step, 17) * 180);
@@ -438,17 +488,24 @@ function windowState(step: number) {
   const telemetryMs = Number((3.1 + Math.abs(wobble(step, 23)) * 1.6).toFixed(2));
   const inferenceMs = Number((7.4 + Math.abs(wobble(step, 29)) * 3.2).toFixed(2));
 
-  // K=8 rollout, 2s per step, confidence decaying with horizon.
-  const forecast = Array.from({ length: 8 }, (_, k) => {
-    const drift = hot ? 1 + (k + 1) * 0.035 : 1 - (k + 1) * 0.06;
+  // K=5 rollout, 30 s per step (cyberworld_v4/config.py), with the conformal
+  // band forecast_band.py sends: half-width growing with horizon.
+  const forecast = Array.from({ length: K }, (_, k) => {
+    const drift = hot ? 1 + (k + 1) * 0.05 : 1 - (k + 1) * 0.08;
     // Walk the forecast forward through the kill chain rather than repeating
     // the current stage — this is what the timeline's forecast cells render.
-    const ahead = PHASES[Math.min(PHASES.length - 2, i + (k < 3 ? 0 : k < 6 ? 1 : 2))];
+    const ahead = PHASES[Math.min(PHASES.length - 2, i + (k < 2 ? 0 : k < 4 ? 1 : 2))];
+    const r = Math.max(0, Math.min(0.99, shown * drift + wobble(step + k, 7) * 0.015));
+    const half = 0.04 + k * 0.025;
+    const token = hot ? LANE_TOKEN[ahead.stage] : LANE_TOKEN.Benign;
     return {
-      horizon_seconds: (k + 1) * 2,
-      risk: Math.max(0, Math.min(0.99, shown * drift + wobble(step + k, 7) * 0.015)),
-      confidence: Math.max(0.35, 0.92 - k * 0.07),
-      predicted_stage: hot ? ahead.stage : "Benign",
+      horizon_seconds: (k + 1) * STEP_S,
+      risk: Number(r.toFixed(4)),
+      confidence: Number(Math.max(0.35, 0.92 - k * 0.1).toFixed(4)),
+      predicted_stage: token,
+      tactic_lane: hot ? ahead.stage : "Benign",
+      risk_lower: Number(Math.max(0, r - half).toFixed(4)),
+      risk_upper: Number(Math.min(1, r + half).toFixed(4)),
     };
   });
 
@@ -783,10 +840,16 @@ function buildCampaign(step: number, now: number): Campaign {
 
 const BASE_STATUS = {
   mode: "LIVE",
-  site_id: "hq-core",
+  site_id: "containerlab-enterprise",
   lab_mode: true,
   model_loaded: true,
+  model_error: null,
   model_meta: MODEL_META,
+  contract: CONTRACT,
+  attack_armed: false,
+  sensorKernelDrops: 0,
+  incompleteWindows: 0,
+  windowsMissed: 0,
   sensor_interface: "span0",
   nodes_running: 15,
   total_nodes: 15,
@@ -813,13 +876,25 @@ export const mockFetchStatus = async (): Promise<SystemStatus> =>
     ...BASE_STATUS,
   }) as unknown as SystemStatus;
 
+/** config/sites/containerlab-enterprise.yaml, as /api/site serves it. */
 export const mockFetchSite = async (): Promise<SiteInfo> => ({
   name: "HQ-CORE / Enterprise Segment",
-  location: "Local",
-  timezone: "UTC",
-  subnet: "10.0.0.0/16",
-  externalIp: ATTACKER,
-  description: "Primary enterprise segment — SPAN mirror on the core uplink.",
+  site_id: "containerlab-enterprise",
+  lab_mode: true,
+  enterprise_cidrs: ["10.0.0.0/8", "172.16.0.0/12"],
+  external_cidrs: ["192.168.100.0/24"],
+  zones: {
+    users: ["10.0.1.0/24"],
+    servers: ["10.0.2.0/24"],
+    dmz: ["10.0.3.0/24"],
+    external: ["192.168.100.0/24"],
+  },
+  assets_of_interest: CORE_ASSETS.filter((a) => a.zone !== "users").map((a) => ({
+    ip: a.ip,
+    name: a.name,
+    role: a.zone === "dmz" ? "dmz" : "server",
+  })),
+  description: "Demo data — the Containerlab enterprise range.",
 });
 
 /* ── Pre-seed ──────────────────────────────────────────────────────────── */
@@ -868,20 +943,20 @@ export function seedEvents(): {
     {
       ageMs: 28_000, severity: "warning", category: "WARNING", source: "192.168.100.41", destination: "10.0.3.10",
       message: "T1046 Network Service Discovery — Reconnaissance",
-      raw: "risk=0.6712 max_future=0.7003 ml=0.4881 rule=0.6712 rules_applied=true",
+      raw: "risk=0.6712 max_future=0.7003 ml=0.6712 rule=— rules_applied=false",
     },
     {
       ageMs: 24_000, severity: "warning", category: "ELEVATED", source: "192.168.100.41", destination: "10.0.3.10",
       message: "T1110 Brute Force — Credential Access",
-      raw: "risk=0.7844 max_future=0.8319 ml=0.5602 rule=0.7844 rules_applied=true",
+      raw: "risk=0.7844 max_future=0.8319 ml=0.7844 rule=— rules_applied=false",
     },
     {
       ageMs: 19_000, severity: "critical", category: "CRITICAL", source: "192.168.100.41", destination: "10.0.3.10",
       message: "T1190 Exploit Public-Facing Application — Initial Access",
-      raw: "risk=0.9021 max_future=0.9337 ml=0.6498 rule=0.9021 rules_applied=true",
+      raw: "risk=0.9021 max_future=0.9337 ml=0.9021 rule=— rules_applied=false",
     },
     { ageMs: 15_000, severity: "info", category: "COMMAND", source: "mitigate", message: "Mitigation ISOLATE_HOST → 10.0.3.10 recorded" },
-    { ageMs: 12_000, severity: "info", category: "NOMINAL", source: "10.0.3.10", message: "Risk returned below threshold after isolation", raw: "risk=0.0912 threshold=0.65" },
+    { ageMs: 12_000, severity: "info", category: "NOMINAL", source: "10.0.3.10", message: "Attack traffic stopped; risk back under threshold", raw: "risk=0.0912 threshold=0.65" },
     { ageMs: 6_000, severity: "info", category: "SYSTEM", source: "ml", message: "Inference state reset" },
   ];
 }
@@ -1171,11 +1246,11 @@ function liveIncident(step: number, now: number): Incident | null {
         : "warning";
 
   const notes: { at: number; text: string }[] = [
-    { at: openedAt, text: "Opened automatically — forecast risk crossed the operating threshold." },
+    { at: openedAt, text: "Opened by a model alert on observed traffic." },
   ];
-  if (s >= 38) notes.push({ at: now - (s - 38) * 2, text: "Branch B rollout projects C2 within 8s. Escalated to ELEVATED." });
+  if (s >= 38) notes.push({ at: now - (s - 38) * 2, text: "Branch B rollout projects C2 within 60s. Escalated to ELEVATED." });
   if (s >= 50) notes.push({ at: now - (s - 50) * 2, text: "DeepOP decoded an Impact token sequence. Escalated to CRITICAL." });
-  if (contained) notes.push({ at: now - (s - RECOVERY_STEP) * 2, text: "Host isolated. Risk returned below threshold." });
+  if (contained) notes.push({ at: now - (s - RECOVERY_STEP) * 2, text: "Isolation recorded; attack traffic stopped and risk fell under threshold." });
 
   // A contained incident keeps the attack that opened it, not the calm after it.
   const cause = contained ? PHASES[PHASES.length - 2] : w.p;
@@ -1222,17 +1297,7 @@ export function seedIncidents(): Incident[] {
  * `benign-baseline` scoring zero flagged windows is the fastest way to show
  * the threshold is doing real work.
  */
-export interface ReplaySample {
-  id: string;
-  /** Filename as it would arrive on disk. */
-  name: string;
-  label: string;
-  kind: "pcap" | "csv";
-  bytes: number;
-  windows: number;
-  source: string;
-  note: string;
-}
+export type { ReplaySample } from "../types/replay";
 
 export const REPLAY_SAMPLES: ReplaySample[] = [
   {
@@ -1322,7 +1387,7 @@ function beatFor(profile: string, u: number, i: number): Beat {
       const inBurst = phase < 0.45;
       return {
         risk: clamp01((inBurst ? 0.58 + phase * 0.5 : 0.16 + phase * 0.1) + jitter),
-        stage: inBurst ? "InitialAccess" : "Recon",
+        stage: inBurst ? "CredentialAccess" : "Recon",
         technique: inBurst ? "T1110 Brute Force" : "T1046 Network Service Discovery",
         tactic: inBurst ? "Credential Access" : "Reconnaissance",
       };
@@ -1465,10 +1530,11 @@ function scoreCapture(
     const rising = beat.risk >= prev;
     const ex = attribution(i, beat.stage, signatureOf(beat.stage, beat.risk));
 
-    const forecast = Array.from({ length: 8 }, (_, k) => ({
-      horizon_seconds: (k + 1) * 2,
-      risk: clamp01(beat.risk * (rising ? 1 + (k + 1) * 0.03 : 1 - (k + 1) * 0.045)),
-    }));
+    const forecast = Array.from({ length: K }, (_, k) => {
+      const r = clamp01(beat.risk * (rising ? 1 + (k + 1) * 0.04 : 1 - (k + 1) * 0.06));
+      const half = 0.04 + k * 0.025;
+      return { horizon_seconds: (k + 1) * STEP_S, risk: r, risk_lower: clamp01(r - half), risk_upper: Math.min(1, r + half) };
+    });
 
     const flows = replayFlows(profile, i, i / span, startUs);
     // A SYN flood opens a flow per spoofed source port, far more than the
@@ -1482,7 +1548,9 @@ function scoreCapture(
       risk: beat.risk,
       ml_risk: beat.risk,
       alert: beat.risk >= THRESHOLD,
-      stage: beat.stage,
+      // As /api/replay sends it: the technique id, and its lane.
+      stage: beat.technique ? beat.technique.split(" ")[0] : "Benign",
+      tactic_lane: beat.stage,
       mitre_tactic: beat.tactic,
       mitre_technique: beat.technique,
       forecast,
@@ -1499,6 +1567,8 @@ function scoreCapture(
     windows_analyzed: results.length,
     flagged_windows: results.filter((r) => r.alert).length,
     rules_disabled: true,
+    window_seconds: 2.0,
+    threshold: THRESHOLD,
     results,
   };
 }
@@ -1511,8 +1581,9 @@ function parseDelay(windows: number): Promise<void> {
 /** Runs one of the built-in captures. */
 export async function mockReplaySample(id: string): Promise<ReplayReport> {
   const sample = REPLAY_SAMPLES.find((s) => s.id === id) ?? REPLAY_SAMPLES[0];
-  await parseDelay(sample.windows);
-  return scoreCapture(sample.name, sample.kind, sample.windows, sample.id);
+  const windows = sample.windows ?? 64;
+  await parseDelay(windows);
+  return scoreCapture(sample.name, sample.kind, windows, sample.id);
 }
 
 /**
@@ -1555,48 +1626,19 @@ export async function mockReplay(file: File, maxWindows = 200): Promise<ReplayRe
  * clock give the same payload — so the live stream and the time-travel
  * backfill are built by one function.
  */
-function payloadAt(step: number, nowMs: number, windowId: number = step, lead?: { stage: string; secondsRemaining: number }) {
+function payloadAt(step: number, nowMs: number, windowId: number = step) {
   const now = new Date(nowMs).toISOString();
   const w = windowState(step);
   const intensity = signatureOf(w.p.stage, w.t);
   const explainability = attribution(step, w.p.stage, intensity);
-
-  // Prediction-leads-observation. While a lead is active (nmap and hping3 fire
-  // this), the observed risk stays w.shown (calm baseline) but the forecast and
-  // the whole alarm state already call the incoming stage — the model flagging
-  // the attack seconds before the traffic actually changes. The predicted stage
-  // is sampled at the top of its own band, so its risk, technique and severity
-  // match where it is headed (recon → T1046 warning, ddos → T1498 critical).
-  // When the lead elapses the stream promotes into the stage and observed risk
-  // catches up.
-  const wf = lead ? windowState(STAGE_BANDS[lead.stage].end - 1) : null;
-  const leadTarget = wf ? wf.shown : 0;
-  const leadForecast = wf
-    ? Array.from({ length: 8 }, (_, k) => ({
-        horizon_seconds: (k + 1) * 2,
-        // Climbs from the calm present up to the predicted stage's risk.
-        risk: Math.min(0.98, 0.12 + ((k + 1) / 8) * Math.max(0, leadTarget - 0.12)),
-        confidence: Math.max(0.45, 0.92 - k * 0.05),
-        predicted_stage: wf.p.stage,
-      }))
-    : null;
-  const forecast = leadForecast ?? w.forecast;
-  const maxFuture = wf ? leadTarget : w.maxFuture;
-  const predStage = wf ? wf.p.stage : w.p.stage;
-  const predTactic = wf ? wf.p.tactic : w.p.tactic;
-  const predTechnique = wf ? wf.p.label : w.p.label;
-  const predTacticId = wf ? wf.p.tacticId : w.p.tacticId;
-  const predDesc = wf ? wf.p.desc : w.p.desc;
-  // During a lead the ALARM state is already raised at the predicted stage's
-  // severity — alert, attack active, early warning — so the console reads
-  // "attack detected, needs attention" the instant the model predicts it. Only
-  // the observed risk line (prediction.risk = w.shown) stays calm until the
-  // lead elapses.
-  const alertLevel = wf ? wf.alertLevel : w.alertLevel;
-  const alert = lead ? true : w.shown >= THRESHOLD || w.maxFuture >= THRESHOLD;
-  // The stage distribution and precursor confidence follow the forecast in a lead.
-  const probStage = lead ? predStage : w.p.stage;
-  const probBase = lead ? maxFuture : w.shown;
+  const forecast = w.forecast;
+  const maxFuture = w.maxFuture;
+  const alert = w.shown >= THRESHOLD || maxFuture >= THRESHOLD;
+  // Lead time as model_adapter.py computes it: 0 when the present window
+  // already crosses, else the horizon of the first forecast step that does.
+  const crossing = forecast.findIndex((f) => f.risk >= THRESHOLD);
+  const leadTime = w.shown >= THRESHOLD ? 0 : crossing >= 0 ? (crossing + 1) * STEP_S : null;
+  const technique = w.hot ? w.p.technique : "Benign";
 
   return {
     type: "prediction",
@@ -1610,29 +1652,35 @@ function payloadAt(step: number, nowMs: number, windowId: number = step, lead?: 
       packet_count: w.packets,
       active_flows: w.flows,
       pipeline_latency_ms: w.telemetryMs,
-      buffer_length: 5,
+      buffer_length: 15,
     },
     prediction: {
       risk: w.shown,
       max_future_risk: maxFuture,
-      hazard_score: Math.min(0.99, maxFuture * 0.92),
-      malicious_confidence: Math.min(0.99, 0.42 + w.shown * 0.55),
-      precursor_confidence: Math.min(0.99, 0.3 + probBase * 0.55),
+      hazard_score: maxFuture,
+      malicious_confidence: w.shown,
+      precursor_confidence: Math.max(0, maxFuture - w.shown),
       alert,
-      alert_level: alertLevel,
+      alert_level: alertLevelFor(Math.max(w.shown, maxFuture)),
       threshold: THRESHOLD,
-      predicted_stage: predStage,
-      mitre_tactic: predTactic,
-      mitre_technique: predTechnique,
-      mitre_tactic_id: predTacticId,
-      mitre_description: predDesc,
-      technique_confidence: Math.min(0.99, 0.5 + probBase * 0.45),
+      // As the backend sends it: the technique id, and the lane beside it.
+      predicted_stage: technique,
+      tactic_lane: w.hot ? w.p.stage : "Benign",
+      mitre_tactic: w.p.tactic,
+      mitre_technique: w.p.label,
+      mitre_tactic_id: w.p.tacticId,
+      mitre_description: w.p.desc,
+      technique_confidence: Math.min(0.99, 0.5 + w.shown * 0.45),
+      // Keyed by Branch A's TECHNIQUE_VOCAB, entries over 0.01 only.
       stage_probabilities: Object.fromEntries(
-        ["Benign", "Recon", "InitialAccess", "C2", "Impact"].map((s) => [
-          s,
-          s === probStage
-            ? Math.min(0.95, 0.5 + probBase * 0.4)
-            : Math.max(0.01, (1 - probBase) * 0.22 + Math.abs(wobble(step, s.length)) * 0.05),
+        ["Benign", "T1046", "T1110", "T1190", "T1071", "T1498"].map((t) => [
+          t,
+          Number(
+            (t === technique
+              ? Math.min(0.95, 0.5 + w.shown * 0.4)
+              : Math.max(0.011, (1 - w.shown) * 0.18 + Math.abs(wobble(step, t.length)) * 0.04)
+            ).toFixed(4)
+          ),
         ])
       ),
       stage_provenance: {
@@ -1642,22 +1690,13 @@ function payloadAt(step: number, nowMs: number, windowId: number = step, lead?: 
         DEEPOP: "technique sequence",
       },
       ml_risk: w.mlRisk,
+      ml_technique: technique,
       rule_risk: w.ruleRisk,
+      rule_technique: null,
       rules_applied: w.rulesApplied,
-      // Fields adapter.ts normally attaches on the real path
-      value: w.shown,
-      confidence: Math.min(0.99, 0.42 + w.shown * 0.55),
-      horizon: 16,
-      model: "K.I.R.A. Ensemble",
-      branch_a_risk: w.shown,
-      branch_b_risk: maxFuture,
-      explainability,
-      signals: explainability.top_features.map((f) => ({
-        name: f.feature,
-        weight: f.score,
-        direction: "neutral",
-        value: f.group,
-      })),
+      risk_source: "model",
+      mitigation_status: null,
+      mitigation_bypass_flows: null,
     },
     forecast,
     explainability,
@@ -1666,61 +1705,43 @@ function payloadAt(step: number, nowMs: number, windowId: number = step, lead?: 
       inference_ms: w.inferenceMs,
       total_ms: Number((w.telemetryMs + w.inferenceMs).toFixed(2)),
     },
-    early_warning: lead
-      ? {
-          is_alert: true,
-          alert_timestamp: now,
-          actual_milestone_timestamp: null,
-          lead_time_seconds: Number(lead.secondsRemaining.toFixed(1)),
-          target_milestone_desc: "predicted T1498 volumetric flood",
-        }
-      : w.hot && w.shown > 0.5
-        ? {
-            is_alert: true,
-            alert_timestamp: now,
-            actual_milestone_timestamp: null,
-            lead_time_seconds: Number((6 + Math.abs(wobble(step, 31)) * 7).toFixed(1)),
-            target_milestone_desc: `first observed ${w.p.stage} milestone`,
-          }
-        : null,
-    attack_active: lead ? true : w.hot,
-    attack_phase: predStage,
-    focus_ips: lead || w.hot ? [ATTACKER, TARGET] : [],
-    focus_edges: lead || w.hot ? [{ src: ATTACKER, dst: TARGET }] : [],
+    early_warning: {
+      is_alert: alert,
+      alert_timestamp: alert ? nowMs / 1000 : null,
+      actual_milestone_timestamp: null,
+      lead_time_seconds: leadTime,
+      target_milestone_desc:
+        leadTime == null ? null : leadTime === 0 ? technique : (forecast[Math.round(leadTime / STEP_S) - 1]?.predicted_stage ?? null),
+    },
+    attack_active: false,
+    attack_phase: null,
+    focus_ips: w.hot ? [TARGET, ATTACKER] : [TARGET],
+    focus_edges: w.hot ? [{ src: ATTACKER, dst: TARGET }] : [],
     target_ip: TARGET,
     throughput: w.throughput,
-    // Demo-only: correlation/ is not wired into control_backend yet.
     campaign: buildCampaign(step, nowMs),
     incidents: buildIncidents(step, nowMs),
-    // Evidence. Present in the pipeline but not forwarded over /ws yet —
-    // see src/types/evidence.ts. Absent against a live backend.
     flows: buildFlows(step, nowMs),
     flows_in_window: w.flows,
     state_vector: stateVector(step, w.p.stage, intensity),
-    // Demo-only: the rollout's competing continuations (types/forecast.ts).
+    // Demo fills these; the real backend sends hops/volume/peak null.
     branches: branchesAt(step, w),
-    // Demo-only: TGNE temporal attention (types/attention.ts).
+    // Demo only: the real dashboard shows this view as under development.
     attention: attentionAt(step, w),
   };
 }
 
-function statusAt(step: number, now: string, lead?: { stage: string; secondsRemaining: number }): SystemStatus {
+function statusAt(step: number, now: string): SystemStatus {
   const w = windowState(step);
-  // During a lead the forecast (not the observed traffic) drives the top-line
-  // threat: the anomaly score and threat level jump immediately to the
-  // predicted stage's severity while observed risk is still calm.
-  const wf = lead ? windowState(STAGE_BANDS[lead.stage].end - 1) : null;
-  const maxFuture = wf ? wf.shown : w.maxFuture;
   return {
     networkStatus: "running",
     telemetryStatus: "running",
     predictionStatus: "running",
-    attackStatus: lead || w.hot ? "active" : "none",
+    attackStatus: "none",
     uptime: 14_820 + step * 2,
     lastUpdate: now,
-    anomalyScore: Math.round(Math.max(w.shown, maxFuture) * 1000) / 10,
-    // Alarm reflects the predicted stage during a lead, even though observed risk is calm.
-    threatLevel: wf ? wf.alertLevel.toLowerCase() : w.alertLevel.toLowerCase(),
+    anomalyScore: Math.round(Math.max(w.shown, w.maxFuture) * 1000) / 10,
+    threatLevel: w.alertLevel.toLowerCase(),
     packetLoss: Number((w.hot ? w.shown * 4.1 : 0.3).toFixed(2)),
     latency: Number((w.telemetryMs + w.inferenceMs).toFixed(2)),
     throughput: w.throughput,
@@ -1732,21 +1753,21 @@ function statusAt(step: number, now: string, lead?: { stage: string; secondsRema
 /* ── Scenario control ──────────────────────────────────────────────────── */
 
 /**
- * Kill-chain stage → the window band [start, end) it occupies within one CYCLE
- * (see PHASES). The live stream walks into a band when the stage is triggered
- * and then holds near its top, so a triggered stage stays on screen with its
+ * Demo scenario → the window band [start, end) it occupies within one CYCLE
+ * (see PHASES). The stream walks into a band when its scenario is launched
+ * and then holds near its top, so a launched stage stays on screen with its
  * forecast projecting ahead — rather than marching on into recovery.
  *
- * Stage names match both the UI's ScenarioId (recon/probe/exploit/c2/lateral)
- * and the terminal demo bridge (which adds `ddos`).
+ * Keys match pages/Controls.tsx:ScenarioId. Every scenario is a technique the
+ * models can emit; there is no lateral-movement scenario because no head has
+ * a lateral-movement output.
  */
 const STAGE_BANDS: Record<string, { start: number; end: number }> = {
   recon: { start: 0, end: 14 },
   probe: { start: 14, end: 26 },
   exploit: { start: 26, end: 38 },
   c2: { start: 38, end: 50 },
-  lateral: { start: LATERAL_OBSERVED, end: 50 },
-  ddos: { start: 50, end: RECOVERY_STEP },
+  flood: { start: 50, end: RECOVERY_STEP },
 };
 
 /** Calm business-as-usual band: past the attacker's TTL, so it has fully aged out. */
@@ -1758,70 +1779,28 @@ const CONTAIN_BAND = { start: RECOVERY_STEP, end: RECOVERY_STEP + 4 };
 /** Windows at the top of a band the stream oscillates over while held in a stage. */
 const HOLD_WINDOWS = 4;
 
-/**
- * Lead time before the observed risk actually spikes: the forecast + alarm call
- * the incoming stage this long ahead — the "we predicted it early" beat of the
- * demo. hping3/DDoS leads by ~5s, nmap/recon by ~2.5s.
- */
-const DDOS_LEAD_MS = 5000;
-const RECON_LEAD_MS = 2500;
-
 /** Live instance, so command/mitigation fixtures can steer the scenario. */
 let active: MockWebSocket | null = null;
 
 export const mockSendCommand = async (command: string): Promise<void> => {
-  active?.note(`command ${command} accepted`);
-  switch (command) {
-    case "reset_environment":
-    case "stop_attack":
-      active?.toBaseline();
-      break;
-    // Adversary emulation: hold workloads/attacker_scenario.py at a stage.
-    case "start_attack":
-    case "emulate_recon":
-      // Predict first, spike the observed risk ~2.5s later (see enterStage lead).
-      active?.enterStage("recon", RECON_LEAD_MS);
-      break;
-    case "emulate_probe":
-      active?.enterStage("probe");
-      break;
-    case "emulate_exploit":
-      active?.enterStage("exploit");
-      break;
-    case "emulate_c2":
-      active?.enterStage("c2");
-      break;
-    case "emulate_lateral":
-      active?.enterStage("lateral");
-      break;
-    case "emulate_ddos":
-      // Predict first, spike the observed risk 5s later (see enterStage lead).
-      active?.enterStage("ddos", DDOS_LEAD_MS);
-      break;
+  active?.note(`command ${command} accepted (demo)`);
+  if (command === "reset_environment" || command === "stop_attack") {
+    active?.toBaseline();
+    return;
   }
+  const scenario = command.startsWith("emulate_") ? command.slice("emulate_".length) : null;
+  if (scenario) active?.enterStage(scenario);
 };
 
 /**
- * Mitigation collapses the scenario into its recovery phase and holds it there.
- * On camera this reads as cause and effect: the operator isolates the host and
- * risk drops — worth more in a demo than any static panel.
+ * Mitigation collapses the scenario into its recovery phase and holds it there,
+ * so the demo shows the response loop. (In the real console a recorded
+ * isolation is not enforced: risk falls only if the traffic actually stops.)
  */
 export const mockSendMitigate = async (payload: MitigationPayload): Promise<void> => {
-  active?.note(`mitigation ${payload.action}${payload.target ? ` → ${payload.target}` : ""} applied`);
+  active?.note(`mitigation ${payload.action}${payload.target ? ` → ${payload.target}` : ""} recorded (demo)`);
   if (!String(payload.action).startsWith("CLEAR")) active?.contain();
 };
-
-/**
- * Apply a terminal-driven trigger (from the Vite demo bridge, `/__demo/*`).
- * A bare stage name arrives over SSE; route it through the same fixtures the
- * UI uses so the scenario, console and events all move together.
- */
-export function applyDemoTrigger(stage: string): void {
-  const s = stage.toLowerCase().trim();
-  if (s === "reset") return void mockSendCommand("reset_environment");
-  if (s === "contain") return void mockSendMitigate({ action: "ISOLATE_HOST", target: TARGET } as unknown as MitigationPayload);
-  if (STAGE_BANDS[s]) return void mockSendCommand(`emulate_${s}`);
-}
 
 /* ── Live stream ───────────────────────────────────────────────────────── */
 
@@ -1836,10 +1815,6 @@ export class MockWebSocket {
   private band: { start: number; end: number } | null = null;
   /** Monotonic window id for display, independent of the (looping) position. */
   private seq = 0;
-  /** Stage the forecast is calling ahead of observation, or null. */
-  private leadStage: string | null = null;
-  /** Wall-clock time (ms) when the lead ends and observed risk spikes. */
-  private leadUntil = 0;
 
   constructor(handlers: WSHandlers) {
     this.handlers = handlers;
@@ -1856,41 +1831,22 @@ export class MockWebSocket {
     }, 200);
   }
 
-  /**
-   * Enter a kill-chain stage from its start, then hold near its top.
-   *
-   * With `leadMs`, the forecast calls the stage now while the observed risk
-   * stays at a calm baseline; after the lead elapses the stream promotes into
-   * the stage and the observed risk spikes — the "predicted it early" beat.
-   */
-  enterStage(stage: string, leadMs = 0) {
+  /** Enter a scenario's stage from its start, then hold near its top. */
+  enterStage(stage: string) {
     const band = STAGE_BANDS[stage];
     if (!band) return;
-    if (leadMs > 0) {
-      this.leadStage = stage;
-      this.leadUntil = Date.now() + leadMs;
-      this.band = null;
-      this.pos = BASELINE_BAND.start;
-    } else {
-      this.leadStage = null;
-      this.leadUntil = 0;
-      this.band = band;
-      this.pos = band.start;
-    }
+    this.band = band;
+    this.pos = band.start;
   }
 
   /** Return to a calm baseline (no attack) and hold there. */
   toBaseline() {
-    this.leadStage = null;
-    this.leadUntil = 0;
     this.band = null;
     this.pos = BASELINE_BAND.start;
   }
 
   /** Collapse into the contained-and-recovering window and hold there. */
   contain() {
-    this.leadStage = null;
-    this.leadUntil = 0;
     this.band = CONTAIN_BAND;
     this.pos = CONTAIN_BAND.start;
   }
@@ -1916,32 +1872,15 @@ export class MockWebSocket {
 
   private emit() {
     const nowMs = Date.now();
-    // If a prediction lead has elapsed, the forecast attack now actually lands:
-    // promote into the stage so the observed risk spikes to meet the forecast.
-    if (this.leadStage && nowMs >= this.leadUntil) {
-      const band = STAGE_BANDS[this.leadStage];
-      this.leadStage = null;
-      this.leadUntil = 0;
-      if (band) {
-        this.band = band;
-        // Jump straight to the hold zone so the observed risk spikes to the
-        // severity that was predicted, rather than ramping up from the band's
-        // calm start (which would briefly dip the alarm back down).
-        this.pos = Math.max(band.start, band.end - HOLD_WINDOWS);
-      }
-    }
-    const lead = this.leadStage
-      ? { stage: this.leadStage, secondsRemaining: Math.max(0, (this.leadUntil - nowMs) / 1000) }
-      : undefined;
-
     const step = this.pos;
     const wid = this.seq++;
     const now = new Date(nowMs).toISOString();
     const w = windowState(step);
 
-    this.handlers.onPrediction?.(payloadAt(step, nowMs, wid, lead) as never);
+    // The backend's wire format, through the same normalisation as /ws.
+    this.handlers.onPrediction?.(normalizePrediction(payloadAt(step, nowMs, wid)) as never);
     this.handlers.onTopologyUpdate?.(buildTopology(step));
-    this.handlers.onSystemStatus?.(statusAt(step, now, lead));
+    this.handlers.onSystemStatus?.(statusAt(step, now));
 
     /* Console traffic so the log panes stay alive under the charts. */
     if (wid % 3 === 0) {
@@ -1950,17 +1889,7 @@ export class MockWebSocket {
         line: `[${now}] sensor INFO: window ${wid} closed — ${w.packets} packets, ${w.flows} flows, ${w.telemetryMs.toFixed(1)}ms`,
       });
     }
-    if (lead) {
-      // The forecast is calling the stage while the wire is still quiet.
-      if (wid % 2 === 0) {
-        const wf = windowState(STAGE_BANDS[lead.stage].end - 1);
-        const word = wf.alertLevel === "CRITICAL" ? "CRITICAL" : "WARN";
-        this.handlers.onCommandOutput?.({
-          command: "ml",
-          line: `[${now}] ml   ${word}: ${wf.p.label} predicted — NEEDS ATTENTION, onset in ~${lead.secondsRemaining.toFixed(1)}s target=${TARGET}`,
-        });
-      }
-    } else if (w.hot && wid % 4 === 0) {
+    if (w.hot && wid % 4 === 0) {
       this.handlers.onCommandOutput?.({
         command: "ml",
         line: `[${now}] ml   ${w.alertLevel === "CRITICAL" ? "CRITICAL" : "WARN"}: ${w.p.label} risk=${w.shown.toFixed(3)} target=${TARGET}`,

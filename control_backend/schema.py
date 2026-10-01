@@ -297,6 +297,9 @@ class SystemStatusEvent(BaseModel):
     ml_status: str = "standby"  # "live" or "standby"
     workloads_active: bool
     attack_active: bool
+    # Operator's ARM EXTERNAL state (also pushed on every window). `attack` on
+    # the live bus means "the model is alerting"; this never does.
+    attack_armed: bool = False
     demo_active: bool = False
     active_command: Optional[str] = None
     model_loaded: bool

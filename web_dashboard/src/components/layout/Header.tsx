@@ -1,5 +1,6 @@
 import type { SystemStatus, SiteInfo } from "../../api/types";
 import { Chip, Square } from "../../design/primitives";
+import { IS_DEMO } from "../../env";
 
 interface HeaderProps {
   status: SystemStatus | null;
@@ -79,6 +80,19 @@ export default function Header({ status, site, wsConnected, pageTitle, theme, on
           <span>{timeline.label}</span>
           <b>Live</b>
         </button>
+      )}
+
+      {/* Small additions: say plainly when the numbers are sample data, and
+          when the backend is running without loadable models. */}
+      {IS_DEMO && (
+        <span title="Demo dashboard: sample data only. Run `python run_dashboard.py` for the real console.">
+          <Chip level="warning">Demo data</Chip>
+        </span>
+      )}
+      {!IS_DEMO && status?.model_loaded === false && (
+        <span title={String(status.model_error ?? "No loadable checkpoints in saved_models/.")}>
+          <Chip level="warning">Models not loaded</Chip>
+        </span>
       )}
 
       {status && <Chip level={status.threatLevel}>{status.threatLevel}</Chip>}

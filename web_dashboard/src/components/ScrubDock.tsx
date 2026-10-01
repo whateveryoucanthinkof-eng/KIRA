@@ -12,12 +12,11 @@ import { useCallback, useRef } from "react";
 import type { ForecastPoint } from "../api/types";
 import { Square, sevColor, sevFromRisk } from "../design/primitives";
 import { FORECAST, OBSERVED } from "../design/charts";
-import { HORIZON_SECONDS, WINDOW_SECONDS, type Cursor, type Frame } from "../types/timeline";
+import { FORECAST_STEP_SECONDS, HORIZON_SECONDS, WINDOW_SECONDS, type Cursor, type Frame } from "../types/timeline";
+import { ahead } from "../design/time";
 
 /** Share of the track given to the recorded windows; the rest is the horizon. */
 const OBSERVED_SHARE = 0.8;
-/** −10s, in windows. */
-const BACK_STEP = 10 / WINDOW_SECONDS;
 
 export default function ScrubDock({
   frames,
@@ -40,6 +39,8 @@ export default function ScrubDock({
   onPlaying: (p: boolean) => void;
 }) {
   const track = useRef<HTMLDivElement>(null);
+  /** −10s, in windows. Read per render: the contract arrives with /api/status. */
+  const BACK_STEP = Math.max(1, Math.round(10 / WINDOW_SECONDS));
   const n = frames.length;
   const liveIdx = n - 1;
   const span = Math.max(1, n - 1);
@@ -58,7 +59,11 @@ export default function ScrubDock({
       const u = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
       if (u > OBSERVED_SHARE + 0.004) {
         const s = ((u - OBSERVED_SHARE) / (1 - OBSERVED_SHARE)) * HORIZON_SECONDS;
-        const snapped = Math.max(WINDOW_SECONDS, Math.min(HORIZON_SECONDS, Math.round(s / WINDOW_SECONDS) * WINDOW_SECONDS));
+        // The rollout has a point every forecast step and nothing between them.
+        const snapped = Math.max(
+          FORECAST_STEP_SECONDS,
+          Math.min(HORIZON_SECONDS, Math.round(s / FORECAST_STEP_SECONDS) * FORECAST_STEP_SECONDS)
+        );
         return { kind: "future", seconds: snapped };
       }
       const i = Math.round((u / OBSERVED_SHARE) * span);
@@ -80,7 +85,7 @@ export default function ScrubDock({
   const stepBy = (windows: number) => {
     onPlaying(false);
     if (cursor.kind === "future") {
-      const s = cursor.seconds + windows * WINDOW_SECONDS;
+      const s = cursor.seconds + Math.sign(windows) * FORECAST_STEP_SECONDS;
       onCursor(s <= 0 ? { kind: "live" } : { kind: "future", seconds: Math.min(HORIZON_SECONDS, s) });
       return;
     }
@@ -112,7 +117,7 @@ export default function ScrubDock({
   if (cursor.kind === "future") {
     mode = "forecast";
     const f = forecast.find((p) => p.horizonSeconds >= cursor.seconds) ?? forecast[forecast.length - 1];
-    when = `t +${cursor.seconds}s`;
+    when = `t ${ahead(cursor.seconds)}`;
     if (f) {
       riskAt = f.predicted / 100;
       band = [f.lowerBound / 100, f.upperBound / 100];
@@ -156,7 +161,7 @@ export default function ScrubDock({
           disabled={!peak}
           title="Jump to the forecast peak"
         >
-          Peak {peak ? `+${peak.horizonSeconds}s` : ""}
+          Peak {peak ? ahead(peak.horizonSeconds) : ""}
         </button>
       </div>
 
@@ -216,8 +221,8 @@ export default function ScrubDock({
         <span className="is-now" style={{ left: `${OBSERVED_SHARE * 100}%` }}>
           NOW
         </span>
-        <span style={{ left: `${futAt(8) * 100}%` }}>+8s</span>
-        <span style={{ left: `${futAt(16) * 100}%` }}>+16s</span>
+        <span style={{ left: `${futAt(HORIZON_SECONDS / 2) * 100}%` }}>{ahead(HORIZON_SECONDS / 2)}</span>
+        <span style={{ left: `${futAt(HORIZON_SECONDS) * 100}%` }}>{ahead(HORIZON_SECONDS)}</span>
       </div>
 
       <div className="sd-readout">

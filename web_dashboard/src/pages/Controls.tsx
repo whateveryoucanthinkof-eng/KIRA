@@ -4,19 +4,25 @@ import type { PredictionEnvelope } from "../types/live";
 import type { Page } from "../components/layout/Sidebar";
 import { sendCommand, sendMitigate } from "../api/adapter";
 import { Btn, Chip, Micro, PanelHead, Sheet, Square, sevColor, sevFromRisk } from "../design/primitives";
+import { IS_DEMO } from "../env";
 
 /**
- * Controls: run the lab, attack it, defend it.
+ * Controls: run the lab, watch it, defend it.
  *
- * The service strip keeps every lab command the backend accepts. Adversary
- * emulation drives workloads/attacker_scenario.py by stage and then watches
- * the model catch it. Response playbooks are sequences of the real
- * /api/mitigate actions (control_backend/telemetry_service.py:215), each step
- * logged as it runs, and the containment playbook finishes by waiting for the
- * model's risk to fall back under threshold.
+ * The service strip keeps every lab command the backend accepts
+ * (control_backend/commands.py). Response playbooks are sequences of the real
+ * /api/mitigate actions, each step logged as it runs; the containment playbook
+ * finishes by waiting for the model's risk to fall back under threshold.
+ *
+ * The left column differs by build. The real console never launches an
+ * attack: attacks run against the Containerlab range from outside it, and the
+ * column arms external-traffic monitoring and tracks what the model sees. The
+ * demo build (IS_DEMO) has scenario buttons that steer the sample stream
+ * instead; they are compiled only into that build.
  */
 
-export type ScenarioId = "recon" | "probe" | "exploit" | "c2" | "lateral";
+/** Demo scenarios — each one a technique our models can emit. */
+export type ScenarioId = "recon" | "probe" | "exploit" | "c2" | "flood";
 
 /** Beginner mode hides lab plumbing (service strip, raw console) behind a toggle. */
 const BEGINNER_KEY = "kira-beginner";
@@ -48,13 +54,13 @@ const LAB_ONLY = new Set([
   "stop_normal_traffic",
 ]);
 
-/** workloads/attacker_scenario.py, stage by stage — with beginner-friendly copy. */
-const SCENARIOS: { id: ScenarioId; stage: string; name: string; chain: string[]; what: string; plain: string }[] = [
-  { id: "recon", stage: "1", name: "RECON_BURST", chain: ["T1046"], what: "Port sweep of the DMZ, then the whole chain", plain: "A scanner maps which doors (ports) are open on your servers." },
-  { id: "probe", stage: "2", name: "WEB_PROBE_STORM", chain: ["T1110"], what: "Threaded login and path probing on dmz-web", plain: "Someone tries many username/password guesses on the web login." },
-  { id: "exploit", stage: "3", name: "EXPLOIT_SIMULATION", chain: ["T1190"], what: "Exploit payload variants against the web app", plain: "An attacker tries a known software flaw to break in." },
-  { id: "c2", stage: "4", name: "MIXED_ATTACK_BURSTS", chain: ["T1071", "T1498"], what: "Beaconing with flood bursts, burst → quiet → burst", plain: "A break-in phones home, then floods the network to cause damage." },
-  { id: "lateral", stage: "5", name: "LATERAL_PIVOT_STORM", chain: ["T1021"], what: "Pivot from dmz-web to the app and database tier", plain: "The attacker hops from one machine to more valuable machines." },
+/** Demo scenarios, stage by stage — only techniques our models can emit. */
+export const SCENARIOS: { id: ScenarioId; stage: string; name: string; chain: string[]; what: string; plain: string }[] = [
+  { id: "recon", stage: "1", name: "RECON_BURST", chain: ["T1046"], what: "Port sweep of the DMZ", plain: "A scanner maps which doors (ports) are open on your servers." },
+  { id: "probe", stage: "2", name: "CREDENTIAL_STUFFING", chain: ["T1110"], what: "Login brute force against dmz-web", plain: "Someone tries many username/password guesses on the web login." },
+  { id: "exploit", stage: "3", name: "EXPLOIT_ATTEMPT", chain: ["T1190"], what: "Exploit payloads against the web app", plain: "An attacker tries a known software flaw to break in." },
+  { id: "c2", stage: "4", name: "C2_BEACONING", chain: ["T1071"], what: "Periodic beaconing to an outside server", plain: "A break-in quietly phones home for instructions." },
+  { id: "flood", stage: "5", name: "VOLUMETRIC_FLOOD", chain: ["T1498"], what: "SYN flood against the web tier", plain: "The attacker floods the network to knock a service over." },
 ];
 
 function logColor(line: string): string {
@@ -128,6 +134,9 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
   }, [launch, prediction?.alert]);
 
   const lab = Boolean(status?.lab_mode);
+  // Without loadable checkpoints the backend refuses Start Inference and says why.
+  const modelsLoaded = IS_DEMO || status?.model_loaded !== false;
+  const modelError = status?.model_error ? String(status.model_error).split("\n")[0] : null;
   const busy = running !== null;
   const threshold = Number(prediction?.threshold ?? 0.65);
   const risk = Number(prediction?.risk ?? 0);
@@ -231,8 +240,8 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
           <Cmd
             cmd="start_ml"
             label="Start"
-            title="Start Inference"
-            disabled={status?.predictionStatus === "running" || status?.telemetryStatus !== "running"}
+            title={modelsLoaded ? "Start Inference" : `Models not loaded — ${modelError ?? "no checkpoints"}`}
+            disabled={!modelsLoaded || status?.predictionStatus === "running" || status?.telemetryStatus !== "running"}
           />
           <Cmd cmd="stop_ml" label="Stop" title="Stop Inference — the sensor keeps capturing" disabled={status?.predictionStatus !== "running"} />
         </>
@@ -251,13 +260,13 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
     },
     {
       name: "External",
-      on: status?.attackStatus === "active",
+      on: Boolean(status?.attack_armed),
       state: ["armed", "disarmed"],
-      level: status?.attackStatus === "active" ? "warning" : undefined,
+      level: status?.attack_armed ? "warning" : undefined,
       cmds: (
         <>
-          <Cmd cmd="start_attack" label="Arm" title="Arm external-attack monitoring" disabled={status?.attackStatus === "active"} />
-          <Cmd cmd="stop_attack" label="Disarm" title="Disarm external-attack monitoring" disabled={status?.attackStatus !== "active"} />
+          <Cmd cmd="start_attack" label="Arm" title="Arm external-attack monitoring" disabled={Boolean(status?.attack_armed)} />
+          <Cmd cmd="stop_attack" label="Disarm" title="Disarm external-attack monitoring" disabled={!status?.attack_armed} />
         </>
       ),
     },
@@ -271,7 +280,20 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
     setNow(Date.now());
   }
 
-  const launched = launch ? SCENARIOS.find((s) => s.id === launch.id) : null;
+  // Real console: the run tracker follows the armed monitoring window.
+  const armed = Boolean(status?.attack_armed ?? status?.attackStatus === "active");
+  const armedAt = useRef<number | null>(null);
+  if (!IS_DEMO) {
+    if (armed && armedAt.current == null) armedAt.current = Date.now();
+    if (!armed) armedAt.current = null;
+  }
+  useEffect(() => {
+    if (IS_DEMO) return;
+    if (armed) setLaunch((l) => l ?? { id: "recon", at: armedAt.current ?? Date.now(), alertAt: null });
+    else setLaunch(null);
+  }, [armed]);
+
+  const launched = launch ? (IS_DEMO ? SCENARIOS.find((s) => s.id === launch.id) : { name: "EXTERNAL TRAFFIC" }) : null;
   const lead = envelope?.early_warning?.lead_time_seconds;
 
   /* ── Playbooks ─────────────────────────────────────────────────────── */
@@ -359,13 +381,20 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
   const sensorOn = status?.telemetryStatus === "running";
   const mlOn = status?.predictionStatus === "running";
   const step1Done = networkOn && sensorOn && mlOn;
-  const friendlyStatus = !step1Done
+  const friendlyStatus = !modelsLoaded
+    ? { tone: "warning" as const, text: `Models not loaded — inference is unavailable. ${modelError ?? ""}`.trim() }
+    : !step1Done
     ? { tone: "warning" as const, text: "Setup incomplete — start the network, sensor and inference below." }
     : defenses.length > 0
       ? { tone: "warning" as const, text: `Defended — ${defenses.length} defense${defenses.length === 1 ? "" : "s"} active.` }
       : risk >= threshold
         ? { tone: "critical" as const, text: "Under attack — risk is above the alert threshold. Run “Contain host” on the right to stop it." }
-        : { tone: "nominal" as const, text: "All clear. The safe demo path: launch an attack on the left, watch it get caught, then run “Contain host” on the right." };
+        : {
+            tone: "nominal" as const,
+            text: IS_DEMO
+              ? "All clear. The demo path: launch a scenario on the left, watch it get caught, then run “Contain host” on the right."
+              : "All clear. Arm external monitoring on the left, run your attack against the lab from outside the console, and watch the model catch it.",
+          };
 
   return (
     <div className={`ct2${beginner ? " is-beginner" : ""}`}>
@@ -375,7 +404,10 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
           <div className="ct2-guide-main">
             <b>{friendlyStatus.text}</b>
             <span>
-              Nothing here touches a real firewall — defenses filter what this console records. Toggle
+              {IS_DEMO
+                ? "Demo dashboard — sample data, nothing here touches a network. "
+                : "Nothing here touches a real firewall — defenses are recorded, not enforced. "}
+              Toggle
               <b> Show advanced</b> for the full service controls and raw console.
             </span>
           </div>
@@ -422,28 +454,71 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
         )}
 
         <div className="ct2-body">
-          {/* ── Adversary emulation ─────────────────────────────────────── */}
+          {/* ── Adversary emulation (demo) / external monitor (real) ───── */}
           <div className="ct2-col">
-            <PanelHead title={beginner ? "1 · Launch an attack (safe, simulated)" : "Adversary emulation"} note={beginner ? "watch the model catch it" : "workloads/attacker_scenario.py"} />
-            <div className="ct2-list">
-              {SCENARIOS.map((s) => (
-                <div key={s.id} className={`ct2-row${launch?.id === s.id ? " is-active" : ""}`}>
-                  <span className="ct2-row-no">{s.stage}</span>
-                  <span className="ct2-row-main">
-                    <b>{s.name}</b>
-                    <em>{beginner ? s.plain : s.what}</em>
-                  </span>
-                  <span className="ct2-chain">
-                    {s.chain.map((t) => (
-                      <i key={t}>{t}</i>
-                    ))}
-                  </span>
-                  <button className="ct2-go" onClick={() => emulate(s.id)} title={`Run ${s.name} — ${beginner ? s.plain : s.what}`}>
-                    {beginner ? "Launch" : "Launch"}
-                  </button>
+            {IS_DEMO ? (
+              <>
+                <PanelHead title={beginner ? "1 · Launch a scenario (demo data)" : "Demo scenarios"} note={beginner ? "watch the model catch it" : "sample stream · demo build only"} />
+                <div className="ct2-list">
+                  {SCENARIOS.map((s) => (
+                    <div key={s.id} className={`ct2-row${launch?.id === s.id ? " is-active" : ""}`}>
+                      <span className="ct2-row-no">{s.stage}</span>
+                      <span className="ct2-row-main">
+                        <b>{s.name}</b>
+                        <em>{beginner ? s.plain : s.what}</em>
+                      </span>
+                      <span className="ct2-chain">
+                        {s.chain.map((t) => (
+                          <i key={t}>{t}</i>
+                        ))}
+                      </span>
+                      <button className="ct2-go" onClick={() => emulate(s.id)} title={`Run ${s.name} — ${beginner ? s.plain : s.what}`}>
+                        Launch
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              </>
+            ) : (
+              <>
+                <PanelHead
+                  title={beginner ? "1 · Watch for an attack" : "External traffic"}
+                  note={beginner ? "attacks run outside the console" : "start_attack · stop_attack"}
+                  aside={<Chip level={armed ? "warning" : undefined}>{armed ? "armed" : "disarmed"}</Chip>}
+                />
+                <div className="ct2-list">
+                  <div className={`ct2-row${armed ? " is-active" : ""}`}>
+                    <span className="ct2-row-no">1</span>
+                    <span className="ct2-row-main">
+                      <b>{armed ? "MONITORING ARMED" : "ARM MONITORING"}</b>
+                      <em>
+                        {beginner
+                          ? "Tell the console an outside attack is expected. It never changes the risk score."
+                          : "Marks the window an external attack is expected; display only, never a model input"}
+                      </em>
+                    </span>
+                    <button
+                      className="ct2-go"
+                      disabled={busy}
+                      onClick={() => void command(armed ? "stop_attack" : "start_attack", armed ? "Disarm external monitoring" : "Arm external monitoring")}
+                    >
+                      {armed ? "Disarm" : "Arm"}
+                    </button>
+                  </div>
+                  <div className="ct2-row">
+                    <span className="ct2-row-no">2</span>
+                    <span className="ct2-row-main">
+                      <b>RUN THE ATTACK</b>
+                      <em>
+                        {lab
+                          ? "From the range's external attacker node, against the enterprise segment the sensor mirrors."
+                          : "From outside the monitored network, against a host on the SPAN the sensor sees."}
+                      </em>
+                    </span>
+                  </div>
+                </div>
+              </>
+            )}
 
             <div className={`ct2-track${launched ? "" : " is-idle"}`}>
               {launched && launch ? (
@@ -472,7 +547,13 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
                   </button>
                 </>
               ) : (
-                <span>{beginner ? "Pick an attack above to launch it. K.I.R.A. will detect it, raise an alert, and show how much warning time you got — all simulated, all safe." : "Launch a stage to watch the model catch it: the technique it reads, when it first alerts, and how far ahead."}</span>
+                <span>
+                  {IS_DEMO
+                    ? beginner
+                      ? "Pick a scenario above to launch it. K.I.R.A. will detect it, raise an alert, and show how much warning time you got — sample data only."
+                      : "Launch a scenario to watch the model catch it: the technique it reads, when it first alerts, and how far ahead."
+                    : "Arm monitoring, then run the attack: this tracks the technique the model reads, when it first alerts, and how far ahead."}
+                </span>
               )}
             </div>
           </div>
@@ -544,7 +625,7 @@ export default function Controls({ status, logLines, onLog, prediction, envelope
                   ))}
                 </div>
               )}
-              Recorded as operator intent and applied as a telemetry filter. Not wired to firewall or policy enforcement.
+              Recorded as operator intent, not enforced: the model keeps scoring the traffic it sees, and reports it if blocked traffic persists.
             </div>
           </div>
         </div>

@@ -1,15 +1,15 @@
 /**
- * Alternate futures — the branches the forecast head weighs from the present.
+ * Alternate futures — the continuations DeepOP weighs from the present.
  *
- * Branch B of the model rolls the hidden state forward; the stage head reads a
- * distribution over what happens next. This is that distribution collapsed to
- * its three most likely continuations, each with the path it would take
- * through the network and what it would cost on the wire.
+ * control_backend/forecast_branches.py: step 0 of the served decoding
+ * (DeepOPForecastDecoder.forecast_sequence) is reproduced exactly, the three
+ * most probable first tokens are kept, and each is decoded greedily through
+ * the same decoder. Branch A is therefore the served forecast itself.
  *
- * Not yet on /ws: the backend forwards the rollout's risk and predicted stage
- * per step (ForecastPoint) but not the competing continuations. The demo
- * stream carries this shape; against a live backend the field is absent and
- * the forecast tree says so.
+ * No model predicts which hosts a branch passes through, its packet and byte
+ * volume, or a per-branch risk peak (Branch B rolls out one future, not
+ * three). Those fields arrive null and the console marks them under
+ * development; the demo fills them so the layout can be seen.
  */
 
 export type BranchKind = "escalation" | "pivot" | "backoff";
@@ -19,27 +19,40 @@ export interface BranchHop {
   name: string;
 }
 
+/** One forecast step along a branch. */
+export interface BranchStep {
+  horizon_seconds: number;
+  tactic_lane: string;
+  technique: string | null;
+  /** DeepOP's probability for this step's token. */
+  probability: number;
+}
+
 export interface ForecastBranch {
   /** A, B, C by probability — A is the most likely continuation. */
   id: "A" | "B" | "C";
   kind: BranchKind;
   /** What happens on this branch, in one line. */
   label: string;
-  /** Kill-chain lane the branch reaches (correlation TACTIC_ORDER). */
+  /** Kill-chain lane the branch reaches (control_backend/tactics.py LANES). */
   stage: string;
   /** ATT&CK technique id, or "—" for a back-off. */
   technique: string;
-  /** Share of the forecast mass on this branch; the three sum to 1. */
+  /** Share of the top-3 first-step mass on this branch; the three sum to 1. */
   probability: number;
-  /** Technique-head confidence for the branch's technique. */
+  /** The first step's actual probability under DeepOP. */
+  probability_raw?: number;
+  /** DeepOP's probability for the branch's technique step. */
   confidence: number;
-  /** When the branch's first milestone is expected, seconds from now. */
+  /** When the branch's technique step lands, seconds from now. */
   horizon_seconds: number;
-  /** The hosts the branch passes through, in order. */
-  hops: BranchHop[];
-  /** Forecast packets and bytes over the horizon if this branch plays out. */
-  packets: number;
-  bytes: number;
-  /** Peak risk the rollout reaches along this branch. */
-  peak_risk: number;
+  /** Every forecast step of the branch. */
+  path?: BranchStep[];
+  /** The hosts the branch passes through. Not predicted by any model yet. */
+  hops: BranchHop[] | null;
+  /** Forecast packets and bytes over the horizon. Not predicted yet. */
+  packets: number | null;
+  bytes: number | null;
+  /** Peak risk along this branch. Not predicted per branch yet. */
+  peak_risk: number | null;
 }

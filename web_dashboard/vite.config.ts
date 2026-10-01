@@ -1,8 +1,7 @@
-import { defineConfig, type Connect, type HtmlTagDescriptor, type Plugin } from 'vite'
+import { defineConfig, type HtmlTagDescriptor, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
-import type { ServerResponse } from 'node:http'
 
 // Removed figma site.json import
 // Vite config — https://vitejs.dev/config/
@@ -17,6 +16,7 @@ export default defineConfig(({ mode }) => {
       minify: !emitSourcemaps,
     },
     plugins: [
+      liveBuildDropsDemoFixtures(mode),
       react(),
       tailwindcss(),
       figmaSiteConfiguration({
@@ -28,7 +28,6 @@ export default defineConfig(({ mode }) => {
       figmaErrorOverlayReplay(),
       figmaReactRefreshBoundaryFallback(),
       figmaMakeKitPlugin({ storiesGlob: '/src/**/*.stories.{ts,tsx,js,jsx}' }),
-      demoTriggerBridge(),
     ],
     resolve: {
       alias: {
@@ -312,108 +311,23 @@ function figmaReactRefreshBoundaryFallback(): Plugin {
 }
 
 /**
- * Terminal → demo-page bridge for recording demo videos.
+ * Keeps the demo fixtures out of every build except `--mode demo`.
  *
- * The demo build (`npm run demo` / `npm run demo:prod`) runs entirely in the
- * browser off `src/api/mock.ts`; there is no backend to poke. This adds two
- * routes to the dev/preview server so a plain terminal command — a fake
- * `hping3` / `nmap` / … that only curls this endpoint — can drive the console
- * from off-screen:
- *
- *   GET/POST /__demo/trigger?stage=ddos   broadcast a stage to open pages
- *   GET      /__demo/stream               Server-Sent Events the page subscribes to
- *
- * Stage names line up with `STAGE_BANDS` in mock.ts. Server-only middleware, so
- * nothing here ships in a production bundle; the routes simply do not exist
- * against the real FastAPI backend.
+ * src/api/mock.ts is only ever called behind IS_DEMO, but a static import
+ * still bundles it. Outside demo mode its imports resolve to
+ * src/api/mock.live.ts, an inert stub with the same exports, so the real
+ * console's bundle carries no sample data at all.
  */
-function demoTriggerBridge(): Plugin {
-  const clients = new Set<ServerResponse>()
-  const STAGES = new Set(['recon', 'probe', 'exploit', 'c2', 'lateral', 'ddos', 'reset', 'contain'])
-
-  function broadcast(stage: string): number {
-    const msg = `event: trigger\ndata: ${JSON.stringify({ stage, at: Date.now() })}\n\n`
-    for (const res of clients) {
-      try {
-        res.write(msg)
-      } catch {
-        clients.delete(res)
-      }
-    }
-    return clients.size
-  }
-
-  const middleware: Connect.NextHandleFunction = (req, res, next) => {
-    const url = req.url || ''
-    const pathname = url.split('?')[0]
-
-    if (pathname === '/__demo/stream') {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-      })
-      res.write('retry: 2000\n\n')
-      res.write(': connected\n\n')
-      clients.add(res)
-      const keepAlive = setInterval(() => {
-        try {
-          res.write(': ka\n\n')
-        } catch {
-          /* dropped below */
-        }
-      }, 15000)
-      req.on('close', () => {
-        clearInterval(keepAlive)
-        clients.delete(res)
-      })
-      return
-    }
-
-    if (pathname === '/__demo/trigger') {
-      const reply = (stage: string) => {
-        const norm = stage.toLowerCase().trim()
-        const ok = STAGES.has(norm)
-        const listeners = ok ? broadcast(norm) : clients.size
-        res.writeHead(ok ? 200 : 400, {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        })
-        res.end(JSON.stringify({ ok, stage: norm, listeners, stages: [...STAGES] }))
-      }
-
-      const query = new URLSearchParams(url.split('?')[1] || '')
-      const fromQuery = query.get('stage')
-      if (fromQuery != null) return reply(fromQuery)
-
-      let body = ''
-      req.on('data', (chunk) => {
-        body += chunk
-        if (body.length > 10_000) req.destroy()
-      })
-      req.on('end', () => {
-        let stage = ''
-        try {
-          stage = String(JSON.parse(body || '{}').stage ?? '')
-        } catch {
-          /* invalid JSON → empty stage → 400 */
-        }
-        reply(stage)
-      })
-      return
-    }
-
-    next()
-  }
-
+function liveBuildDropsDemoFixtures(mode: string): Plugin {
+  const stub = path.resolve(__dirname, 'src/api/mock.live.ts')
   return {
-    name: 'cyberworld-demo-trigger-bridge',
-    configureServer(server) {
-      server.middlewares.use(middleware)
-    },
-    configurePreviewServer(server) {
-      server.middlewares.use(middleware)
+    name: 'kira-live-build-drops-demo-fixtures',
+    enforce: 'pre',
+    resolveId(source, importer) {
+      if (mode === 'demo' || !importer) return null
+      const target = path.resolve(path.dirname(importer), source)
+      if (target === path.resolve(__dirname, 'src/api/mock')) return stub
+      return null
     },
   }
 }

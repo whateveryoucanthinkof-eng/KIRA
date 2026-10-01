@@ -16,33 +16,9 @@ import type { Campaign } from "../types/campaign";
 import type { ForecastBranch } from "../types/forecast";
 import { sevColor, sevFromRisk } from "../design/primitives";
 import { FORECAST, OBSERVED } from "../design/charts";
+import { ahead } from "../design/time";
 
-/** correlation/causal_edge_scorer.py:TACTIC_ORDER */
-const LANES = [
-  { key: "Recon", label: "Recon" },
-  { key: "InitialAccess", label: "Initial Access" },
-  { key: "Execution", label: "Execution" },
-  { key: "C2", label: "C2" },
-  { key: "LateralMovement", label: "Lateral Movement" },
-  { key: "Exfiltration", label: "Exfiltration" },
-  { key: "Impact", label: "Impact" },
-];
-
-/** Display names for the techniques the lab scenario produces. */
-const TECHNIQUE_NAMES: Record<string, string> = {
-  T1046: "Network Service Discovery",
-  T1110: "Brute Force",
-  T1190: "Exploit Public-Facing App",
-  T1071: "Application Layer Protocol",
-  T1021: "Remote Services",
-  T1005: "Data from Local System",
-  T1041: "Exfiltration Over C2",
-  T1020: "Automated Exfiltration",
-  T1595: "Active Scanning",
-  T1498: "Network Denial of Service",
-  T1133: "External Remote Services",
-  T1078: "Valid Accounts",
-};
+import { LANES, TECHNIQUE_NAMES } from "../design/lanes";
 
 type State = "done" | "now" | "forecast" | "idle";
 
@@ -59,7 +35,7 @@ interface Cell {
 
 function signed(seconds: number): string {
   const s = Math.round(seconds);
-  return s === 0 ? "NOW" : s < 0 ? `t −${Math.abs(s)}s` : `+${s}s`;
+  return s === 0 ? "NOW" : s < 0 ? `t −${Math.abs(s)}s` : ahead(s);
 }
 
 export default function Storyline({
@@ -96,18 +72,18 @@ export default function Storyline({
   }
 
   // Forecast: the leading branch first, then the rollout's own stages.
-  const ahead = new Map<string, { technique: string | null; at: number; probability: number | null }>();
+  const upcoming = new Map<string, { technique: string | null; at: number; probability: number | null }>();
   for (const b of branches ?? []) {
-    if (b.kind === "backoff" || ahead.has(b.stage)) continue;
-    ahead.set(b.stage, { technique: b.technique, at: b.horizon_seconds, probability: b.probability });
+    if (b.kind === "backoff" || upcoming.has(b.stage)) continue;
+    upcoming.set(b.stage, { technique: b.technique, at: b.horizon_seconds, probability: b.probability });
   }
   for (const f of forecast) {
     const k = f.predictedStage;
-    if (!k || ahead.has(k)) continue;
-    ahead.set(k, { technique: projected.get(k)?.technique ?? null, at: f.horizonSeconds, probability: null });
+    if (!k || upcoming.has(k)) continue;
+    upcoming.set(k, { technique: projected.get(k)?.technique ?? null, at: f.horizonSeconds, probability: null });
   }
   for (const [k, v] of projected) {
-    if (!ahead.has(k) && v.at > 0) ahead.set(k, { technique: v.technique, at: v.at, probability: null });
+    if (!upcoming.has(k) && v.at > 0) upcoming.set(k, { technique: v.technique, at: v.at, probability: null });
   }
 
   const cells: Cell[] = LANES.map((lane, i) => {
@@ -118,7 +94,7 @@ export default function Storyline({
     if (o && (nowIdx < 0 || i < nowIdx)) {
       return { key: lane.key, label: lane.label, state: "done", technique: o.technique, anchor: signed(o.at), at: o.at, probability: null };
     }
-    const a = ahead.get(lane.key);
+    const a = upcoming.get(lane.key);
     if (a && (nowIdx < 0 || i > nowIdx)) {
       return {
         key: lane.key,
@@ -147,7 +123,11 @@ export default function Storyline({
         const reached = c.state === "forecast" && futureSeconds != null && c.at != null && c.at <= futureSeconds;
         const name = c.technique ? TECHNIQUE_NAMES[c.technique] : null;
         return (
-          <div key={c.key} className={`sl-cell is-${c.state}${reached ? " is-reached" : ""}`}>
+          <div
+            key={c.key}
+            className={`sl-cell is-${c.state}${reached ? " is-reached" : ""}${LANES[i].dev ? " is-udev" : ""}`}
+            title={LANES[i].dev ? "Under development: no deployed head emits this stage yet." : undefined}
+          >
             <span className={`sl-rail is-left is-${joint(cells[i - 1], c)}`} />
             <span className={`sl-rail is-right is-${joint(c, cells[i + 1])}`} />
             <span
@@ -164,7 +144,7 @@ export default function Storyline({
             />
             <div className="sl-lane">{c.label}</div>
             <div className="sl-line" title={name ?? undefined}>
-              {c.technique ? <b>{c.technique}</b> : <span className="sl-none">—</span>}
+              {c.technique ? <b>{c.technique}</b> : <span className="sl-none">{LANES[i].dev ? "in dev" : "—"}</span>}
               {c.anchor && (
                 <span className="sl-anchor" style={c.state === "now" ? { color: nowColour } : undefined}>
                   {c.anchor}
