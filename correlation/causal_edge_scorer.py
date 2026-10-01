@@ -37,16 +37,26 @@ _CONTRACT = get_contract()
 EVIDENCE_HORIZON_SEC: float = _CONTRACT.history_seconds + _CONTRACT.forecast_seconds
 
 # Kill-chain stage ordering (hand-set). -1 = not an attack stage.
+#: CredentialAccess sits between Recon and InitialAccess, as the console's
+#: kill-chain lanes draw it (control_backend/tactics.py). It was missing, so
+#: DeepOP's CredentialAccess.T1110 (brute force) ranked -1 and scored as "not an
+#: attack stage" (plausibility 0.1): a brute-force episode could never link into
+#: the campaign it opens. In this corpus T1110 is external password guessing
+#: against an exposed service, i.e. the step that GAINS access, which is why it
+#: precedes InitialAccess here rather than following it as in ATT&CK's
+#: enterprise matrix (where it is post-compromise credential theft).
 TACTIC_ORDER = {
     "Recon": 0,
-    "InitialAccess": 1,
-    "Execution": 2,
-    "C2": 3,
-    "LateralMovement": 4,
-    "Exfiltration": 5,
-    "Impact": 6,
+    "CredentialAccess": 1,
+    "InitialAccess": 2,
+    "Execution": 3,
+    "C2": 4,
+    "LateralMovement": 5,
+    "Exfiltration": 6,
+    "Impact": 7,
     "Benign": -1,
     "Unknown": -1,
+    "UNKNOWN": -1,
 }
 
 #: Every tunable number in the scorer. None of these were fitted.
