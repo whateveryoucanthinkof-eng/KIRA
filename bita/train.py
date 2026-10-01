@@ -35,7 +35,7 @@ from data_unification.tgne_features import (
     extract_canonical_edge_features,
 )
 from data_unification.density import require_full_density
-from cyberworld_v4.training_guard import (STOP, ResumePoint, TrainingGuard, default_warmup_steps,
+from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingGuard, default_warmup_steps,
                                           run_fingerprint)
 from data_unification.ip_features import ablated_node_features as _ablated_node_features
 
@@ -239,6 +239,21 @@ class Data:
         if self._n_unique is None:
             self._n_unique = count_unique(self.sources, self.destinations)
         return self._n_unique
+
+
+@torch.no_grad()
+def replay_memory(tgn, data, batch_size, n_neighbors):
+    """Advance TGN memory over `data` (in its order) with the current weights,
+    forward only: the memory state those weights build. Negatives are not
+    needed for memory, so the destinations stand in for them."""
+    tgn.eval()
+    n = len(data.sources)
+    for a in range(0, n, batch_size):
+        b = min(n, a + batch_size)
+        d = np.asarray(data.destinations[a:b])
+        tgn.compute_temporal_embeddings(np.asarray(data.sources[a:b]), d, d,
+                                        np.asarray(data.timestamps[a:b]),
+                                        np.asarray(data.edge_idxs[a:b]), n_neighbors)
 
 
 def interleave_by_capture(data, capture_of_edge, store=None, prefix="train_il"):
@@ -1783,6 +1798,7 @@ def train(args):
         atexit.register(planner.close)
         logging.info("batch planner enabled (pid %d)", planner.proc.pid)
 
+    best_val_memory = None
     logging.info("Starting training loop...")
     for epoch in range(first_epoch, args.n_epoch):
         start_epoch = time.time()
@@ -1982,6 +1998,9 @@ def train(args):
 
         if args.use_memory:
             tgn.memory.restore_memory(val_memory_backup)
+            # Only needed between the two validation passes. It used to stay
+            # alive (on the GPU) through the whole next training epoch.
+            del train_memory_backup
 
         val_aps.append(val_ap)
         val_aucs.append(val_auc)
@@ -2055,6 +2074,10 @@ def train(args):
         if nn_val_ap == nn_val_ap and nn_val_ap < 0.55:
             _health.append(f"inductive link prediction AP {nn_val_ap:.3f}: near chance on unseen hosts")
         _action = guard.end_epoch(_sel, train_loss=mean_train_loss, health=_health)
+        if args.use_memory and _action == IMPROVED:
+            # The memory these weights built over train + validation. The test
+            # pass must start from THIS, not from whatever epoch ran last.
+            best_val_memory = val_memory_backup
         resume.save(epoch + 1, model=tgn.state_dict(), optimizer=optimizer.state_dict(),
                     guard=guard.state_dict(), curves={k: list(v) for k, v in _curves.items()},
                     samplers=_sampler_states())
@@ -2136,6 +2159,21 @@ def train(args):
     tgn.set_neighbor_finder(full_ngh_finder)
 
     if args.use_memory:
+        # Test must continue from the memory the SERVED (best) weights built.
+        # This restored the LAST epoch's post-validation memory onto the best
+        # epoch's weights -- e.g. epoch-7 memory under epoch-4 weights on
+        # 2026-09-25 -- a state no model ever produced, which every reported
+        # test metric was then computed from.
+        if best_val_memory is None:
+            logging.info("Rebuilding memory with the best weights (forward-only replay of "
+                         "train, then validation): no in-run snapshot of it exists")
+            tgn.memory.__init_memory__()
+            tgn.set_neighbor_finder(train_ngh_finder)
+            replay_memory(tgn, train_data, args.batch_size, args.n_degree)
+            tgn.set_neighbor_finder(full_ngh_finder)
+            replay_memory(tgn, val_data, 200, args.n_degree)
+            best_val_memory = tgn.memory.backup_memory()
+        val_memory_backup = best_val_memory
         tgn.memory.restore_memory(val_memory_backup)
 
     # Transductive Test (Old Nodes)
