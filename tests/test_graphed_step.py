@@ -76,3 +76,36 @@ def test_support_index_loss_matches_mask(device):
                                       support_index=sup.nonzero().squeeze(1).to(device))
         gb, = torch.autograd.grad(b, logits)
         assert torch.equal(a, b) and torch.equal(pa, pb) and torch.equal(ga, gb)
+
+
+def _guard_run(graph_undo):
+    torch.manual_seed(0)
+    m = torch.nn.Sequential(torch.nn.Linear(27, 64), torch.nn.ReLU(), torch.nn.Dropout(0.2),
+                            torch.nn.Linear(64, 3)).cuda()
+    opt = torch.optim.Adam(m.parameters(), lr=1e-3, weight_decay=1e-4)
+    g = TrainingGuard("t", [m], opt, mode="min", patience=3, step_back_after=2, warmup_steps=5,
+                      clip_norm=1.0, log=lambda s: None, graph_undo=graph_undo)
+    gen = torch.Generator().manual_seed(1)
+    torch.manual_seed(5)
+    for i in range(80):
+        x = torch.randn(32, 27, generator=gen).cuda()
+        y = torch.randn(32, 3, generator=gen).cuda()
+        opt.zero_grad(set_to_none=True)
+        loss = torch.nn.functional.mse_loss(m(x), y)
+        if i in (13, 14, 40):
+            loss = loss * float("nan")          # a skipped step: the undo must restore exactly
+        if i == 50:
+            g.flush()                           # optimizer state reloaded: tensors move
+            opt.load_state_dict(opt.state_dict())
+        g.backward_step_deferred(loss)
+    g.flush()
+    return ({k: v.cpu() for k, v in m.state_dict().items()},
+            (g.n_steps, g.n_nonfinite, g.n_grad, g.n_clipped, g.grad_norm_sum, g.global_step))
+
+
+def test_guard_graph_undo_is_bit_identical():
+    w0, c0 = _guard_run(False)
+    w1, c1 = _guard_run(True)
+    assert c0 == c1 and c0[1] == 3
+    for k in w0:
+        assert torch.equal(w0[k], w1[k]), k

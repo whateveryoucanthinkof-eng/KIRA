@@ -301,7 +301,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                           patience=patience, step_back_after=step_back_after,
                           warmup_steps=default_warmup_steps(_nb_total),
                           clip_norm=clip_norm or None,
-                          log=lambda m: print(m, flush=True))
+                          log=lambda m: print(m, flush=True),
+                          graph_undo=(str(device) == "cuda" and graphs_enabled()))
     first_epoch = 0
     _rp = resume.load() if resume is not None else None
     if _rp is not None:
@@ -756,7 +757,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                           patience=patience, step_back_after=step_back_after,
                           warmup_steps=default_warmup_steps(_nb_total),
                           clip_norm=clip_norm or None,
-                          log=lambda m: print(m, flush=True))
+                          log=lambda m: print(m, flush=True),
+                          graph_undo=(str(device) == "cuda" and graphs_enabled()))
     first_epoch = 0
     _rp = resume.load() if resume is not None else None
     if _rp is not None:

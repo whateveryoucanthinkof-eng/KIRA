@@ -1698,7 +1698,8 @@ def main():
         warmup_steps=(args.warmup_steps if args.warmup_steps is not None
                       else default_warmup_steps(_n_train_batches)),
         clip_norm=args.clip_norm or None,
-        log=lambda m: print(m, flush=True))
+        log=lambda m: print(m, flush=True),
+        graph_undo=(device == "cuda" and graphs_enabled() and not args.no_cuda_graph))
     if args.eval_only:
         # Re-score an existing checkpoint without retraining.
         #

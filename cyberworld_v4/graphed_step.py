@@ -32,6 +32,7 @@ Training mode is captured; call the eager module for evaluation.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import Callable, Optional, Sequence
 
@@ -44,6 +45,31 @@ def graphs_enabled(default: bool = True) -> bool:
     if v is None:
         return default
     return v not in ("0", "false", "False", "")
+
+
+@contextlib.contextmanager
+def thread_local_capture():
+    """Capture with capture_error_mode="thread_local" while this is active.
+
+    The default ("global") makes CUDA reject an unsafe API call from ANY
+    thread during a capture -- and the DataLoader's pin-memory thread pins
+    host buffers concurrently, which invalidated a DeepOP capture. Only this
+    thread's stream is being captured, so only this thread needs checking.
+    make_graphed_callables does not take the mode, so `torch.cuda.graph` is
+    swapped for the duration (it is looked up at call time).
+    """
+    orig = torch.cuda.graph
+
+    class _TL(orig):
+        def __init__(self, cuda_graph, pool=None, stream=None, capture_error_mode="thread_local"):
+            super().__init__(cuda_graph, pool=pool, stream=stream,
+                             capture_error_mode=capture_error_mode)
+
+    torch.cuda.graph = _TL
+    try:
+        yield
+    finally:
+        torch.cuda.graph = orig
 
 
 class _Wrap(torch.nn.Module):
@@ -98,8 +124,9 @@ class GraphedLoss:
             p.grad = None
         static = tuple(a.detach().clone() if torch.is_tensor(a) else a for a in example)
         try:
-            self._graphed = torch.cuda.make_graphed_callables(
-                _Wrap(self.fn, self.modules), static, allow_unused_input=True)
+            with thread_local_capture():
+                self._graphed = torch.cuda.make_graphed_callables(
+                    _Wrap(self.fn, self.modules), static, allow_unused_input=True)
             self._sig = self._signature(example)
         except Exception as e:          # an op that cannot be captured: stay eager
             self._graphed = None

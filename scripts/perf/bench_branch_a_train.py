@@ -60,7 +60,8 @@ def main():
                           risk_objective="soft_bce", **MultiTaskLSTM.PAPER_ARCH).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     guard = TrainingGuard("branch_a", [model], opt, mode="max", patience=3, step_back_after=2,
-                          warmup_steps=500, clip_norm=1.0, log=print)
+                          warmup_steps=500, clip_norm=1.0, log=print,
+                          **({} if a.legacy else {'graph_undo': not getattr(a, 'no_graph', False)}))
     step = guard.backward_step if (a.legacy or not guard.deferred_supported()) \
         else guard.backward_step_deferred
     def _f(x, th, r, tc, gr):
