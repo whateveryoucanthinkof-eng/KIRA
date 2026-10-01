@@ -430,6 +430,10 @@ _PARSE_ENTRY_MODULES = (
     "data_unification.label_resolver",
     "data_unification.training_sources",
     "data_unification.attack_windows",
+    # imported lazily by the day loaders, so never loaded by the imports
+    # above: without it here, a change to how participants scope labels
+    # would not invalidate cached parses
+    "data_unification.attack_participants",
     "data_unification.pcap_bridge",
     "data_unification.pcap_adapter",
     "telemetry.capture.sniffer",
