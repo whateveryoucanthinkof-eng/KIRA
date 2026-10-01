@@ -125,3 +125,94 @@ def _advise(mm, flag: str) -> None:
         mm.madvise(getattr(_mmap, flag))
     except (AttributeError, OSError, ValueError):
         pass             # advisory only
+
+
+def host_major_for(store, rows_list, host_major: Optional[bool] = None,
+                   spill_dir: Optional[str] = None):
+    """(flat, base, feats_hm) for a dataset over `rows_list` of `store`.
+
+    `feats_hm` is None when the block is held in RAM (the default when
+    `host_major` is None): random gathers from RAM are cheap, and a copy would
+    double the memory. The copy is cached on the store, so Branch B and DeepOP
+    -- two datasets over the same store -- share one.
+    """
+    flat, base = flat_row_order(rows_list)
+    if host_major is None:
+        host_major = isinstance(store.feats, np.memmap)
+    if not host_major:
+        return flat, base, None
+    cached = getattr(store, "_host_major_cache", None)
+    if cached is not None and cached[0] is flat:
+        return flat, base, cached[1]
+    hm = host_major_copy(store.feats, flat, spill_dir)
+    if flat is getattr(rows_list[0], "base", None):     # the store's own order: shareable
+        store._host_major_cache = (flat, hm)
+    return flat, base, hm
+
+
+class BatchedView:
+    """A dataset whose DataLoader batches come from one `ds.gather_batch(indices)`.
+
+    Use with `collate_fn=collate_prebatched`. The samplers see the same length,
+    so they draw the same indices in the same order as over `ds` itself.
+    """
+
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        return self.ds[idx]
+
+    def __getitems__(self, indices):
+        return self.ds.gather_batch(indices)
+
+
+def collate_prebatched(batch):
+    """collate_fn for BatchedView: the batch is already collated."""
+    return batch
+
+
+def _torch():
+    import torch
+    return torch
+
+
+class PermutationBatchSampler:
+    """`BatchSampler(RandomSampler(n), batch_size, drop_last=False)` without the list.
+
+    RandomSampler (generator=None) draws a seed from torch's global RNG, then
+    yields `torch.randperm(n, generator=g).tolist()` -- for 68M samples a
+    Python list of ~2.4 GB in the trainer's main process, every epoch. This
+    draws the same seed the same way and yields the same batches from the
+    permutation tensor (8 B per sample). Identical indices, identical order,
+    identical global-RNG consumption: tests/test_branch_a_batched_loader.py.
+    """
+
+    def __init__(self, n: int, batch_size: int):
+        self.n, self.batch_size = int(n), int(batch_size)
+
+    def __len__(self) -> int:
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        torch = _torch()
+        seed = int(torch.empty((), dtype=torch.int64).random_().item())
+        g = torch.Generator()
+        g.manual_seed(seed)
+        perm = torch.randperm(self.n, generator=g).numpy()
+        bs = self.batch_size
+        for i in range(0, self.n, bs):
+            yield perm[i:i + bs]
+
+
+def batched_loader(ds, batch_size: int, shuffle: bool, **loader_kw):
+    """DataLoader over `ds.gather_batch`, drawing what DataLoader(ds, ...) would."""
+    from torch.utils.data import DataLoader
+    if shuffle:
+        return DataLoader(BatchedView(ds), batch_sampler=PermutationBatchSampler(len(ds), batch_size),
+                          collate_fn=collate_prebatched, **loader_kw)
+    return DataLoader(BatchedView(ds), batch_size=batch_size, shuffle=False,
+                      collate_fn=collate_prebatched, **loader_kw)

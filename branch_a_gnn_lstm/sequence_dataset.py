@@ -389,18 +389,17 @@ class LazyHostSequenceDataset(Dataset):
         `host_major` None means "when the feature block is a memmap" -- a
         block held in RAM gains nothing from the copy but would double its memory.
         """
-        from data_unification.host_major import flat_row_order, host_major_copy
+        from data_unification.host_major import host_major_for
         st = self.store
-        self._flat, self._base = flat_row_order(self._rows)
-        if host_major is None:
-            host_major = isinstance(st.feats, np.memmap)
-        self._feats_hm = host_major_copy(st.feats, self._flat, spill_dir) if host_major else None
+        self._flat, self._base, self._feats_hm = host_major_for(
+            st, self._rows, host_major=host_major, spill_dir=spill_dir)
         benign = TECH_TO_IDX.get("Benign", 0)
         self._grad_of_cat = np.array([GRADATION_LEVELS.get(c, 0) for c in st.categories] or [0],
                                      dtype=np.int64)
         self._tech_of_code = np.array([TECH_TO_IDX.get(t, benign) for t in st.techniques] or [benign],
                                       dtype=np.int64)
         self._benign = benign
+        self._batched_ready = True
         return self
 
     def gather_batch(self, indices):
@@ -451,53 +450,6 @@ class LazyHostSequenceDataset(Dataset):
         }
 
 
-class BatchedSequenceView(Dataset):
-    """`ds` for a DataLoader: each batch comes from one `ds.gather_batch` call.
-
-    Use with `collate_fn=collate_prebatched`. The DataLoader's samplers see the
-    same length, so they draw the same indices in the same order.
-    """
-
-    def __init__(self, ds: LazyHostSequenceDataset):
-        self.ds = ds
-
-    def __len__(self) -> int:
-        return len(self.ds)
-
-    def __getitem__(self, idx):
-        return self.ds[idx]
-
-    def __getitems__(self, indices):
-        return self.ds.gather_batch(indices)
-
-
-def collate_prebatched(batch):
-    """collate_fn for BatchedSequenceView: the batch is already collated."""
-    return batch
-
-
-class PermutationBatchSampler(torch.utils.data.Sampler):
-    """`BatchSampler(RandomSampler(n), batch_size, drop_last=False)` without the list.
-
-    RandomSampler (generator=None) draws a seed from torch's global RNG, then
-    yields `torch.randperm(n, generator=g).tolist()` -- a 68M-element Python
-    list (~2.4 GB) in the trainer's main process every epoch. This draws the
-    same seed the same way and yields the same batches from the permutation
-    tensor (int64, 8 B per sample). Identical indices, identical order, and
-    the same global-RNG consumption: tests/test_branch_a_batched_loader.py.
-    """
-
-    def __init__(self, n: int, batch_size: int):
-        self.n, self.batch_size = int(n), int(batch_size)
-
-    def __len__(self) -> int:
-        return (self.n + self.batch_size - 1) // self.batch_size
-
-    def __iter__(self):
-        seed = int(torch.empty((), dtype=torch.int64).random_().item())
-        g = torch.Generator()
-        g.manual_seed(seed)
-        perm = torch.randperm(self.n, generator=g).numpy()
-        bs = self.batch_size
-        for i in range(0, self.n, bs):
-            yield perm[i:i + bs]
+# Generic pieces, shared with Branch B and DeepOP (data_unification/host_major.py).
+from data_unification.host_major import (  # noqa: E402
+    BatchedView as BatchedSequenceView, PermutationBatchSampler, collate_prebatched)

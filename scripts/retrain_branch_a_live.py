@@ -842,18 +842,7 @@ def _warn_if_head_collapsed(metrics, where):
               flush=True)
 
 
-def _hist(idx, n, weights=None):
-    """`torch.bincount(idx, weights, minlength=n)` for idx known to lie in [0, n).
-
-    Same counts (and, on the CPU, the same sequential float sums: a fresh
-    buffer filled in index order, like bincount) without bincount's CUDA
-    host-device sync -- it reads `idx.max()` back to size its output. The
-    boolean-mask selections this replaces (`_b[_y]`) synchronised as well.
-    `weights` defaults to ones (int64, as bincount counts).
-    """
-    if weights is None:
-        weights = torch.ones_like(idx, dtype=torch.long)
-    return torch.zeros(n, device=idx.device, dtype=weights.dtype).index_add_(0, idx, weights)
+from cyberworld_v4.device_hist import device_hist as _hist  # noqa: E402  (no CUDA sync)
 
 
 def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,

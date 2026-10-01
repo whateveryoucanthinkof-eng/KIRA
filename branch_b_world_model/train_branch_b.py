@@ -425,3 +425,57 @@ class LazyHostRolloutDataset(Dataset):
             out["t_future"] = torch.from_numpy(
                 np.ascontiguousarray(t_fut * self.window_seconds, dtype=np.float32))
         return out
+
+    # -- batched access ------------------------------------------------------
+    #
+    # A sample reads T history + K future rows of one host. In the store those
+    # rows are scattered across the feature block (one disk read per row when
+    # the block is a memmap bigger than page cache); in the host-major copy
+    # (data_unification/host_major.py) they are one contiguous slice.
+    # `gather_batch` returns exactly what default_collate([self[i] ...]) did:
+    # tests/test_branch_b_deepop_batched_loader.py.
+
+    def enable_batched(self, host_major=None, spill_dir=None):
+        """Precompute what `gather_batch` needs. Call before DataLoader workers fork."""
+        from data_unification.host_major import host_major_for
+        rows = [self.store._rows_by_host[h] for h in self.hosts]
+        self._flat, self._base, self._feats_hm = host_major_for(
+            self.store, rows, host_major=host_major, spill_dir=spill_dir)
+        self._n_rows = np.fromiter((len(r) for r in rows), dtype=np.int64, count=len(rows))
+        self._batched_ready = True
+        return self
+
+    def gather_batch(self, indices):
+        if not hasattr(self, "_flat"):
+            self.enable_batched(host_major=False)
+        st, T, K = self.store, self.T, self.K
+        idx = np.asarray(indices, dtype=np.int64)
+        h = self._host_idx[idx].astype(np.int64)
+        i = self._pos[idx].astype(np.int64)
+        b = self._base[h]
+        last = (b + self._n_rows[h] - 1)[:, None]
+        ph = (b + i)[:, None] - T + np.arange(T, dtype=np.int64)          # history, [B, T]
+        pf = np.minimum((b + i)[:, None] + np.arange(K, dtype=np.int64), last)  # future, edge-padded
+        p = np.concatenate([ph, pf], axis=1)
+        if self._feats_hm is not None:
+            x = np.asarray(self._feats_hm[p])
+        else:
+            x = np.asarray(st.feats[self._flat[p]])
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        rows_f = self._flat[pf]
+        out = {
+            "h_history": torch.from_numpy(np.ascontiguousarray(x[:, :T])),
+            "h_future": torch.from_numpy(np.ascontiguousarray(x[:, T:])),
+            "risk_future": torch.from_numpy(
+                np.ascontiguousarray(np.asarray(st.risk_score)[rows_f], dtype=np.float32)),
+        }
+        if self.emit_times:
+            w = np.asarray(st.window_idx)
+            w0 = w[self._flat[(b + i - 1)]].astype(np.float64)[:, None]
+            t_h = w[self._flat[ph]].astype(np.float64) - w0
+            t_f = w[rows_f].astype(np.float64) - w0
+            out["t_history"] = torch.from_numpy(
+                np.ascontiguousarray(t_h * self.window_seconds, dtype=np.float32))
+            out["t_future"] = torch.from_numpy(
+                np.ascontiguousarray(t_f * self.window_seconds, dtype=np.float32))
+        return out
