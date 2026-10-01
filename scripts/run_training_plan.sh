@@ -241,7 +241,11 @@ import json, math, sys
 from pathlib import Path
 out, ip = Path(sys.argv[1]), sys.argv[2]
 keys = ("test_2017_macro_f1_seen", "test_2017_macro_f1_all", "test_2017_risk_auc",
-        "test_2017_risk_brier", "val_2018_macro_f1")
+        "test_2017_risk_onset_auc", "test_2017_risk_brier", "val_2018_macro_f1",
+        # PS 26153 benchmark: Branch A vs logistic regression vs persistence
+        "test_2017_a_overall_f1", "test_2017_lr_overall_f1", "test_2017_persist_overall_f1",
+        "test_2017_a_onset_f1", "test_2017_lr_onset_f1",
+        "test_2017_a_overall_fpr", "test_2017_lr_overall_fpr")
 print("\n== both IP variants, seed 42 (reported, not selected on) ==")
 cmp42 = out / "compare_seed42" / "comparison.md"
 print(cmp42.read_text() if cmp42.exists() else f"  {cmp42} missing")
