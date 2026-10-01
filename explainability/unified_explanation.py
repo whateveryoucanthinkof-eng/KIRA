@@ -235,13 +235,14 @@ class UnifiedExplainer:
                     if was_training:
                         self.branch_a.train()
 
+                # Summed over every timestep (see model_adapter._explain_full).
                 grads = (
-                    x.grad[0, -1, :].cpu().numpy()
+                    x.grad[0].cpu().numpy()
                     if x.grad is not None
-                    else np.zeros(len(names), dtype=np.float32)
+                    else np.zeros((x.shape[1], len(names)), dtype=np.float32)
                 )
-                inputs = x[0, -1, :].detach().cpu().numpy()
-                attributions = np.abs(grads * inputs)
+                inputs = x[0].detach().cpu().numpy()
+                attributions = np.abs(grads * inputs).sum(axis=0)
                 attn_weights = [float(w) for w in out["attention_weights"][0].detach().cpu().numpy()]
 
             # Normalize and sort feature attributions
@@ -315,11 +316,17 @@ class UnifiedExplainer:
         self,
         trajectories: Dict[str, HostAttackTrajectory],
         campaigns: Optional[List[AttackCampaign]] = None,
-        fast_mode: bool = True,
+        fast_mode: bool = False,
         feature_sequences: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, UnifiedExplanation]:
         """
-        Explains a batch of host trajectories efficiently.
+        Explains a batch of host trajectories.
+
+        fast_mode defaulted to True, i.e. the forward-only proxy: it ranks
+        features by their INPUT MAGNITUDE (times one attention weight), which
+        says how large a feature is, not how much it moved the prediction --
+        a host with heavy benign traffic would be "explained" by its byte
+        counts. The default is now the Input x Gradient attribution.
         """
         # Build host-to-campaign map
         host_to_camp: Dict[str, AttackCampaign] = {}

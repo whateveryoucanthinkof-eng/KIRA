@@ -521,8 +521,8 @@ class AntigravityModelAdapter:
            torch.backends.cudnn.flags(enabled=False) achieves the same thing
            while the module stays in eval().
 
-        Attribution is over the last timestep of the real sequence, with
-        gradients flowing through the full history.
+        Attribution is |grad * input| summed over every timestep of the scored
+        sequence, per feature.
         """
         x = x_tensor.detach().clone().to(self.device)
         x.requires_grad_(True)
@@ -542,13 +542,17 @@ class AntigravityModelAdapter:
                 self.branch_a.zero_grad(set_to_none=True)
                 risk.backward()
 
+            # Every timestep, not just the last: the risk is a function of the
+            # whole 15-window history, and what drives a FORECAST is often an
+            # earlier window (a scan 20 s ago). |grad * input| summed over time
+            # per feature; padded steps are zeros and add nothing.
             grads = (
-                x.grad[0, -1, :].detach().cpu().numpy()
+                x.grad[0].detach().cpu().numpy()
                 if x.grad is not None
-                else np.zeros(x.shape[-1], dtype=np.float32)
+                else np.zeros(tuple(x.shape[1:]), dtype=np.float32)
             )
-            inputs = x[0, -1, :].detach().cpu().numpy()
-            attributions = np.abs(grads * inputs)
+            inputs = x[0].detach().cpu().numpy()
+            attributions = np.abs(grads * inputs).sum(axis=0)
         finally:
             if was_training:
                 self.branch_a.train()
