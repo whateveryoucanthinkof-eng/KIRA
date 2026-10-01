@@ -1,6 +1,6 @@
-"""Throughput of Branch A's training DataLoader alone, on a synthetic store.
+"""Throughput of a downstream training DataLoader alone, on a synthetic store.
 
-    python scripts/perf/bench_branch_a_loader.py --rows 77468077 --hosts 3491797 \
+    python scripts/perf/bench_loader.py --dataset a|b|deepop --rows 77468077 --hosts 3491797 \
         --feats /path/on/disk/feats.bin --batches 3000 [--repo /other/checkout]
 
 `--repo` imports the dataset from another checkout (an A/B against the
@@ -35,7 +35,8 @@ def main():
     ap.add_argument("--feats", default=None, help="feature block on disk (memmap); RAM if unset")
     ap.add_argument("--batches", type=int, default=2000)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--batch-size", type=int, default=None, help="default: the trainer's (128, 128, 64)")
+    ap.add_argument("--dataset", choices=("a", "b", "deepop"), default="a")
     ap.add_argument("--repo", default=str(HERE.parent.parent))
     ap.add_argument("--evict", action="store_true", help="drop the feature file from page cache first")
     ap.add_argument("--batched", action="store_true", help="new code: batched gather, host-major features")
@@ -54,15 +55,27 @@ def main():
     torch.manual_seed(42)
     t = time.time()
     store = make_store(a.rows, a.hosts, n_windows=a.windows, seed=7, feats_path=a.feats)
-    ds = sd.LazyHostSequenceDataset(store, seq_len=15, min_trajectory_len=1)
+    store.use_hazard_target(10.0)
+    if a.dataset == "a":
+        ds = sd.LazyHostSequenceDataset(store, seq_len=15, min_trajectory_len=1)
+    elif a.dataset == "b":
+        from branch_b_world_model.train_branch_b import LazyHostRolloutDataset
+        ds = LazyHostRolloutDataset(store, T=15, K=5)
+    else:
+        from deepop_decoder.joint_vocab import get_joint_vocab
+        from deepop_decoder.train_cwa_decoder import LazyCWADataset
+        ds = LazyCWADataset(store, get_joint_vocab(network_observable_only=True), K=5, T=15)
+    a.batch_size = a.batch_size or {"a": 128, "b": 128, "deepop": 64}[a.dataset]
+    print(f"index built {time.time() - t:.0f}s", flush=True)
     dset, kw = ds, dict(batch_size=a.batch_size, shuffle=True)
     if a.batched:
         t1 = time.time()
         ds.enable_batched()
         print(f"enable_batched {time.time() - t1:.0f}s", flush=True)
-        dset = sd.BatchedSequenceView(ds)
-        kw = dict(batch_sampler=sd.PermutationBatchSampler(len(ds), a.batch_size),
-                  collate_fn=sd.collate_prebatched)
+        from data_unification.host_major import BatchedView, PermutationBatchSampler, collate_prebatched
+        dset = BatchedView(ds)
+        kw = dict(batch_sampler=PermutationBatchSampler(len(ds), a.batch_size),
+                  collate_fn=collate_prebatched)
     print(f"setup {time.time() - t:.0f}s, {len(ds):,} samples, feats "
           f"{type(store.feats).__name__} {store.feats.nbytes / 1e9:.1f} GB", flush=True)
     if a.evict and a.feats:
@@ -89,7 +102,7 @@ def main():
             print(f"  {n} batches  {n / el:7.1f} batch/s  worker majflt/batch "
                   f"{(sum(_majflt(p) for p in pids) - f0) / n:7.1f}", flush=True)
     el = time.perf_counter() - t0
-    print(f"RESULT batch/s {n / el:.1f}  majflt/batch {(sum(_majflt(p) for p in pids) - f0) / n:.1f}  "
+    print(f"RESULT {a.dataset} {'batched' if a.batched else 'legacy'} batch/s {n / el:.1f}  majflt/batch {(sum(_majflt(p) for p in pids) - f0) / n:.1f}  "
           f"main cpu {100 * (os.times().user - c0.user + os.times().system - c0.system) / el:.0f}%",
           flush=True)
 

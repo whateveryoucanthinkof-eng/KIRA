@@ -590,23 +590,29 @@ class LazyCWADataset(Dataset):
             return self._row_tok
         st = self.store
         n_rows = int(len(st.cat_id))
+        nt = len(st.techniques) + 1
+        # One encode per (category, technique-or-None) pair -- a few hundred --
+        # then a table lookup per row, in chunks so the peak stays small (an
+        # np.unique over 77M int64 keys peaked at several GB).
+        lut = np.empty(max(1, len(st.categories)) * nt, dtype=np.int64)
+        for c in range(len(st.categories)):
+            for t in range(-1, nt - 1):
+                lut[c * nt + t + 1] = self.vocab.encode(
+                    st.categories[c], st.techniques[t] if t >= 0 else "None")
+        dt = np.int16 if (lut.size == 0 or (lut.min() >= -2 ** 15 and lut.max() < 2 ** 15)) else np.int64
+        lut = lut.astype(dt)
+        out = np.empty(n_rows, dtype=dt)
         tech_off = np.asarray(st.tech_off)
         tech_flat = np.asarray(st.tech_flat)
-        has = tech_off[1:n_rows + 1] > tech_off[:n_rows]
-        first_tech = np.full(n_rows, -1, dtype=np.int64)
-        if has.any():
-            first_tech[has] = tech_flat[tech_off[:n_rows][has]]
-        cats = np.asarray(st.cat_id[:n_rows], dtype=np.int64)
-        key = cats * (len(st.techniques) + 1) + (first_tech + 1)
-        uniq, inv = np.unique(key, return_inverse=True)
-        lut = np.empty(len(uniq), dtype=np.int64)
-        for j, k in enumerate(uniq):
-            c = int(k) // (len(st.techniques) + 1)
-            t = int(k) % (len(st.techniques) + 1) - 1
-            lut[j] = self.vocab.encode(st.categories[c],
-                                       st.techniques[t] if t >= 0 else "None")
-        dt = np.int16 if (lut.size == 0 or lut.max() < 2 ** 15) else np.int64
-        self._row_tok = lut.astype(dt)[inv.reshape(-1)]
+        for r0 in range(0, n_rows, 1 << 22):
+            r1 = min(n_rows, r0 + (1 << 22))
+            lo, hi = tech_off[r0:r1], tech_off[r0 + 1:r1 + 1]
+            first = np.full(r1 - r0, -1, dtype=np.int64)
+            has = hi > lo
+            if has.any():
+                first[has] = tech_flat[lo[has]]
+            out[r0:r1] = lut[np.asarray(st.cat_id[r0:r1], dtype=np.int64) * nt + first + 1]
+        self._row_tok = out
         return self._row_tok
 
     def __len__(self):
