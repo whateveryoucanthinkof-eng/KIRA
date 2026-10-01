@@ -842,6 +842,20 @@ def _warn_if_head_collapsed(metrics, where):
               flush=True)
 
 
+def _hist(idx, n, weights=None):
+    """`torch.bincount(idx, weights, minlength=n)` for idx known to lie in [0, n).
+
+    Same counts (and, on the CPU, the same sequential float sums: a fresh
+    buffer filled in index order, like bincount) without bincount's CUDA
+    host-device sync -- it reads `idx.max()` back to size its output. The
+    boolean-mask selections this replaces (`_b[_y]`) synchronised as well.
+    `weights` defaults to ones (int64, as bincount counts).
+    """
+    if weights is None:
+        weights = torch.ones_like(idx, dtype=torch.long)
+    return torch.zeros(n, device=idx.device, dtype=weights.dtype).index_add_(0, idx, weights)
+
+
 def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
               risk_positive_above=0.0, collect_logits=False):
     """Validation pass.
@@ -930,7 +944,7 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             abs_err_sum += err.double().sum()
             n_risk += int(err.numel())
             _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-            resid_hist += torch.bincount(_rb.reshape(-1), minlength=RISK_BINS)
+            resid_hist += _hist(_rb.reshape(-1), RISK_BINS)
 
             # Risk as a probability: AUC, Brier and calibration, accumulated
             # from a fixed histogram so 1.02M samples cost O(bins) memory and
@@ -949,11 +963,11 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             _y = (targets["risk"] > risk_positive_above).reshape(-1)
             brier_sum += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
             _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-            pos_hist += torch.bincount(_b[_y], minlength=RISK_BINS)
-            neg_hist += torch.bincount(_b[~_y], minlength=RISK_BINS)
+            pos_hist += _hist(_b, RISK_BINS, _y.long())
+            neg_hist += _hist(_b, RISK_BINS, (~_y).long())
             # Sum of the predicted probabilities per bin, so ECE can use each
             # bin's ACTUAL mean confidence rather than its nominal centre.
-            conf_hist += torch.bincount(_b, weights=_p.double(), minlength=RISK_BINS)
+            conf_hist += _hist(_b, RISK_BINS, _p.double())
             prob_sum += _p.double().sum()
 
             pred_t = predictions["technique_logits"].argmax(dim=-1)
@@ -961,15 +975,14 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             # No separate hit counter: the confusion matrix's trace IS the
             # number correct, so accumulating it twice bought one more
             # device tensor and an extra `.item()` sync at the end.
-            confusion += torch.bincount(true_t * C + pred_t, minlength=C * C)
+            confusion += _hist(true_t * C + pred_t, C * C)
 
             if "gradation_logits" in predictions:
                 pred_g = predictions["gradation_logits"].argmax(dim=-1)
                 true_g = targets["gradation"]
                 grad_correct += (pred_g == true_g).sum()
                 grad_total += int(true_g.numel())
-                grad_confusion += torch.bincount(true_g * G + pred_g,
-                                                 minlength=G * G)
+                grad_confusion += _hist(true_g * G + pred_g, G * G)
 
             if collect_logits:
                 _raw = predictions.get("technique_logits_raw")
