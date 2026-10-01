@@ -131,3 +131,8 @@ as "Under development" until a model produces it.
   (12 edge features, time encoding, memory) isn't implemented.
 - **Campaigns and incidents are heuristic.** They come from `correlation/` (hand-set
   parameters, nothing fitted) applied to model outputs, not from a learned model.
+- **Evaluate the campaign heuristic before trusting the Campaign page.** As of 2026-10-01
+  `control_backend/correlation_service.py` runs `correlation/` live (the only serving caller of
+  `HeuristicCausalEdgeScorer`, allowlisted in `tests/test_serving_causal_edge_guard.py`).
+  `HEURISTIC_PARAMS` has never been evaluated, and a big kill-chain jump (Recon → Impact) scores
+  under the 0.35 link threshold, so those two episodes show as separate campaigns.

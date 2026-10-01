@@ -58,7 +58,7 @@ class LiveStateBuilder:
         n_packets = len(self.current_window_packets)
 
         # Snapshot 5-tuples before aggregate extract (which may prune idle flows)
-        flow_snapshot = self.flow_table.snapshot_flows(max_flows=256)
+        flow_snapshot = self.flow_table.snapshot_flows(max_flows=256, with_flags=True)
         flow_feats = self.flow_table.extract_window_features(self.window_sec)
 
         self.window_id += 1

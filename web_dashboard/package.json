@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite",
     "demo": "vite --mode demo",
-    "demo:prod": "vite build --mode demo --outDir dist-demo --emptyOutDir && vite preview --outDir dist-demo --port 8444 --strictPort",
     "build": "vite build",
+    "build:demo": "vite build --mode demo --outDir dist-demo --emptyOutDir",
+    "demo:prod": "vite build --mode demo --outDir dist-demo --emptyOutDir && vite preview --outDir dist-demo --port 8444 --strictPort",
     "preview": "vite preview",
     "format": "oxfmt"
   },

@@ -5354,7 +5354,9 @@
 
 .sl {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  /* One column per kill-chain lane (design/lanes.ts), however many there are. */
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   padding: 4px var(--s-2) var(--s-2);
 }
 

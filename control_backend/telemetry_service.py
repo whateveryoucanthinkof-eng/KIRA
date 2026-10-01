@@ -379,10 +379,12 @@ class LiveTelemetryService:
                         or self.last_window_at
                     )
 
+                    # Topology ages on the sensor's clock (window_end), which
+                    # is the wall clock live and capture time on a replay.
                     topo = topology_service.apply_window(
                         raw_flows,
                         window_end=window_end,
-                        now=self.last_window_at,
+                        now=window_end,
                     )
 
                     # Live reality metrics -- MEASURED, not synthesised.
@@ -451,7 +453,7 @@ class LiveTelemetryService:
                                     )
                                 }
                             )
-                            topo = topology_service.snapshot(now=self.last_window_at)
+                            topo = topology_service.snapshot(now=window_end)
                         broker.broadcast_sync(topo)
                         broker.broadcast_sync(event)
                     else:

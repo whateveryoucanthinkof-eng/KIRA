@@ -105,7 +105,7 @@ class FlowRecord:
             if flags.get("URG"): self.urg_count += 1
 
 class LiveFlowTable:
-    def snapshot_flows(self, max_flows: Optional[int] = None) -> List[Dict[str, Any]]:
+    def snapshot_flows(self, max_flows: Optional[int] = None, with_flags: bool = False) -> List[Dict[str, Any]]:
         """Export active 5-tuple flows for downstream UnifiedFlowRecord ingestion.
 
         fwd_bytes/bwd_bytes/fwd_packets/bwd_packets are the traffic seen SINCE
@@ -141,7 +141,7 @@ class LiveFlowTable:
         out: List[Dict[str, Any]] = []
         for key, f in items:
             src, dst, sport, dport, proto = key
-            out.append({
+            rec = {
                 "src_ip": str(src),
                 "dst_ip": str(dst),
                 "src_port": int(sport),
@@ -153,15 +153,19 @@ class LiveFlowTable:
                 "bwd_bytes": int(f.bwd_bytes - f.exported_bwd_bytes),
                 "fwd_packets": int(f.fwd_pkts - f.exported_fwd_pkts),
                 "bwd_packets": int(f.bwd_pkts - f.exported_bwd_pkts),
+            }
+            if with_flags:
                 # TCP flag counts over the whole flow, for the console's flow
-                # table. Display only: flows_from_span_dicts() does not read
-                # them, so they never reach the model's features.
-                "flags": {
+                # table. Opt-in and display only: the live sensor asks for
+                # them; offline extraction does not, so its export stays
+                # identical to the Rust port (rust/pcap_fast/verify.py), and
+                # flows_from_span_dicts() never reads them into features.
+                rec["flags"] = {
                     "syn": int(f.syn_count), "ack": int(f.ack_count),
                     "psh": int(f.psh_count), "rst": int(f.rst_count),
                     "fin": int(f.fin_count), "urg": int(f.urg_count),
-                },
-            })
+                }
+            out.append(rec)
             f.exported_fwd_bytes = f.fwd_bytes
             f.exported_bwd_bytes = f.bwd_bytes
             f.exported_fwd_pkts = f.fwd_pkts

@@ -146,10 +146,20 @@ def test_flow_table_exports_flag_counts_the_model_never_reads():
             "src_port": 40000, "dst_port": 80, "protocol": 6, "packet_length": 60,
             "tcp_flags": flags,
         })
-    snap = table.snapshot_flows()
+    snap = table.snapshot_flows(with_flags=True)
     assert snap[0]["flags"]["syn"] == 2 and snap[0]["flags"]["ack"] == 2
     rec = flows_from_span_dicts(snap)[0]
     assert not hasattr(rec, "flags")
+
+
+def test_offline_export_is_unchanged_by_the_console_flags():
+    """Offline extraction must stay byte-identical to the Rust port."""
+    from telemetry.flow.flow_table import LiveFlowTable
+    table = LiveFlowTable()
+    table.process_packet({"timestamp": 1.0, "src_ip": "10.0.2.10", "dst_ip": "10.0.3.10",
+                          "src_port": 1, "dst_port": 80, "protocol": 6, "packet_length": 60,
+                          "tcp_flags": {"SYN": True}})
+    assert "flags" not in table.snapshot_flows()[0]
 
 
 def test_state_vector_carries_all_27_dims():
@@ -237,3 +247,20 @@ def test_incidents_open_count_and_reopen_after_the_evidence_horizon():
     assert [i["id"] for i in inc] == ["INC-0002", "INC-0001"]
     _, inc = corr.observe(_event(0.9, "T1110"), window_end=300.0, contained_hosts={TARGET})
     assert inc[0]["status"] == "contained"
+
+
+# --- topology on a replayed capture -----------------------------------------
+
+def test_replayed_hosts_are_not_evicted_against_the_wall_clock():
+    """A capture replayed today carries flows stamped in the past. Ages run on
+    the sensor's clock, so the hosts stay on the map instead of being evicted
+    as 'hours old' the moment they arrive."""
+    from control_backend.topology_service import TopologyService
+
+    topo = TopologyService()
+    captured_at = 1_600_000_000.0   # 2020: far older than any TTL
+    flows = [_raw("10.0.2.10", "10.0.3.10", captured_at - 1.0)]
+    event = topo.apply_window(flows, window_end=captured_at, now=captured_at)
+    assert {n.ip for n in event.nodes} == {"10.0.2.10", "10.0.3.10"}
+    # A later snapshot with no explicit time reads the sensor's clock too.
+    assert {n.ip for n in topo.snapshot().nodes} == {"10.0.2.10", "10.0.3.10"}

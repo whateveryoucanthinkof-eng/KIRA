@@ -47,3 +47,43 @@ The panel-by-panel data map lives in `docs/DASHBOARD_INTEGRATION.md`.
 6. Verify: backend tests, build both modes, screenshot both UIs against Cyber World's.
 
 ## Log
+
+### 2026-10-01 — first pass complete
+
+Commits on `feat/kira-dashboard`, in order:
+
+1. **Baseline**: Cyber World's `web_dashboard/` copied verbatim, so every adaptation is a diff.
+2. **Backend starts without models**: `get_model_adapter()` loads once under a lock, remembers why it
+   failed, and retries on Start Inference. `/api/status` reports `model_loaded`, `model_error`, `contract`.
+   `/api/replay` answers 503 with the reason.
+3. **Backend sends the evidence**: `tactic_lane`, DeepOP top-3 `branches` (branch A == the served
+   forecast, tested), the full 27-D `state_vector`, `flows` (with TCP flags), `campaign` and `incidents`
+   (`correlation/` wired into serving for the first time), replay volume, real replay samples.
+4. **Frontend wired**: contract-driven timeline, real conformal band, shared lanes (Credential Access
+   added; Execution/Lateral marked under development), site-aware internal/zones instead of 18
+   hardcoded `10.` checks, `UnderDev` marks, real Controls (no launch buttons; external monitor), demo
+   scenarios compiled into the demo build only, live build stubs the fixtures, codenames dropped,
+   demo mock reshaped to our contract/vocabulary with no rule lift and no scripted "predicted early".
+5. **Launcher, topology fix, docs**: `run_dashboard.py --demo`; on-demand UI builds (npm or toolbox);
+   topology ages on the sensor clock (replayed captures were evicted on arrival).
+
+Found on the way and fixed:
+
+- `/ws` status pushes reused `attack` for "the model is alerting" while REST used it for "armed":
+  added `attack_armed`.
+- Cyber World's demo displayed rule-lifted risk (`max(ml, rule)`); its UI invented the forecast band;
+  its inner launcher bound `0.0.0.0` with no token (replaced by a delegate to the root launcher).
+- Replay used a hardcoded 0.65 threshold; now the model's fitted one.
+
+Verified:
+
+- Backend tests: the four modules that failed collection now run; 29 new tests in
+  `tests/test_dashboard_evidence.py`.
+- Both UIs typecheck and build; demo strings are absent from the live bundle.
+- Screenshots of all 12 pages: Cyber World reference vs our demo (same look, differences only where
+  intended), and the real console running without models on a replayed capture.
+
+Deferred, with a design in `docs/DASHBOARD_INTEGRATION.md`: TGNE attention read-out (cannot be
+checked against real weights until the encoder is retrained).
+
+Model gaps recorded for the ML review: `do_this_in_next_session_ml_review.md` §8.

@@ -31,7 +31,7 @@ export default defineConfig(({ mode }) => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, './src'),
+        '@': path.resolve(import.meta.dirname, './src'),
       },
     },
     server: {
@@ -319,14 +319,14 @@ function figmaReactRefreshBoundaryFallback(): Plugin {
  * console's bundle carries no sample data at all.
  */
 function liveBuildDropsDemoFixtures(mode: string): Plugin {
-  const stub = path.resolve(__dirname, 'src/api/mock.live.ts')
+  const stub = path.resolve(import.meta.dirname, 'src/api/mock.live.ts')
   return {
     name: 'kira-live-build-drops-demo-fixtures',
     enforce: 'pre',
     resolveId(source, importer) {
       if (mode === 'demo' || !importer) return null
       const target = path.resolve(path.dirname(importer), source)
-      if (target === path.resolve(__dirname, 'src/api/mock')) return stub
+      if (target === path.resolve(import.meta.dirname, 'src/api/mock')) return stub
       return null
     },
   }
