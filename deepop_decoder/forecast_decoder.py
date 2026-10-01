@@ -655,9 +655,20 @@ class DeepOPTokenScorer:
         pred_tf:      [B, K] teacher-forced argmax, or None
         pred_free:    [B, K] free-running generation, or None
         """
+        self.update_device(target, input_tokens, obs_token, pred_tf=pred_tf, pred_free=pred_free)
+        self.update_host(target, has_free=pred_free is not None)
+
+    def update_host(self, target, has_free: bool):
+        """The host-side half of `update`: counts that depend on shapes only."""
+        self._n += int(target.numel())
+        if has_free:
+            self._have_free = True
+
+    def update_device(self, target, input_tokens, obs_token, pred_tf=None, pred_free=None):
+        """The device-side half of `update`: in-place accumulator updates only,
+        no host effect -- so it can be replayed as part of a CUDA graph."""
         V = self.V
         t = target.reshape(-1)
-        self._n += int(t.numel())
         self._tgt_hist += device_hist(t, V)      # bincount syncs on CUDA
 
         if pred_tf is not None:
@@ -665,7 +676,6 @@ class DeepOPTokenScorer:
             self._hit_tf += (pf == t).sum()
             self._conf_tf += device_hist(t * V + pf, V * V)
         if pred_free is not None:
-            self._have_free = True
             pr = pred_free.reshape(-1)
             self._hit_free += (pr == t).sum()
             self._conf_free += device_hist(t * V + pr, V * V)

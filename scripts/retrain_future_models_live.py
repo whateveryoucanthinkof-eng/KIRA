@@ -63,7 +63,7 @@ from deepop_decoder.train_cwa_decoder import (
 )
 from cyberworld_v4.config import get_contract
 from cyberworld_v4.device_hist import device_hist
-from cyberworld_v4.graphed_step import GraphedLoss, WholeStepGraph, graphs_enabled
+from cyberworld_v4.graphed_step import GraphedBody, GraphedLoss, WholeStepGraph, graphs_enabled
 from data_unification.host_major import batched_loader, unpack_batch
 
 
@@ -269,6 +269,151 @@ def _accumulate_ok(ok, acc_pairs, nb):
         nb += ok.to(nb.dtype)
 
 
+# --------------------------------------------------------------- validation
+#
+# Each validation batch is a forward pass plus in-place updates of a few
+# device accumulators. The bodies below are exactly what the training loops
+# ran inline; they are replayed as CUDA graphs (cyberworld_v4/graphed_step.
+# GraphedBody) because a validation batch, like a training step, is many tiny
+# kernels whose launch cost exceeded their GPU time. Host-side counters (batch
+# and token counts) are kept outside the bodies: a graph replays device work
+# only. Same kernels, same order: identical accumulators.
+
+def _bb_val_body(wdt, risk, K, step_offset):
+    def body(acc, h, target, target_risk, t_hist, t_fut):
+        pred = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut)
+        pred_risk, _ = risk.forward_trajectory(pred)
+        _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
+        acc["resid_hist"] += device_hist((_rb.view(-1, K) + step_offset).reshape(-1),
+                                         K * FORECAST_RISK_BINS)
+        acc["v_sum"] += (F.mse_loss(pred, target) + risk.risk_loss(pred_risk, target_risk)).double().sum()
+        # persistence: repeat the last observed step across the horizon
+        _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
+        acc["mse_model"] += F.mse_loss(pred, target).double()
+        acc["mse_persist"] += F.mse_loss(_last, target).double()
+        acc["bce_model"] += F.binary_cross_entropy(pred_risk, target_risk).double()
+        acc["risk_mae_model"] += (pred_risk - target_risk).abs().double().mean()
+        acc["risk_sum"] += target_risk.double().mean()
+    return body
+
+
+def validate_branch_b(wdt, risk, loader, device, K):
+    """Branch B's validation pass: the accumulators the epoch summary reads."""
+    z = lambda: torch.zeros((), device=device, dtype=torch.float64)
+    acc = {"v_sum": z(), "mse_model": z(), "mse_persist": z(), "bce_model": z(),
+           "risk_mae_model": z(), "risk_sum": z(),
+           # per-step |risk residual| histograms for the forecast's conformal band
+           "resid_hist": torch.zeros(K * FORECAST_RISK_BINS, device=device, dtype=torch.long)}
+    step_offset = (torch.arange(K, device=device) * FORECAST_RISK_BINS).view(1, K)
+    run = GraphedBody(_bb_val_body(wdt, risk, K, step_offset), acc,
+                      enabled=(str(device) == "cuda" and graphs_enabled()))
+    nblk = (str(device) == "cuda")
+    vn = risk_n = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = unpack_batch(batch, device)
+            h = batch["h_history"].to(device, non_blocking=nblk)
+            target = batch["h_future"].to(device, non_blocking=nblk)
+            target_risk = batch["risk_future"].to(device, non_blocking=nblk)
+            t_hist = batch["t_history"].to(device, non_blocking=nblk) if "t_history" in batch else None
+            t_fut = batch["t_future"].to(device, non_blocking=nblk) if "t_future" in batch else None
+            run(h, target, target_risk, t_hist, t_fut)
+            vn += 1
+            risk_n += 1
+    return {**acc, "vn": vn, "risk_n": risk_n, "graphed_batches": run.n_graphed}
+
+
+class _ScorerView:
+    """A DeepOPTokenScorer's accumulators taken from a dict, so a graph body
+    can update either the scorer's own tensors or warm-up copies of them."""
+
+    def __init__(self, V, acc):
+        self.V = V
+        for k in _SCORER_KEYS:
+            setattr(self, k, acc["sc" + k])
+
+
+_SCORER_KEYS = ("_tgt_hist", "_hit_tf", "_conf_tf", "_hit_free", "_conf_free",
+                "_hit_persist_free", "_hit_persist_fed")
+
+
+def _dp_val_body(decoder, V, with_scorer):
+    def body(acc, hv, inp, tgt, obs_seq, obs):
+        logits = decoder(hv, inp, obs_tokens=obs_seq)
+        acc["v_sum"] += F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1)).double().sum()
+        pred = logits.argmax(dim=-1)
+        if with_scorer:
+            _free, _ = decoder.forecast_sequence(
+                hv, max_steps=hv.shape[1], observed_token=obs, observed_sequence=obs_seq,
+                continuity_bonus=0.0, decode_names=False)
+            DeepOPTokenScorer.update_device(_ScorerView(V, acc), tgt, inp, obs,
+                                            pred_tf=pred, pred_free=_free)
+        flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
+        acc["hit_model"] += (flat_p == flat_t).sum()
+        acc["conf"] += device_hist(flat_t * V + flat_p, V * V)
+        acc["tgt_hist"] += device_hist(flat_t, V)
+        # persistence: the last token actually observed, repeated
+        acc["hit_persist"] += (obs.unsqueeze(1).expand_as(tgt) == tgt).sum()
+    return body
+
+
+def validate_deepop(decoder, wdt, loader, device, vocab):
+    """DeepOP's validation pass: the accumulators the epoch summary reads."""
+    V = vocab.vocab_size
+    nblk = (str(device) == "cuda")
+    try:
+        scorer = DeepOPTokenScorer(V, device=device)
+    except Exception as _e:
+        print(f"  token scorer unavailable: {_e}", flush=True); scorer = None
+    acc = {"v_sum": torch.zeros((), device=device, dtype=torch.float64),
+           "hit_model": torch.zeros((), device=device, dtype=torch.long),
+           "hit_persist": torch.zeros((), device=device, dtype=torch.long),
+           "conf": torch.zeros(V * V, device=device, dtype=torch.long),
+           "tgt_hist": torch.zeros(V, device=device, dtype=torch.long)}
+    if scorer is not None:
+        acc.update({"sc" + k: getattr(scorer, k) for k in _SCORER_KEYS})
+    run = GraphedBody(_dp_val_body(decoder, V, scorer is not None), acc,
+                      enabled=(str(device) == "cuda" and graphs_enabled()))
+    vn = tok_total = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = unpack_batch(batch, device)
+            hv = batch["h_future"].to(device, non_blocking=nblk)
+            if "h_rollout" in batch:
+                hv = batch["h_rollout"].to(device, non_blocking=nblk)
+            elif wdt is not None and "h_history" in batch:
+                _th = batch["t_history"].to(device, non_blocking=nblk) if "t_history" in batch else None
+                _tf = batch["t_future"].to(device, non_blocking=nblk) if "t_future" in batch else None
+                hv = wdt.rollout(batch["h_history"].to(device, non_blocking=nblk), K=hv.shape[1],
+                                 t_history=_th, t_future=_tf).detach()
+            tgt = batch["target_tokens"].to(device, non_blocking=nblk)
+            obs_seq = batch["obs_tokens"].to(device, non_blocking=nblk)
+            inp = batch["input_tokens"].to(device, non_blocking=nblk)
+            obs = batch.get("obs_token")
+            if obs is None:
+                # never produced by LazyCWADataset; kept for hand-built batches
+                _eager_dp_val_no_obs(decoder, V, acc, hv, inp, tgt, obs_seq)
+            else:
+                obs = obs.to(device, non_blocking=nblk)
+                run(hv, inp, tgt, obs_seq, obs)
+                if scorer is not None:
+                    scorer.update_host(tgt, has_free=True)
+            vn += 1
+            tok_total += int(tgt.numel())
+    return {**acc, "vn": vn, "tok_total": tok_total, "scorer": scorer,
+            "graphed_batches": run.n_graphed}
+
+
+def _eager_dp_val_no_obs(decoder, V, acc, hv, inp, tgt, obs_seq):
+    logits = decoder(hv, inp, obs_tokens=obs_seq)
+    acc["v_sum"] += F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1)).double().sum()
+    pred = logits.argmax(dim=-1)
+    flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
+    acc["hit_model"] += (flat_p == flat_t).sum()
+    acc["conf"] += device_hist(flat_t * V + flat_p, V * V)
+    acc["tgt_hist"] += device_hist(flat_t, V)
+
+
 def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_workers: int = 4, patience: int = 3, risk_target: str = "severity",
                         lr: float = 1e-3, step_back_after: int = 2, clip_norm: float = 1.0,
                         resume: "ResumePoint | None" = None):
@@ -405,40 +550,13 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         # with its best validation at epoch 1 -- consistent either with a model
         # that converged instantly or with one that never learned anything, and
         # nothing reported could tell those apart.
-        _v_sum = torch.zeros((), device=device, dtype=torch.float64); _vn = 0
-        _mse_model = torch.zeros((), device=device, dtype=torch.float64)
-        _mse_persist = torch.zeros((), device=device, dtype=torch.float64)
-        _bce_model = torch.zeros((), device=device, dtype=torch.float64)
-        _risk_mae_model = torch.zeros((), device=device, dtype=torch.float64)
-        _risk_sum = torch.zeros((), device=device, dtype=torch.float64)
-        _risk_n = 0
-        # Per-step |risk residual| histograms for the forecast's conformal band
-        # (see _forecast_risk_conformal). One bincount per batch, on device.
         _K = _c.forecast_steps
-        _resid_hist = torch.zeros(_K * FORECAST_RISK_BINS, device=device, dtype=torch.long)
-        _step_offset = (torch.arange(_K, device=device) * FORECAST_RISK_BINS).view(1, _K)
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = unpack_batch(batch, device)
-                h=batch["h_history"].to(device, non_blocking=_nblk)
-                target=batch["h_future"].to(device, non_blocking=_nblk)
-                target_risk=batch["risk_future"].to(device, non_blocking=_nblk)
-                t_hist=batch["t_history"].to(device, non_blocking=_nblk) if "t_history" in batch else None
-                t_fut=batch["t_future"].to(device, non_blocking=_nblk) if "t_future" in batch else None
-                pred=wdt.rollout(h,K=_c.forecast_steps,t_history=t_hist,t_future=t_fut); pred_risk,_=risk.forward_trajectory(pred)
-                _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
-                _resid_hist += device_hist((_rb.view(-1, _K) + _step_offset).reshape(-1),
-                                           _K * FORECAST_RISK_BINS)
-                _v_sum += (F.mse_loss(pred,target)+risk.risk_loss(pred_risk,target_risk)).double().sum()
-                _vn += 1
-                # persistence: repeat the last observed step across the horizon
-                _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
-                _mse_model += F.mse_loss(pred, target).double()
-                _mse_persist += F.mse_loss(_last, target).double()
-                _bce_model += F.binary_cross_entropy(pred_risk, target_risk).double()
-                _risk_mae_model += (pred_risk - target_risk).abs().double().mean()
-                _risk_sum += target_risk.double().mean()
-                _risk_n += 1
+        _va = validate_branch_b(wdt, risk, val_loader, device, _K)
+        _v_sum, _vn = _va["v_sum"], _va["vn"]
+        _mse_model, _mse_persist = _va["mse_model"], _va["mse_persist"]
+        _bce_model, _risk_mae_model = _va["bce_model"], _va["risk_mae_model"]
+        _risk_sum, _risk_n, _resid_hist = _va["risk_sum"], _va["risk_n"], _va["resid_hist"]
+        print(f"  validation: {_va['graphed_batches']} of {_va['vn']} batches as a cuda graph", flush=True)
         score=float((_v_sum/max(_vn,1)).item())
         _trl=float((_tr_sum/max(_nb,1)).item())
         _n = max(_risk_n, 1)
@@ -852,54 +970,10 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         # sitting on the class prior. Token accuracy, macro F1 over the tokens
         # actually present, and both baselines are reported together.
         V = vocab.vocab_size
-        _v_sum=torch.zeros((),device=device,dtype=torch.float64); _vn=0
-        _hit_model = torch.zeros((), device=device, dtype=torch.long)
-        _hit_persist = torch.zeros((), device=device, dtype=torch.long)
-        _tok_total = 0
-        _conf = torch.zeros(V * V, device=device, dtype=torch.long)
-        try:
-            _scorer = DeepOPTokenScorer(V, device=device)
-        except Exception as _e:
-            print(f"  token scorer unavailable: {_e}", flush=True); _scorer = None
-        _tgt_hist = torch.zeros(V, device=device, dtype=torch.long)
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = unpack_batch(batch, device)
-                hv=batch["h_future"].to(device,non_blocking=_nblk)
-                if "h_rollout" in batch:
-                    hv=batch["h_rollout"].to(device,non_blocking=_nblk)
-                elif wdt is not None and "h_history" in batch:
-                    _th=batch["t_history"].to(device,non_blocking=_nblk) if "t_history" in batch else None
-                    _tf=batch["t_future"].to(device,non_blocking=_nblk) if "t_future" in batch else None
-                    hv=wdt.rollout(batch["h_history"].to(device,non_blocking=_nblk), K=hv.shape[1],
-                                   t_history=_th, t_future=_tf).detach()
-                tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
-                obs_seq=batch["obs_tokens"].to(device,non_blocking=_nblk)
-                logits=decoder(hv,batch["input_tokens"].to(device,non_blocking=_nblk),obs_tokens=obs_seq)
-                _v_sum+=F.cross_entropy(logits.reshape(-1,V),tgt.reshape(-1)).double().sum()
-                _vn+=1
-                pred = logits.argmax(dim=-1)
-                if _scorer is not None:
-                    _obs = batch.get("obs_token")
-                    if _obs is not None:
-                        _free, _ = decoder.forecast_sequence(
-                            hv, max_steps=hv.shape[1],
-                            observed_token=_obs.to(device, non_blocking=_nblk),
-                            observed_sequence=obs_seq,
-                            continuity_bonus=0.0, decode_names=False)
-                        _scorer.update(tgt, batch["input_tokens"].to(device, non_blocking=_nblk),
-                                       _obs.to(device, non_blocking=_nblk),
-                                       pred_tf=pred, pred_free=_free)
-                flat_p, flat_t = pred.reshape(-1), tgt.reshape(-1)
-                _hit_model += (flat_p == flat_t).sum()
-                _tok_total += int(flat_t.numel())
-                _conf += device_hist(flat_t * V + flat_p, V * V)
-                _tgt_hist += device_hist(flat_t, V)
-                # persistence: the last token actually observed, repeated
-                obs = batch.get("obs_token")
-                if obs is not None:
-                    obs = obs.to(device, non_blocking=_nblk)
-                    _hit_persist += (obs.unsqueeze(1).expand_as(tgt) == tgt).sum()
+        _va = validate_deepop(decoder, wdt, val_loader, device, vocab)
+        _v_sum, _vn, _hit_model, _hit_persist = _va["v_sum"], _va["vn"], _va["hit_model"], _va["hit_persist"]
+        _tok_total, _conf, _tgt_hist, _scorer = _va["tok_total"], _va["conf"], _va["tgt_hist"], _va["scorer"]
+        print(f"  validation: {_va['graphed_batches']} of {_va['vn']} batches as a cuda graph", flush=True)
         score=float((_v_sum/max(_vn,1)).item())
         _tt = max(_tok_total, 1)
         acc = float(_hit_model.item()) / _tt

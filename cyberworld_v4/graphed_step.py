@@ -304,3 +304,71 @@ class WholeStepGraph:
             return out[0]
         self.last_extras = ()
         return out
+
+
+class GraphedBody:
+    """Replay `body(acc, *inputs)` as a CUDA graph -- for validation loops.
+
+    `body` updates the tensors in the dict `acc` in place (sums, histograms,
+    confusion matrices) from the batch tensors `inputs`, with no host-side
+    effect: a graph replays only device work, so anything Python-side (a host
+    counter, a flag) must be done by the caller, outside the body. Same kernels
+    in the same order as calling `body` eagerly, so the accumulators come out
+    identical.
+
+    Warm-up runs on scratch copies of `acc`, so the real accumulators are only
+    ever touched by real batches. Inputs of another shape (the last batch)
+    run eagerly. Capture failure falls back to eager, with a note.
+    """
+
+    def __init__(self, body: Callable, acc: dict, enabled: bool = True,
+                 log: Optional[Callable[[str], None]] = print):
+        self.body, self.acc = body, acc
+        self.enabled = bool(enabled) and torch.cuda.is_available()
+        self.log = log
+        self.error = None
+        self._g = None
+        self._sig = None
+        self.n_graphed = 0
+        self.n_eager = 0
+
+    def __call__(self, *inputs):
+        if self.enabled and all(torch.is_tensor(x) and x.is_cuda for x in inputs):
+            sig = GraphedLoss._signature(inputs)
+            if self._g is None:
+                self._capture(inputs)
+            if self._g is not None and sig == self._sig:
+                for s, x in zip(self._static, inputs):
+                    s.copy_(x, non_blocking=True)
+                self._g.replay()
+                self.n_graphed += 1
+                return
+        self.n_eager += 1
+        self.body(self.acc, *inputs)
+
+    def _capture(self, inputs):
+        dev = inputs[0].device
+        cuda_rng, cpu_rng = torch.cuda.get_rng_state(dev), torch.get_rng_state()
+        try:
+            static = [x.detach().clone() for x in inputs]
+            scratch = {k: v.clone() for k, v in self.acc.items()}
+            side = torch.cuda.Stream(device=dev)
+            side.wait_stream(torch.cuda.current_stream(dev))
+            with torch.cuda.stream(side), torch.no_grad():
+                for _ in range(2):
+                    self.body(scratch, *static)
+            torch.cuda.current_stream(dev).wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(g, stream=side, capture_error_mode="thread_local"):
+                self.body(self.acc, *static)
+            self._g, self._static = g, static
+            self._sig = GraphedLoss._signature(inputs)
+        except Exception as e:
+            self._g = None
+            self.enabled = False
+            self.error = f"{type(e).__name__}: {e}"
+            if self.log is not None:
+                self.log(f"  validation cuda graph unavailable ({self.error}); running eagerly")
+        finally:
+            torch.cuda.set_rng_state(cuda_rng, dev)
+            torch.set_rng_state(cpu_rng)
