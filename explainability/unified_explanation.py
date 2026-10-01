@@ -41,6 +41,23 @@ assert len(FEATURE_NAMES) == 27, (
     f"Branch A input is 27-D (12 embedding + 15 attributes); got {len(FEATURE_NAMES)}"
 )
 
+# A Branch A trained with --packet-features reads 57-D: the 15 flow attributes
+# plus the 30 PCAP packet-level ones (TTL, TCP window, retransmissions, IAT,
+# SYN/scan signatures, ...), in the extractor's order.
+from data_unification.host_attributes import EXTENDED_HOST_ATTRIBUTES  # noqa: E402
+
+FEATURE_NAMES_PACKET = TGNE_LATENT_NAMES + list(EXTENDED_HOST_ATTRIBUTES)
+
+
+def feature_names_for(width: int) -> List[str]:
+    """The names of a Branch A input row of `width` columns."""
+    if width == len(FEATURE_NAMES):
+        return FEATURE_NAMES
+    if width == len(FEATURE_NAMES_PACKET):
+        return FEATURE_NAMES_PACKET
+    raise ValueError(f"no feature names for a {width}-wide input "
+                     f"(known: {len(FEATURE_NAMES)}, {len(FEATURE_NAMES_PACKET)})")
+
 
 @dataclass
 class UnifiedExplanation:
@@ -172,11 +189,13 @@ class UnifiedExplainer:
             seq = np.asarray(feature_sequence, dtype=np.float32)
             if seq.ndim == 3 and seq.shape[0] == 1:
                 seq = seq[0]
-            if seq.ndim != 2 or seq.shape[-1] != len(FEATURE_NAMES):
+            if seq.ndim != 2 or seq.shape[-1] not in (len(FEATURE_NAMES), len(FEATURE_NAMES_PACKET)):
                 raise ValueError(
-                    f"feature_sequence must be [T, {len(FEATURE_NAMES)}] (the window that "
-                    f"was scored); got {np.asarray(feature_sequence).shape}"
+                    f"feature_sequence must be [T, {len(FEATURE_NAMES)}] or "
+                    f"[T, {len(FEATURE_NAMES_PACKET)}] (the window that was scored); "
+                    f"got {np.asarray(feature_sequence).shape}"
                 )
+            names = feature_names_for(seq.shape[-1])
             # The sequence length is the model's, not a literal: this was
             # hardcoded to 5 in four places while the contract is 15, so even a
             # correctly-populated window would have been truncated to its last
@@ -219,7 +238,7 @@ class UnifiedExplainer:
                 grads = (
                     x.grad[0, -1, :].cpu().numpy()
                     if x.grad is not None
-                    else np.zeros(len(FEATURE_NAMES), dtype=np.float32)
+                    else np.zeros(len(names), dtype=np.float32)
                 )
                 inputs = x[0, -1, :].detach().cpu().numpy()
                 attributions = np.abs(grads * inputs)
@@ -230,7 +249,7 @@ class UnifiedExplainer:
             if total_attr > 0:
                 attributions = attributions / total_attr
             feat_ranks = sorted(
-                zip(FEATURE_NAMES, [float(v) for v in attributions]),
+                zip(names, [float(v) for v in attributions]),
                 key=lambda item: item[1],
                 reverse=True,
             )[:5]

@@ -1285,7 +1285,7 @@ def _pcap_trajectories_per_day(args, extractor):
     # -- worse, if defaulted -- be folded into training. It is extracted and
     # kept separate so a held-out PCAP evaluation is possible, and it is never
     # returned to the trainers.
-    builders = {k: TrajectoryStoreBuilder(spill_dir=spill)
+    builders = {k: TrajectoryStoreBuilder(spill_dir=spill, feat_dim=12 + extractor.n_temporal_attrs)
                 for k in ("train", "val", "test")}
     wbase = {"train": 0, "val": 0, "test": 0}
     from data_unification.capture_columns import columns_plan
@@ -1367,6 +1367,10 @@ def main():
     parser.add_argument("--rows-per-file",type=int,default=None,
                         help="Cap records kept per capture. Default None = FULL DENSITY.")
     parser.add_argument("--stride",type=int,default=1)
+    parser.add_argument("--packet-features", action="store_true",
+                        help="Append the 30 PCAP packet-level host attributes (TTL, IAT, TCP "
+                             "window, retransmissions, SYN/scan signatures): state 27-D -> 57-D. "
+                             "Needs PCAP-derived train AND test captures.")
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=12,
                         help="Upper bound; the training guard stops each model once "
@@ -1435,7 +1439,14 @@ def main():
     enable_fast_extraction(tgn)   # serial extraction paths; workers do the same
     extractor=HostTrajectoryExtractor(
         tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds,
-        spill_dir=str(args.spill_dir) if args.spill_dir else None)
+        spill_dir=str(args.spill_dir) if args.spill_dir else None,
+        include_packet_features=args.packet_features)
+    if args.packet_features:
+        print("PACKET-LEVEL FEATURES ON: host state = 12 latent + 15 flow + 30 packet "
+              "attributes (TTL, IAT, TCP window, retransmissions, SYN/scan signatures, ...). "
+              "Only PCAP captures carry them; flow-only captures (CTU-13 NetFlow, "
+              "CICFlowMeter CSVs) get an all-zero packet block, which a model can read as "
+              "'which corpus is this'. Train and test on PCAP-derived captures.", flush=True)
 
     require_full_density(
         'Branch B + DeepOP retrain',
@@ -1494,7 +1505,7 @@ def main():
         _spill = str(args.spill_dir) if args.spill_dir else None
 
         def _store_per_capture(files, label):
-            shared = TrajectoryStoreBuilder(spill_dir=_spill)
+            shared = TrajectoryStoreBuilder(spill_dir=_spill, feat_dim=12 + extractor.n_temporal_attrs)
             widx_base, total = 0, 0
             for i, f in enumerate(files):
                 t = time.time()
@@ -1655,7 +1666,7 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
 
     _c = get_contract()
     caps = discover_captures(scheme="cross_year", cic2017_dir=args.cic2017_dir)["test"]
-    b = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+    b = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None, feat_dim=12 + extractor.n_temporal_attrs)
     wbase = 0
     from data_unification.capture_columns import ColumnSpec, columns_plan, iter_capture_columns
     plan = columns_plan(args.capture_cache, args.spill_dir, extractor)

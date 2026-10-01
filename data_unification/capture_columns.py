@@ -81,7 +81,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 
 #: Bump when the on-disk layout or the meaning of a column changes.
-FORMAT = 2
+FORMAT = 3   # 3: the "pkt" column + pkt_feats.npy (packet-level features per host-window)
 
 #: (name, dtype). Every column has one row per kept record, sorted by start.
 COLUMNS: Tuple[Tuple[str, str], ...] = (
@@ -92,6 +92,9 @@ COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("protocol", "int64"), ("dst_port", "int64"),
     ("is_attack", "bool"), ("cat", "int32"), ("tech", "int32"),
     ("unresolved", "bool"),
+    # Row of pkt_feats.npy holding this record's host-window packet-level
+    # features (30, normalised as normalize_packet_features does), or -1.
+    ("pkt", "int32"),
 )
 EDGE_DIM = 12
 _CHUNK = 1 << 16
@@ -255,6 +258,9 @@ class CaptureColumns:
             cov = dict(cov)
             cov["top_unresolved_labels"] = [tuple(x) for x in cov["top_unresolved_labels"]]
         self.coverage = cov
+        #: (n_host_windows, 30) float32, normalised packet-level features;
+        #: the "pkt" column indexes it. Empty for flow-only corpora.
+        self.pkt_table: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return int(self.meta["n"])
@@ -291,6 +297,7 @@ class CaptureColumns:
         mode = "r" if mmap else None
         cols = {name: np.load(d / f"{name}.npy", mmap_mode=mode) for name, _ in COLUMNS}
         edge = np.load(d / "edge.npy", mmap_mode=mode)
+        pkt_table = np.load(d / "pkt_feats.npy", mmap_mode=mode)
         if drop_unresolved:
             if meta["n_unresolved"]:
                 keep = ~np.asarray(cols["unresolved"])
@@ -299,7 +306,9 @@ class CaptureColumns:
                 meta["n"] = int(keep.sum())
         else:
             meta["coverage"] = None
-        return cls(cols, edge, meta, d)
+        out = cls(cols, edge, meta, d)
+        out.pkt_table = pkt_table
+        return out
 
 
 @contextmanager
@@ -339,6 +348,7 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
     from data_unification.label_filter import _category
     from data_unification.label_resolver import is_unresolved
     from data_unification.tgne_features import extract_flow_record_edge_features
+    from data_unification.host_attributes import PACKET_ATTR_DIM, normalize_packet_features
 
     t0 = time.time()
     out_dir = Path(out_dir)
@@ -351,8 +361,16 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
     n_total = n_bad = n = 0
     fh = {name: open(out_dir / f"{name}.bin", "wb") for name, _ in COLUMNS}
     fh_edge = open(out_dir / "edge.bin", "wb")
+    fh_pkt = open(out_dir / "pkt_feats.bin", "wb")
     buf: Dict[str, list] = {name: [] for name, _ in COLUMNS}
     ebuf: List[np.ndarray] = []
+    pbuf: List[np.ndarray] = []
+    # pcap_bridge attaches ONE dict per host-window to that host-window's
+    # records, which arrive contiguously: a new object is a new table row.
+    # (Identity of the previous object only -- it is still referenced, so its
+    # id cannot have been reused.)
+    pkt_last = [None, -1]
+    n_pkt = 0
 
     def flush():
         for name, dt in COLUMNS:
@@ -362,6 +380,9 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
         if ebuf:
             np.stack(ebuf).astype(np.float32, copy=False).tofile(fh_edge)
             ebuf.clear()
+        if pbuf:
+            np.stack(pbuf).astype(np.float32, copy=False).tofile(fh_pkt)
+            pbuf.clear()
 
     it = records if records is not None else iter_spec_records(spec)
     b_src, b_dst = buf["src"], buf["dst"]
@@ -369,6 +390,7 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
     b_fb, b_bb, b_fp, b_bp = buf["fwd_bytes"], buf["bwd_bytes"], buf["fwd_packets"], buf["bwd_packets"]
     b_proto, b_port, b_atk = buf["protocol"], buf["dst_port"], buf["is_attack"]
     b_cat, b_tech, b_unres = buf["cat"], buf["tech"], buf["unresolved"]
+    b_pkt = buf["pkt"]
     try:
         with _edge_ablation_off():
             for r in it:
@@ -410,6 +432,17 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
                     i = tech_index[tt] = len(tech_index)
                 b_tech.append(i)
                 ebuf.append(extract_flow_record_edge_features(r))
+                md = getattr(r, "metadata", None)
+                pf = md.get("packet_features") if md else None
+                if not pf:
+                    b_pkt.append(-1)
+                elif pf is pkt_last[0]:
+                    b_pkt.append(pkt_last[1])
+                else:
+                    pbuf.append(normalize_packet_features(pf))
+                    pkt_last[0], pkt_last[1] = pf, n_pkt
+                    b_pkt.append(n_pkt)
+                    n_pkt += 1
                 n += 1
                 if len(b_src) >= _CHUNK:
                     flush()
@@ -418,7 +451,11 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
         for f in fh.values():
             f.close()
         fh_edge.close()
+        fh_pkt.close()
     t_parse = time.time() - t0
+    np.save(out_dir / "pkt_feats.npy",
+            np.fromfile(out_dir / "pkt_feats.bin", dtype=np.float32).reshape(-1, PACKET_ATTR_DIM))
+    os.unlink(out_dir / "pkt_feats.bin")
 
     # Stable sort by start time: the order process_records' and
     # extract_trajectories' `sorted(records, key=start_time)` produce.

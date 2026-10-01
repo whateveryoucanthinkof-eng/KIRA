@@ -115,7 +115,8 @@ def extract_parallel(
     kw = dict(window_size_sec=extractor.window_size_sec,
               n_temporal_attrs=extractor.n_temporal_attrs,
               attack_role=extractor.attack_role,
-              n_neighbors=extractor.n_neighbors)
+              n_neighbors=extractor.n_neighbors,
+              include_packet_features=extractor.include_packet_features)
     repo = str(Path(__file__).resolve().parents[1])
     part_dir = Path(part_dir)
     part_dir.mkdir(parents=True, exist_ok=True)

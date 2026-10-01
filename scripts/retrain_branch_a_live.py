@@ -1216,6 +1216,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows-per-file", type=int, default=None,
                         help="Cap records kept per capture. Default None = FULL DENSITY.")
+    parser.add_argument("--packet-features", action="store_true",
+                        help="Append the 30 PCAP packet-level host attributes (TTL, IAT, TCP "
+                             "window, retransmissions, SYN/scan signatures): state 27-D -> 57-D. "
+                             "Needs PCAP-derived train AND test captures.")
     parser.add_argument("--spill-dir", type=Path, default=None, help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (applied in data_unification/training_sources.read_capture)")
     parser.add_argument("--epochs", type=int, default=5)
@@ -1474,7 +1478,14 @@ def main():
     # produces history_steps=15, so it yields a v4 checkpoint, not a v3 one.
     _c = get_contract()
     extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=_c.window_seconds,
-                                        spill_dir=str(args.spill_dir) if args.spill_dir else None)
+                                        spill_dir=str(args.spill_dir) if args.spill_dir else None,
+                                        include_packet_features=args.packet_features)
+    if args.packet_features:
+        print("PACKET-LEVEL FEATURES ON: host state = 12 latent + 15 flow + 30 packet "
+              "attributes (TTL, IAT, TCP window, retransmissions, SYN/scan signatures, ...). "
+              "Only PCAP captures carry them; flow-only captures (CTU-13 NetFlow, "
+              "CICFlowMeter CSVs) get an all-zero packet block, which a model can read as "
+              "'which corpus is this'. Train and test on PCAP-derived captures.", flush=True)
     # Load -> extract -> free, one split at a time. Holding both record lists
     # at once costs an extra ~2.8 GB at full density for no reason: the val
     # records are not needed until the train split has already been reduced to
@@ -1539,7 +1550,7 @@ def main():
             # extractor's, to be reported (and reset) below as before.
             shared, total_recs, coverage, extractor._exposure = _prebuilt.pop(label)
         else:
-            shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+            shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None, feat_dim=12 + extractor.n_temporal_attrs)
         if label in _done_labels:
             pass
         elif _cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1:
@@ -1661,7 +1672,7 @@ def main():
         from data_unification.parallel_extract import extract_parallel
         from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
         splits = (("train", list(train_files)), ("val", list(val_files)), ("test", list(test_files)))
-        builders = {l: TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+        builders = {l: TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None, feat_dim=12 + extractor.n_temporal_attrs)
                     for l, _ in splits}
         expo = {l: dict.fromkeys(extractor._exposure, 0) for l, _ in splits}
         cov = {l: [] for l, _ in splits}
@@ -1835,7 +1846,7 @@ def main():
         _arch["focal_gamma"] = args.focal_gamma
     print(f"Branch A architecture: {args.architecture} {_arch}", flush=True)
     model = MultiTaskLSTM(
-        input_dim=27,
+        input_dim=12 + extractor.n_temporal_attrs,
         num_techniques=len(TECHNIQUE_VOCAB),
         num_gradations=4,
         risk_objective=args.risk_objective,
@@ -2299,7 +2310,7 @@ def main():
         print("\nlogistic-regression baseline (PS 26153): same [L, 27] inputs and time channel, "
               "same target, same operating-point rule", flush=True)
         _lr = train_logistic_baseline(train_loader, unpack_batch, device,
-                                      seq_len=_c.history_steps, input_dim=27,
+                                      seq_len=_c.history_steps, input_dim=12 + extractor.n_temporal_attrs,
                                       risk_positive_above=risk_positive_above,
                                       epochs=args.lr_baseline_epochs,
                                       log=lambda m: print(m, flush=True))
@@ -2322,7 +2333,8 @@ def main():
         benchmark = benchmark_table(_thr, _hists, test_metrics.get("persistence_counts"))
         print(format_benchmark(benchmark, "held-out test"), flush=True)
         ckpt["logistic_baseline"] = {"state_dict": _lr.state_dict(), "operating_point": _lr_op,
-                                     "seq_len": _c.history_steps, "input_dim": 27}
+                                     "seq_len": _c.history_steps,
+                                     "input_dim": 12 + extractor.n_temporal_attrs}
     test_metrics = slim(test_metrics)
     test_metrics["tech_per_class"] = _per_class
     test_metrics["gradation_per_class"] = _grad_per_class

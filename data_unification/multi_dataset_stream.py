@@ -818,8 +818,6 @@ class HostTrajectoryExtractor:
         across calls, or draws random numbers in a different order (uniform
         neighbour sampling).
         """
-        if self.include_packet_features:
-            return "include_packet_features reads record.metadata, which the columns do not keep"
         if self.heuristic_label_augmentation or heuristic_label_override_enabled():
             return "the heuristic label override fingerprints whole records"
         if self.auth_events:
@@ -866,6 +864,10 @@ class HostTrajectoryExtractor:
         dst_c = np.asarray(cols.dst)
         timestamps = np.asarray(cols.start, dtype=np.float64)
         n_ips = len(cols.ips)
+        pkt_table = getattr(cols, "pkt_table", None)
+        if self.include_packet_features and pkt_table is None:
+            raise ValueError("include_packet_features needs capture columns of format >= 3 "
+                             "(the 'pkt' column and pkt_feats.npy); rebuild the column cache")
 
         # Node ids exactly as FlowToTemporalEventAdapter.get_or_create_node_id
         # assigns them over time-sorted records: src then dst, first seen first.
@@ -1040,6 +1042,16 @@ class HostTrajectoryExtractor:
             attrs[:, 12] = np.minimum(1.0, np.log1p(f64(tot_b) / dur_window) / BYTE_RATE_LOG_SCALE)
             attrs[:, 13] = np.minimum(1.0, np.log1p(f64(tot_p) / dur_window) / COUNT_LOG_SCALE)
             attrs[:, 14] = np.minimum(1.0, f64(n_peers) / nf)
+            if self.include_packet_features:
+                # The record path's _packet_features_of(host_recs): the FIRST
+                # of the host's records in this window (window order) that
+                # carries packet features. Groups are in (host, record) order,
+                # so that is each host's first such row.
+                pk = np.asarray(cols.pkt[s_idx:e_idx])[j]
+                has = np.flatnonzero(pk >= 0)
+                if has.size:
+                    hh, first = np.unique(h[has], return_index=True)
+                    attrs[hh, HOST_ATTR_DIM:] = np.asarray(pkt_table)[pk[has[first]]]
 
             atk_rec = np.asarray(cols.is_attack[s_idx:e_idx])[j]
             if role == "target":

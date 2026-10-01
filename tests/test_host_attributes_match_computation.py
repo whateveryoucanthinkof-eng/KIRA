@@ -230,10 +230,11 @@ def test_the_dashboard_group_map_covers_every_attribute():
     ns = {}
     exec(compile(src.split("class AntigravityModelAdapter")[0], "ma", "exec"), ns)
     group_map = ns["FEATURE_GROUP_MAP"]
-    for name in HOST_ATTRIBUTES:
+    from data_unification.host_attributes import PACKET_ATTRIBUTES
+    for name in list(HOST_ATTRIBUTES) + list(PACKET_ATTRIBUTES):
         assert name in group_map, f"{name} has no dashboard group"
-    dangling = [k for k in group_map
-                if not k.startswith("H_emb_") and k not in HOST_ATTRIBUTES]
+    dangling = [k for k in group_map if not k.startswith("H_emb_")
+                and k not in HOST_ATTRIBUTES and k not in PACKET_ATTRIBUTES]
     assert not dangling, f"group map keys that are not real attributes: {dangling}"
 
 

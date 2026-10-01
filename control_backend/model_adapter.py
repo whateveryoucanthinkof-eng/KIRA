@@ -126,9 +126,27 @@ if _missing or _extra:
         f"missing={_missing} unknown={_extra}"
     )
 
+def _packet_group(name: str) -> str:
+    """Console group of one PCAP packet-level attribute (--packet-features)."""
+    for prefix, group in (("ttl_", "Packet: TTL"), ("tcp_window", "Packet: TCP window"),
+                          ("tcp_retransmission", "Packet: Retransmission"),
+                          ("pkt_iat", "Packet: Timing"), ("payload_", "Packet: Payload"),
+                          ("syn_", "Packet: TCP flags"), ("rst_after_syn", "Packet: TCP flags"),
+                          ("tcp_handshake", "Packet: TCP flags"),
+                          ("vertical_scan", "Packet: Scan signature"),
+                          ("horizontal_scan", "Packet: Scan signature"),
+                          ("http_", "Packet: HTTP"), ("dns_", "Packet: DNS")):
+        if name.startswith(prefix):
+            return group
+    return "Packet: Fan-out"
+
+
+from data_unification.host_attributes import PACKET_ATTRIBUTES  # noqa: E402
+
 FEATURE_GROUP_MAP = {
     **{f"H_emb_{i}": "TGNE Latent" for i in range(12)},
     **_ATTR_GROUPS,
+    **{n: _packet_group(n) for n in PACKET_ATTRIBUTES},
 }
 
 class AntigravityModelAdapter:
@@ -226,6 +244,20 @@ class AntigravityModelAdapter:
         # model (1 x 256 LSTM, linear heads) or the older 2 x 64 variant.
         self.branch_a = MultiTaskLSTM.from_checkpoint(ckpt, device=self.device)
         self.branch_a.eval()
+        # A Branch A trained with --packet-features reads 12 + 45 per window.
+        # The live extractor must then append the same 30 packet-level
+        # attributes, or every window would arrive 30 columns short.
+        from data_unification.host_attributes import EXTENDED_HOST_ATTR_DIM, HOST_ATTR_DIM
+        _want = int(self.branch_a.input_dim) - 12
+        from explainability.unified_explanation import feature_names_for
+        self.feature_names = feature_names_for(int(self.branch_a.input_dim))
+        if _want == EXTENDED_HOST_ATTR_DIM:
+            self.extractor = HostTrajectoryExtractor(
+                tgne_ta_model=self.tgn, window_size_sec=self.window_seconds,
+                persist_memory=True, include_packet_features=True)
+        elif _want != HOST_ATTR_DIM:
+            raise RuntimeError(f"Branch A expects {_want} host attributes per window; the "
+                               f"extractor produces {HOST_ATTR_DIM} or {EXTENDED_HOST_ATTR_DIM}")
         self._adopt_contract(ckpt, "branch_a")
         self._warn_if_not_credible(ckpt, "branch_a")
 
@@ -527,7 +559,7 @@ class AntigravityModelAdapter:
         group_scores: Dict[str, float] = {}
         top_features: List[ExplainabilityFeature] = []
         ranked = sorted(
-            zip(FEATURE_NAMES, attributions.tolist()),
+            zip(getattr(self, "feature_names", FEATURE_NAMES), attributions.tolist()),
             key=lambda t: t[1],
             reverse=True,
         )
@@ -882,7 +914,8 @@ class AntigravityModelAdapter:
             mitigation_status = "recorded_quiet"
 
         explain, attributions = self._explain_full(x_tensor, t_history)
-        state_dims = state_vector(FEATURE_NAMES, FEATURE_GROUP_MAP, feature_vector, attributions)
+        state_dims = state_vector(getattr(self, "feature_names", FEATURE_NAMES), FEATURE_GROUP_MAP,
+                                  feature_vector, attributions)
         branches = self._forecast_branches(
             h_future, observed_seq, obs_token_tensor, lane_of(obs_technique))
         inf_ms = (time.perf_counter() - t0) * 1000.0
@@ -928,7 +961,7 @@ class AntigravityModelAdapter:
             model=ModelMetadata(
                 name="Antigravity-DualBranch-DeepOP",
                 version="3.2-SOC",
-                feature_count=27,
+                feature_count=len(getattr(self, "feature_names", FEATURE_NAMES)),
                 history_steps=self.history_steps,
                 window_seconds=self.window_seconds,
                 forecast_steps=self.forecast_steps,

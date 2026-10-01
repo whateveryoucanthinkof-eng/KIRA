@@ -79,6 +79,10 @@ SEEDS_EXTRA=(123 2024)             # with 42 from `compare`: cyberworld_v4.confi
 # PLAN_ENCODER_EXTRA / PLAN_BRANCH_A_EXTRA / PLAN_DOWNSTREAM_EXTRA are appended
 # to each stage's arguments (later flags win). scripts/dry_run_plan.py uses
 # them to run this exact plan on a tiny synthetic corpus.
+# PCAP packet-level features (TTL, IAT, TCP window, retransmissions, SYN/scan
+# signatures; 27-D -> 57-D state) are opt-in: add --packet-features to BOTH
+# PLAN_BRANCH_A_EXTRA and PLAN_DOWNSTREAM_EXTRA, and only with PCAP-derived
+# test captures (flow-only corpora get an all-zero packet block).
 ENCODER_ARGS="--use_memory --n_degree 10 --n_epoch 50 --patience 3 --step_back_after 2 \
 --ingest_workers $INGEST_WORKERS --ingest_cache $INGEST_CACHE --shared_setup_dir $SHARED_SETUP ${PLAN_ENCODER_EXTRA:-}"
 BRANCH_A_ARGS="--architecture paper --risk-objective soft_bce --risk-target hazard \
