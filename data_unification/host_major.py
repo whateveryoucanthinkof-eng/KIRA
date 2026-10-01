@@ -137,17 +137,59 @@ def host_major_for(store, rows_list, host_major: Optional[bool] = None,
     -- two datasets over the same store -- share one.
     """
     flat, base = flat_row_order(rows_list)
+    cached = getattr(store, "_host_major_cache", None)
+    if cached is not None and cached[0] is flat and host_major is not False:
+        return flat, base, cached[1]
     if host_major is None:
         host_major = isinstance(store.feats, np.memmap)
     if not host_major:
         return flat, base, None
-    cached = getattr(store, "_host_major_cache", None)
-    if cached is not None and cached[0] is flat:
-        return flat, base, cached[1]
     hm = host_major_copy(store.feats, flat, spill_dir)
     if flat is getattr(rows_list[0], "base", None):     # the store's own order: shareable
         store._host_major_cache = (flat, hm)
+        if isinstance(store.feats, np.memmap) and len(flat) == store.feats.shape[0]:
+            # One copy on disk, not two: the store now reads its rows from the
+            # host-major copy, and the original block (unlinked when it was
+            # spilled) is released -- 8.4 GB back at full scale.
+            store.feats = RowMappedFeats(hm, flat)
     return flat, base, hm
+
+
+class RowMappedFeats:
+    """A store's feature block served from its host-major copy.
+
+    Row r of the original block is `hm[pos[r]]`, with pos the inverse of the
+    host-major order, so every read returns the same bytes as before. Supports
+    what the store's readers use: a row, a slice, an array of rows (any shape),
+    any of those followed by column indices, `.shape`, `.dtype`, `.nbytes`,
+    `len()` and `np.asarray()`.
+    """
+
+    def __init__(self, hm, flat):
+        self.hm = hm
+        pos = np.empty(len(flat), dtype=np.int32 if len(flat) < 2 ** 31 else np.int64)
+        pos[flat] = np.arange(len(flat), dtype=pos.dtype)
+        self.pos = pos
+        self.shape = tuple(hm.shape)
+        self.dtype = hm.dtype
+        self.ndim = hm.ndim
+        self.nbytes = hm.nbytes
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, key):
+        rows, rest = (key[0], key[1:]) if isinstance(key, tuple) else (key, ())
+        if isinstance(rows, slice):
+            rows = np.arange(*rows.indices(self.shape[0]))
+        p = self.pos[rows] if np.isscalar(rows) or isinstance(rows, (int, np.integer)) \
+            else self.pos[np.asarray(rows)]
+        out = np.asarray(self.hm[p])
+        return out[(Ellipsis,) + tuple(rest)] if rest else out
+
+    def __array__(self, dtype=None, copy=None):
+        out = np.asarray(self.hm)[self.pos]
+        return out.astype(dtype, copy=False) if dtype is not None else out
 
 
 class BatchedView:

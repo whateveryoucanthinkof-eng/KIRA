@@ -162,3 +162,34 @@ def test_packed_batches_unpack_to_identical_tensors(store, device):
                 assert torch.equal(x[k], y[k].cpu()), k
             else:
                 assert x[k] == y[k]
+
+
+def test_store_reads_through_host_major_copy_identically(tmp_path):
+    """After the host-major copy, the store serves its rows from it (one copy
+    on disk, not two): every access pattern returns the original bytes."""
+    from data_unification.host_major import RowMappedFeats
+    from branch_b_world_model.train_branch_b import LazyHostRolloutDataset
+    st = make_store(30_000, 1_500, n_windows=3_000, seed=4, small_frac=0.8)
+    ref = np.array(st.feats)
+    path = tmp_path / "f.bin"
+    ref.tofile(path)
+    st.feats = np.memmap(path, dtype=np.float32, mode="r", shape=ref.shape)
+    rng = np.random.default_rng(0)
+    keys = [5, -1, int(rng.integers(len(ref))), slice(10, 50), slice(None, None, 7),
+            rng.integers(0, len(ref), 300), rng.integers(0, len(ref), (40, 15)),
+            (17, slice(None, 12)), (rng.integers(0, len(ref), 64), slice(12, None))]
+    before = [np.array(st.feats[k]) for k in keys]
+    ds = LazyHostSequenceDataset(st, seq_len=15, min_trajectory_len=1)
+    ds.enable_batched(host_major=True, spill_dir=str(tmp_path))
+    assert isinstance(st.feats, RowMappedFeats)
+    for k, b in zip(keys, before):
+        a = st.feats[k]
+        assert a.shape == b.shape and a.dtype == b.dtype and np.array_equal(a, b), k
+    assert np.array_equal(np.asarray(st.feats), ref)
+    assert st.feats.shape == ref.shape and st.n_snapshots == len(ref)
+    # a second dataset on the same store reuses the copy instead of making another
+    ds2 = LazyHostRolloutDataset(st, T=15, K=5)
+    ds2.enable_batched(spill_dir=str(tmp_path))
+    assert ds2._feats_hm is ds._feats_hm
+    idx = np.arange(0, len(ds2), 11)[:200]
+    _same(default_collate([ds2[int(i)] for i in idx]), ds2.gather_batch(idx))
