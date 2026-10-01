@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--legacy", action="store_true", help="per-sample loader + syncing guard step")
     ap.add_argument("--no-graph", action="store_true")
     ap.add_argument("--whole", action="store_true", help="whole-step graph (deferred_step_graphed)")
+    ap.add_argument("--pack", action="store_true", help="one buffer per batch")
     a = ap.parse_args()
     sys.path.insert(0, os.path.abspath(a.repo))
     sys.path.insert(0, str(HERE))
@@ -96,7 +97,7 @@ def main():
     else:
         from data_unification.host_major import batched_loader
         ds.enable_batched()
-        dl = batched_loader(ds, bs, True, **kwl)
+        dl = batched_loader(ds, bs, True, pack=a.pack, **kwl)
     guard = TrainingGuard("x", mods, opt, mode="min", patience=3, step_back_after=2,
                           warmup_steps=500, clip_norm=1.0, log=print,
                           **({} if a.legacy else {'graph_undo': not getattr(a, 'no_graph', False)}))
@@ -113,7 +114,11 @@ def main():
         m.train()
     acc = torch.zeros((), device=dev, dtype=torch.float64)
 
+    from data_unification.host_major import unpack_batch
+
     def one(b):
+        if a.pack:
+            b = unpack_batch(b, dev)
         opt.zero_grad(set_to_none=True)
         if whole is not None:
             loss, ok = guard.deferred_step_graphed(whole, inputs(b))
@@ -133,7 +138,7 @@ def main():
         one(next(it))
     torch.cuda.synchronize()
     el = time.perf_counter() - t0
-    tag = "legacy" if a.legacy else ("new" + ("+whole" if a.whole else ("" if a.no_graph else "+graph")))
+    tag = "legacy" if a.legacy else ("new" + ("+whole" if a.whole else ("" if a.no_graph else "+graph")) + ("+pack" if a.pack else ""))
     print(f"RESULT {a.model} {tag} w{a.workers} {a.batches / el:.1f} batch/s "
           f"({1e3 * el / a.batches:.2f} ms/batch)", flush=True)
 

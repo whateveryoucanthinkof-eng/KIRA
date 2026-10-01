@@ -45,10 +45,16 @@ SM ~21 % at idle clocks).
 | Sync-free training step (`backward_step_deferred`), `effective_temperature` on device (2 syncs/step), cached `_tech_level` (sync H2D copy/step) | -- | end to end |
 | Validation without syncs (`cyberworld_v4/device_hist.py` instead of bincount/boolean masks) | 327 -> 358 batch/s | `tests/test_branch_a_eval_hist.py` |
 | Forward+backward as a CUDA graph (`cyberworld_v4/graphed_step.py`; warm-up RNG restored, partial batches eager) | step 3.39 -> 1.26 ms; loop 219 -> 374 | `tests/test_graphed_step.py` (dropout live) + end to end (87 graphed steps) |
-| Guard snapshot/undo as CUDA graphs (`TrainingGuard(graph_undo=True)`) | 374 -> **418 batch/s** | NaN-skip + optimizer-reload test + end to end |
+| Guard snapshot/undo as CUDA graphs (`TrainingGuard(graph_undo=True)`) | 374 -> 418 batch/s | NaN-skip + optimizer-reload test + end to end |
+| **Whole step as one CUDA graph** (`TrainingGuard.deferred_step_graphed` + `WholeStepGraph`: forward, loss, backward, clipping, finite checks, snapshot; only Adam eager) | 422 -> 518 batch/s | 150-step test with inf-injected batches, partial batch, epoch boundary, optimizer reload: identical losses, weights, counters; end to end |
+| **One buffer per batch** (`host_major.pack_batch` / `unpack_batch`: one shm handle, one pin, one H2D copy) | 509 -> **770 batch/s** | pack/pin/unpack test + loader order test + end to end |
 
-**Projected full-scale epoch:** 529,723 batches at ~400 batch/s = **~22 min**
-(was ~5 h). Validation (139k batches) ~6.5 min.
+Branch A loop overall (store in RAM, same input, interleaved): **211 -> 770
+batch/s (3.6x)**; at full scale the old loop was I/O-bound at 24.5-29 batch/s,
+so **~25x**. Host 1.30 ms/batch vs ~1 ms GPU: close to the GPU.
+
+**Projected full-scale epoch:** 529,723 batches at ~700 batch/s = **~13 min**
+(was ~5 h). Validation (139k batches) a few minutes.
 
 ## 2. Branch B
 
@@ -79,7 +85,12 @@ syncs per step (`bool(sup.any())`, boolean column mask).
 | Host-major batched gather + per-row token table | loader 37.0 -> **467 batch/s** | batched-loader tests + end to end |
 | Oversampling mask from a cumulative sum; vectorised histogram | index 309 s -> 99 s; histogram minutes -> seconds | compared with the old loops in the tests |
 | `smoothed_and_plain_ce(support_index=...)` | removes 2 syncs/step, makes the loss capturable | values and gradients equal (test) |
-| CUDA-graphed step + graphed guard undo | loop 78.0 -> **257 batch/s** | end to end (77 graphed steps) |
+| CUDA-graphed step + graphed guard undo | loop 78.0 -> 257 batch/s | end to end (77 graphed steps) |
+| Whole step as one CUDA graph | 257 -> **295 batch/s** | end to end (76 of 78 steps graphed) |
+| Validation: `forecast_sequence(decode_names=False)` (it decoded every token to a name with one `.cpu()` per sample, then discarded them), sync-free scorer | ~300k val batches/epoch at full scale no longer sync 64x each | end to end + 98 DeepOP tests |
+
+**Now GPU-bound:** a py-spy profile shows the main thread waiting on the
+previous step's GPU event (31 %); packed batches change nothing (296 -> 298).
 
 ## 4. Extraction (data prep before every Branch A / B / DeepOP run)
 
@@ -97,6 +108,22 @@ ran its *reference* streaming code -- 45 % in a per-node Python loop
 
 Rejected after measuring: more torch threads per extraction worker
 (2 threads: 2.3e-6 differences, only 10 % faster).
+
+## 5. Encoder (checked, as asked)
+
+Full corpus, production flags (level 4 + batch planner), one lane: ~300
+batch/s and still climbing at 116k batches; **GPU SM ~41 %, main process
+pegged at ~97 % of one core** -- host-bound like the downstream trainers were.
+Main-thread profile: memory-overlay reads (`fast_read`) ~15 %, waiting on the
+planner ~9 %, the guard's per-tensor undo loop ~5 %, eager BiTA transformer.
+
+Done: the guard's snapshot/undo graphs are on by default for every trainer
+(`CYBERWORLD_CUDA_GRAPH`), the encoder included, without touching
+`bita/train.py` (it is part of the shared-setup cache key). Bit-identity is
+proven by the deterministic unit test; on the encoder itself the baseline is
+not GPU-deterministic (two baseline runs differ by up to 2.2e-5, median
+3.7e-9, from atomics), and baseline-vs-new sits in that same band (3.4e-5,
+median 7.5e-9). Speed: see the A/B below.
 
 ## How to switch things off
 
@@ -121,4 +148,10 @@ All on by default (all bit-identical):
   setup store once (~7 min, ~20 GB). The parse-code hash is unchanged, and
   none of the key's source files differ from 0173d2e; the store on disk was
   built from a state that is not the committed one.
-* Branch B is GPU-bound in fp32 attention; see section 2 for the opt-in options.
+* Branch B and DeepOP are GPU-bound in fp32 kernels (attention). Faster
+  kernels exist (other SDPA backends, KV cache, lower precision) but change
+  floating-point results or dropout masks. **Not done, by your rule: no
+  quality loss of any kind, fp32 rounding included.**
+* Extraction worker memory: peak RssAnon 3.4 GB on a 12M-record PCAP day
+  (largest days ~17M). Three workers already use most of the 22 GB laptop;
+  more workers would need the 32 GB machine.

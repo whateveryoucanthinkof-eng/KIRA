@@ -68,7 +68,7 @@ class TrainingGuard:
         max_nonfinite_frac: float = 0.01,
         min_delta: float = 1e-4,
         log: Callable[[str], None] = print,
-        graph_undo: bool = False,
+        graph_undo: Optional[bool] = None,
     ):
         if mode not in ("max", "min"):
             raise ValueError(f"mode must be 'max' or 'min', got {mode!r}")
@@ -108,6 +108,12 @@ class TrainingGuard:
         #: CUDA graphs (one launch each instead of one per tensor). Same
         #: kernels on the same tensors: bit-identical. Re-captured whenever the
         #: tensors move (e.g. a step-back reloads the optimizer state).
+        #: None: on unless CYBERWORLD_CUDA_GRAPH=0 (it only acts on CUDA, in the
+        #: deferred step). Every trainer, the encoder included, gets it without
+        #: an argument -- bita/train.py is part of the shared-setup cache key.
+        if graph_undo is None:
+            import os as _os
+            graph_undo = _os.environ.get("CYBERWORLD_CUDA_GRAPH", "1") not in ("0", "false", "False", "")
         self.graph_undo = bool(graph_undo)
         self._undo_graphs = None
         self._reset_epoch_stats()
