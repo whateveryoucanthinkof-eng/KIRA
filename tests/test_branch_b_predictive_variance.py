@@ -88,3 +88,22 @@ def test_variance_head_learns_the_noise_level():
     assert abs(sigma - 0.3) < 0.05, sigma
     assert abs(cov - 0.90) < 0.03, cov
     assert gaussian_nll(mean, lv, tgt) < gaussian_nll(mean, torch.zeros_like(lv), tgt)
+
+
+def test_padded_future_steps_are_masked_out_of_the_loss():
+    """A trajectory ending inside the horizon is edge-padded; the padded copies
+    are not observations. They must carry no weight, so 'the state stops
+    changing' is never trained -- or credited to persistence -- as a fact."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rfml2", ROOT / "scripts" / "retrain_future_models_live.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    pred = torch.zeros(2, 3, 4)
+    tgt = torch.zeros(2, 3, 4)
+    tgt[:, 2] = 100.0                     # garbage in the padded step only
+    valid = torch.tensor([[1., 1., 0.], [1., 1., 0.]])
+    assert float(m._masked_mse(pred, tgt, valid)) == 0.0
+    assert float(m._bb_variance_loss(pred, torch.zeros_like(pred), tgt, valid)) < 3.0
+    from branch_b_world_model.infiltration_head import InfiltrationRiskHead
+    r = InfiltrationRiskHead.risk_loss(torch.zeros(2, 3), tgt[..., 0] / 100, weight=valid)
+    assert float(r) == 0.0

@@ -402,10 +402,17 @@ class LazyHostRolloutDataset(Dataset):
             h_fut = np.pad(h_fut, ((0, pad), (0, 0)), mode="edge")
             r_fut = np.pad(r_fut, (0, pad), mode="edge")
 
+        valid = np.zeros(self.K, dtype=np.float32)
+        valid[:n_fut] = 1.0
         out = {
             "h_history": torch.from_numpy(np.ascontiguousarray(h_hist, dtype=np.float32)),
             "h_future": torch.from_numpy(np.ascontiguousarray(h_fut, dtype=np.float32)),
             "risk_future": torch.from_numpy(np.ascontiguousarray(r_fut, dtype=np.float32)),
+            # 1 for a real future step, 0 for an edge-padded copy of the last
+            # one (trajectory ended). Padded steps are not observations: the
+            # losses and metrics mask them, or "the state stops changing"
+            # would be trained -- and credited to persistence -- as a fact.
+            "future_valid": torch.from_numpy(valid),
         }
         if self.emit_times:
             # Seconds relative to the last OBSERVED step (rows[i-1]), which is
@@ -463,11 +470,13 @@ class LazyHostRolloutDataset(Dataset):
             x = np.asarray(st.feats[self._flat[p]])
         x = np.ascontiguousarray(x, dtype=np.float32)
         rows_f = self._flat[pf]
+        real = (b + i)[:, None] + np.arange(K, dtype=np.int64) <= last
         out = {
             "h_history": torch.from_numpy(np.ascontiguousarray(x[:, :T])),
             "h_future": torch.from_numpy(np.ascontiguousarray(x[:, T:])),
             "risk_future": torch.from_numpy(
                 np.ascontiguousarray(np.asarray(st.risk_score)[rows_f], dtype=np.float32)),
+            "future_valid": torch.from_numpy(real.astype(np.float32)),
         }
         if self.emit_times:
             w = np.asarray(st.window_idx)

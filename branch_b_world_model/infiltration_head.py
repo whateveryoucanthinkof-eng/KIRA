@@ -44,7 +44,8 @@ class InfiltrationRiskHead(nn.Module):
         return self.mlp(h_state).squeeze(-1)
 
     @staticmethod
-    def risk_loss(pred: torch.Tensor, target: torch.Tensor, beta: float = 0.1) -> torch.Tensor:
+    def risk_loss(pred: torch.Tensor, target: torch.Tensor, beta: float = 0.1,
+                  weight: "torch.Tensor | None" = None) -> torch.Tensor:
         """The loss to train this head against, for a continuous [0, 1] target.
 
         ## Why not binary_cross_entropy, now that the target is continuous
@@ -104,8 +105,13 @@ class InfiltrationRiskHead(nn.Module):
             pred: [*] in [0, 1] (post-sigmoid head output).
             target: [*] in [0, 1], same shape as pred.
             beta: the L2/L1 transition point; see above for why 0.1.
+            weight: optional [*] mask (1 = real step); the mean is over the
+                weighted elements, so padded forecast steps contribute nothing.
         """
-        return F.smooth_l1_loss(pred, target, beta=beta)
+        if weight is None:
+            return F.smooth_l1_loss(pred, target, beta=beta)
+        el = F.smooth_l1_loss(pred, target, beta=beta, reduction="none")
+        return (el * weight).sum() / weight.sum().clamp_min(1.0)
 
     def forward_trajectory(self, h_rollout: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """

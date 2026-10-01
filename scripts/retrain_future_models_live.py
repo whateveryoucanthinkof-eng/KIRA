@@ -287,15 +287,38 @@ def _accumulate_ok(ok, acc_pairs, nb):
 # and token counts) are kept outside the bodies: a graph replays device work
 # only. Same kernels, same order: identical accumulators.
 
-def _bb_variance_loss(pred, logvar, target):
+def _masked_mse(pred, target, valid):
+    """MSE over the real (non-padded) forecast steps. pred/target [B, K, D] or
+    [B, D] with valid [B, K] or [B]."""
+    v = valid.unsqueeze(-1).to(pred.dtype)
+    return ((pred - target) ** 2 * v).sum() / (v.sum() * pred.shape[-1]).clamp_min(1.0)
+
+
+def _future_valid(batch, K, device, nblk):
+    """The batch's [B, K] real-step mask (all ones for a loader that has none)."""
+    v = batch.get("future_valid")
+    if v is None:
+        return torch.ones(batch["h_future"].shape[0], K, device=device)
+    return v.to(device, non_blocking=nblk)
+
+
+def _bb_variance_loss(pred, logvar, target, valid=None):
     """Gaussian NLL of the step-k residual under the predicted variance.
 
     The mean is detached (and logvar_head reads a detached trunk), so this
     trains ONLY the variance: the mean -- the forecast the persistence gate
     judges -- trains exactly as it did under MSE alone."""
     from branch_b_world_model.rollout_encoder_decoder import gaussian_nll
-    return sum((0.9 ** k) * gaussian_nll(pred[:, k].detach(), logvar[:, k], target[:, k])
-               for k in range(pred.shape[1]))
+    if valid is None:
+        return sum((0.9 ** k) * gaussian_nll(pred[:, k].detach(), logvar[:, k], target[:, k])
+                   for k in range(pred.shape[1]))
+    out = 0.0
+    for k in range(pred.shape[1]):
+        lv, mu = logvar[:, k], pred[:, k].detach()
+        el = 0.5 * (lv + (target[:, k] - mu) ** 2 * torch.exp(-lv) + 1.8378770664093453)
+        v = valid[:, k].unsqueeze(-1).to(el.dtype)
+        out = out + (0.9 ** k) * (el * v).sum() / (v.sum() * el.shape[-1]).clamp_min(1.0)
+    return out
 
 
 #: z for a two-sided 90% Gaussian interval: coverage of mean +/- 1.645 sigma.
@@ -303,24 +326,32 @@ _Z90 = 1.6448536269514722
 
 
 def _bb_val_body(wdt, risk, K, step_offset):
-    def body(acc, h, target, target_risk, t_hist, t_fut):
+    def body(acc, h, target, target_risk, t_hist, t_fut, valid):
         pred, logv = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut, return_logvar=True)
-        from branch_b_world_model.rollout_encoder_decoder import gaussian_nll
-        acc["nll_model"] += gaussian_nll(pred, logv, target).double()
+        _v = valid.unsqueeze(-1).double()
+        _el = 0.5 * (logv + (target - pred) ** 2 * torch.exp(-logv) + 1.8378770664093453)
+        acc["nll_model"] += (_el.double() * _v).sum() / (_v.sum() * _el.shape[-1]).clamp_min(1.0)
         _inside = ((target - pred).abs() <= _Z90 * torch.exp(0.5 * logv)).double()
-        acc["cov90_by_step"] += _inside.mean(dim=(0, 2))
+        acc["cov90_by_step"] += (_inside * _v).sum(dim=(0, 2)) / (
+            _v.sum(dim=(0, 2)) * _inside.shape[-1]).clamp_min(1.0)
         pred_risk, _ = risk.forward_trajectory(pred)
         _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
         acc["resid_hist"] += device_hist((_rb.view(-1, K) + step_offset).reshape(-1),
-                                         K * FORECAST_RISK_BINS)
-        acc["v_sum"] += (F.mse_loss(pred, target) + risk.risk_loss(pred_risk, target_risk)).double().sum()
+                                         K * FORECAST_RISK_BINS, valid.reshape(-1).long())
+        # Every metric over REAL future steps only: padded steps repeat the
+        # last state, which persistence predicts perfectly by construction.
+        _w = valid.double()
+        _nw = _w.sum().clamp_min(1.0)
+        _mm = _masked_mse(pred, target, valid).double()
+        acc["v_sum"] += _mm + risk.risk_loss(pred_risk, target_risk, weight=valid).double()
         # persistence: repeat the last observed step across the horizon
         _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
-        acc["mse_model"] += F.mse_loss(pred, target).double()
-        acc["mse_persist"] += F.mse_loss(_last, target).double()
-        acc["bce_model"] += F.binary_cross_entropy(pred_risk, target_risk).double()
-        acc["risk_mae_model"] += (pred_risk - target_risk).abs().double().mean()
-        acc["risk_sum"] += target_risk.double().mean()
+        acc["mse_model"] += _mm
+        acc["mse_persist"] += _masked_mse(_last, target, valid).double()
+        acc["bce_model"] += (F.binary_cross_entropy(pred_risk, target_risk, reduction="none").double()
+                             * _w).sum() / _nw
+        acc["risk_mae_model"] += ((pred_risk - target_risk).abs().double() * _w).sum() / _nw
+        acc["risk_sum"] += (target_risk.double() * _w).sum() / _nw
     return body
 
 
@@ -347,7 +378,7 @@ def validate_branch_b(wdt, risk, loader, device, K):
             target_risk = batch["risk_future"].to(device, non_blocking=nblk)
             t_hist = batch["t_history"].to(device, non_blocking=nblk) if "t_history" in batch else None
             t_fut = batch["t_future"].to(device, non_blocking=nblk) if "t_future" in batch else None
-            run(h, target, target_risk, t_hist, t_fut)
+            run(h, target, target_risk, t_hist, t_fut, _future_valid(batch, K, device, nblk))
             vn += 1
             risk_n += 1
     return {**acc, "vn": vn, "risk_n": risk_n, "graphed_batches": run.n_graphed}
@@ -498,13 +529,14 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _nb_dev = torch.zeros((), device=device, dtype=torch.long); _k = 0
         _step = _guard_step_fn(guard)
         if _graphed is None:
-            def _bb_loss(h_, target_, target_risk_, t_hist_, t_fut_):
+            def _bb_loss(h_, target_, target_risk_, t_hist_, t_fut_, valid_):
                 pred_, logv_ = wdt.rollout(h_, K=_c.forecast_steps, t_history=t_hist_,
                                            t_future=t_fut_, return_logvar=True)
                 pred_risk_, _ = risk.forward_trajectory(pred_)
-                loss_ = sum((0.9 ** k) * F.mse_loss(pred_[:, k], target_[:, k])
+                loss_ = sum((0.9 ** k) * _masked_mse(pred_[:, k], target_[:, k], valid_[:, k])
                             for k in range(_c.forecast_steps))
-                return loss_ + _bb_variance_loss(pred_, logv_, target_) + risk.risk_loss(pred_risk_, target_risk_)
+                return (loss_ + _bb_variance_loss(pred_, logv_, target_, valid_)
+                        + risk.risk_loss(pred_risk_, target_risk_, weight=valid_))
             _graphed = GraphedLoss(_bb_loss, [wdt, risk],
                                    enabled=(str(device) == "cuda" and graphs_enabled()))
         _t0 = time.time()
@@ -514,6 +546,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             h = batch["h_history"].to(device, non_blocking=_nblk)
             target = batch["h_future"].to(device, non_blocking=_nblk)
             target_risk = batch["risk_future"].to(device, non_blocking=_nblk)
+            valid = _future_valid(batch, _c.forecast_steps, device, _nblk)
             # Real elapsed times. LazyHostRolloutDataset has emitted these all
             # along and rollout() encodes them, but this -- the trainer that
             # produces the SERVED checkpoint -- never passed them, so the
@@ -528,7 +561,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                 # forward + loss + backward replayed as a CUDA graph (cyberworld_v4/
                 # graphed_step.py): identical losses and weights, a fraction of the
                 # launch overhead. Same computation as the eager lines below.
-                loss = _graphed(h, target, target_risk, t_hist, t_fut)
+                loss = _graphed(h, target, target_risk, t_hist, t_fut, valid)
                 _ok = _step(loss)
                 if _ok is False:
                     continue
@@ -542,8 +575,9 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             pred, logv = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut,
                                      return_logvar=True)
             pred_risk, _ = risk.forward_trajectory(pred)
-            loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
-            loss = loss + _bb_variance_loss(pred, logv, target)
+            loss = sum((0.9 ** k) * _masked_mse(pred[:, k], target[:, k], valid[:, k])
+                       for k in range(_c.forecast_steps))
+            loss = loss + _bb_variance_loss(pred, logv, target, valid)
             # Huber, not BCE.
             #
             # BCE(p,t) is linear in t, so its minimiser is E[t|x] -- the same
@@ -556,7 +590,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             # Measured on a synthetic hazard target: BCE 0.244, MSE 0.244,
             # Huber(beta=0.1) 0.216 against a zero baseline of 0.230 -- only
             # Huber beats it.
-            loss = loss + risk.risk_loss(pred_risk, target_risk)
+            loss = loss + risk.risk_loss(pred_risk, target_risk, weight=valid)
             _ok = _step(loss)
             if _ok is False:
                 continue
