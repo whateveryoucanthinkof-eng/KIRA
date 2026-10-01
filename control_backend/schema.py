@@ -5,7 +5,7 @@ Decouples React dashboard from specific model architectures, dimensions, or chec
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -57,6 +57,9 @@ class ForecastPoint(BaseModel):
     # (control_backend/forecast_band.py). None when the checkpoint has none.
     risk_lower: Optional[float] = None
     risk_upper: Optional[float] = None
+    # Kill-chain lane of predicted_stage (control_backend/tactics.py), so the
+    # console can place the step without parsing the token.
+    tactic_lane: Optional[str] = None
 
 
 class ExplainabilityGroup(BaseModel):
@@ -96,6 +99,8 @@ class PredictionData(BaseModel):
     stage_probabilities: Optional[Dict[str, float]] = None
     technique_confidence: Optional[float] = None
     stage_provenance: Optional[Dict[str, str]] = None
+    # Kill-chain lane of predicted_stage (control_backend/tactics.py).
+    tactic_lane: Optional[str] = None
 
     # Provenance (spec 21, 41). `risk`, `predicted_stage` and `alert` are always
     # the model's output. The optional SOC rule layer is advisory: its opinion
@@ -133,6 +138,74 @@ class FocusEdge(BaseModel):
     dst: str
 
 
+class StateDim(BaseModel):
+    """One of the 27 dimensions Branch A read for this window."""
+    index: int
+    feature: str          # H_emb_0..11, then the 15 host attributes
+    group: str            # FEATURE_GROUP_MAP
+    value: float
+    attribution: float    # share of |input x gradient|, sums to 1 over the 27
+
+
+class BranchStep(BaseModel):
+    horizon_seconds: float
+    tactic_lane: str
+    technique: Optional[str] = None
+    probability: float    # DeepOP's probability for this step's token
+
+
+class ForecastBranch(BaseModel):
+    """One of DeepOP's three most likely continuations (forecast_branches.py).
+
+    Ranked by the probability of the first forecast step's token; each is then
+    decoded greedily, exactly as the main forecast is. Fields no model
+    produces yet are None and the console marks them under development.
+    """
+    id: str                       # "A" | "B" | "C"
+    kind: str                     # escalation | pivot | backoff
+    label: str
+    stage: str                    # kill-chain lane the branch reaches
+    technique: str                # ATT&CK id, or "—" for a back-off
+    probability: float            # share of the top-3 mass; the three sum to 1
+    probability_raw: float        # the first step's actual probability
+    confidence: float             # DeepOP's probability for the technique's step
+    horizon_seconds: float
+    path: List[BranchStep] = Field(default_factory=list)
+    hops: Optional[List[Dict[str, str]]] = None   # not predicted: models are per-host
+    packets: Optional[float] = None               # not predicted
+    bytes: Optional[float] = None                 # not predicted
+    peak_risk: Optional[float] = None             # not predicted per branch
+
+
+class FlowFlags(BaseModel):
+    syn: int = 0
+    ack: int = 0
+    psh: int = 0
+    rst: int = 0
+    fin: int = 0
+    urg: int = 0
+
+
+class FlowRecordOut(BaseModel):
+    """A flow the sensor exported for this window, as the console lists it."""
+    id: str
+    window: int
+    ts_us: int
+    src_ip: str
+    src_port: int
+    dst_ip: str
+    dst_port: int
+    protocol: str         # TCP | UDP | ICMP | OTHER
+    fwd_bytes: int
+    bwd_bytes: int
+    fwd_packets: int
+    bwd_packets: int
+    duration_ms: float
+    flags: FlowFlags
+    direction: str        # inbound | outbound | internal (site CIDRs)
+    on_path: bool         # touches the host scored this window
+
+
 class PredictionEvent(BaseModel):
     type: str = "prediction"
     mode: str = "LIVE"  # "STANDBY" | "LIVE"
@@ -152,6 +225,16 @@ class PredictionEvent(BaseModel):
     focus_edges: List[FocusEdge] = Field(default_factory=list)
     target_ip: Optional[str] = None
     throughput: float = 0.0
+
+    # Evidence and structure behind the verdict. Each is None when the
+    # pipeline did not produce it for this window.
+    state_vector: Optional[List[StateDim]] = None
+    branches: Optional[List[ForecastBranch]] = None
+    flows: Optional[List[FlowRecordOut]] = None
+    flows_in_window: Optional[int] = None
+    attention: Optional[Dict[str, Any]] = None     # attention_probe.py
+    campaign: Optional[Dict[str, Any]] = None      # correlation_service.py
+    incidents: Optional[List[Dict[str, Any]]] = None
 
 
 class TopologyNode(BaseModel):

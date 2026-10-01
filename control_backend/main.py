@@ -358,6 +358,41 @@ def _get_replay_adapter():
     return _replay_adapter
 
 
+#: Captures the Replay page offers as built-in samples (repo `captures/`).
+CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
+_REPLAY_SUFFIXES = (".pcap", ".pcapng", ".csv", ".binetflow")
+#: Flow rows returned per replayed window, so a 200-window report stays small.
+_REPLAY_FLOWS_PER_WINDOW = 100
+
+
+@app.get("/api/replay/samples")
+async def replay_samples():
+    """Real captures on disk the Replay page can analyse without an upload."""
+    out = []
+    if CAPTURES_DIR.is_dir():
+        for p in sorted(CAPTURES_DIR.iterdir()):
+            if p.is_file() and p.suffix.lower() in _REPLAY_SUFFIXES:
+                out.append({
+                    "id": p.name,
+                    "name": p.name,
+                    "label": p.stem.replace("_", " ").replace("-", " "),
+                    "kind": "csv" if p.suffix.lower() in (".csv", ".binetflow") else "pcap",
+                    "bytes": p.stat().st_size,
+                    "source": f"captures/{p.name}",
+                })
+    return out
+
+
+@app.post("/api/replay/samples/{name}")
+async def replay_sample(name: str, max_windows: int = 200):
+    """Analyse one of /api/replay/samples in place (no upload round trip)."""
+    path = (CAPTURES_DIR / name).resolve()
+    if path.parent != CAPTURES_DIR.resolve() or not path.is_file() \
+            or path.suffix.lower() not in _REPLAY_SUFFIXES:
+        raise HTTPException(404, f"No capture named {name!r} in captures/")
+    return _analyse_capture(path, path.suffix.lower(), name, max_windows)
+
+
 @app.post("/api/replay")
 async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     """Offline analysis of an uploaded capture or flow CSV.
@@ -380,10 +415,6 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
     """
     import tempfile
 
-    from control_backend.model_adapter import select_primary_target
-
-    replay_adapter = _get_replay_adapter()
-
     name = (file.filename or "upload").lower()
     suffix = Path(name).suffix
     if suffix not in (".pcap", ".pcapng", ".csv", ".binetflow", ""):
@@ -395,58 +426,87 @@ async def replay_file(file: UploadFile = File(...), max_windows: int = 200):
 
     tmp = Path(tempfile.mkstemp(suffix=suffix or ".bin")[1])
     tmp.write_bytes(data)
-
     try:
-        # replay_adapter is private to this endpoint (see _get_replay_adapter),
-        # so forcing rules off and clearing history here can never affect the
-        # live tail worker's adapter or its state.
-        replay_adapter.rules_enabled = False
-        replay_adapter.reset_history()
-
-        if suffix in (".csv", ".binetflow"):
-            records = _parse_flow_file(tmp, suffix)
-            windows = _group_records_into_windows(records, replay_adapter.window_seconds)
-        else:
-            windows = _replay_pcap_windows(tmp, max_windows, replay_adapter.window_seconds)
-
-        results = []
-        for widx, flows in enumerate(windows[:max_windows]):
-            if not flows:
-                continue
-            target = select_primary_target(flows)
-            if not target:
-                continue
-            ev = replay_adapter.predict_window(target_ip=target, flows=flows, window_id=widx)
-            results.append({
-                "window": widx,
-                "target": target,
-                "risk": ev.prediction.risk,
-                "ml_risk": ev.prediction.ml_risk,
-                "risk_source": ev.prediction.risk_source,
-                "alert": ev.prediction.alert,
-                "stage": ev.prediction.predicted_stage,
-                "mitre_tactic": ev.prediction.mitre_tactic,
-                "mitre_technique": ev.prediction.mitre_technique,
-                "forecast": [
-                    {"horizon_seconds": f.horizon_seconds, "risk": f.risk} for f in ev.forecast
-                ],
-                "top_features": [
-                    {"feature": f.feature, "score": f.score, "group": f.group}
-                    for f in ev.explainability.top_features[:5]
-                ],
-            })
-
-        flagged = [r for r in results if r["alert"]]
-        return {
-            "filename": file.filename,
-            "kind": "csv" if suffix in (".csv", ".binetflow") else "pcap",
-            "windows_analyzed": len(results),
-            "flagged_windows": len(flagged),
-            "rules_disabled": True,
-            "results": results,
-        }
+        return _analyse_capture(tmp, suffix, file.filename, max_windows)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _analyse_capture(path: Path, suffix: str, filename: Optional[str], max_windows: int):
+    """Score a capture window by window on the private replay adapter."""
+    from control_backend.evidence import flow_records
+    from control_backend.model_adapter import select_primary_target
+
+    replay_adapter = _get_replay_adapter()
+    # replay_adapter is private to this endpoint (see _get_replay_adapter),
+    # so forcing rules off and clearing history here can never affect the
+    # live tail worker's adapter or its state.
+    replay_adapter.rules_enabled = False
+    replay_adapter.reset_history()
+
+    if suffix in (".csv", ".binetflow"):
+        records = _parse_flow_file(path, suffix)
+        windows = _group_records_into_windows(records, replay_adapter.window_seconds)
+    else:
+        windows = _replay_pcap_windows(path, max_windows, replay_adapter.window_seconds)
+
+    results = []
+    for widx, flows in enumerate(windows[:max_windows]):
+        if not flows:
+            continue
+        target = select_primary_target(flows)
+        if not target:
+            continue
+        ev = replay_adapter.predict_window(target_ip=target, flows=flows, window_id=widx)
+        results.append({
+            "window": widx,
+            "target": target,
+            "risk": ev.prediction.risk,
+            "ml_risk": ev.prediction.ml_risk,
+            "risk_source": ev.prediction.risk_source,
+            "alert": ev.prediction.alert,
+            "stage": ev.prediction.predicted_stage,
+            "tactic_lane": ev.prediction.tactic_lane,
+            "mitre_tactic": ev.prediction.mitre_tactic,
+            "mitre_technique": ev.prediction.mitre_technique,
+            "forecast": [
+                {"horizon_seconds": f.horizon_seconds, "risk": f.risk,
+                 "risk_lower": f.risk_lower, "risk_upper": f.risk_upper}
+                for f in ev.forecast
+            ],
+            "top_features": [
+                {"feature": f.feature, "score": f.score, "group": f.group}
+                for f in ev.explainability.top_features[:5]
+            ],
+            # Measured volume of the window, both directions.
+            "packets": int(sum(r.fwd_packets + r.bwd_packets for r in flows)),
+            "bytes": int(sum(r.fwd_bytes + r.bwd_bytes for r in flows)),
+            "flows": [
+                f.model_dump() for f in flow_records(
+                    [_record_dict(r) for r in flows], widx, target,
+                )[:_REPLAY_FLOWS_PER_WINDOW]
+            ],
+        })
+
+    flagged = [r for r in results if r["alert"]]
+    return {
+        "filename": filename,
+        "kind": "csv" if suffix in (".csv", ".binetflow") else "pcap",
+        "windows_analyzed": len(results),
+        "flagged_windows": len(flagged),
+        "rules_disabled": True,
+        "window_seconds": replay_adapter.window_seconds,
+        "results": results,
+    }
+
+
+def _record_dict(r) -> Dict[str, Any]:
+    return {
+        "src_ip": r.src_ip, "dst_ip": r.dst_ip, "src_port": r.src_port, "dst_port": r.dst_port,
+        "protocol": r.protocol, "start_time": r.start_time, "end_time": r.end_time,
+        "fwd_bytes": r.fwd_bytes, "bwd_bytes": r.bwd_bytes,
+        "fwd_packets": r.fwd_packets, "bwd_packets": r.bwd_packets,
+    }
 
 
 def _parse_flow_file(path: Path, suffix: str):

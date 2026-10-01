@@ -97,3 +97,37 @@ as an ML engineer before trusting any metric from the run on branch v5.5o.
   `test_control_backend`, `test_topology_service` and `test_site_config` load
   `saved_models/bita_bigru_transformer-unified_final.pth`, which is feature schema 1.0.0
   while the tree is 2.0.0. Promote the new encoder, or regenerate the fixture.
+
+## 8. Model gaps found while wiring the K.I.R.A. dashboard (2026-10-01)
+
+Found while mapping each dashboard panel to a real model output (branch
+`feat/kira-dashboard`, see `docs/DASHBOARD_INTEGRATION.md`). The console shows each of these
+as "Under development" until a model produces it.
+
+- **No trained downstream checkpoints, and a stale encoder.** `saved_models/` has no
+  `branch_a/`, `branch_b/` or `deepop/` files. The only encoder `.pth` is on feature schema
+  1.0.0, but the tree is on 2.0.0. The backend now starts and serves without models, but nothing
+  can be scored until the retrain lands.
+- **No Lateral Movement or Execution output.** Branch A's `TECHNIQUE_VOCAB` (14 techniques)
+  has no T1021, and DeepOP's joint vocabulary has 6 macro-techniques plus Benign, with no
+  LateralMovement or Execution token. Pivoting between internal hosts, the core of a
+  multi-host campaign, can't be named by any model. Decide whether to add these classes.
+  (Is there labelled lateral-movement traffic in the corpora at all?)
+- **`correlation/` doesn't know CredentialAccess.** `TACTIC_ORDER` in
+  `causal_edge_scorer.py` has no `CredentialAccess`, yet DeepOP emits `CredentialAccess.T1110`
+  (brute force). Those alerts get rank -1, so they score as "not an attack stage"
+  (plausibility 0.1) and rarely link into a campaign. Not changed silently: decide where it
+  sits in the order (the dashboard draws it between Recon and InitialAccess).
+- **Forecasts are per host; nothing predicts *where* an attack goes next.** Branch B and
+  DeepOP roll out one host's future. The forecast tree's "hops" (hosts a branch passes
+  through) has no model behind it. Neither does a per-host attack path.
+- **One rollout, not one per alternative.** Branch B produces a single future-state
+  trajectory, so the risk head gives one risk curve. The three DeepOP alternatives shown as
+  A/B/C (top-3 first tokens, then greedy) have no per-branch risk peak.
+- **No traffic-volume forecast.** No model predicts future packets or bytes (the tree's
+  per-branch packet/byte figures).
+- **Attention saliency isn't computed.** TGNE's attention weights can be read out (2 heads,
+  `graph_attention`), but the per-cell Input × Gradient breakdown over the key's inputs
+  (12 edge features, time encoding, memory) isn't implemented.
+- **Campaigns and incidents are heuristic.** They come from `correlation/` (hand-set
+  parameters, nothing fitted) applied to model outputs, not from a learned model.

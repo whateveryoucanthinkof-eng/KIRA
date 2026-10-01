@@ -14,6 +14,8 @@ import time
 from typing import Dict, Optional, Any
 
 from control_backend.capture_accounting import CaptureAccounting
+from control_backend.correlation_service import LiveCorrelation
+from control_backend.evidence import flow_records
 from control_backend.event_broker import broker
 from control_backend.lab_config import (
     MONOREPO_ROOT,
@@ -59,6 +61,8 @@ class LiveTelemetryService:
         self.current_threat_level: str = "low"
         # Windows never delivered, or built while the kernel dropped frames.
         self.capture = CaptureAccounting()
+        # Campaigns and incidents assembled from the scored windows.
+        self.correlation = LiveCorrelation()
 
         self.isolated_hosts: set = set()
         self.blocked_ips: set = set()
@@ -86,6 +90,7 @@ class LiveTelemetryService:
         adapter = self.adapter
         if adapter is not None:
             adapter.reset_history()
+        self.correlation.reset()
 
     def _window_seconds(self) -> float:
         adapter = self.adapter
@@ -317,6 +322,17 @@ class LiveTelemetryService:
                 n += 1
         return n
 
+    def _attach_evidence(self, event, record, raw_flows, flows, target, window_end) -> None:
+        """Flows, campaign and incidents for the console. Never costs the verdict."""
+        try:
+            window_id = int(record.get("window_id", self.windows_streamed))
+            event.flows = flow_records(raw_flows, window_id, target)
+            event.flows_in_window = len(raw_flows)
+            event.campaign, event.incidents = self.correlation.observe(
+                event, window_end, flows, contained_hosts=set(self.isolated_hosts))
+        except Exception:
+            logger.exception("evidence for window failed; serving the verdict without it")
+
     def _stdout_logger(self):
         if not self.process or not self.process.stdout:
             return
@@ -423,6 +439,7 @@ class LiveTelemetryService:
                             active_flows=int(record.get("active_flows", len(flows)) or 0),
                             throughput=self.current_throughput,
                         )
+                        self._attach_evidence(event, record, raw_flows, flows, target, window_end)
                         if target and event.prediction:
                             topology_service.attach_risks(
                                 {

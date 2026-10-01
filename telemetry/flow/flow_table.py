@@ -153,6 +153,14 @@ class LiveFlowTable:
                 "bwd_bytes": int(f.bwd_bytes - f.exported_bwd_bytes),
                 "fwd_packets": int(f.fwd_pkts - f.exported_fwd_pkts),
                 "bwd_packets": int(f.bwd_pkts - f.exported_bwd_pkts),
+                # TCP flag counts over the whole flow, for the console's flow
+                # table. Display only: flows_from_span_dicts() does not read
+                # them, so they never reach the model's features.
+                "flags": {
+                    "syn": int(f.syn_count), "ack": int(f.ack_count),
+                    "psh": int(f.psh_count), "rst": int(f.rst_count),
+                    "fin": int(f.fin_count), "urg": int(f.urg_count),
+                },
             })
             f.exported_fwd_bytes = f.fwd_bytes
             f.exported_bwd_bytes = f.bwd_bytes
