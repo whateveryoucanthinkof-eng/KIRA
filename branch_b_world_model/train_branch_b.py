@@ -334,11 +334,19 @@ class LazyHostRolloutDataset(Dataset):
     """
 
     def __init__(self, store, T: int = None, K: int = None,
-                 emit_times: bool = True, window_seconds: float = None):
+                 emit_times: bool = True, window_seconds: float = None,
+                 min_history_steps: int = None):
         _c = get_contract()
         self.T = _c.history_steps if T is None else T
         self.K = _c.forecast_steps if K is None else K
         self.store = store
+        # How many REAL history steps a sample needs (default: all T). Serving
+        # scores a host from its first window, so a model trained only on
+        # full histories meets short ones there first. With fewer than T the
+        # history is edge-padded (the first real state repeated, its time
+        # repeated too) -- the padding DeepOP's rollout conditioning and
+        # serving use.
+        self.min_history_steps = self.T if min_history_steps is None else max(1, int(min_history_steps))
         # Emit the REAL elapsed time of each step, not just its ordinal.
         #
         # This dataset indexes a host's snapshots by POSITION in its own
@@ -368,12 +376,13 @@ class LazyHostRolloutDataset(Dataset):
         for h in store:
             rows = store._rows_by_host[h]
             n = len(rows)
-            if n < self.T + 1:
+            m = self.min_history_steps
+            if n < m + 1:
                 continue
             hi = len(hosts)
             hosts.append(h)
-            host_idx.append(np.full(n - self.T, hi, dtype=np.int32))
-            pos.append(np.arange(self.T, n, dtype=np.int32))
+            host_idx.append(np.full(n - m, hi, dtype=np.int32))
+            pos.append(np.arange(m, n, dtype=np.int32))
 
         self.hosts = hosts
         self._host_idx = np.concatenate(host_idx) if host_idx else np.zeros(0, np.int32)
@@ -388,7 +397,9 @@ class LazyHostRolloutDataset(Dataset):
         rows = self.store._rows_by_host[host]
 
         # The full feature block: TGNE embedding AND host attributes.
-        h_hist = self.store.feats[rows[i - self.T:i]]
+        # rows[max(0, i-T):i], edge-padded on the left when i < T.
+        hist_rows = np.asarray(rows)[np.maximum(np.arange(i - self.T, i), 0)]
+        h_hist = self.store.feats[hist_rows]
 
         fut_rows = rows[i:i + self.K]
         h_fut = self.store.feats[fut_rows]
@@ -420,7 +431,7 @@ class LazyHostRolloutDataset(Dataset):
             # history <= 0 with its last entry exactly 0, future > 0.
             w = self.store.window_idx
             w0 = float(w[rows[i - 1]])
-            t_hist = (np.asarray(w[rows[i - self.T:i]], dtype=np.float64) - w0)
+            t_hist = (np.asarray(w[hist_rows], dtype=np.float64) - w0)
             t_fut = (np.asarray(w[fut_rows], dtype=np.float64) - w0)
             if n_fut < self.K:
                 # Edge-padded future states repeat the last real one, so they
@@ -461,7 +472,7 @@ class LazyHostRolloutDataset(Dataset):
         i = self._pos[idx].astype(np.int64)
         b = self._base[h]
         last = (b + self._n_rows[h] - 1)[:, None]
-        ph = (b + i)[:, None] - T + np.arange(T, dtype=np.int64)          # history, [B, T]
+        ph = np.maximum((b + i)[:, None] - T + np.arange(T, dtype=np.int64), b[:, None])  # history, edge-padded
         pf = np.minimum((b + i)[:, None] + np.arange(K, dtype=np.int64), last)  # future, edge-padded
         p = np.concatenate([ph, pf], axis=1)
         if self._feats_hm is not None:

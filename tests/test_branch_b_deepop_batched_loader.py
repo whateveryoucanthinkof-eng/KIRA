@@ -68,6 +68,21 @@ def test_branch_b_gather_batch(store, host_major, emit_times, tmp_path):
 
 
 @pytest.mark.parametrize("host_major", [False, True])
+def test_branch_b_short_histories_are_edge_padded_identically(store, host_major, tmp_path):
+    """min_history_steps=1: histories shorter than T are edge-padded (first
+    real state and its time repeated) in both access paths, as serving pads."""
+    ds = LazyHostRolloutDataset(store, T=15, K=5, min_history_steps=1)
+    full = LazyHostRolloutDataset(store, T=15, K=5)
+    assert len(ds) > len(full)
+    ds.enable_batched(host_major=host_major, spill_dir=str(tmp_path))
+    _check_batches(ds)
+    k = int(np.flatnonzero(ds._pos == 1)[0])          # one real history step
+    s = ds[k]
+    assert torch.equal(s["h_history"][0], s["h_history"][-1])
+    assert float(s["t_history"][0]) == 0.0 and float(s["t_history"][-1]) == 0.0
+
+
+@pytest.mark.parametrize("host_major", [False, True])
 @pytest.mark.parametrize("T,oversample", [(15, True), (15, False), (0, True), (3, False)])
 def test_deepop_gather_batch(store, host_major, T, oversample, tmp_path):
     vocab = get_joint_vocab(network_observable_only=True)

@@ -483,8 +483,12 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
     # ~38 GiB at the 35M samples full corpus density produces. The store
     # already holds every embedding in one memmapped block.
-    train_ds = LazyHostRolloutDataset(train_traj, T=_c.history_steps, K=_c.forecast_steps)
-    val_ds = LazyHostRolloutDataset(val_traj, T=_c.history_steps, K=_c.forecast_steps)
+    # min_history_steps=1: serving scores a host from its first window, so the
+    # world model must learn short (edge-padded) histories too.
+    train_ds = LazyHostRolloutDataset(train_traj, T=_c.history_steps, K=_c.forecast_steps,
+                                      min_history_steps=1)
+    val_ds = LazyHostRolloutDataset(val_traj, T=_c.history_steps, K=_c.forecast_steps,
+                                    min_history_steps=1)
     print(f"Branch B samples: train={len(train_ds)} val={len(val_ds)}", flush=True)
     _lk = _loader_kwargs(device, num_workers)
     train_loader = _make_loader(train_ds, 128, True, device, num_workers)

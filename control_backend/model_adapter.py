@@ -666,15 +666,17 @@ class AntigravityModelAdapter:
         #
         # A recorded mitigation does not empty `flows`: the model scores the
         # traffic it actually sees (see the docstring).
+        # The window is the flows that STARTED in its last window_seconds --
+        # how training extraction buckets them (_window_boundaries, by start
+        # time, each flow in exactly one window). This kept every flow that
+        # merely ENDED in the window, so a 60 s flow's whole byte and packet
+        # count re-entered every window it overlapped: flow counts, volumes and
+        # rates the host attributes were never trained on.
         window_flows = flows
         if flows:
-            window_end = max(record.end_time for record in flows)
-            window_start = window_end - self.window_seconds
-            window_flows = [
-                record
-                for record in flows
-                if record.end_time >= window_start or record.start_time >= window_start
-            ]
+            last_start = max(record.start_time for record in flows)
+            window_start = last_start - self.window_seconds
+            window_flows = [record for record in flows if record.start_time > window_start]
 
         host_flows = [
             record
@@ -794,8 +796,11 @@ class AntigravityModelAdapter:
         # The Branch A feature history two blocks above already takes a copy;
         # this one did not, and that was the whole difference.
         padded_h = list(h_state_history)
+        # Edge padding (the first real state repeated), as Branch B is trained
+        # on short histories and as DeepOP's conditioning rollouts are built.
+        # Zero states were never in any training input.
         while len(padded_h) < self.history_steps:
-            padded_h.insert(0, torch.zeros_like(curr_h))
+            padded_h.insert(0, padded_h[0])
         h_seq = torch.stack(padded_h, dim=1)
 
         # Real elapsed seconds of each history step, relative to the latest

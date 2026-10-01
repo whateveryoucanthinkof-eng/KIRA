@@ -87,6 +87,7 @@ ENCODER_ARGS="--use_memory --n_degree 10 --n_epoch 50 --patience 3 --step_back_a
 --ingest_workers $INGEST_WORKERS --ingest_cache $INGEST_CACHE --shared_setup_dir $SHARED_SETUP ${PLAN_ENCODER_EXTRA:-}"
 BRANCH_A_ARGS="--architecture paper --risk-objective soft_bce --risk-target hazard \
 --epochs 15 --patience 3 --step-back-after 2 --operating-point-criterion budgeted_f1 --alert-budget 2.0 \
+--min-history-steps 1 \
 --spill-dir $OUT/.spill --num-workers $NUM_WORKERS ${PLAN_BRANCH_A_EXTRA:-}"
 
 compare_dir() { echo "$OUT/compare_seed$1"; }
