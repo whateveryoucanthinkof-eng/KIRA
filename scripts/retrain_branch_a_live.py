@@ -97,6 +97,19 @@ def _selection_score(metrics, mode):
     - ``val_loss``: the previous behaviour, kept so a run can be reproduced.
       Negated here because this function is maximised.
     """
+    if mode == "early_warning":
+        # Harmonic mean of technique macro-F1 and the ONSET risk head's Gini
+        # (2*AUC - 1, so chance is 0). Onset = last input window benign: the
+        # early-warning case the PS asks for. The overall AUC is dominated by
+        # continuations of ongoing attacks, which persistence gets right with
+        # no model, so it rewarded copying the present; and an arithmetic mean
+        # let a strong term hide a collapsed one (the encoder's failure).
+        f1 = float(metrics.get("tech_macro_f1", 0.0))
+        auc = float(metrics.get("risk_onset_auc", float("nan")))
+        if auc != auc:
+            auc = float(metrics.get("risk_auc", float("nan")))
+        gini = max(0.0, 2.0 * auc - 1.0) if auc == auc else 0.0
+        return 0.0 if f1 + gini <= 0 else 2.0 * f1 * gini / (f1 + gini)
     if mode == "val_loss":
         return -float(metrics["loss"])
     if mode == "macro_f1":
@@ -1132,12 +1145,17 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             acc_in_bin = np.where(cnt > 0, ph / np.maximum(cnt, 1), 0.0)
             conf = np.where(cnt > 0, ch / np.maximum(cnt, 1), 0.0)
         risk_ece = float((cnt * np.abs(acc_in_bin - conf)).sum() / max(cnt.sum(), 1))
+        if has_prev.get("v"):
+            risk_onset_auc = _auc_from_histograms(onset_pos_hist.cpu().numpy(),
+                                                  onset_neg_hist.cpu().numpy())
     else:
         # AUC and ECE need both classes; the BASE RATE does not, and reporting
         # it as 0.0 on an all-attack split (every CTU-13 scenario is one) said
         # the opposite of the truth and drove `risk_brier_baseline` to 0, which
         # made the "no better than the base rate" warning fire unconditionally.
         risk_auc, risk_ece = float("nan"), float("nan")
+    if not has_prev.get("v") or not (P > 0 and N > 0):
+        risk_onset_auc = float("nan")
     base_rate = P / (P + N) if (P + N) > 0 else 0.0
     n_prob = max(int(P + N), 1)
     out_tasks = {k: (float((v / nb).item()) if nb else 0.0) for k, v in task_sums.items()}
@@ -1147,6 +1165,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         "tech_accuracy": accuracy,
         # -- risk as a probability, judged the way a probability must be --
         "risk_auc": risk_auc,
+        # early warning: AUC over samples whose last input window is benign
+        "risk_onset_auc": risk_onset_auc,
         "risk_brier": float((brier_sum / n_prob).item()),
         "risk_brier_baseline": base_rate * (1 - base_rate),   # always predict the base rate
         "risk_ece": risk_ece,
@@ -1348,9 +1368,11 @@ def main():
                         help="Gradient-norm clip; 0 disables clipping (norms still logged)")
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="Linear LR warmup; default ~5%% of the first epoch, at most 500")
-    parser.add_argument("--select-on", choices=("composite", "macro_f1", "val_loss"),
-                        default="composite",
+    parser.add_argument("--select-on", choices=("early_warning", "composite", "macro_f1", "val_loss"),
+                        default="early_warning",
                         help="Which validation metric picks the kept checkpoint. "
+                             "Default 'early_warning' = harmonic mean of technique macro-F1 and "
+                             "the onset slice's risk Gini (2*AUC-1); see _selection_score. "
                              "Default 'composite' = 0.5*macro_f1 + 0.5*risk_auc. "
                              "(It read '0.5*(1-risk_mae)' until 2026-09-22; that "
                              "was the first version and the help text outlived "

@@ -231,3 +231,16 @@ def test_smooth_l1_objective_still_sees_the_magnitude():
     _, pa = m.compute_loss(preds, t_a)
     _, pb = m.compute_loss(preds, t_b)
     assert float(pa["loss_risk"]) != pytest.approx(float(pb["loss_risk"]), abs=1e-9)
+
+
+def test_early_warning_selection_needs_both_heads_and_ignores_persistence():
+    """Default selection: harmonic mean of macro-F1 and the onset Gini. A head
+    that only copies the present (high overall AUC, chance on onset) or a
+    collapsed technique head cannot win."""
+    good = {"tech_macro_f1": 0.5, "risk_auc": 0.80, "risk_onset_auc": 0.80}
+    persistence_like = {"tech_macro_f1": 0.5, "risk_auc": 0.99, "risk_onset_auc": 0.50}
+    collapsed = {"tech_macro_f1": 0.02, "risk_auc": 0.95, "risk_onset_auc": 0.95}
+    s = lambda m: bra._selection_score(m, "early_warning")   # noqa: E731
+    assert s(persistence_like) == 0.0
+    assert s(good) > s(collapsed) and s(good) > s(persistence_like)
+    assert s({"tech_macro_f1": 1.0, "risk_onset_auc": 1.0}) == pytest.approx(1.0)
