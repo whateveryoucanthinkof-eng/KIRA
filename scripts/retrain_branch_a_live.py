@@ -87,7 +87,8 @@ def _selection_score(metrics, mode):
     A selection metric has to mean the same thing at every epoch. Macro F1 and
     risk MAE do; the weighted loss does not.
 
-    - ``composite`` (default): ``0.5 * macro_f1 + 0.5 * risk_auc`` -- balances
+    - ``early_warning`` (default): see below.
+    - ``composite`` (the default until 2026-10-02): ``0.5 * macro_f1 + 0.5 * risk_auc`` -- balances
       the two heads that carry the task, both bounded in [0, 1] and both
       independent of the loss weighting. AUC replaces the risk MAE that was
       here first: MAE is median-seeking, so on a target that is 0 for 82.5% of
@@ -1383,7 +1384,7 @@ def main():
                         help="Which validation metric picks the kept checkpoint. "
                              "Default 'early_warning' = harmonic mean of technique macro-F1 and "
                              "the onset slice's risk Gini (2*AUC-1); see _selection_score. "
-                             "Default 'composite' = 0.5*macro_f1 + 0.5*risk_auc. "
+                             "'composite' (the default until 2026-10-02) = 0.5*macro_f1 + 0.5*risk_auc. "
                              "(It read '0.5*(1-risk_mae)' until 2026-09-22; that "
                              "was the first version and the help text outlived "
                              "it. MAE is median-seeking, so on a target that is "
