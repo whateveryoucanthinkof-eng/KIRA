@@ -506,10 +506,19 @@ def benchmark_table(op_threshold_by_model, hists_by_model, persistence_counts, b
         if thr is None:
             continue
         b = int(round(thr * (bins - 1)))
-        r = {"threshold": thr, "overall": _point(_pr_curve_from_histograms(ph, nh, bins), b),
-             "auc": _auc_from_histograms(ph, nh)}
+
+        def _pt(pos_, neg_):
+            pt = _point(_pr_curve_from_histograms(pos_, neg_, bins), b)
+            if pt["tp"] + pt["fp"] == 0:
+                # No alert at all. The curve's precision 1.0 there is sklearn's
+                # convention for picking thresholds; in a results table it
+                # would read as a perfect score for a model that said nothing.
+                pt["precision"] = float("nan")
+            return pt
+
+        r = {"threshold": thr, "overall": _pt(ph, nh), "auc": _auc_from_histograms(ph, nh)}
         if oph is not None:
-            r["onset"] = _point(_pr_curve_from_histograms(oph, onh, bins), b)
+            r["onset"] = _pt(oph, onh)
             r["onset_auc"] = _auc_from_histograms(oph, onh)
         rows[name] = r
     if persistence_counts is not None:

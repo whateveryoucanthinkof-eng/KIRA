@@ -88,3 +88,12 @@ def test_point_has_fpr():
     pos[-1], neg[-1], neg[0] = 5, 5, 90
     c = rbal._pr_curve_from_histograms(pos, neg)
     assert abs(rbal._point(c, B - 1)["fpr"] - 5 / 95) < 1e-12
+
+
+def test_a_silent_model_is_not_reported_as_perfectly_precise():
+    rbal = _branch_a()
+    B = rbal.RISK_BINS
+    pos = np.zeros(B, np.int64); neg = np.zeros(B, np.int64)
+    pos[0], neg[0] = 10, 90                 # every score below any threshold
+    rows = rbal.benchmark_table({"m": 0.5}, {"m": (pos, neg, None, None)}, None)
+    assert np.isnan(rows["m"]["overall"]["precision"]) and rows["m"]["overall"]["recall"] == 0.0
