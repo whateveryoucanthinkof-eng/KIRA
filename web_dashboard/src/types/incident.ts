@@ -40,6 +40,31 @@ export interface Incident {
   notes: { at: number; text: string }[];
 }
 
+/**
+ * An analyst's edits on top of the stream. Status and assignee replace the
+ * stream's; notes are appended to its trail. `since` is the stream's alert
+ * count when the first edit was made — an incident whose count falls below it
+ * has restarted (the same host attacked again), and the old edits no longer
+ * apply to it.
+ */
+export interface IncidentEdit {
+  status?: IncidentStatus;
+  assignee?: string | null;
+  notes?: Incident["notes"];
+  since?: number;
+}
+
+/** The stream's incident with the analyst's edits applied, if they still belong to it. */
+export function applyEdit(i: Incident, e: IncidentEdit | undefined): Incident {
+  if (!e || (e.since != null && i.alertCount < e.since)) return i;
+  return {
+    ...i,
+    status: e.status ?? i.status,
+    assignee: e.assignee !== undefined ? e.assignee : i.assignee,
+    notes: e.notes?.length ? [...i.notes, ...e.notes].sort((a, b) => a.at - b.at) : i.notes,
+  };
+}
+
 /** Queue ordering: unresolved first, then severity, then most recent. */
 const SEV_RANK: Record<Incident["severity"], number> = {
   critical: 0,

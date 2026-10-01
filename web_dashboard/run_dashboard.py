@@ -16,7 +16,5 @@ from run_dashboard import *
 if __name__ == "__main__":
     import uvicorn
     import threading
-    threading.Thread(target=open_browser, args=(8000,), daemon=True).start()
-    # Loopback only. Use the root run_dashboard.py --host to expose it, which
-    # also sets up the access token.
-    uvicorn.run("control_backend.main:app", host="127.0.0.1", port=8000, reload=False)
+    threading.Thread(target=open_browser, daemon=True).start()
+    uvicorn.run("control_backend.main:app", host="0.0.0.0", port=8000, reload=False)

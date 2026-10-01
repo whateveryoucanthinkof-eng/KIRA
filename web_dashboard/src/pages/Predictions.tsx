@@ -16,7 +16,7 @@ import {
   sevColor,
   sevFromRisk,
 } from "../design/primitives";
-import { FORECAST, Grid, Legend, NowLine, OBSERVED, Plot, ThresholdLine, Tip, TimeAxis, ValueAxis } from "../design/charts";
+import { FORECAST, Grid, Legend, NowLine, RISK_BAND_COLORS, splitRisk, Plot, ThresholdLine, Tip, TimeAxis, ValueAxis } from "../design/charts";
 import { Num } from "../design/motion";
 import KillChain from "../components/KillChain";
 
@@ -48,23 +48,29 @@ export default function Predictions({ history, forecast, prediction, envelope }:
    * rollout to the right. Splitting them into two charts hides the only thing
    * that matters — whether the forecast continues the observed curve.
    */
-  const joined = [
-    ...history.slice(-40).map((p) => ({
-      t: p.label,
-      observed: p.risk,
-      forecast: undefined as number | undefined,
-      band: undefined as [number, number] | undefined,
-    })),
-    ...(prediction
-      ? [{ t: "NOW", observed: risk, forecast: risk, band: [risk, risk] as [number, number] }]
-      : []),
-    ...forecast.map((f) => ({
-      t: horizon(f.horizonSeconds),
-      observed: undefined as number | undefined,
-      forecast: f.predicted / 100,
-      band: [f.lowerBound / 100, f.upperBound / 100] as [number, number],
-    })),
-  ];
+  // Observed history wears the severity ladder (green → amber → red at the
+  // model's own thresholds); the forecast rollout stays dashed and cool.
+  const joined = splitRisk(
+    [
+      ...history.slice(-40).map((p) => ({
+        t: p.label,
+        observed: p.risk,
+        forecast: undefined as number | undefined,
+        band: undefined as [number, number] | undefined,
+      })),
+      ...(prediction
+        ? [{ t: "NOW", observed: risk, forecast: risk, band: [risk, risk] as [number, number] }]
+        : []),
+      ...forecast.map((f) => ({
+        t: horizon(f.horizonSeconds),
+        observed: undefined as number | undefined,
+        forecast: f.predicted / 100,
+        band: [f.lowerBound / 100, f.upperBound / 100] as [number, number],
+      })),
+    ],
+    threshold,
+    (r) => r.observed,
+  );
 
   const stages = prediction?.stage_probabilities
     ? Object.entries(prediction.stage_probabilities).sort((a, b) => n(b[1]) - n(a[1]))
@@ -134,7 +140,9 @@ export default function Predictions({ history, forecast, prediction, envelope }:
             aside={
               <Legend
                 items={[
-                  { color: OBSERVED, label: "observed" },
+                  { color: RISK_BAND_COLORS[0], label: "observed" },
+                  { color: RISK_BAND_COLORS[1], label: "≥ threshold" },
+                  { color: RISK_BAND_COLORS[3], label: "critical" },
                   { color: FORECAST, label: "forecast", dashed: true },
                   { color: FORECAST, label: "band", fill: true },
                 ]}
@@ -147,7 +155,7 @@ export default function Predictions({ history, forecast, prediction, envelope }:
               <ResponsiveContainer width="100%" height="100%">
                 <ComposedChart data={joined} margin={{ top: 16, right: 12, left: 0, bottom: 0 }}>
                   <Grid />
-                  <TimeAxis />
+                  <TimeAxis count={joined.length} />
                   <ValueAxis domain={[0, 1]} ticks={[0, 0.25, 0.5, 0.75, 1]} />
                   <Tooltip
                     content={<Tip fmt={(v) => (Array.isArray(v) ? "" : Number(v).toFixed(3))} />}
@@ -157,23 +165,12 @@ export default function Predictions({ history, forecast, prediction, envelope }:
                   {prediction && <NowLine x="NOW" />}
 
                   <Area dataKey="band" name="band" stroke="none" fill="var(--fill-forecast)" isAnimationActive={false} connectNulls />
-                  <Area
-                    type="monotone"
-                    dataKey="observed"
-                    name="observed"
-                    stroke="none"
-                    fill="var(--fill-observed)"
-                    isAnimationActive={false}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="observed"
-                    name="observed"
-                    stroke={OBSERVED}
-                    strokeWidth={1.5}
-                    dot={false}
-                    isAnimationActive={false}
-                  />
+                  {(["observed-nominal", "observed-warning", "observed-elevated", "observed-critical"] as const).map((key, i) => (
+                    <Area key={key} type="monotone" dataKey={key} name="observed" stroke="none" fill={RISK_BAND_COLORS[i]} fillOpacity={0.1} isAnimationActive={false} />
+                  ))}
+                  {(["observed-nominal", "observed-warning", "observed-elevated", "observed-critical"] as const).map((key, i) => (
+                    <Line key={key} type="monotone" dataKey={key} name="observed" stroke={RISK_BAND_COLORS[i]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                  ))}
                   <Line
                     type="monotone"
                     dataKey="forecast"
@@ -269,16 +266,12 @@ export default function Predictions({ history, forecast, prediction, envelope }:
                     label="Precursor conf."
                     value={prediction.precursor_confidence != null ? n(prediction.precursor_confidence).toFixed(3) : "—"}
                   />
-                  <Field label="Risk source" value={prediction.risk_source ?? "model"} />
-                  <Field label="Model risk" value={prediction.ml_risk != null ? n(prediction.ml_risk).toFixed(3) : "—"} />
-                  <Field label="Model technique" value={prediction.ml_technique ?? prediction.predicted_stage ?? "—"} />
+                  <Field label="ML risk" value={prediction.ml_risk != null ? n(prediction.ml_risk).toFixed(3) : "—"} />
+                  <Field label="Rule risk" value={prediction.rule_risk != null ? n(prediction.rule_risk).toFixed(3) : "—"} />
                   <Field
-                    label="Rule opinion (advisory)"
-                    value={
-                      prediction.rule_risk != null
-                        ? `${n(prediction.rule_risk).toFixed(3)} ${prediction.rule_technique ?? ""}`.trim()
-                        : "—"
-                    }
+                    label="Rules applied"
+                    value={prediction.rules_applied ? "YES" : "no"}
+                    color={prediction.rules_applied ? "var(--sev-warning)" : undefined}
                   />
                 </div>
               </>

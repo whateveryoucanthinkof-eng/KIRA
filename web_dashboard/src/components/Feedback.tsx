@@ -86,7 +86,7 @@ const KEYS: { group: string; rows: [string, string][] }[] = [
   {
     group: "Navigation",
     rows: [
-      ["1 – 9, 0", "Jump to a view by its sidebar index"],
+      ["1 – 9, 0", "Views 01–10 by sidebar index"],
       ["Ctrl / Cmd + K", "Command palette"],
       ["[  ]", "Previous / next view"],
     ],
@@ -95,6 +95,7 @@ const KEYS: { group: string; rows: [string, string][] }[] = [
     group: "View",
     rows: [
       ["T", "Toggle ink / paper theme"],
+      ["F", "Full-screen host graph (Network, 3D)"],
       ["?", "This reference"],
       ["Esc", "Close any overlay"],
     ],

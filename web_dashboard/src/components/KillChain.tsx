@@ -6,7 +6,7 @@
  * claim, stated in one line: here is how far the intrusion has actually got,
  * and here is where the model says it goes next.
  *
- * Lanes are the real ordering from `correlation/causal_edge_scorer.py:TACTIC_ORDER`
+ * Lanes are the real ordering from `correlation/causal_edge_scorer.py:19`
  * TACTIC_ORDER. Stage assignment comes off the wire — `predicted_stage` on
  * PredictionData for the present, and on each ForecastPoint for the rollout.
  *

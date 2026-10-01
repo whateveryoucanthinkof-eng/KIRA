@@ -52,9 +52,6 @@ function mapSystemStatus(backendStatus: any): SystemStatus {
     latency: backendStatus.latency || 0,
     throughput: backendStatus.throughput || 0,
     activeConnections: backendStatus.activeConnections || 0,
-    sensorKernelDrops: backendStatus.sensorKernelDrops || 0,
-    incompleteWindows: backendStatus.incompleteWindows || 0,
-    windowsMissed: backendStatus.windowsMissed || 0,
     // Keep raw backend fields for conditional logic
     ...backendStatus,
   };
@@ -343,7 +340,7 @@ export function connectWebSocket(handlers: WSHandlers): any {
             confidence: p.prediction.malicious_confidence || 0,
             branch_a_risk: p.prediction.risk ?? 0,
             branch_b_risk: p.prediction.max_future_risk ?? p.prediction.risk ?? 0,
-            model: "cyberworld Ensemble",
+            model: "K.I.R.A. Ensemble",
             explainability: explain,
             // Real per-feature attributions. The old hardcoded trio (hazard
             // score / forecast error / max future risk) were risk scores, not

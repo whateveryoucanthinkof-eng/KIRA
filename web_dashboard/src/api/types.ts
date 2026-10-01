@@ -16,12 +16,6 @@ export interface SystemStatus {
   latency: number; // ms
   throughput: number; // Mbps
   activeConnections: number;
-  // Sensor blind spots (control_backend/capture_accounting.py). Cumulative
-  // since the sensor started; nonzero means some windows were scored on a
-  // partial capture or never scored at all.
-  sensorKernelDrops: number; // frames the kernel dropped before capture saw them
-  incompleteWindows: number; // windows built while the kernel was dropping
-  windowsMissed: number; // windows the sensor never delivered
   [key: string]: any; // Allow raw backend fields (network_online, ml_active, etc.)
 }
 
@@ -85,19 +79,11 @@ export interface PredictionResult {
   stage_probabilities?: Record<string, number> | null;
   technique_confidence?: number | null;
   stage_provenance?: Record<string, string>;
-  // Provenance (schema.py:PredictionData, spec 21/41). `risk` and
-  // `predicted_stage` are always the model's. The advisory rule layer, when
-  // enabled, reports its own opinion alongside and never replaces them.
+  // Provenance of the displayed risk (schema.py:PredictionData, spec 21/41):
+  // the SOC rule layer may blend model output with deterministic rules.
   ml_risk?: number | null;
-  ml_technique?: string | null;
   rule_risk?: number | null;
-  rule_technique?: string | null;
   rules_applied?: boolean | null;
-  risk_source?: string;
-  // A recorded block/isolation is not enforced by the console. The model keeps
-  // scoring real traffic; "traffic_persists" means the block is not working.
-  mitigation_status?: "recorded_quiet" | "traffic_persists" | null;
-  mitigation_bypass_flows?: number | null;
   branch_a_risk?: number;
   branch_b_risk?: number;
 }

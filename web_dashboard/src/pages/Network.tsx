@@ -1,6 +1,10 @@
-import { useMemo, useState } from "react";
-import type { Topology, TopologyEdge, TopologyNode } from "../api/types";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import type { PredictionResult, Topology, TopologyEdge, TopologyNode } from "../api/types";
 import type { PredictionEnvelope } from "../types/live";
+import type { FlowRecord } from "../types/evidence";
+import FlowTable from "../components/FlowTable";
+import Boundary, { hasWebGL } from "../components/Boundary";
+import type { Campaign } from "../types/campaign";
 import {
   Chip,
   Data,
@@ -15,10 +19,18 @@ import {
   sevColor,
 } from "../design/primitives";
 import { Legend } from "../design/charts";
+import { clockTime } from "../design/time";
+
+// three.js is ~600KB. Split it out so only this view pays for it.
+const Network3D = lazy(() => import("../components/Network3D"));
 
 interface NetworkProps {
   topology: Topology | null;
   envelope: PredictionEnvelope | null;
+  flows: FlowRecord[];
+  flowsInWindow: number | null;
+  campaign: Campaign | null;
+  prediction?: PredictionResult | null;
 }
 
 const ZONES = [
@@ -34,11 +46,68 @@ function edgeStroke(e: TopologyEdge): string {
   return "var(--rule-hard)";
 }
 
-export default function Network({ topology, envelope }: NetworkProps) {
+export default function Network({ topology, envelope, flows, flowsInWindow, campaign, prediction }: NetworkProps) {
   const [selNode, setSelNode] = useState<string | null>(null);
   const [selEdge, setSelEdge] = useState<string | null>(null);
 
   const focus = useMemo(() => new Set(envelope?.focus_ips ?? []), [envelope]);
+  const [bottom, setBottom] = useState<"hosts" | "flows">("hosts");
+  const [mode, setModeState] = useState<"3d" | "2d">(() => {
+    if (!hasWebGL()) return "2d";
+    try {
+      return localStorage.getItem("nw_mode") === "2d" ? "2d" : "3d";
+    } catch {
+      return "3d";
+    }
+  });
+  const setMode = (m: "3d" | "2d") => {
+    setModeState(m);
+    try {
+      localStorage.setItem("nw_mode", m);
+    } catch {
+      /* per-viewer convenience only */
+    }
+  };
+  /* The inventory can be hidden to give the graph the full height. */
+  const [tableOpen, setTableOpenState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("nw_table") !== "hidden";
+    } catch {
+      return true;
+    }
+  });
+  const setTableOpen = (open: boolean) => {
+    setTableOpenState(open);
+    try {
+      localStorage.setItem("nw_table", open ? "open" : "hidden");
+    } catch {
+      /* per-viewer convenience only */
+    }
+  };
+
+  /* The 2D layout is authored on an 800-unit canvas with hosts in x 80–720.
+     The viewBox widens to the panel's aspect and that range maps onto the
+     full width, so the graph spreads across the panel instead of
+     letterboxing into its middle. */
+  const graphArea = useRef<HTMLDivElement>(null);
+  const [area, setArea] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = graphArea.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(([entry]) => setArea({ w: entry.contentRect.width, h: entry.contentRect.height }));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const vw = area.h > 0 ? Math.max(800, Math.round((460 * area.w) / area.h)) : 800;
+  const X = (v: number) => 48 + ((v - 80) / 640) * (vw - 96);
+
+  const latestWindow = envelope?.state?.window_id ?? null;
+  const latestFlows = flows.filter((f) => f.window === latestWindow).length;
+  const names = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const t of topology?.nodes ?? []) if (t.ip && t.label && t.label !== t.ip) m[t.ip] = t.label;
+    return m;
+  }, [topology]);
 
   const nodes = topology?.nodes ?? [];
   const edges = topology?.edges ?? [];
@@ -57,34 +126,13 @@ export default function Network({ topology, envelope }: NetworkProps) {
     setSelEdge(null);
   }
 
-  return (
-    <div className="nw">
-      {/* ── Canvas ───────────────────────────────────────────────────── */}
-      <div className="nw-canvas sheet" style={{ gap: 1 }}>
-        {/* flex 1 1 0 — without an explicit grow the canvas sizes to content
-            and collapses against the fixed-height inventory below it. */}
-        <Panel flush clip style={{ flex: "1 1 0", display: "flex", flexDirection: "column", minHeight: 0 }}>
-          <PanelHead
-            title="Host graph"
-            note={topology ? `${nodes.length} hosts · ${edges.length} edges` : undefined}
-            aside={
-              <Legend
-                items={[
-                  { color: "var(--sev-nominal)", label: "online" },
-                  { color: "var(--sev-warning)", label: "at risk" },
-                  { color: "var(--sev-critical)", label: "compromised" },
-                  { color: "var(--paper-600)", label: "stale" },
-                ]}
-              />
-            }
-          />
+  const labelled = (n: TopologyNode) => (n as TopologyNode & { tier?: string }).tier !== "background";
 
-          <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
-            {nodes.length ? (
+  const graph2d = nodes.length ? (
               <svg
                 width="100%"
                 height="100%"
-                viewBox="0 0 800 460"
+                viewBox={`0 0 ${vw} 460`}
                 preserveAspectRatio="xMidYMid meet"
                 style={{ display: "block" }}
                 onClick={() => {
@@ -98,7 +146,7 @@ export default function Network({ topology, envelope }: NetworkProps) {
                     <line
                       x1={0}
                       y1={z.top}
-                      x2={800}
+                      x2={vw}
                       y2={z.top}
                       stroke="var(--rule-hair)"
                       strokeWidth={1}
@@ -131,9 +179,9 @@ export default function Network({ topology, envelope }: NetworkProps) {
                     <g key={e.id}>
                       {/* Fat invisible hit target — 1px lines are unclickable */}
                       <line
-                        x1={s.x}
+                        x1={X(s.x)}
                         y1={s.y}
-                        x2={t.x}
+                        x2={X(t.x)}
                         y2={t.y}
                         stroke="transparent"
                         strokeWidth={10}
@@ -145,9 +193,9 @@ export default function Network({ topology, envelope }: NetworkProps) {
                         }}
                       />
                       <line
-                        x1={s.x}
+                        x1={X(s.x)}
                         y1={s.y}
-                        x2={t.x}
+                        x2={X(t.x)}
                         y2={t.y}
                         stroke={on ? "var(--paper-000)" : edgeStroke(e)}
                         strokeWidth={on ? 2 : hot ? 1.6 : 1}
@@ -158,9 +206,9 @@ export default function Network({ topology, envelope }: NetworkProps) {
                       {isPath && (
                         <line
                           className="is-traveling"
-                          x1={s.x}
+                          x1={X(s.x)}
                           y1={s.y}
-                          x2={t.x}
+                          x2={X(t.x)}
                           y2={t.y}
                           stroke={sevColor(hot ? "critical" : "elevated")}
                           strokeWidth={2}
@@ -193,7 +241,7 @@ export default function Network({ topology, envelope }: NetworkProps) {
                       {/* Focus bracket — hosts the model is currently attending to */}
                       {isFocus && (
                         <rect
-                          x={x.x - half - 5}
+                          x={X(x.x) - half - 5}
                           y={x.y - half - 5}
                           width={(half + 5) * 2}
                           height={(half + 5) * 2}
@@ -218,7 +266,7 @@ export default function Network({ topology, envelope }: NetworkProps) {
                             return (
                               <path
                                 key={`${sx}${sy}`}
-                                d={`M ${x.x + sx * d} ${x.y + sy * d - sy * 6} L ${x.x + sx * d} ${x.y + sy * d} L ${x.x + sx * d - sx * 6} ${x.y + sy * d}`}
+                                d={`M ${X(x.x) + sx * d} ${x.y + sy * d - sy * 6} L ${X(x.x) + sx * d} ${x.y + sy * d} L ${X(x.x) + sx * d - sx * 6} ${x.y + sy * d}`}
                                 fill="none"
                                 stroke={sevColor(x.status)}
                                 strokeWidth={1.4}
@@ -227,7 +275,7 @@ export default function Network({ topology, envelope }: NetworkProps) {
                             );
                           })}
                           <text
-                            x={x.x}
+                            x={X(x.x)}
                             y={x.y - half - 16}
                             textAnchor="middle"
                             fill="var(--paper-600)"
@@ -241,7 +289,7 @@ export default function Network({ topology, envelope }: NetworkProps) {
                       )}
                       {on && (
                         <rect
-                          x={x.x - half - 4}
+                          x={X(x.x) - half - 4}
                           y={x.y - half - 4}
                           width={(half + 4) * 2}
                           height={(half + 4) * 2}
@@ -252,15 +300,18 @@ export default function Network({ topology, envelope }: NetworkProps) {
                         />
                       )}
                       <rect
-                        x={x.x - half}
+                        x={X(x.x) - half}
                         y={x.y - half}
                         width={half * 2}
                         height={half * 2}
                         fill={c}
                         shapeRendering="crispEdges"
                       />
+                      {/* Background population stays unlabelled, so a dense
+                          segment reads as dense rather than as a pile of text. */}
+                      {(labelled(x) || on) && (
                       <text
-                        x={x.x}
+                        x={X(x.x)}
                         y={x.y + half + 12}
                         textAnchor="middle"
                         fill={on ? "var(--paper-000)" : "var(--paper-400)"}
@@ -269,9 +320,10 @@ export default function Network({ topology, envelope }: NetworkProps) {
                       >
                         {x.label}
                       </text>
-                      {x.ip && x.ip !== x.label && (
+                      )}
+                      {(labelled(x) || on) && x.ip && x.ip !== x.label && (
                         <text
-                          x={x.x}
+                          x={X(x.x)}
                           y={x.y + half + 22}
                           textAnchor="middle"
                           fill="var(--paper-600)"
@@ -289,14 +341,109 @@ export default function Network({ topology, envelope }: NetworkProps) {
               <Empty hint="Nodes are discovered from observed SPAN traffic and expire after their TTL.">
                 No hosts discovered
               </Empty>
+            );
+
+  return (
+    <div className="nw">
+      {/* ── Canvas ───────────────────────────────────────────────────── */}
+      <div className="nw-canvas sheet" style={{ gap: 1 }}>
+        {/* flex 1 1 0 — without an explicit grow the canvas sizes to content
+            and collapses against the fixed-height inventory below it. */}
+        <Panel flush clip style={{ flex: "1 1 0", display: "flex", flexDirection: "column", minHeight: 0 }}>
+          <PanelHead
+            title="Host graph"
+            note={topology ? `${nodes.length} hosts · ${edges.length} edges` : undefined}
+            aside={
+              <>
+                {mode === "2d" && (
+                  <Legend
+                    items={[
+                      { color: "var(--sev-nominal)", label: "online" },
+                      { color: "var(--sev-warning)", label: "at risk" },
+                      { color: "var(--sev-critical)", label: "compromised" },
+                      { color: "var(--paper-600)", label: "stale" },
+                    ]}
+                  />
+                )}
+                <span className="seg-group">
+                  <button className="seg" aria-pressed={mode === "3d"} onClick={() => setMode("3d")} disabled={!hasWebGL()}>
+                    3D
+                  </button>
+                  <button className="seg" aria-pressed={mode === "2d"} onClick={() => setMode("2d")}>
+                    2D
+                  </button>
+                </span>
+              </>
+            }
+          />
+
+          <div ref={graphArea} style={{ flex: 1, minHeight: 0, position: "relative" }}>
+            {mode === "3d" ? (
+              <Boundary fallback={graph2d}>
+                <Suspense fallback={<Empty hint="Loading the WebGL renderer.">Preparing 3D view</Empty>}>
+                  <Network3D
+                    topology={topology}
+                    envelope={envelope}
+                    campaign={campaign}
+                    flows={flows}
+                    selected={selNode}
+                    situation={
+                      prediction
+                        ? { level: prediction.alert_level, risk: prediction.risk, technique: prediction.mitre_technique }
+                        : null
+                    }
+                    onSelect={(id) => {
+                      setSelNode(id);
+                      setSelEdge(null);
+                    }}
+                  />
+                </Suspense>
+              </Boundary>
+            ) : (
+              graph2d
             )}
           </div>
         </Panel>
 
         {/* ── Host table ───────────────────────────────────────────── */}
-        <Panel flush clip style={{ flex: "0 0 200px", display: "flex", flexDirection: "column" }}>
-          <PanelHead title="Host inventory" note={`${nodes.length}`} />
-          <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+        <Panel
+          flush
+          clip
+          style={{ flex: tableOpen ? "0 0 clamp(150px, 22vh, 240px)" : "0 0 auto", display: "flex", flexDirection: "column" }}
+        >
+          <div className="tabs" style={tableOpen ? undefined : { borderBottom: "none" }}>
+            <button
+              className="tab"
+              aria-selected={tableOpen && bottom === "hosts"}
+              onClick={() => {
+                setBottom("hosts");
+                setTableOpen(true);
+              }}
+            >
+              <span>Host inventory</span>
+              <span className="tab-count">{nodes.length}</span>
+            </button>
+            <button
+              className="tab"
+              aria-selected={tableOpen && bottom === "flows"}
+              onClick={() => {
+                setBottom("flows");
+                setTableOpen(true);
+              }}
+            >
+              <span>Flows</span>
+              <span className="tab-count">{latestFlows}</span>
+            </button>
+            <button className="tab tab-end" onClick={() => setTableOpen(!tableOpen)} aria-expanded={tableOpen}>
+              {tableOpen ? "Hide table" : "Show table"}
+            </button>
+          </div>
+          {!tableOpen ? null : bottom === "flows" ? (
+            <div key="flows" className="is-entering" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+              <FlowTable flows={flows} flowsInWindow={flowsInWindow ?? undefined} latestWindow={latestWindow} names={names} />
+            </div>
+          ) : (
+          <div key="hosts" className="is-entering" style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
             <table className="tbl">
               <thead>
                 <tr>
@@ -341,6 +488,7 @@ export default function Network({ topology, envelope }: NetworkProps) {
               </tbody>
             </table>
           </div>
+          )}
         </Panel>
       </div>
 
@@ -443,7 +591,7 @@ export default function Network({ topology, envelope }: NetworkProps) {
               <PanelBody>
                 <Field label="Nodes" value={String(nodes.length)} />
                 <Field label="Edges" value={String(edges.length)} />
-                <Field label="Updated" value={topology ? new Date(topology.lastUpdated).toLocaleTimeString("en-GB", { hour12: false }) : "—"} />
+                <Field label="Updated" value={topology ? clockTime(topology.lastUpdated) : "—"} />
                 {envelope?.target_ip && <Field label="Primary target" value={envelope.target_ip} />}
               </PanelBody>
 

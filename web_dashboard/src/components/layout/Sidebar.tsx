@@ -3,6 +3,8 @@ import { Micro, Square, Rule } from "../../design/primitives";
 
 type Page =
   | "overview"
+  | "stage"
+  | "investigation"
   | "network"
   | "predictions"
   | "campaign"
@@ -19,6 +21,8 @@ type Page =
  */
 const NAV: { id: Page; label: string }[] = [
   { id: "overview", label: "Overview" },
+  { id: "stage", label: "Forecast Stage" },
+  { id: "investigation", label: "Investigation" },
   { id: "network", label: "Network" },
   { id: "predictions", label: "Predictions" },
   { id: "campaign", label: "Campaign" },
@@ -65,13 +69,30 @@ export default function Sidebar({ activePage, onNavigate, status }: SidebarProps
         height: "100%",
       }}
     >
-      {/* ── Masthead ─────────────────────────────────────────────── */}
-      <div style={{ padding: "var(--s-4)", borderBottom: "var(--hard)" }}>
-        <div className="t-display-m" style={{ color: "var(--paper-000)", lineHeight: 1 }}>
-          cyberworld
+      {/* ── Masthead — mark and wordmark as one lockup ───────────── */}
+      <div style={{ padding: "var(--s-3) var(--s-4)", borderBottom: "var(--hair)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+          <img src="/kira-mark.png" alt="K.I.R.A. mark" width={34} height={34} style={{ display: "block", flexShrink: 0 }} />
+          <div
+            style={{
+              color: "var(--paper-000)",
+              lineHeight: 1,
+              fontFamily: "var(--face-display)",
+              fontWeight: 700,
+              fontSize: 20,
+              letterSpacing: "0.02em",
+              whiteSpace: "nowrap",
+            }}
+          >
+            K.I.R.A.
+          </div>
         </div>
-        <Micro style={{ marginTop: 6, color: "var(--paper-600)", letterSpacing: "0.1em" }}>
-          Attack Forecasting
+        <Micro
+          style={{ marginTop: 7, color: "var(--paper-600)", letterSpacing: "0.14em", fontSize: 8, lineHeight: 1.55 }}
+          title="Kinetic Intrusion Risk Anticipator"
+        >
+          <span style={{ display: "block" }}>Kinetic Intrusion</span>
+          <span style={{ display: "block" }}>Risk Anticipator</span>
         </Micro>
       </div>
 

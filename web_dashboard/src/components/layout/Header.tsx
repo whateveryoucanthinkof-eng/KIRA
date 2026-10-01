@@ -1,5 +1,5 @@
 import type { SystemStatus, SiteInfo } from "../../api/types";
-import { Chip, Micro, Square } from "../../design/primitives";
+import { Chip, Square } from "../../design/primitives";
 
 interface HeaderProps {
   status: SystemStatus | null;
@@ -8,15 +8,8 @@ interface HeaderProps {
   pageTitle: string;
   theme: "ink" | "paper";
   onToggleTheme: () => void;
-}
-
-function clock(ts?: string): string {
-  if (!ts) return "--:--:--";
-  try {
-    return new Date(ts).toLocaleTimeString("en-GB", { hour12: false });
-  } catch {
-    return "--:--:--";
-  }
+  /** Set when the console is showing a recorded or forecast moment, not the present. */
+  timeline?: { label: string; onLive: () => void } | null;
 }
 
 /**
@@ -49,42 +42,7 @@ function ThemeSwitch({ theme, onToggle }: { theme: "ink" | "paper"; onToggle: ()
   );
 }
 
-/** Model card straight off the wire — never hardcode the temporal contract. */
-function ModelStrip({ status }: { status: SystemStatus | null }) {
-  const meta = status?.model_meta as
-    | { name?: string; version?: string; history_steps?: number; forecast_steps?: number; window_seconds?: number; threshold?: number }
-    | null
-    | undefined;
-
-  if (!meta) {
-    return (
-      <span className="t-data-s" style={{ color: "var(--paper-600)" }}>
-        no model loaded
-      </span>
-    );
-  }
-
-  const L = meta.history_steps;
-  const K = meta.forecast_steps;
-  const w = meta.window_seconds;
-  const parts: string[] = [];
-  if (meta.version) parts.push(`v${String(meta.version).replace(/^v/, "")}`);
-  if (L != null && K != null) parts.push(`L=${L} K=${K}`);
-  if (w != null) parts.push(`Δt=${w}s`);
-  if (meta.threshold != null) parts.push(`θ=${meta.threshold.toFixed(2)}`);
-
-  return (
-    <span
-      className="t-data-s"
-      style={{ color: "var(--paper-600)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-      title={meta.name ?? undefined}
-    >
-      {parts.join("  ·  ")}
-    </span>
-  );
-}
-
-export default function Header({ status, site, wsConnected, pageTitle, theme, onToggleTheme }: HeaderProps) {
+export default function Header({ status, site, wsConnected, pageTitle, theme, onToggleTheme, timeline }: HeaderProps) {
   return (
     <header
       style={{
@@ -116,22 +74,14 @@ export default function Header({ status, site, wsConnected, pageTitle, theme, on
 
       <div style={{ flex: 1, minWidth: "var(--s-4)" }} />
 
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 1, minWidth: 0 }}>
-        <Micro style={{ letterSpacing: "0.1em" }}>Model</Micro>
-        <ModelStrip status={status} />
-      </div>
-
-      <span style={{ width: 1, height: 28, background: "var(--rule-hair)", flexShrink: 0 }} />
+      {timeline && (
+        <button className="hdr-timeline" onClick={timeline.onLive} title="Return to live">
+          <span>{timeline.label}</span>
+          <b>Live</b>
+        </button>
+      )}
 
       {status && <Chip level={status.threatLevel}>{status.threatLevel}</Chip>}
-
-      <span
-        className="t-data-s"
-        style={{ color: "var(--paper-400)", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}
-        title="last backend update"
-      >
-        {clock(status?.lastUpdate)}
-      </span>
 
       <span
         style={{

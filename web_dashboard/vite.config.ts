@@ -1,7 +1,8 @@
-import { defineConfig, type HtmlTagDescriptor, type Plugin } from 'vite'
+import { defineConfig, type Connect, type HtmlTagDescriptor, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
+import type { ServerResponse } from 'node:http'
 
 // Removed figma site.json import
 // Vite config — https://vitejs.dev/config/
@@ -19,29 +20,39 @@ export default defineConfig(({ mode }) => {
       react(),
       tailwindcss(),
       figmaSiteConfiguration({
-        title: 'cyberworld — Attack Forecasting',
+        title: 'K.I.R.A. — Kinetic Intrusion Risk Anticipator',
         description:
-          'Near-term network attack forecasting console. Live host graph and ATT&CK-aware risk trajectory from SPAN telemetry.',
-        icons: { icon: '/favicon.svg' },
+          'Network attack forecasting console. Live host graph, ATT&CK-aware risk trajectory and campaign reconstruction from SPAN telemetry.',
+        icons: { icon: '/kira-mark.png' },
       }),
       figmaErrorOverlayReplay(),
       figmaReactRefreshBoundaryFallback(),
       figmaMakeKitPlugin({ storiesGlob: '/src/**/*.stories.{ts,tsx,js,jsx}' }),
+      demoTriggerBridge(),
     ],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),
       },
     },
-    // Loopback by default; set FIGMA_DEV_SERVER_HOST to expose the dev server.
     server: {
-      host: process.env.FIGMA_DEV_SERVER_HOST || '127.0.0.1',
+      host: process.env.FIGMA_DEV_SERVER_HOST || '0.0.0.0',
       port: parseInt(process.env.PORT || '8443'),
       strictPort: true,
       watch: { ignored: ['**/.figma/**'] },
+      proxy: {
+        '/api': {
+          target: 'http://localhost:8000',
+          changeOrigin: true,
+        },
+        '/ws': {
+          target: 'ws://localhost:8000',
+          ws: true,
+        },
+      },
     },
     preview: {
-      host: process.env.FIGMA_DEV_SERVER_HOST || '127.0.0.1',
+      host: process.env.FIGMA_DEV_SERVER_HOST || '0.0.0.0',
       port: parseInt(process.env.PORT || '8443'),
     },
   }
@@ -296,6 +307,113 @@ function figmaReactRefreshBoundaryFallback(): Plugin {
       }
 
       return null
+    },
+  }
+}
+
+/**
+ * Terminal → demo-page bridge for recording demo videos.
+ *
+ * The demo build (`npm run demo` / `npm run demo:prod`) runs entirely in the
+ * browser off `src/api/mock.ts`; there is no backend to poke. This adds two
+ * routes to the dev/preview server so a plain terminal command — a fake
+ * `hping3` / `nmap` / … that only curls this endpoint — can drive the console
+ * from off-screen:
+ *
+ *   GET/POST /__demo/trigger?stage=ddos   broadcast a stage to open pages
+ *   GET      /__demo/stream               Server-Sent Events the page subscribes to
+ *
+ * Stage names line up with `STAGE_BANDS` in mock.ts. Server-only middleware, so
+ * nothing here ships in a production bundle; the routes simply do not exist
+ * against the real FastAPI backend.
+ */
+function demoTriggerBridge(): Plugin {
+  const clients = new Set<ServerResponse>()
+  const STAGES = new Set(['recon', 'probe', 'exploit', 'c2', 'lateral', 'ddos', 'reset', 'contain'])
+
+  function broadcast(stage: string): number {
+    const msg = `event: trigger\ndata: ${JSON.stringify({ stage, at: Date.now() })}\n\n`
+    for (const res of clients) {
+      try {
+        res.write(msg)
+      } catch {
+        clients.delete(res)
+      }
+    }
+    return clients.size
+  }
+
+  const middleware: Connect.NextHandleFunction = (req, res, next) => {
+    const url = req.url || ''
+    const pathname = url.split('?')[0]
+
+    if (pathname === '/__demo/stream') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+      })
+      res.write('retry: 2000\n\n')
+      res.write(': connected\n\n')
+      clients.add(res)
+      const keepAlive = setInterval(() => {
+        try {
+          res.write(': ka\n\n')
+        } catch {
+          /* dropped below */
+        }
+      }, 15000)
+      req.on('close', () => {
+        clearInterval(keepAlive)
+        clients.delete(res)
+      })
+      return
+    }
+
+    if (pathname === '/__demo/trigger') {
+      const reply = (stage: string) => {
+        const norm = stage.toLowerCase().trim()
+        const ok = STAGES.has(norm)
+        const listeners = ok ? broadcast(norm) : clients.size
+        res.writeHead(ok ? 200 : 400, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        })
+        res.end(JSON.stringify({ ok, stage: norm, listeners, stages: [...STAGES] }))
+      }
+
+      const query = new URLSearchParams(url.split('?')[1] || '')
+      const fromQuery = query.get('stage')
+      if (fromQuery != null) return reply(fromQuery)
+
+      let body = ''
+      req.on('data', (chunk) => {
+        body += chunk
+        if (body.length > 10_000) req.destroy()
+      })
+      req.on('end', () => {
+        let stage = ''
+        try {
+          stage = String(JSON.parse(body || '{}').stage ?? '')
+        } catch {
+          /* invalid JSON → empty stage → 400 */
+        }
+        reply(stage)
+      })
+      return
+    }
+
+    next()
+  }
+
+  return {
+    name: 'cyberworld-demo-trigger-bridge',
+    configureServer(server) {
+      server.middlewares.use(middleware)
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(middleware)
     },
   }
 }

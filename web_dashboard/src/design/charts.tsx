@@ -12,8 +12,9 @@
  *   · The model's own alert threshold is drawn on every risk plot.
  */
 
-import { CartesianGrid, ReferenceLine, XAxis, YAxis } from "recharts";
+import { Area, CartesianGrid, Line, ReferenceLine, XAxis, YAxis } from "recharts";
 import type { ReactNode } from "react";
+import { sevFromRisk } from "./primitives";
 
 export const OBSERVED = "var(--signal-observed)";
 export const FORECAST = "var(--signal-forecast)";
@@ -30,9 +31,27 @@ export function Grid() {
   return <CartesianGrid stroke="var(--rule-hair)" strokeDasharray="0" vertical={false} />;
 }
 
-export function TimeAxis({ dataKey = "t", interval }: { dataKey?: string; interval?: number | "preserveStartEnd" }) {
-  return <XAxis dataKey={dataKey} {...axisProps} minTickGap={28} interval={interval ?? "preserveStartEnd"} />;
+/**
+ * Time runs left to right. Pass `count` (the series length): the axis then
+ * labels every nth point directly, instead of Recharts measuring every
+ * candidate label in the DOM on each render to decide which fit — which, on a
+ * live series whose labels change every tick, never hits its cache.
+ */
+export function TimeAxis({
+  dataKey = "t",
+  count,
+  interval,
+}: {
+  dataKey?: string;
+  count?: number;
+  interval?: number | "preserveStartEnd";
+}) {
+  const every = interval ?? (count != null ? Math.max(0, Math.ceil(count / LABELS) - 1) : "preserveStartEnd");
+  return <XAxis dataKey={dataKey} {...axisProps} minTickGap={28} interval={every} />;
 }
+
+/** Labels per time axis — roughly one per 110px at the console's chart widths. */
+const LABELS = 7;
 
 export function ValueAxis({
   domain,
@@ -97,6 +116,61 @@ export function NowLine({ x, label = "NOW" }: { x: string | number; label?: stri
    TOOLTIP — a hard-edged ink panel. No radius, no shadow, mono throughout.
    ════════════════════════════════════════════════════════════════════════ */
 
+/* ══════════════════════════════════════════════════════════════════
+   RISK BANDS — the curve wears the severity ladder
+   ──────────────────────────────────────────────────────────────────
+   A risk plot is not one flat line: the stroke changes colour exactly
+   where the risk crosses the severity thresholds that colour every
+   readout — amber at θ (warning/elevated), red past the critical bound,
+   nominal green below θ. Same source of truth as the numbers: sevFromRisk.
+   ══════════════════════════════════════════════════════════════════ */
+
+/** Band colours, index-matched to sevFromRisk: nominal, warning, elevated, critical. */
+export const RISK_BAND_COLORS = ["var(--sev-nominal)", "var(--sev-warning)", "var(--sev-elevated)", "var(--sev-critical)"] as const;
+
+const BAND_KEYS = ["observed-nominal", "observed-warning", "observed-elevated", "observed-critical"] as const;
+
+/** Legend entries matching the banded risk curve. */
+export const RISK_LEGEND_ITEMS = [
+  { color: RISK_BAND_COLORS[0], label: "observed" },
+  { color: RISK_BAND_COLORS[1], label: "≥ θ" },
+  { color: RISK_BAND_COLORS[3], label: "critical" },
+] as const;
+
+/** Data keys of the four severity bands, in ladder order. */
+export const riskBandKeys = BAND_KEYS;
+
+/**
+ * Split an observed risk series into one column per severity band. When the
+ * curve crosses a boundary the outgoing band also receives the crossing
+ * point, so the per-band segments join seamlessly and the stroke changes
+ * colour exactly at the threshold — never between windows.
+ */
+export function splitRisk<T>(rows: T[], threshold: number, getValue: (row: T) => number | undefined) {
+  type Row = T & Record<(typeof BAND_KEYS)[number], number | undefined>;
+  const out = rows.map(
+    (r) =>
+      ({ ...r, "observed-nominal": undefined, "observed-warning": undefined, "observed-elevated": undefined, "observed-critical": undefined }) as Row,
+  );
+  const bandOf = (v: number): number => {
+    const s = sevFromRisk(v, threshold);
+    return s === "critical" ? 3 : s === "elevated" ? 2 : s === "warning" ? 1 : 0;
+  };
+  let prevBand = -1;
+  for (let i = 0; i < rows.length; i++) {
+    const v = getValue(rows[i]);
+    if (v == null || !Number.isFinite(v)) {
+      prevBand = -1;
+      continue;
+    }
+    const b = bandOf(v);
+    if (prevBand !== -1 && prevBand !== b) out[i][BAND_KEYS[prevBand]] = v;
+    out[i][BAND_KEYS[b]] = v;
+    prevBand = b;
+  }
+  return out;
+}
+
 interface TipItem {
   name?: string;
   value?: number | string;
@@ -119,7 +193,17 @@ export function Tip({
   suffix?: string;
 }) {
   if (!active || !payload?.length) return null;
-  const items = (payload as TipItem[]).filter((i) => i.value !== undefined && i.value !== null);
+  // A series drawn as both an area fill and a line appears twice in the
+  // payload under the same dataKey. Keep the first of each, or the tooltip
+  // repeats the row and React sees duplicate keys.
+  const seen = new Set<string>();
+  const items = (payload as TipItem[]).filter((i) => {
+    if (i.value === undefined || i.value === null) return false;
+    const k = String(i.dataKey ?? i.name);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
   if (!items.length) return null;
 
   return (
