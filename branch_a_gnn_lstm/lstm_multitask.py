@@ -618,7 +618,7 @@ class MultiTaskLSTM(nn.Module):
             # technique prediction by construction.
             p = torch.softmax(tech_logits, dim=-1)
             level_p = p.new_zeros(p.shape[0], self.num_gradations).index_add_(
-                1, self._tech_level.to(p.device), p)
+                1, self._tech_level_on(p.device), p)
             grad_logits = torch.log(level_p.clamp_min(1e-12))
 
         return {
@@ -630,6 +630,18 @@ class MultiTaskLSTM(nn.Module):
             "attention_weights": attn_weights,
             "context": context,
         }
+
+    def _tech_level_on(self, device) -> torch.Tensor:
+        """`self._tech_level` on `device`, copied once rather than every forward.
+
+        `.to(cuda)` of a pageable CPU tensor was a synchronous host-to-device
+        copy on every training step (and cannot be recorded in a CUDA graph).
+        Same values; the CPU original is kept for anything that reads it."""
+        cached = getattr(self, "_tech_level_dev", None)
+        if cached is None or cached.device != torch.device(device):
+            cached = self._tech_level.to(device)
+            self._tech_level_dev = cached
+        return cached
 
     # -- construction from a checkpoint ------------------------------------
     def arch_config(self) -> Dict[str, Any]:

@@ -37,6 +37,7 @@ from data_unification.split_policy import is_cross_year
 from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingGuard,
                                           default_warmup_steps, run_fingerprint)
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
+from cyberworld_v4.graphed_step import GraphedLoss, graphs_enabled
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
@@ -1282,6 +1283,11 @@ def main():
                              "this corpus has one window, so the default drops a lot "
                              "and says so).")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-cuda-graph", action="store_true",
+                        help="Run the training step's forward/backward eagerly instead of "
+                             "replaying it as a CUDA graph (cyberworld_v4/graphed_step.py; "
+                             "bit-identical, ~2.7x less host time per step). Also "
+                             "CYBERWORLD_CUDA_GRAPH=0.")
     parser.add_argument("--legacy-loader", action="store_true",
                         help="Per-sample __getitem__ + default collate (the pre-2026-10 "
                              "loader). The default batched loader yields bit-identical "
@@ -1801,7 +1807,7 @@ def main():
     # Crash recovery (cyberworld_v4/training_guard.ResumePoint). Extraction
     # re-runs on a restart; the finished epochs do not.
     resume = ResumePoint(args.output.with_name(args.output.stem + "_resume.pt"),
-                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers", "legacy_loader")),
+                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers", "legacy_loader", "no_cuda_graph")),
                          enabled=not args.no_resume, log=lambda m: print(m, flush=True))
     first_epoch = 1
     _rp = resume.load()
@@ -1815,6 +1821,7 @@ def main():
         if guard.should_stop():
             first_epoch = args.epochs + 1    # it had already stopped; just finish
 
+    _graphed_loss = None
     for epoch in range(first_epoch, args.epochs + 1):
         model.train()
         # Loss is accumulated as a GPU tensor and read once at the end of the
@@ -1842,6 +1849,16 @@ def main():
         # restores the syncing step.
         _guard_step = (guard.backward_step_deferred if guard.deferred_supported()
                        else guard.backward_step)
+        # forward + loss + backward replayed as a CUDA graph for full batches
+        # (built once, on the first one); identical losses and weights.
+        if _graphed_loss is None:
+            def _train_loss(x_, t_, risk_, tech_, grad_):
+                p_ = model(x_, t_history=t_)
+                return model.compute_loss(
+                    p_, {"risk": risk_, "technique": tech_, "gradation": grad_})[0]
+            _graphed_loss = GraphedLoss(
+                _train_loss, [model],
+                enabled=(device == "cuda" and not args.no_cuda_graph and graphs_enabled()))
         for batch in train_loader:
             _k += 1
             x = batch["features"].to(device, non_blocking=_non_blocking)
@@ -1866,8 +1883,12 @@ def main():
                       f"cos(tech,grad)={_c3['tech_vs_grad']:+.3f} "
                       f"dominant={_conflict['dominant_task']}", flush=True)
             optimizer.zero_grad(set_to_none=True)
-            predictions = model(x, t_history=t_hist)
-            loss, _ = model.compute_loss(predictions, targets)
+            if t_hist is not None:
+                loss = _graphed_loss(x, t_hist, targets["risk"], targets["technique"],
+                                     targets["gradation"])
+            else:
+                predictions = model(x, t_history=t_hist)
+                loss, _ = model.compute_loss(predictions, targets)
             # backward + clip + step. A non-finite loss is skipped and counted,
             # never stepped on; the guard turns a run of them into a step back.
             _ok = _guard_step(loss)
@@ -1898,6 +1919,10 @@ def main():
                       f"eta={_eta / 60:.1f}m", flush=True)
         guard.flush()
         _nb = int(_nb_dev)
+        if _graphed_loss is not None and _graphed_loss.enabled:
+            print(f"  cuda graph: {_graphed_loss.n_graphed} graphed steps, "
+                  f"{_graphed_loss.n_eager} eager (other batch shapes)", flush=True)
+            _graphed_loss.n_graphed = _graphed_loss.n_eager = 0
 
         metrics = _evaluate(model, val_loader, device,
                             num_techniques=len(TECHNIQUE_VOCAB),

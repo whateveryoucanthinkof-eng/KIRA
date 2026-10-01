@@ -63,6 +63,14 @@ def main():
                           warmup_steps=500, clip_norm=1.0, log=print)
     step = guard.backward_step if (a.legacy or not guard.deferred_supported()) \
         else guard.backward_step_deferred
+    def _f(x, th, r, tc, gr):
+        return model.compute_loss(model(x, t_history=th),
+                                  {"risk": r, "technique": tc, "gradation": gr})[0]
+    if a.cuda_graph:
+        from cyberworld_v4.graphed_step import GraphedLoss
+        lossfn = GraphedLoss(_f, [model])
+    else:
+        lossfn = _f
     loss_sum = torch.zeros((), device=dev, dtype=torch.float64)
     nb = torch.zeros((), device=dev, dtype=torch.long)
     model.train()
@@ -70,11 +78,10 @@ def main():
     def one(batch):
         nonlocal loss_sum
         x = batch["features"].to(dev, non_blocking=True)
-        tg = {k: batch[k].to(dev, non_blocking=True) for k in ("risk", "technique", "gradation")}
+        tg = [batch[k].to(dev, non_blocking=True) for k in ("risk", "technique", "gradation")]
         th = batch["t_history"].to(dev, non_blocking=True)
         opt.zero_grad(set_to_none=True)
-        p = model(x, t_history=th)
-        loss, _ = model.compute_loss(p, tg)
+        loss = lossfn(x, th, *tg)
         ok = step(loss)
         if ok is False:
             return
@@ -110,7 +117,7 @@ def main():
         n += 1
     torch.cuda.synchronize()
     el = time.perf_counter() - t0
-    print(f"RESULT {'legacy' if a.legacy else 'new'} {n / el:.1f} batch/s "
+    print(f"RESULT {'legacy' if a.legacy else 'new'}{'+graph' if a.cuda_graph else ''} w{a.workers} {n / el:.1f} batch/s "
           f"({1e3 * el / n:.2f} ms/batch)", flush=True)
 
 
