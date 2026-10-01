@@ -13,8 +13,20 @@ def eval_edge_prediction_with_categories(
     n_neighbors=20,
     device=None,
     edge_criterion=None,
-    category_criterion=None
+    category_criterion=None,
+    ignore_classes=(),
 ):
+    """Link-prediction and category metrics over `data`.
+
+    `ignore_classes` (UNKNOWN: edges without a label) are scored for link
+    prediction like any edge but left out of every CATEGORY metric, and the
+    head is never credited or blamed for predicting them: argmax runs over the
+    labelled classes only.
+
+    Per-class accuracy of a class ABSENT from `data` is NaN, not 0.0. A 0.0
+    there read as "the head never recalls this class" -- the health check
+    reported it as a dead class -- when the split simply holds none of it.
+    """
     model.eval()
     if device is None:
         device = model.device
@@ -83,6 +95,13 @@ def eval_edge_prediction_with_categories(
     pos_scores = np.concatenate(all_pos_scores)
     neg_scores = np.concatenate(all_neg_scores)
 
+    ignore = [int(c) for c in ignore_classes if 0 <= int(c) < category_logits.shape[1]]
+    if ignore:
+        category_logits[:, ignore] = -np.inf
+        keep = ~np.isin(y_true, ignore)
+        y_true = y_true[keep]
+        category_logits = category_logits[keep]
+        y_pred = np.argmax(category_logits, axis=1) if len(category_logits) else y_pred[:0]
     y_scores = torch.softmax(torch.tensor(category_logits), dim=1).numpy()
 
     # Binary classification (link prediction)
@@ -90,6 +109,16 @@ def eval_edge_prediction_with_categories(
     all_labels = np.concatenate([np.ones_like(pos_scores), np.zeros_like(neg_scores)])
     auc_score = roc_auc_score(all_labels, all_scores)
     avg_precision = average_precision_score(all_labels, all_scores)
+
+    if len(y_true) == 0:
+        # Every edge of this split is unlabelled: link metrics only.
+        nan, C = float("nan"), category_logits.shape[1]
+        per = {c: nan for c in range(C) if c not in ignore}
+        return (avg_precision, auc_score, nan, nan, nan,
+                total_category_loss / num_batches if category_criterion else None,
+                {'edge_loss': total_edge_loss / num_batches if edge_criterion else None},
+                dict(per), nan, nan, nan, nan, nan, nan, nan, nan, y_true, y_scores,
+                dict(per), dict(per), dict(per), dict(per))
 
     # Hits@K and MRR, vectorised.
     #
@@ -153,14 +182,18 @@ def eval_edge_prediction_with_categories(
     accuracy_by_class = {}
 
     for c in range(num_classes):
+        if c in ignore:
+            continue
         true_indices = (y_true == c)
         if true_indices.sum() == 0:
-            accuracy_by_class[c] = 0.0
+            accuracy_by_class[c] = float("nan")     # absent from this split, not "never recalled"
         else:
             correct_preds = (y_pred[true_indices] == c).sum()
             accuracy_by_class[c] = correct_preds / true_indices.sum()
 
     for c in range(num_classes):
+        if c in ignore:
+            continue
         y_true_bin = (y_true == c).astype(int)
         y_pred_bin = (y_pred == c).astype(int)
         y_score_class = y_scores[:, c]
@@ -169,9 +202,11 @@ def eval_edge_prediction_with_categories(
         recall_by_class[c] = recall_score(y_true_bin, y_pred_bin, zero_division=0)
         f1_by_class[c] = f1_score(y_true_bin, y_pred_bin, zero_division=0)
 
-        try:
+        # Undefined with one class present: NaN, without asking sklearn (which
+        # warned on every such slice, every epoch, and returned NaN anyway).
+        if 0 < y_true_bin.sum() < len(y_true_bin):
             auc_by_class[c] = roc_auc_score(y_true_bin, y_score_class)
-        except:
+        else:
             auc_by_class[c] = float('nan')
 
         # Per-class MRR, vectorised.

@@ -72,10 +72,16 @@ class FocalLoss(nn.Module):
                     raise ValueError("scalar alpha needs num_classes")
                 a = torch.full((num_classes,), float(a))
             self.register_buffer("alpha", a)
+        # A class with alpha exactly 0 is IGNORED (UNKNOWN: an edge with no
+        # label). Its rows add nothing, and the mean is taken over the labelled
+        # rows only, so a batch that is half unlabelled does not halve the
+        # gradient of the other half. Without ignored classes the reduction is
+        # the plain mean, unchanged.
+        self._ignore = bool(self.alpha is not None and bool((self.alpha == 0).any()))
 
     @staticmethod
     def inverse_frequency_alpha(labels, num_classes: int, *, power: float = 0.5,
-                                clip: tuple = (0.2, 5.0)) -> torch.Tensor:
+                                clip: tuple = (0.2, 5.0), ignore_classes=()) -> torch.Tensor:
         """Damped, clipped inverse-frequency per-class weights.
 
         Plain 1/frequency is unstable on this corpus. Classes absent (or nearly
@@ -91,6 +97,9 @@ class FocalLoss(nn.Module):
         sane, and clipped to a bounded range.
         """
         counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=num_classes).astype(np.float64)
+        ignored = [int(c) for c in ignore_classes if 0 <= int(c) < num_classes]
+        counts_all = counts.copy()
+        counts[ignored] = 0.0          # never a target: must not shape the others' weights
         w = np.ones(num_classes, dtype=np.float64)
         present = counts > 0
         if present.any():
@@ -114,6 +123,8 @@ class FocalLoss(nn.Module):
             w[present] = inv / float(np.exp(np.mean(np.log(inv))))
         w_unclipped = w.copy()
         w = np.clip(w, clip[0], clip[1])
+        w[ignored] = 0.0
+        w_unclipped[ignored] = 1.0
 
         # Report what the weights were actually built from. The class counts
         # are the single most diagnostic number here: a weight of exactly 1.0
@@ -122,7 +133,7 @@ class FocalLoss(nn.Module):
         # cut was splitting by corpus).
         logging.info(
             "focal alpha: counts=%s -> weights=%s",
-            {i: int(c) for i, c in enumerate(counts)},
+            {i: int(c) for i, c in enumerate(counts_all)},
             {i: round(float(x), 3) for i, x in enumerate(w)},
         )
         n_pinned = int(np.sum((w_unclipped < clip[0]) | (w_unclipped > clip[1])))
@@ -144,6 +155,8 @@ class FocalLoss(nn.Module):
             at = self.alpha.to(inputs.device)[targets]
             loss = loss * at
         if self.reduction == 'mean':
+            if self._ignore:
+                return loss.sum() / (at > 0).sum().clamp_min(1)
             return loss.mean()
         elif self.reduction == 'sum':
             return loss.sum()
@@ -226,6 +239,102 @@ class Data:
         if self._n_unique is None:
             self._n_unique = count_unique(self.sources, self.destinations)
         return self._n_unique
+
+
+def interleave_by_capture(data, capture_of_edge, store=None, prefix="train_il"):
+    """`data` reordered by each edge's PROGRESS through its own capture.
+
+    ## Why
+
+    Batches are time-ordered because TGN memory requires it, and the edges were
+    sorted by ABSOLUTE time over the whole corpus. The corpus is 17 captures
+    from 2011 (CTU-13) and from eight separate days in 2018 (CIC-2018), so an
+    epoch was the captures one after another: all of CTU-13, then 14 Feb
+    (brute force), 15-16 Feb (DoS), 20-21 Feb (DDoS), 22-23 Feb (web), and
+    28 Feb last. The category head and Adam's moments therefore tracked one
+    capture's label mix at a time and ended every epoch fitted to the last
+    one -- the encoder run of 2026-09-25 predicted a single class for every
+    validation edge, every epoch, with training loss low throughout.
+
+    ## Why it is exact for the memory
+
+    Node ids are per capture (load_and_preprocess_unified_dataset keys nodes
+    by (capture, ip)), so no node, memory row, neighbourhood or negative pool
+    spans two captures. Sorting on (t - capture start) / capture span is
+    monotone in t inside a capture, and the sort is stable, so every node sees
+    exactly the same sequence of its own edges in exactly the same order; only
+    the interleaving BETWEEN independent captures changes. Each update now
+    spans every capture's traffic at the same relative point in its day,
+    which is the class contrast the time-ordered sequence lacked.
+
+    `capture_of_edge[e - 1]` is the capture of edge index e (graph_df row
+    order: edge indices are 1-based row numbers).
+    """
+    idx = np.asarray(data.edge_idxs)
+    n = len(idx)
+    if n == 0:
+        return data
+    cap = np.empty(n, dtype=np.int64)
+    for a in range(0, n, CHUNK):
+        cap[a:a + CHUNK] = capture_of_edge[np.asarray(idx[a:a + CHUNK], dtype=np.int64) - 1]
+    ts = np.asarray(data.timestamps, dtype=np.float64)
+    n_cap = int(cap.max()) + 1
+    lo = np.full(n_cap, np.inf)
+    hi = np.full(n_cap, -np.inf)
+    np.minimum.at(lo, cap, ts)
+    np.maximum.at(hi, cap, ts)
+    span = np.maximum(hi - lo, 1e-9)
+    key = (ts - lo[cap]) / span[cap]
+    del cap
+    order = np.argsort(key, kind="stable")
+    del key
+
+    def _take(col, name):
+        col = np.asarray(col)
+        out = store_empty(store, f"{prefix}_{name}", n, col.dtype)
+        for a in range(0, n, CHUNK):
+            np.take(col, order[a:a + CHUNK], out=out[a:a + CHUNK])
+        return out
+
+    out = Data(_take(data.sources, "src"), _take(data.destinations, "dst"),
+               _take(data.timestamps, "ts"), _take(data.edge_idxs, "idx"),
+               _take(data.labels, "label"))
+    logging.info("Training order: %d edges from %d capture(s) interleaved by within-capture "
+                 "progress (each node's own edge order unchanged)", n, int(np.isfinite(lo).sum()))
+    return out
+
+
+def selection_score(inductive_ap: float, macro_f1: float) -> float:
+    """Encoder model-selection score: the HARMONIC mean of inductive link AP
+    and validation category macro-F1.
+
+    This was the arithmetic mean, and with link AP saturated at ~0.98 it let a
+    collapsed category head win: on 2026-09-25 every epoch predicted one class
+    for all of validation (macro-F1 0.05-0.08) while the score moved only with
+    AP's third decimal, so epochs were "IMPROVED" or not on link-prediction
+    noise. The harmonic mean is dominated by the weaker of the two -- 0.98 and
+    0.05 score 0.095, not 0.52 -- so a head that does not separate classes
+    can no longer be selected, and neither can embeddings that do not
+    generalise to unseen hosts.
+
+    A split with no labelled edges (macro-F1 NaN) is judged on AP alone."""
+    ap, f1 = float(inductive_ap), float(macro_f1)
+    if f1 != f1:
+        return ap
+    if ap != ap:
+        return f1
+    return 0.0 if ap + f1 <= 0 else 2.0 * ap * f1 / (ap + f1)
+
+
+def _unknown_ids(category_mapping) -> list:
+    """Category ids that carry no label (UNKNOWN): kept as graph edges for link
+    prediction, never a category target, never in a category metric.
+
+    PCAP flows inside an attack interval that names no participants are
+    UNKNOWN (data_unification/attack_windows.unscoped_label_policy), and so is
+    any raw label the maps do not know (label_resolver)."""
+    from data_unification.label_resolver import UNKNOWN_CATEGORY
+    return [int(i) for i, name in (category_mapping or {}).items() if name == UNKNOWN_CATEGORY]
 
 
 def _contract_window_seconds() -> float:
@@ -1008,7 +1117,7 @@ def load_and_preprocess_unified_dataset(
 
 
 def split_data(graph_df, edge_features, node_features, different_new_nodes=True, randomize_features=False,
-               store=None):
+               store=None, ignore_labels=()):
     """The 70/15/15 per-capture temporal split plus the inductive node draw.
 
     Every set operation that used to iterate edges in Python (set(sources),
@@ -1162,9 +1271,14 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     # Re-draw, excluding the offending hosts, until no class is wiped out.
     # This does not manufacture generalisation -- see the warning below -- it
     # only stops the split from silently deleting a class.
+    # UNKNOWN (unlabelled) is not a class to protect: under time-only intervals
+    # it is carried by every host active in them, and protecting its carriers
+    # would empty the inductive draw.
+    _ignore = {int(c) for c in ignore_labels}
+
     def _classes_lost(mask):
         in_train = set(np.unique(labels[np.logical_and(train_mask_t, mask)]))
-        return set(np.unique(labels)) - in_train
+        return set(np.unique(labels)) - in_train - _ignore
 
     lost = _classes_lost(observed_edges_mask)
     if lost:
@@ -1189,6 +1303,8 @@ def split_data(graph_df, edge_features, node_features, different_new_nodes=True,
     # as a behaviour -- a model that scores well on it has memorised that host
     # -- so its metrics must never be reported as detection performance.
     for c in np.unique(labels):
+        if int(c) in _ignore:
+            continue
         if _ids_ok:
             _seen = np.zeros(_max_id + 1, dtype=bool)
             for a in range(0, len(sources), CHUNK):
@@ -1388,7 +1504,8 @@ def train(args):
 
         node_features, edge_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
             split_data(graph_df, edge_features, node_features, different_new_nodes=args.different_new_nodes,
-                       randomize_features=args.randomize_features, store=store)
+                       randomize_features=args.randomize_features, store=store,
+                       ignore_labels=_unknown_ids(category_mapping))
 
         # Neighbor finders
         train_ngh_finder = get_neighbor_finder(train_data, uniform=args.uniform, store=store)
@@ -1462,6 +1579,16 @@ def train(args):
      mean_time_shift_dst, std_time_shift_dst) = (_setup[k] for k in _setup_names)
     num_categories = len(category_mapping)
 
+    # Shuffled batches (memory off) have no order to fix.
+    if (getattr(args, "interleave_captures", True) and not args.shuffle_batches
+            and "capture" in getattr(graph_df, "columns", ())):
+        _il_store = None
+        if not args.in_memory:
+            import atexit
+            _il_store = DiskStore(os.path.join(args.checkpoint_dir, "interleave"))
+            atexit.register(_il_store.cleanup)
+        train_data = interleave_by_capture(train_data, graph_df["capture"].values, store=_il_store)
+
     model_save_path = os.path.join(args.save_dir, f"{args.prefix}-{args.data_name}.pth")
     checkpoint_path_fn = lambda epoch: os.path.join(args.checkpoint_dir, f"{args.prefix}-{args.data_name}-{epoch}.pth")
     results_path = f"results/{args.prefix}.pkl"
@@ -1523,8 +1650,13 @@ def train(args):
 
     # Loss Functions & Optimizer
     edge_criterion = nn.BCELoss()
+    unknown_ids = _unknown_ids(category_mapping)
+    if unknown_ids:
+        logging.info("category ids %s (UNKNOWN) carry no label: kept as edges, excluded from the "
+                     "category loss and every category metric", unknown_ids)
     if args.focal_loss:
-        _alpha = FocalLoss.inverse_frequency_alpha(train_data.labels, num_categories)
+        _alpha = FocalLoss.inverse_frequency_alpha(train_data.labels, num_categories,
+                                                   ignore_classes=unknown_ids)
         logging.info(f"focal-loss per-class alpha (inverse frequency): "
                      f"{ {category_mapping.get(i, i): round(float(w), 3) for i, w in enumerate(_alpha)} }")
         # On the device: FocalLoss moves alpha to the logits' device on every
@@ -1532,7 +1664,8 @@ def train(args):
         # once per batch. Same values, same kernels.
         category_criterion = FocalLoss(alpha=_alpha, gamma=2.0).to(device)
     else:
-        category_criterion = nn.CrossEntropyLoss()
+        category_criterion = (nn.CrossEntropyLoss(ignore_index=unknown_ids[0]) if len(unknown_ids) == 1
+                              else nn.CrossEntropyLoss())
     optimizer = torch.optim.Adam([p for p in tgn.parameters() if p.requires_grad],
                                  lr=args.lr, weight_decay=args.weight_decay)
 
@@ -1567,9 +1700,23 @@ def train(args):
                          run_fingerprint(args, ignore=("n_epoch", "gpu", "num_workers", "in_memory",
                                                  "fast_step", "fast_step_level", "batch_planner")),
                          enabled=not args.no_resume, log=logging.info)
+    # The seeded evaluation samplers advance their own RNG every epoch; the
+    # resume point carries them so a resumed run draws the same validation
+    # negatives as an uninterrupted one (it restarted them from their seeds:
+    # ctu7 AUC 0.9211 resumed vs 0.9215 straight through).
+    _eval_samplers = {"val": val_rand_sampler, "nn_val": nn_val_rand_sampler,
+                      "test": test_rand_sampler, "nn_test": nn_test_rand_sampler}
+
+    def _sampler_states():
+        return {k: smp.random_state.get_state() for k, smp in _eval_samplers.items()
+                if getattr(smp, "seed", None) is not None}
+
     first_epoch = 0
     _rp = resume.load()
     if _rp is not None:
+        for _k, _st in (_rp.get("samplers") or {}).items():
+            if _k in _eval_samplers:
+                _eval_samplers[_k].random_state.set_state(_st)
         tgn.load_state_dict(_rp["model"])
         optimizer.load_state_dict(_rp["optimizer"])
         guard.load_state_dict(_rp["guard"])
@@ -1614,7 +1761,9 @@ def train(args):
             args.backprop_every,
         )
     logging.info("Batch sampling: %s",
-                 "SHUFFLED (memory off)" if args.shuffle_batches else "time-ordered")
+                 "SHUFFLED (memory off)" if args.shuffle_batches else
+                 ("time-ordered within each capture, captures interleaved"
+                  if getattr(args, "interleave_captures", True) else "time-ordered"))
     # Batch planner (opt-in; bita/fast/planner.py): each training batch's
     # value-independent host work -- the batch slices, the negative draws
     # (the planner continues this process's numpy RNG stream and hands the
@@ -1646,6 +1795,15 @@ def train(args):
         # Per-step losses stay on the device and are read (one sync) only
         # when printed; see StepLossLog.
         m_loss = StepLossLog(args.backprop_every)
+        # Training confusion, on the device: one tiny scatter per batch, read
+        # once at the end of the epoch. "Training category loss is low" said
+        # nothing about WHICH classes the head fits; this does.
+        _train_conf = torch.zeros(num_categories * num_categories, dtype=torch.long, device=device)
+
+        def _count_train(logits, labels_g):
+            y = labels_g.reshape(-1)
+            _train_conf.index_put_((y * num_categories + logits.detach().argmax(dim=1),),
+                                   torch.ones_like(y), accumulate=True)
         guard_step = guard.backward_step_deferred if guard.deferred_supported() else guard.backward_step
         fast_batch_losses = getattr(tgn, "fast_batch_losses", None)
 
@@ -1686,9 +1844,10 @@ def train(args):
 
                 if plans is not None:
                     # The plan carries this batch's arrays, negatives and labels.
-                    batch_edge_loss, batch_cat_loss, _ = fast_batch_losses(
+                    batch_edge_loss, batch_cat_loss, _outs = fast_batch_losses(
                         None, None, None, None, None, None, edge_criterion, category_criterion,
                         n_neighbors=args.n_degree, plan=plans.next(batch_idx))
+                    _count_train(_outs[2], tgn._last_labels_g)
                     loss += batch_edge_loss
                     category_loss_total += batch_cat_loss
                     continue
@@ -1709,10 +1868,11 @@ def train(args):
                 if fast_batch_losses is not None:
                     # The fast path computes the same two losses itself, the
                     # fixed-shape part as a CUDA graph at --fast_step_level 3.
-                    batch_edge_loss, batch_cat_loss, _ = fast_batch_losses(
+                    batch_edge_loss, batch_cat_loss, _outs = fast_batch_losses(
                         sources_batch, destinations_batch, negatives_batch, timestamps_batch,
                         edge_idxs_batch, categories_batch, edge_criterion, category_criterion,
                         n_neighbors=args.n_degree)
+                    _count_train(_outs[2], tgn._last_labels_g)
                 else:
                     pos_prob, neg_prob, category_logits = tgn.compute_edge_probabilities_and_categories(
                         sources_batch, destinations_batch, negatives_batch,
@@ -1729,6 +1889,7 @@ def train(args):
                     # from pageable memory synchronises the stream every batch).
                     categories_batch_tensor = upload(np.asarray(categories_batch), device, torch.long)
                     batch_cat_loss = category_criterion(category_logits, categories_batch_tensor)
+                    _count_train(category_logits, categories_batch_tensor)
 
                 loss += batch_edge_loss
                 category_loss_total += batch_cat_loss
@@ -1792,7 +1953,8 @@ def train(args):
         val_results = eval_edge_prediction_with_categories(
             model=tgn, negative_edge_sampler=val_rand_sampler,
             data=val_data, n_neighbors=args.n_degree,
-            edge_criterion=edge_criterion, category_criterion=category_criterion
+            edge_criterion=edge_criterion, category_criterion=category_criterion,
+            ignore_classes=unknown_ids
         )
         val_ap = val_results[0]
         val_auc = val_results[1]
@@ -1809,7 +1971,8 @@ def train(args):
         nn_val_results = eval_edge_prediction_with_categories(
             model=tgn, negative_edge_sampler=nn_val_rand_sampler,
             data=new_node_val_data, n_neighbors=args.n_degree,
-            edge_criterion=edge_criterion, category_criterion=category_criterion
+            edge_criterion=edge_criterion, category_criterion=category_criterion,
+            ignore_classes=unknown_ids
         )
         nn_val_ap = nn_val_results[0]
         nn_val_auc = nn_val_results[1]
@@ -1848,6 +2011,14 @@ def train(args):
             {_nm[i]: round(float(a), 3) for i, a in sorted(_per_class.items())},
             {_nm.get(i, i): round(float(a), 3) for i, a in sorted(_nn_per_class.items())},
         )
+        _tc = _train_conf.view(num_categories, num_categories).cpu().numpy()
+        _tsup = _tc.sum(axis=1)
+        logging.info(
+            "           per-class TRAIN acc: %s (support %s)",
+            {category_mapping.get(i, i): round(float(_tc[i, i] / _tsup[i]), 3)
+             for i in range(num_categories) if _tsup[i] > 0 and i not in unknown_ids},
+            {category_mapping.get(i, i): int(_tsup[i]) for i in range(num_categories) if _tsup[i] > 0},
+        )
 
         # Checkpoint current epoch
         torch.save(tgn.state_dict(), checkpoint_path_fn(epoch))
@@ -1870,9 +2041,9 @@ def train(args):
         # discriminative power left at 0.9968), and balanced classification
         # (macro F1, not aggregate accuracy, because Benign is ~90% of val and
         # dominates any unweighted average).
-        _sel = 0.5 * float(nn_val_ap) + 0.5 * float(val_f1_macro)
+        _sel = selection_score(nn_val_ap, val_f1_macro)
         logging.info(
-            "           selection=%.4f  (inductive AP %.4f, val macro-F1 %.4f)",
+            "           selection=%.4f  (harmonic mean: inductive AP %.4f, val macro-F1 %.4f)",
             _sel, nn_val_ap, val_f1_macro,
         )
 
@@ -1885,7 +2056,8 @@ def train(args):
             _health.append(f"inductive link prediction AP {nn_val_ap:.3f}: near chance on unseen hosts")
         _action = guard.end_epoch(_sel, train_loss=mean_train_loss, health=_health)
         resume.save(epoch + 1, model=tgn.state_dict(), optimizer=optimizer.state_dict(),
-                    guard=guard.state_dict(), curves={k: list(v) for k, v in _curves.items()})
+                    guard=guard.state_dict(), curves={k: list(v) for k, v in _curves.items()},
+                    samplers=_sampler_states())
         # Only the best epoch's file is read again (below), and the current one
         # may become the best; the rest are dead weight in --checkpoint_dir.
         for _e in range(epoch):
@@ -1970,7 +2142,8 @@ def train(args):
     test_res = eval_edge_prediction_with_categories(
         model=tgn, negative_edge_sampler=test_rand_sampler,
         data=test_data, n_neighbors=args.n_degree,
-        edge_criterion=edge_criterion, category_criterion=category_criterion
+        edge_criterion=edge_criterion, category_criterion=category_criterion,
+        ignore_classes=unknown_ids
     )
 
     if args.use_memory:
@@ -1980,7 +2153,8 @@ def train(args):
     nn_test_res = eval_edge_prediction_with_categories(
         model=tgn, negative_edge_sampler=nn_test_rand_sampler,
         data=new_node_test_data, n_neighbors=args.n_degree,
-        edge_criterion=edge_criterion, category_criterion=category_criterion
+        edge_criterion=edge_criterion, category_criterion=category_criterion,
+        ignore_classes=unknown_ids
     )
 
     logging.info("=" * 60)
@@ -2168,6 +2342,13 @@ if __name__ == '__main__':
     parser.add_argument('--learn_time_encoding', action='store_true',
                         help='Train the cos(w*dt+b) time-encoding frequencies (TGN/TGAT). '
                              'Off by default: fixed encoding, see the note in train()')
+    parser.add_argument('--interleave_captures', dest='interleave_captures', action='store_true',
+                        default=True,
+                        help='Order training edges by progress through their own capture, so every '
+                             'batch mixes all captures (default; exact for the memory because nodes '
+                             'are per capture). See interleave_by_capture.')
+    parser.add_argument('--no_interleave_captures', dest='interleave_captures', action='store_false',
+                        help='The old order: absolute time over the whole corpus, capture after capture.')
     parser.add_argument('--n_layer', type=int, default=1, help='Number of GNN layers')
     parser.add_argument('--n_head', type=int, default=2, help='Number of attention heads')
     parser.add_argument('--n_degree', type=int, default=10, help='Number of sampled neighbors')
