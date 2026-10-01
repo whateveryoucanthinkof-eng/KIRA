@@ -50,6 +50,29 @@ every epoch: val predicted InitialAccess for every edge, macro-F1 0.05-0.08, tes
 | §6, rest of §8 | open (evtx logs, LateralMovement labels, per-alternative rollouts, attention saliency, campaign heuristic evaluation) |
 | edge-feature ablation (`dst_port`) | open: needs a retrain |
 
+**Second and third pass (same day), each fixed and tested:**
+
+| area | bug | fix |
+|---|---|---|
+| encoder test | the best epoch's weights were tested on the **last** epoch's memory (epoch 4 weights + epoch 7 memory on 2026-09-25); a run resumed after its last epoch died with a NameError | keep the best epoch's post-validation memory; forward-only replay when none exists |
+| hazard target | tau = 5 × 2 s = **10 s** while the contract forecasts 5 × 30 s = 150 s (the target was nearly a nowcast) | tau = `forecast_seconds` in both trainers |
+| CIC-2017 test | Branch B risk scored against the severity column (store never converted to hazard) | converted like train/val |
+| cross-year scoring | `rollout()` without elapsed times (model told every step is 2 s); padded steps counted; risk head never scored | real times, masked steps, risk MAE vs predict-zero |
+| Branch B data | edge-padded future copies trained and scored as targets (free win for persistence) | `future_valid` mask in losses, validation, conformal |
+| train/serve | serving scored new hosts with zero-padded histories that no model trained on; Branch B was zero-padded, DeepOP's rollouts edge-padded | Branch A trains with `--min-history-steps 1`; Branch B learns short edge-padded histories; serving edge-pads |
+| train/serve | serving took flows by END time (long flows counted in every window); training buckets by START time | serving buckets by start time |
+| host attributes | sent/received bytes and packets not oriented to the host (a flood's victim "sent" the flood) | oriented, both paths; schema 2.1.0 |
+| Branch A selection | arithmetic mean of macro-F1 and overall AUC (dominated by continuations) | `early_warning`: harmonic mean of macro-F1 and onset Gini |
+| Branch B alerts | forecast risk thresholded with Branch A's operating point | Branch B fits and ships its own |
+| explanations | Input×Gradient read only the last of 15 windows; batch API defaulted to "input magnitude" | summed over all timesteps; gradient attribution by default |
+| DeepOP | trained on clean history tokens, served Branch A's predictions; noise only removed tokens | + 10% substitution noise |
+| rollout callers | standalone DeepOP trainer also omitted elapsed times | fixed; AST test covers every caller |
+| CTU-13 labels | `Background` (unlabelled per the dataset authors) resolved to Benign | `CYBERWORLD_CTU_BACKGROUND=unknown` switch (default unchanged) |
+
+Reviewed and left as is (by design or pinned by tests): guard gives one epoch after a
+step-back; BiTA cross-edge context; TGN attention/neighbour finder (strictly before t);
+DeepOP repetition penalty/continuity bonus (off for paper checkpoints).
+
 ## 1. Category head collapses at full scale (highest priority)
 
 - **Observed:** epoch 1 at full scale (130.6M edges, 3.49M nodes, 4 classes). Both encoders
