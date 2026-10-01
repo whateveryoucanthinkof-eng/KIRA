@@ -147,6 +147,41 @@ bit-identical and worth its risk. The encoder baseline is not GPU-deterministic
 (two baseline runs differ by up to 2.2e-5 in weights from atomics), which is
 worth knowing for any future change to it.
 
+## 6. Second round: validation, disk, scheduling
+
+| Change | Measured | Equivalence |
+|---|---|---|
+| Validation passes as CUDA graphs (`graphed_step.GraphedBody`: forward + every accumulator per batch; host counters outside; DeepOP scorer split into `update_device` / `update_host`) | Branch A 480 -> **1,540** batch/s; Branch B 154 -> **281**; DeepOP 47.9 -> **269.5** (full scale: ~1.7 h -> ~19 min per DeepOP epoch) | end to end, CPU + GPU, 0 + 2 workers: identical in every leaf |
+| One feature block on disk: after the host-major copy the store reads rows through it (`RowMappedFeats`) and the original spill block is released | -8.4 GB disk per downstream / Branch A run | every access pattern tested; end to end with memmap-forced stores identical |
+| DeepOP rollout cache computes/stores each distinct window once (oversampled duplicates mapped), each at its original batch size; RNG draw preserved | dry-run corpus -24 % rollouts; at full scale roughly the attack-window share of the train set, tens of GB -> less | dedup cache == original for every sample, RNG state equal; end to end identical |
+
+**Disk:** the DeepOP stage at full scale (rollout cache ~44-50 GB train +
+~10 GB val, plus spill + host-major copy) needed ~72 of ~75 GB free. With the
+two disk changes it is roughly 50-55 GB.
+
+**Measured and rejected:**
+* Running Branch B / DeepOP alongside the later encoder runs. Full-scale encoder
+  + Branch B at once: encoder ~330 -> ~160-215 batch/s, Branch B 79 -> 47 --
+  ~10 % more combined throughput, both runs much longer, more RAM risk. At
+  steady state the encoder keeps the GPU ~72-78 % busy (the 41 % measured
+  earlier was its warm-up), so the two compete for the GPU.
+* Deeper encoder work. Its remaining host costs are spread thin (memory-overlay
+  reads ~15 %, planner hand-off ~9 %, guard ~5 % of the main thread) with the
+  GPU ~75 % busy: single-digit gains at best, inside a fast path that cannot
+  run on CPU and is not GPU-deterministic, so bit-identity could not be proven.
+
+## Estimated total plan time
+
+Early stopping decides the epoch counts; typical 5-8 epochs assumed.
+
+| Stage | Per epoch | Per run | Runs | Total |
+|---|---|---|---|---|
+| Encoder | ~20 min + validation | ~3-4 h | 4 | ~12-16 h |
+| Branch A | ~17 min train + ~1.5 min validation; extraction ~35 min | ~2-3 h | 4 | ~8-11 h |
+| Branch B | ~1.85 h train + ~9 min validation; extraction ~35 min | ~8-13 h | 1 | ~8-13 h |
+| DeepOP | ~1.2 h train + ~19 min validation; rollout precompute ~45 min | ~6-10 h | 1 | ~6-10 h |
+| **Total** | | | | **~34-50 h** |
+
 ## How to switch things off
 
 All on by default (all bit-identical):
@@ -154,6 +189,7 @@ All on by default (all bit-identical):
 * `--legacy-loader` (both trainers): the old per-sample loaders (no packing).
 * `CYBERWORLD_EXTRACT_ONE_QUEUE=0`: Branch A extracts split by split.
 * `NUM_WORKERS=4` in the plan env: the previous loader worker count.
+* `CYBERWORLD_CUDA_GRAPH=0` also turns off the validation graphs.
 * `--no-cuda-graph` (Branch A) or `CYBERWORLD_CUDA_GRAPH=0` (all): eager steps.
 * `CYBERWORLD_GUARD_SYNC=1`: the old syncing guard step.
 * `CYBERWORLD_FAST_EXTRACT=0`: the reference extraction path.
