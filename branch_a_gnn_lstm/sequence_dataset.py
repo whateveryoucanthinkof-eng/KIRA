@@ -355,6 +355,11 @@ class LazyHostSequenceDataset(Dataset):
             "host_ip": host,
             "window_idx": window_idx,
             "t_history": torch.from_numpy(self._t_history(rows, start, end)),
+            # Is the LAST INPUT window an attack? Not a model input: it splits
+            # evaluation into onset (host benign now) vs continuation, and is
+            # the persistence baseline's prediction.
+            "prev_attack": torch.tensor(int(bool(self.store.is_attack[int(rows[end - 1])])),
+                                        dtype=torch.long),
         }
 
     def _t_history(self, rows, start, end):
@@ -439,6 +444,7 @@ class LazyHostSequenceDataset(Dataset):
             tech[has] = self._tech_of_code[np.asarray(st.tech_flat)[tlo[has]].astype(np.int64)]
         grad = self._grad_of_cat[np.asarray(st.cat_id)[tgt].astype(np.int64)]
         risk = np.asarray(st.risk_score)[tgt].astype(np.float32)
+        prev = np.asarray(st.is_attack)[self._flat[b + end - 1]].astype(np.int64)
         return {
             "features": torch.from_numpy(x),
             "risk": torch.from_numpy(risk),
@@ -447,6 +453,7 @@ class LazyHostSequenceDataset(Dataset):
             "host_ip": [self.hosts[int(k)] for k in h],
             "window_idx": torch.from_numpy(np.asarray(st.window_idx)[tgt].astype(np.int64)),
             "t_history": torch.from_numpy(t_hist),
+            "prev_attack": torch.from_numpy(prev),
         }
 
 
