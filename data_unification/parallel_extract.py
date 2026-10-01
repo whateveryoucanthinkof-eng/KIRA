@@ -61,6 +61,8 @@ def _worker_init(tgne: Optional[str], extractor_kw: dict, threads: int, repo: st
     else:
         from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
         tgn = build_or_load_tgne_ta(checkpoint_path=tgne)
+    from data_unification.fast_extract import enable_fast_extraction
+    enable_fast_extraction(tgn)      # bit-identical, ~2x (data_unification/fast_extract.py)
     _WORKER["ex"] = HostTrajectoryExtractor(tgne_ta_model=tgn, **extractor_kw)
 
 

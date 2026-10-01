@@ -1188,6 +1188,8 @@ def main():
     t0=time.time()
 
     tgn=build_or_load_tgne_ta(checkpoint_path=str(args.tgne))
+    from data_unification.fast_extract import enable_fast_extraction
+    enable_fast_extraction(tgn)   # serial extraction paths; workers do the same
     extractor=HostTrajectoryExtractor(
         tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds,
         spill_dir=str(args.spill_dir) if args.spill_dir else None)

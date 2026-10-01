@@ -1355,6 +1355,8 @@ def main():
               flush=True)
     import time
     tgn = build_or_load_tgne_ta(checkpoint_path=str(args.tgne) if args.tgne else None)
+    from data_unification.fast_extract import enable_fast_extraction
+    enable_fast_extraction(tgn)   # serial extraction paths; workers do the same
     # Contract-bound (v4). Previously 2.0s / seq_len=5 hardcoded, which matched
     # the v3 contract by coincidence rather than by construction. Under v4 this
     # produces history_steps=15, so it yields a v4 checkpoint, not a v3 one.
