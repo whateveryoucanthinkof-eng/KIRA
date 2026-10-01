@@ -37,7 +37,7 @@ from data_unification.split_policy import is_cross_year
 from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingGuard,
                                           default_warmup_steps, run_fingerprint)
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
-from cyberworld_v4.graphed_step import GraphedLoss, graphs_enabled
+from cyberworld_v4.graphed_step import WholeStepGraph, graphs_enabled
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
@@ -1859,9 +1859,13 @@ def main():
                 p_ = model(x_, t_history=t_)
                 return model.compute_loss(
                     p_, {"risk": risk_, "technique": tech_, "gradation": grad_})[0]
-            _graphed_loss = GraphedLoss(
+            # The whole step -- forward, loss, backward, clipping, the guard's
+            # finite checks and snapshot -- as one CUDA graph
+            # (TrainingGuard.deferred_step_graphed); the optimizer step stays eager.
+            _graphed_loss = WholeStepGraph(
                 _train_loss, [model],
-                enabled=(device == "cuda" and not args.no_cuda_graph and graphs_enabled()))
+                enabled=(device == "cuda" and not args.no_cuda_graph and graphs_enabled()
+                         and guard.deferred_supported()))
         for batch in train_loader:
             _k += 1
             x = batch["features"].to(device, non_blocking=_non_blocking)
@@ -1886,15 +1890,18 @@ def main():
                       f"cos(tech,grad)={_c3['tech_vs_grad']:+.3f} "
                       f"dominant={_conflict['dominant_task']}", flush=True)
             optimizer.zero_grad(set_to_none=True)
-            if t_hist is not None:
-                loss = _graphed_loss(x, t_hist, targets["risk"], targets["technique"],
-                                     targets["gradation"])
+            if t_hist is not None and _graphed_loss.enabled:
+                loss, _ok = guard.deferred_step_graphed(
+                    _graphed_loss, [x, t_hist, targets["risk"], targets["technique"],
+                                    targets["gradation"]])
             else:
                 predictions = model(x, t_history=t_hist)
                 loss, _ = model.compute_loss(predictions, targets)
+                _ok = None
             # backward + clip + step. A non-finite loss is skipped and counted,
             # never stepped on; the guard turns a run of them into a step back.
-            _ok = _guard_step(loss)
+            if _ok is None:
+                _ok = _guard_step(loss)
             if _ok is False:
                 continue
             # Keep the log-variances in range in the saved weights too: a step
@@ -1922,10 +1929,10 @@ def main():
                       f"eta={_eta / 60:.1f}m", flush=True)
         guard.flush()
         _nb = int(_nb_dev)
-        if _graphed_loss is not None and _graphed_loss.enabled:
-            print(f"  cuda graph: {_graphed_loss.n_graphed} graphed steps, "
-                  f"{_graphed_loss.n_eager} eager (other batch shapes)", flush=True)
-            _graphed_loss.n_graphed = _graphed_loss.n_eager = 0
+        if _graphed_loss is not None and (_graphed_loss.enabled or _graphed_loss.error):
+            print(f"  cuda graph: {_graphed_loss.n_graphed} whole steps graphed of {_k}"
+                  + (f" ({_graphed_loss.error})" if _graphed_loss.error else ""), flush=True)
+            _graphed_loss.n_graphed = 0
 
         metrics = _evaluate(model, val_loader, device,
                             num_techniques=len(TECHNIQUE_VOCAB),

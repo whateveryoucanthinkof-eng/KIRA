@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--legacy", action="store_true")
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--cuda-graph", action="store_true")
+    ap.add_argument("--whole", action="store_true", help="whole-step graph (deferred_step_graphed)")
     a = ap.parse_args()
     repo = os.path.abspath(a.repo)
     sys.path.insert(0, repo)
@@ -61,13 +62,18 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     guard = TrainingGuard("branch_a", [model], opt, mode="max", patience=3, step_back_after=2,
                           warmup_steps=500, clip_norm=1.0, log=print,
-                          **({} if a.legacy else {'graph_undo': not getattr(a, 'no_graph', False)}))
+                          **({} if a.legacy else {'graph_undo': bool(a.cuda_graph or a.whole)}))
     step = guard.backward_step if (a.legacy or not guard.deferred_supported()) \
         else guard.backward_step_deferred
     def _f(x, th, r, tc, gr):
         return model.compute_loss(model(x, t_history=th),
                                   {"risk": r, "technique": tc, "gradation": gr})[0]
-    if a.cuda_graph:
+    whole = None
+    if a.whole:
+        from cyberworld_v4.graphed_step import WholeStepGraph
+        whole = WholeStepGraph(_f, [model])
+        lossfn = _f
+    elif a.cuda_graph:
         from cyberworld_v4.graphed_step import GraphedLoss
         lossfn = GraphedLoss(_f, [model])
     else:
@@ -82,8 +88,11 @@ def main():
         tg = [batch[k].to(dev, non_blocking=True) for k in ("risk", "technique", "gradation")]
         th = batch["t_history"].to(dev, non_blocking=True)
         opt.zero_grad(set_to_none=True)
-        loss = lossfn(x, th, *tg)
-        ok = step(loss)
+        if whole is not None:
+            loss, ok = guard.deferred_step_graphed(whole, [x, th, *tg])
+        else:
+            loss = lossfn(x, th, *tg)
+            ok = step(loss)
         if ok is False:
             return
         model.uncertainty_loss.project_()
@@ -118,7 +127,7 @@ def main():
         n += 1
     torch.cuda.synchronize()
     el = time.perf_counter() - t0
-    print(f"RESULT {'legacy' if a.legacy else 'new'}{'+graph' if a.cuda_graph else ''} w{a.workers} {n / el:.1f} batch/s "
+    print(f"RESULT {'legacy' if a.legacy else 'new'}{'+graph' if a.cuda_graph else ''}{'+whole' if a.whole else ''} w{a.workers} {n / el:.1f} batch/s "
           f"({1e3 * el / n:.2f} ms/batch)", flush=True)
 
 

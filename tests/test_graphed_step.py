@@ -109,3 +109,53 @@ def test_guard_graph_undo_is_bit_identical():
     assert c0 == c1 and c0[1] == 3
     for k in w0:
         assert torch.equal(w0[k], w1[k]), k
+
+
+def _whole_run(mode, n=150):
+    from cyberworld_v4.graphed_step import WholeStepGraph
+    torch.manual_seed(0)
+    m = MultiTaskLSTM(input_dim=27, num_techniques=14, num_gradations=4,
+                      risk_objective="soft_bce", **MultiTaskLSTM.PAPER_ARCH).cuda()
+    opt = torch.optim.Adam(m.parameters(), lr=1e-3, weight_decay=1e-4)
+    g = TrainingGuard("a", [m], opt, mode="max", patience=3, step_back_after=2,
+                      warmup_steps=20, clip_norm=1.0, log=lambda s: None, graph_undo=True)
+    m.train()
+
+    def f(x, t, r, tc, gr):
+        return m.compute_loss(m(x, t_history=t), {"risk": r, "technique": tc, "gradation": gr})[0]
+    whole = WholeStepGraph(f, [m], log=None)
+    data = _data(n)
+    torch.manual_seed(123)
+    losses, epoch_stats = [], []
+    for i, d in enumerate(data):
+        d = [t.cuda() for t in d]
+        if i in (30, 31, 97):
+            d[0] = d[0].clone()
+            d[0][0, 0, 0] = float("inf")          # non-finite loss: the step must be undone
+        if i == 75:                                # epoch boundary + optimizer reload (tensors move)
+            g.flush()
+            epoch_stats.append((g.n_steps, g.n_nonfinite, g.n_grad, g.n_clipped, g.grad_norm_sum))
+            g._reset_epoch_stats()
+            opt.load_state_dict(opt.state_dict())
+        opt.zero_grad(set_to_none=True)
+        if mode == "whole":
+            loss, ok = g.deferred_step_graphed(whole, d)
+        else:
+            loss = f(*d)
+            ok = g.backward_step_deferred(loss)
+        m.uncertainty_loss.project_()
+        losses.append(loss.detach().clone())
+    g.flush()
+    epoch_stats.append((g.n_steps, g.n_nonfinite, g.n_grad, g.n_clipped, g.grad_norm_sum, g.global_step))
+    return (torch.stack(losses).cpu(), {k: v.cpu() for k, v in m.state_dict().items()},
+            epoch_stats, whole)
+
+
+def test_whole_step_graph_is_bit_identical():
+    L0, W0, S0, _ = _whole_run("eager")
+    L1, W1, S1, whole = _whole_run("whole")
+    assert whole.n_graphed > 100, whole.n_graphed
+    assert S0 == S1 and S0[0][1] == 2 and S0[1][1] == 1
+    assert torch.equal(L0.nan_to_num(9.0, 9.0, -9.0), L1.nan_to_num(9.0, 9.0, -9.0))
+    for k in W0:
+        assert torch.equal(W0[k].nan_to_num(3.0), W1[k].nan_to_num(3.0)), k
