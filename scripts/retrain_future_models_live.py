@@ -873,7 +873,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                             hv, max_steps=hv.shape[1],
                             observed_token=_obs.to(device, non_blocking=_nblk),
                             observed_sequence=obs_seq,
-                            continuity_bonus=0.0)
+                            continuity_bonus=0.0, decode_names=False)
                         _scorer.update(tgt, batch["input_tokens"].to(device, non_blocking=_nblk),
                                        _obs.to(device, non_blocking=_nblk),
                                        pred_tf=pred, pred_free=_free)

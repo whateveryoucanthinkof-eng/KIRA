@@ -451,6 +451,7 @@ class DeepOPForecastDecoder(nn.Module):
         return_probs: bool = False,
         continuity_bonus: Optional[float] = None,
         observed_sequence: Optional[torch.Tensor] = None,
+        decode_names: bool = True,
     ) -> Any:
         """
         Autoregressive sequence generation conditioned on h_future and optional observed_token.
@@ -558,6 +559,14 @@ class DeepOPForecastDecoder(nn.Module):
         # Exclude initial prefix (<BOS>)
         pred_tokens = curr_tokens[:, prefix_len:]
         decoded_names = []
+        # `decode_names=False` skips the per-sample decode (one `.cpu()` sync
+        # per sample) for callers that only use the tokens -- validation scores
+        # 1.46M+ samples per epoch and discarded every name. The tokens are the
+        # same either way; the names come back as None.
+        if not decode_names:
+            if return_probs:
+                return pred_tokens, None, all_attack_probs, all_token_probs
+            return pred_tokens, None
         for b in range(B):
             sample_tokens = []
             for t_idx in pred_tokens[b].cpu().numpy():
@@ -569,6 +578,8 @@ class DeepOPForecastDecoder(nn.Module):
 
         return pred_tokens, decoded_names
 
+
+from cyberworld_v4.device_hist import device_hist  # noqa: E402
 
 class DeepOPTokenScorer:
     """Streaming DeepOP token metrics with information-matched baselines.
@@ -647,17 +658,17 @@ class DeepOPTokenScorer:
         V = self.V
         t = target.reshape(-1)
         self._n += int(t.numel())
-        self._tgt_hist += torch.bincount(t, minlength=V)
+        self._tgt_hist += device_hist(t, V)      # bincount syncs on CUDA
 
         if pred_tf is not None:
             pf = pred_tf.reshape(-1)
             self._hit_tf += (pf == t).sum()
-            self._conf_tf += torch.bincount(t * V + pf, minlength=V * V)
+            self._conf_tf += device_hist(t * V + pf, V * V)
         if pred_free is not None:
             self._have_free = True
             pr = pred_free.reshape(-1)
             self._hit_free += (pr == t).sum()
-            self._conf_free += torch.bincount(t * V + pr, minlength=V * V)
+            self._conf_free += device_hist(t * V + pr, V * V)
 
         obs = obs_token.reshape(-1)
         # free-running persistence: one observation, held for the whole horizon
@@ -878,10 +889,12 @@ def evaluate_forecast_rigor(
             pred_tf = decoder.forward(h_b, inp_b).argmax(dim=-1)
             free_b, _ = decoder.forecast_sequence(
                 h_b, max_steps=K, observed_token=obs_b,
-                repetition_penalty=repetition_penalty, continuity_bonus=1.0)
+                repetition_penalty=repetition_penalty, continuity_bonus=1.0,
+                decode_names=False)
             free_nb, _ = decoder.forecast_sequence(
                 h_b, max_steps=K, observed_token=obs_b,
-                repetition_penalty=repetition_penalty, continuity_bonus=0.0)
+                repetition_penalty=repetition_penalty, continuity_bonus=0.0,
+                decode_names=False)
             scorer.update(tgt_b, inp_b, obs_b, pred_tf=pred_tf, pred_free=free_b)
             scorer_nobonus.update(tgt_b, inp_b, obs_b, pred_tf=pred_tf, pred_free=free_nb)
 
