@@ -741,7 +741,7 @@ class DeepOPTokenScorer:
 
 
 def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=None,
-                          support=None):
+                          support=None, support_index=None):
     """Both losses from one forward pass, because only one of them is comparable.
 
     `train_deepop_live` optimises `cross_entropy(..., label_smoothing=0.04)`
@@ -774,11 +774,23 @@ def smoothed_and_plain_ce(logits, target, label_smoothing: float = 0.04, weight=
     it makes the gap WORSE, not better. "val is only 0.14 above train" was the
     flattering reading.
 
+    `support_index` is `support.nonzero()` computed once by the caller (a
+    non-empty LongTensor of class ids, ascending). Same columns, same order,
+    same values as the boolean mask, without the two host-device syncs the
+    mask costs on every call (`bool(sup.any())` and the masked select) -- which
+    also makes the loss capturable in a CUDA graph. Takes precedence over
+    `support`.
+
     Returns (loss_to_backprop, plain_ce_detached).
     """
     V = logits.shape[-1]
     flat, tgt = logits.reshape(-1, V), target.reshape(-1)
-    if support is None or weight is not None:
+    if support_index is not None and weight is None:
+        logp = F.log_softmax(flat, dim=-1)
+        nll_t = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
+        nll_u = -logp.index_select(1, support_index).mean(dim=1)
+        smoothed = ((1.0 - label_smoothing) * nll_t + label_smoothing * nll_u).mean()
+    elif support is None or weight is not None:
         smoothed = F.cross_entropy(flat, tgt, weight=weight, label_smoothing=label_smoothing)
     else:
         # Smooth over the tokens that can actually occur, not the whole

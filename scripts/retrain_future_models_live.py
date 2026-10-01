@@ -63,6 +63,7 @@ from deepop_decoder.train_cwa_decoder import (
 )
 from cyberworld_v4.config import get_contract
 from cyberworld_v4.device_hist import device_hist
+from cyberworld_v4.graphed_step import GraphedLoss, graphs_enabled
 from data_unification.host_major import batched_loader
 
 
@@ -309,6 +310,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         best, best_epoch, best_state = _rp["best"], _rp["best_epoch"], _rp["best_state"]
         _history[:] = _rp["history"]
         first_epoch = epochs if guard.should_stop() else _rp["done_epochs"]
+    _graphed = None
     for epoch in range(first_epoch, epochs):
         wdt.train(); risk.train()
         # Accumulated on device and read once per epoch: a `.item()` per batch
@@ -318,6 +320,15 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _tr_sum = torch.zeros((), device=device, dtype=torch.float64); _nb = 0
         _nb_dev = torch.zeros((), device=device, dtype=torch.long); _k = 0
         _step = _guard_step_fn(guard)
+        if _graphed is None:
+            def _bb_loss(h_, target_, target_risk_, t_hist_, t_fut_):
+                pred_ = wdt.rollout(h_, K=_c.forecast_steps, t_history=t_hist_, t_future=t_fut_)
+                pred_risk_, _ = risk.forward_trajectory(pred_)
+                loss_ = sum((0.9 ** k) * F.mse_loss(pred_[:, k], target_[:, k])
+                            for k in range(_c.forecast_steps))
+                return loss_ + risk.risk_loss(pred_risk_, target_risk_)
+            _graphed = GraphedLoss(_bb_loss, [wdt, risk],
+                                   enabled=(str(device) == "cuda" and graphs_enabled()))
         _t0 = time.time()
         for batch in train_loader:
             _k += 1
@@ -334,6 +345,21 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             t_hist = batch["t_history"].to(device, non_blocking=_nblk) if "t_history" in batch else None
             t_fut = batch["t_future"].to(device, non_blocking=_nblk) if "t_future" in batch else None
             optimizer.zero_grad(set_to_none=True)
+            if t_hist is not None and t_fut is not None:
+                # forward + loss + backward replayed as a CUDA graph (cyberworld_v4/
+                # graphed_step.py): identical losses and weights, a fraction of the
+                # launch overhead. Same computation as the eager lines below.
+                loss = _graphed(h, target, target_risk, t_hist, t_fut)
+                _ok = _step(loss)
+                if _ok is False:
+                    continue
+                _accumulate_ok(_ok, [(_tr_sum, loss.detach().double().sum())], _nb_dev)
+                if _k % 2000 == 0:
+                    _el = time.time() - _t0; _r = _k / max(_el, 1e-9)
+                    print(f"  Branch B epoch={epoch+1} batch={_k}/{_nb_total} "
+                          f"({100.0*_k/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
+                          f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m", flush=True)
+                continue
             pred = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut)
             pred_risk, _ = risk.forward_trajectory(pred)
             loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
@@ -361,6 +387,10 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                       f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m", flush=True)
         guard.flush()
         _nb = int(_nb_dev)
+        if _graphed is not None and _graphed.enabled:
+            print(f"  cuda graph: {_graphed.n_graphed} graphed steps, {_graphed.n_eager} eager",
+                  flush=True)
+            _graphed.n_graphed = _graphed.n_eager = 0
         wdt.eval(); risk.eval()
         # Validation, measured against baselines that cost nothing to beat.
         #
@@ -715,6 +745,9 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
     _base_ds = getattr(train_ds, "base", train_ds)
     _hist = np.asarray(_base_ds.target_token_histogram())
     _support = torch.as_tensor(_hist > 0, dtype=torch.bool, device=device)
+    # the same support as class ids, computed once (see smoothed_and_plain_ce)
+    _support_idx = (torch.as_tensor(np.flatnonzero(_hist > 0), dtype=torch.long, device=device)
+                    if (_hist > 0).any() else None)
     print(f"DeepOP label-smoothing support: {int(_support.sum())} of {len(_hist)} "
           f"tokens occur as a target", flush=True)
 
@@ -732,6 +765,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         best, best_epoch = _rp["best"], _rp["best_epoch"]
         _history[:] = _rp["history"]
         first_epoch = epochs if guard.should_stop() else _rp["done_epochs"]
+    _graphed = None
     for epoch in range(first_epoch, epochs):
         decoder.train()
         # On-device accumulation: `loss.item()` per batch synced the host to
@@ -740,6 +774,14 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _tr_plain=torch.zeros((),device=device,dtype=torch.float64); _nb=0
         _nb_dev=torch.zeros((),device=device,dtype=torch.long); _k=0
         _step=_guard_step_fn(guard)
+        if _graphed is None:
+            def _dp_loss(h_aug_, inp_, tgt_, obs_seq_):
+                logits_ = decoder(h_aug_, inp_, obs_tokens=obs_seq_)
+                l_, p_ = smoothed_and_plain_ce(logits_, tgt_, label_smoothing=0.04,
+                                               support=_support, support_index=_support_idx)
+                return l_, p_.detach()
+            _graphed = GraphedLoss(_dp_loss, [decoder],
+                                   enabled=(str(device) == "cuda" and graphs_enabled()))
         _t0=time.time()
         for batch in train_loader:
             _k+=1
@@ -760,14 +802,15 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                 step_sigma=torch.linspace(0.015,0.055,steps=h.shape[1],device=device).unsqueeze(0).unsqueeze(-1)
                 h_aug=h+torch.randn_like(h)*step_sigma
             obs_seq=_drop_observed(batch["obs_tokens"].to(device,non_blocking=_nblk),vocab,OBS_TOKEN_DROPOUT)
-            optimizer.zero_grad(set_to_none=True); logits=decoder(h_aug,inp,obs_tokens=obs_seq)
+            optimizer.zero_grad(set_to_none=True)
+            # forward + loss + backward as a CUDA graph (cyberworld_v4/graphed_step.py);
+            # the observed-token dropout above stays eager, so its RNG draws are unchanged.
             # Train used smoothed CE while validation used plain CE, so the two
             # printed numbers were different functions and their gap was not a
             # generalisation gap. Identity: L_smooth = 0.96*plain + 0.04*U with
             # U >= ln(10), which put the real degradation at >= 0.2087 nats
             # against a printed 0.1404. Both are now reported.
-            loss, _plain = smoothed_and_plain_ce(logits, tgt, label_smoothing=0.04,
-                                                 support=_support)
+            loss, _plain = _graphed(h_aug, inp, tgt, obs_seq)
             _ok=_step(loss)
             if _ok is False:
                 continue
@@ -780,6 +823,10 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                       f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m",flush=True)
         guard.flush()
         _nb=int(_nb_dev)
+        if _graphed is not None and _graphed.enabled:
+            print(f"  cuda graph: {_graphed.n_graphed} graphed steps, {_graphed.n_eager} eager",
+                  flush=True)
+            _graphed.n_graphed = _graphed.n_eager = 0
         decoder.eval()
         # Validation against the two predictors that require no model at all.
         #

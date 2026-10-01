@@ -59,14 +59,20 @@ class _Wrap(torch.nn.Module):
 class GraphedLoss:
     """`GraphedLoss(fn, modules, example)(*inputs) == fn(*inputs)`, replayed as a graph.
 
-    `fn` returns a scalar loss (or a tuple of tensors) from the tensors it is
-    given and the parameters of `modules`. `example` fixes the graphed shapes
+    `fn` returns a scalar loss, or a tuple whose first element is the loss and
+    whose other elements are DETACHED monitors (a monitor that required grad
+    would get a zero grad_output in the graphed backward), from the tensors it
+    is given and the parameters of `modules`. `example` fixes the graphed shapes
     and dtypes; inputs of any other shape fall back to calling `fn` eagerly.
     Built lazily on the first matching call, so it costs nothing when unused.
     """
 
-    def __init__(self, fn: Callable, modules: Sequence[torch.nn.Module], enabled: bool = True):
+    def __init__(self, fn: Callable, modules: Sequence[torch.nn.Module], enabled: bool = True,
+                 on_error: str = "eager", log: Optional[Callable[[str], None]] = print):
         self.fn = fn
+        self.on_error = on_error
+        self.log = log
+        self.error = None
         self.modules = list(modules)
         self.enabled = bool(enabled) and torch.cuda.is_available()
         self._graphed = None
@@ -91,13 +97,23 @@ class GraphedLoss:
         for p, _ in saved:
             p.grad = None
         static = tuple(a.detach().clone() if torch.is_tensor(a) else a for a in example)
-        self._graphed = torch.cuda.make_graphed_callables(
-            _Wrap(self.fn, self.modules), static, allow_unused_input=True)
-        for p, g in saved:
-            p.grad = g
-        torch.cuda.set_rng_state(cuda_rng, dev)
-        torch.set_rng_state(cpu_rng)
-        self._sig = self._signature(example)
+        try:
+            self._graphed = torch.cuda.make_graphed_callables(
+                _Wrap(self.fn, self.modules), static, allow_unused_input=True)
+            self._sig = self._signature(example)
+        except Exception as e:          # an op that cannot be captured: stay eager
+            self._graphed = None
+            self.enabled = False
+            self.error = f"{type(e).__name__}: {e}"
+            if self.on_error == "raise":
+                raise
+            if self.log is not None:
+                self.log(f"  cuda graph unavailable ({self.error}); running eagerly")
+        finally:
+            for p, g in saved:
+                p.grad = g
+            torch.cuda.set_rng_state(cuda_rng, dev)
+            torch.set_rng_state(cpu_rng)
 
     def __call__(self, *args):
         if self.enabled and all(m.training for m in self.modules):

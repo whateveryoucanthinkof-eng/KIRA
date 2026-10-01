@@ -59,3 +59,20 @@ def test_graphed_training_is_bit_identical_to_eager():
     assert torch.equal(L0, L1)
     for k in W0:
         assert torch.equal(W0[k].nan_to_num(3.0), W1[k].nan_to_num(3.0)), k
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_support_index_loss_matches_mask(device):
+    from deepop_decoder.forecast_decoder import smoothed_and_plain_ce
+    g = torch.Generator().manual_seed(3)
+    for sup_list in ([0, 3, 4, 9], list(range(10)), [5]):
+        sup = torch.zeros(10, dtype=torch.bool)
+        sup[sup_list] = True
+        logits = torch.randn(64, 5, 10, generator=g).to(device).requires_grad_(True)
+        tgt = torch.randint(0, 10, (64, 5), generator=g).to(device)
+        a, pa = smoothed_and_plain_ce(logits, tgt, support=sup.to(device))
+        ga, = torch.autograd.grad(a, logits)
+        b, pb = smoothed_and_plain_ce(logits, tgt, support=sup.to(device),
+                                      support_index=sup.nonzero().squeeze(1).to(device))
+        gb, = torch.autograd.grad(b, logits)
+        assert torch.equal(a, b) and torch.equal(pa, pb) and torch.equal(ga, gb)
