@@ -287,9 +287,28 @@ def _accumulate_ok(ok, acc_pairs, nb):
 # and token counts) are kept outside the bodies: a graph replays device work
 # only. Same kernels, same order: identical accumulators.
 
+def _bb_variance_loss(pred, logvar, target):
+    """Gaussian NLL of the step-k residual under the predicted variance.
+
+    The mean is detached (and logvar_head reads a detached trunk), so this
+    trains ONLY the variance: the mean -- the forecast the persistence gate
+    judges -- trains exactly as it did under MSE alone."""
+    from branch_b_world_model.rollout_encoder_decoder import gaussian_nll
+    return sum((0.9 ** k) * gaussian_nll(pred[:, k].detach(), logvar[:, k], target[:, k])
+               for k in range(pred.shape[1]))
+
+
+#: z for a two-sided 90% Gaussian interval: coverage of mean +/- 1.645 sigma.
+_Z90 = 1.6448536269514722
+
+
 def _bb_val_body(wdt, risk, K, step_offset):
     def body(acc, h, target, target_risk, t_hist, t_fut):
-        pred = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut)
+        pred, logv = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut, return_logvar=True)
+        from branch_b_world_model.rollout_encoder_decoder import gaussian_nll
+        acc["nll_model"] += gaussian_nll(pred, logv, target).double()
+        _inside = ((target - pred).abs() <= _Z90 * torch.exp(0.5 * logv)).double()
+        acc["cov90_by_step"] += _inside.mean(dim=(0, 2))
         pred_risk, _ = risk.forward_trajectory(pred)
         _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
         acc["resid_hist"] += device_hist((_rb.view(-1, K) + step_offset).reshape(-1),
@@ -310,6 +329,9 @@ def validate_branch_b(wdt, risk, loader, device, K):
     z = lambda: torch.zeros((), device=device, dtype=torch.float64)
     acc = {"v_sum": z(), "mse_model": z(), "mse_persist": z(), "bce_model": z(),
            "risk_mae_model": z(), "risk_sum": z(),
+           # the predictive distribution: mean NLL, and per-step coverage of the
+           # nominal 90% interval (calibrated <=> ~0.90 at every step)
+           "nll_model": z(), "cov90_by_step": torch.zeros(K, device=device, dtype=torch.float64),
            # per-step |risk residual| histograms for the forecast's conformal band
            "resid_hist": torch.zeros(K * FORECAST_RISK_BINS, device=device, dtype=torch.long)}
     step_offset = (torch.arange(K, device=device) * FORECAST_RISK_BINS).view(1, K)
@@ -477,11 +499,12 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _step = _guard_step_fn(guard)
         if _graphed is None:
             def _bb_loss(h_, target_, target_risk_, t_hist_, t_fut_):
-                pred_ = wdt.rollout(h_, K=_c.forecast_steps, t_history=t_hist_, t_future=t_fut_)
+                pred_, logv_ = wdt.rollout(h_, K=_c.forecast_steps, t_history=t_hist_,
+                                           t_future=t_fut_, return_logvar=True)
                 pred_risk_, _ = risk.forward_trajectory(pred_)
                 loss_ = sum((0.9 ** k) * F.mse_loss(pred_[:, k], target_[:, k])
                             for k in range(_c.forecast_steps))
-                return loss_ + risk.risk_loss(pred_risk_, target_risk_)
+                return loss_ + _bb_variance_loss(pred_, logv_, target_) + risk.risk_loss(pred_risk_, target_risk_)
             _graphed = GraphedLoss(_bb_loss, [wdt, risk],
                                    enabled=(str(device) == "cuda" and graphs_enabled()))
         _t0 = time.time()
@@ -516,9 +539,11 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                           f"({100.0*_k/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
                           f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m", flush=True)
                 continue
-            pred = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut)
+            pred, logv = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut,
+                                     return_logvar=True)
             pred_risk, _ = risk.forward_trajectory(pred)
             loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
+            loss = loss + _bb_variance_loss(pred, logv, target)
             # Huber, not BCE.
             #
             # BCE(p,t) is linear in t, so its minimiser is E[t|x] -- the same
@@ -577,8 +602,12 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _p = min(max(_rbar, 1e-7), 1 - 1e-7)
         _bce_base = -(_rbar * math.log(_p) + (1 - _rbar) * math.log(1 - _p))
         _skill = (1.0 - _mm / _mp) if _mp > 0 else float("nan")
+        _nll = float((_va["nll_model"] / _n).item())
+        _cov = [round(float(c), 4) for c in (_va["cov90_by_step"] / _n).tolist()]
         print(f"Branch B epoch={epoch+1} train_loss={_trl:.4f} val_loss={score:.4f} "
               f"wall={(time.time()-_t0)/60:.1f}m", flush=True)
+        print(f"  predictive distribution: nll={_nll:.4f} "
+              f"90%-interval coverage by step={_cov} (calibrated ~0.90)", flush=True)
         print(f"  embeddings: mse_model={_mm:.6f} mse_persistence={_mp:.6f} "
               f"skill={_skill:+.3f}"
               f"{'  <-- WORSE THAN COPYING THE LAST STEP' if _mm >= _mp else ''}", flush=True)
@@ -586,6 +615,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
               f"mae_model={_rmae:.4f} mae_predict_zero={_rbar:.4f}"
               f"{'  <-- WORSE THAN PREDICTING ZERO' if _rmae >= _rbar else ''}", flush=True)
         _history.append({"epoch": epoch + 1, "train_loss": _trl, "val_loss": score,
+                         "nll_model": _nll, "coverage90_by_step": _cov,
                          "mse_model": _mm, "mse_persistence": _mp, "skill": _skill,
                          "bce_model": _bm, "bce_constant": _bce_base,
                          "risk_mae_model": _rmae, "risk_mae_zero": _rbar})
