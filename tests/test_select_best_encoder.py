@@ -115,3 +115,16 @@ def test_smooth_handles_edges_and_trivial_windows():
     assert len(out) == len(v)
     assert out[0] == pytest.approx(1.5)      # clipped at the start
     assert out[-1] == pytest.approx(3.5)     # clipped at the end
+
+
+def test_promotion_uses_the_trainers_harmonic_rule():
+    """A collapsed head (macro recall ~0.25 = one of four classes) must not be
+    promoted over a working one on link AP alone."""
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("sbe", root / "scripts" / "select_best_encoder.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    collapsed, working = m._harmonic(0.99, 0.25), m._harmonic(0.95, 0.60)
+    assert working > collapsed
