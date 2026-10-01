@@ -22,12 +22,14 @@ from control_backend.lab_config import (
     SENSOR_CONTAINER,
 )
 from control_backend.model_adapter import (
-    model_adapter,
     flows_from_span_dicts,
+    get_model_adapter,
+    model_load_error,
     select_primary_target,
 )
 from control_backend.schema import CommandEvent, utc_now_iso
 from control_backend.topology_service import topology_service
+from cyberworld_v4.config import WINDOW_SECONDS
 
 logger = logging.getLogger("antigravity.telemetry_service")
 
@@ -38,7 +40,9 @@ class LiveTelemetryService:
         self.tail_thread: Optional[threading.Thread] = None
         self.is_running = False
         self.is_ml_active = False
-        self.adapter = model_adapter
+        # The adapter is resolved on use, not at import: without trained
+        # checkpoints the sensor, topology and lab controls must still work.
+        self._adapter_override = None
         self.windows_streamed = 0
         self.last_window_at: float = 0.0
         self.external_attack_armed = False
@@ -66,6 +70,28 @@ class LiveTelemetryService:
                 os.remove(ML_TRIGGER_FILE)
             except Exception:
                 pass
+
+    @property
+    def adapter(self):
+        """The serving adapter, or None while the models are not loaded."""
+        if self._adapter_override is not None:
+            return self._adapter_override
+        return get_model_adapter()
+
+    @adapter.setter
+    def adapter(self, value):
+        self._adapter_override = value
+
+    def _reset_model_history(self) -> None:
+        adapter = self.adapter
+        if adapter is not None:
+            adapter.reset_history()
+
+    def _window_seconds(self) -> float:
+        adapter = self.adapter
+        if adapter is not None:
+            return float(getattr(adapter, "window_seconds", 0.0) or WINDOW_SECONDS)
+        return WINDOW_SECONDS
 
     def start_sensor(self) -> Dict[str, Any]:
         if self.is_running:
@@ -138,7 +164,7 @@ class LiveTelemetryService:
         self.windows_streamed = 0
         self.capture.reset_sequence()
         self.last_window_at = 0.0
-        self.adapter.reset_history()
+        self._reset_model_history()
         topology_service.reset()
 
         self.tail_thread = threading.Thread(target=self._tail_worker, daemon=True)
@@ -185,9 +211,14 @@ class LiveTelemetryService:
             raise RuntimeError("Cannot start ML: telemetry sensor must be running first.")
         if self.is_ml_active:
             return {"status": "already_active"}
+        if self._adapter_override is None and get_model_adapter(retry=True) is None:
+            raise RuntimeError(
+                "Cannot start inference: the models are not loaded. "
+                + (model_load_error() or "No checkpoints found in saved_models/.")
+            )
 
         self.is_ml_active = True
-        self.adapter.reset_history()
+        self._reset_model_history()
         broker.broadcast_sync(
             CommandEvent(
                 type="command_output",
@@ -200,7 +231,7 @@ class LiveTelemetryService:
 
     def stop_ml(self) -> Dict[str, Any]:
         self.is_ml_active = False
-        self.adapter.reset_history()
+        self._reset_model_history()
         broker.clear_prediction()
         broker.broadcast_sync(
             CommandEvent(
@@ -250,7 +281,7 @@ class LiveTelemetryService:
             self.blocked_ips.clear()
             self.blocked_ports.clear()
             self.credentials_revoked = False
-            self.adapter.reset_history()
+            self._reset_model_history()
             msg = "[🔄 SOAR]: Cleared recorded defenses."
         else:
             msg = f"[?] Unknown mitigation action: {act}"
@@ -362,7 +393,7 @@ class LiveTelemetryService:
                     # The window divisor was also the literal 2.0 rather than
                     # the served contract, so throughput would silently be
                     # wrong by the ratio of the two if the window ever changed.
-                    window_s = float(getattr(self.adapter, "window_seconds", 2.0)) or 2.0
+                    window_s = self._window_seconds()
                     total_bytes = sum((getattr(f, "fwd_bytes", 0) + getattr(f, "bwd_bytes", 0)) for f in flows)
                     self.current_throughput = round((total_bytes * 8.0) / (window_s * 1_000_000.0), 2)
                     self.current_active_connections = len(flows)
@@ -375,9 +406,10 @@ class LiveTelemetryService:
 
                     self.current_latency = round(float(record.get("pipeline_latency_ms", 0.0)), 1)
 
-                    if self.is_ml_active:
+                    adapter = self.adapter if self.is_ml_active else None
+                    if adapter is not None:
                         self.windows_streamed += 1
-                        event = self.adapter.predict_window(
+                        event = adapter.predict_window(
                             target_ip=target,
                             flows=flows,
                             window_id=int(record.get("window_id", self.windows_streamed)),
@@ -460,7 +492,7 @@ class LiveTelemetryService:
                         "attack": (
                             "running"
                             if self.current_anomaly_score
-                            >= float(getattr(self.adapter, "alert_threshold", 0.65)) * 100.0
+                            >= float(getattr(self.adapter, "alert_threshold", 0.65) or 0.65) * 100.0
                             else "stopped"
                         ),
                         "ml": "running" if self.is_ml_active else "stopped",

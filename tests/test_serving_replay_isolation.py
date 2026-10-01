@@ -35,7 +35,16 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault("CYBERWORLD_ALLOW_CONTRACT_MISMATCH", "1")
 
 import control_backend.main as main_mod
-from control_backend.model_adapter import model_adapter as live_adapter
+from control_backend import model_adapter as _ma
+
+# The live singleton, or None when no trained checkpoints can be loaded. The
+# source guards below hold either way; the behavioural classes need real
+# models and are skipped with the loader's own reason until a retrain lands.
+live_adapter = _ma.get_model_adapter()
+_requires_models = pytest.mark.skipif(
+    live_adapter is None,
+    reason=f"trained models not loadable: {(_ma.model_load_error() or '')[:200]}",
+)
 
 
 # --------------------------------------------------------------------------
@@ -75,6 +84,9 @@ def _isolate_live_adapter_state():
     """Snapshot + restore the live singleton's history around each test, so
     this file's sentinels never leak into a test that runs after it in the
     same pytest session."""
+    if live_adapter is None:
+        yield
+        return
     saved_h = dict(live_adapter.h_state_history_by_target)
     saved_f = dict(live_adapter.feature_history_by_target)
     saved_rules = live_adapter.rules_enabled
@@ -88,6 +100,7 @@ def _isolate_live_adapter_state():
     main_mod._replay_adapter = None
 
 
+@_requires_models
 class TestReplayAdapterIsIsolatedFromLiveSingleton:
     def test_get_replay_adapter_is_not_the_live_singleton(self):
         replay_adapter = main_mod._get_replay_adapter()
@@ -110,6 +123,7 @@ class TestReplayAdapterIsIsolatedFromLiveSingleton:
         )
 
 
+@_requires_models
 class TestReplayCannotCorruptLiveHistory:
     def test_replay_reset_history_does_not_wipe_every_live_host(self):
         """The exact old bug: reset_history() on the shared singleton wiped

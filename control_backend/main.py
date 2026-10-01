@@ -28,7 +28,7 @@ from control_backend.event_broker import broker
 import model_contract
 from control_backend.lab_config import TOTAL_NODES, LAB_NAME_FILTER
 from control_backend.site_config import get_site_config
-from control_backend.schema import SystemStatusEvent, ModelMetadata, utc_now_iso
+from control_backend.schema import SystemStatusEvent, ModelMetadata, TemporalContractInfo, utc_now_iso
 from control_backend.telemetry_service import telemetry_service
 from control_backend.topology_service import topology_service
 
@@ -39,6 +39,11 @@ logger = logging.getLogger("antigravity.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     broker.set_loop(asyncio.get_running_loop())
+    # Load the models off the request path. Without checkpoints this records
+    # why (see model_adapter.get_model_adapter) and the console still runs.
+    from control_backend.model_adapter import get_model_adapter
+    import threading
+    threading.Thread(target=get_model_adapter, daemon=True, name="model-load").start()
     site = get_site_config()
     logger.info(
         "cyberworld SOC backend online — site=%s lab_mode=%s (discovery topology).",
@@ -198,28 +203,44 @@ async def get_system_status():
         ml_state = "stopped"
 
     ml_live = ml_state == "running"
-    # Report the contract the loaded checkpoints actually carry.
-    #
-    # These were literals -- history_steps=5, forecast_steps=8 -- which were
-    # the v3 values. After the v4 retrain the served models use history 15 /
-    # forecast 5, so /api/status was telling an operator the wrong temporal
-    # contract for the model that was answering their queries. The adapter
-    # already adopts the real values from the checkpoints in _adopt_contract
-    # and refuses to load if they disagree with each other, so it is the one
-    # source worth reporting.
-    from control_backend.model_adapter import model_adapter as _served
-    model_meta = ModelMetadata(
-        name="Antigravity-DualBranch-DeepOP",
-        version="3.3-SOC",
-        feature_count=model_contract.BRANCH_A_INPUT_DIM,
-        history_steps=_served.history_steps,
-        window_seconds=_served.window_seconds,
-        forecast_steps=_served.forecast_steps,
-        checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
-        threshold=_served.alert_threshold,
-        forecast_step_seconds=_served.step_seconds,
-        rules_enabled=_served.rules_enabled,
-    )
+    # Report the contract the loaded checkpoints actually carry; the adapter
+    # adopts it from them in _adopt_contract and refuses to load if they
+    # disagree with each other. Without models there is nothing loaded to
+    # describe: model_meta is None, model_error says why, and the timeline
+    # falls back to the configured contract.
+    from control_backend.model_adapter import get_model_adapter, model_load_error
+    from cyberworld_v4.config import get_contract
+    _served = get_model_adapter()
+    model_meta = None
+    if _served is not None:
+        model_meta = ModelMetadata(
+            name="Antigravity-DualBranch-DeepOP",
+            version="3.3-SOC",
+            feature_count=model_contract.BRANCH_A_INPUT_DIM,
+            history_steps=_served.history_steps,
+            window_seconds=_served.window_seconds,
+            forecast_steps=_served.forecast_steps,
+            checkpoint="host_wdt.pt + branch_a_lstm.pt + cwa_forecast_decoder.pt",
+            threshold=_served.alert_threshold,
+            forecast_step_seconds=_served.step_seconds,
+            rules_enabled=_served.rules_enabled,
+        )
+        contract = TemporalContractInfo(
+            window_seconds=_served.window_seconds,
+            history_steps=_served.history_steps,
+            forecast_steps=_served.forecast_steps,
+            forecast_step_seconds=_served.step_seconds,
+            source="checkpoints",
+        )
+    else:
+        c = get_contract()
+        contract = TemporalContractInfo(
+            window_seconds=c.window_seconds,
+            history_steps=c.history_steps,
+            forecast_steps=c.forecast_steps,
+            forecast_step_seconds=c.forecast_window_seconds,
+            source="config",
+        )
 
     now_iso = utc_now_iso()
     return SystemStatusEvent(
@@ -241,8 +262,10 @@ async def get_system_status():
         attack_active=attack_running,
         demo_active=False,
         active_command=active_cmd,
-        model_loaded=True,
+        model_loaded=_served is not None,
         model_meta=model_meta,
+        model_error=None if _served is not None else (model_load_error() or "Models are loading."),
+        contract=contract,
         lab_mode=site.lab_mode,
         site_id=site.site_id,
         topology_nodes=topo.stats.nodes,
@@ -326,7 +349,12 @@ def _get_replay_adapter():
     global _replay_adapter
     if _replay_adapter is None:
         from control_backend.model_adapter import AntigravityModelAdapter
-        _replay_adapter = AntigravityModelAdapter()
+        try:
+            _replay_adapter = AntigravityModelAdapter()
+        except Exception as e:
+            raise HTTPException(
+                503, f"Replay needs the trained models, which are not loaded: {type(e).__name__}: {e}"
+            ) from e
     return _replay_adapter
 
 

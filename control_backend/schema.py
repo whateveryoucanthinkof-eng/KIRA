@@ -30,6 +30,15 @@ class ModelMetadata(BaseModel):
                             "changes `risk`, `predicted_stage` or `alert`.")
 
 
+class TemporalContractInfo(BaseModel):
+    window_seconds: float
+    history_steps: int
+    forecast_steps: int
+    forecast_step_seconds: float
+    # "checkpoints" when read from the loaded models, "config" otherwise.
+    source: str
+
+
 class StateMetadata(BaseModel):
     window_id: int
     sequence_ready: bool
@@ -209,6 +218,12 @@ class SystemStatusEvent(BaseModel):
     active_command: Optional[str] = None
     model_loaded: bool
     model_meta: Optional[ModelMetadata] = None
+    # Why inference is unavailable when model_loaded is False (missing, stale or
+    # mismatched checkpoints). None when the models are loaded.
+    model_error: Optional[str] = None
+    # The temporal contract the console should lay its timeline out on: the
+    # loaded checkpoints' when there are models, cyberworld_v4.config's when not.
+    contract: Optional[TemporalContractInfo] = None
     # Site / discovery (Phase 4+)
     lab_mode: bool = False
     site_id: Optional[str] = None

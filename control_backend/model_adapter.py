@@ -9,6 +9,7 @@ runs TGNE-TA → Branch A / Branch B (WDT) / DeepOP CWA, and emits PredictionEve
 from datetime import datetime, timezone
 import logging
 import os
+import threading
 import time
 from typing import Dict, List, Optional, Any
 
@@ -1068,6 +1069,45 @@ def flows_from_span_dicts(raw_flows: List[Dict[str, Any]]) -> List[UnifiedFlowRe
 # access (PEP 562) rather than at import. Importing this module for its helpers
 # or its class used to load all four checkpoints as a side effect.
 _singleton: Optional[AntigravityModelAdapter] = None
+#: Why the last load attempt failed, or None. Kept so the backend can run
+#: without models -- sensor, topology and lab controls still work -- and say
+#: why inference is unavailable instead of failing to start at all.
+_load_error: Optional[str] = None
+_load_lock = threading.Lock()
+
+
+def get_model_adapter(retry: bool = False) -> Optional[AntigravityModelAdapter]:
+    """The serving adapter, or None when the checkpoints cannot be loaded.
+
+    A failed load is remembered and not re-attempted on every status poll;
+    `retry=True` (used when the operator presses Start Inference) tries again,
+    so checkpoints dropped into saved_models/ are picked up without a restart.
+    """
+    global _singleton, _load_error
+    if _singleton is not None:
+        return _singleton
+    if _load_error is not None and not retry:
+        return None
+    # Status polls, the sensor's tail thread and Start Inference can all ask
+    # first; one load, not three concurrent ones.
+    with _load_lock:
+        if _singleton is not None:
+            return _singleton
+        if _load_error is not None and not retry:
+            return None
+        try:
+            _singleton = AntigravityModelAdapter()
+            _load_error = None
+        except Exception as e:  # any load failure: missing, stale or mismatched checkpoints
+            _load_error = f"{type(e).__name__}: {e}"
+            logger.error("Models not loaded; inference unavailable. %s", _load_error)
+            return None
+        return _singleton
+
+
+def model_load_error() -> Optional[str]:
+    """The reason the models are not loaded, or None if they are (or were never tried)."""
+    return _load_error
 
 
 def __getattr__(name: str):
