@@ -759,6 +759,8 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
             "live, so the rollout is not a function of its input and every "
             "epoch would otherwise see a different conditioning signal")
 
+    if not (LEGACY_LOADER or not hasattr(ds, "gather_batch") or not hasattr(ds, "_host_idx")):
+        return _precompute_rollouts_unique(wdt, ds, device, spill_dir, label, K, batch, num_workers)
     n = len(ds)
     # The rollout has the width of its input: 27 for the world state
     # s(t) = [TGNE ; attributes], not the bare 12-D embedding. A hard-coded 12
@@ -799,6 +801,122 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
           f"{(time.time()-t0)/60:.1f}m ({cache.nbytes/2**30:.2f} GiB, unlinked)",
           flush=True)
     return cache
+
+
+class _RolloutCache:
+    """Rollout rows plus a per-sample map: sample i's rollout is rows[map[i]]."""
+
+    def __init__(self, rows, idx_map):
+        self.rows, self.map = rows, idx_map
+        self.nbytes = rows.nbytes + idx_map.nbytes
+
+    def __len__(self):
+        return len(self.map)
+
+    def __getitem__(self, i):
+        return self.rows[self.map[i]]
+
+
+class _Indexed:
+    """`ds` restricted to the sample indices `idx`, for gather_batch loaders."""
+
+    _batched_ready = True          # delegates to `ds`, prepared by the caller
+
+    def __init__(self, ds, idx):
+        self.ds, self.idx = ds, np.asarray(idx, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.idx)
+
+    def __getitem__(self, j):
+        return self.ds[int(self.idx[j])]
+
+    def gather_batch(self, js):
+        return self.ds.gather_batch(self.idx[np.asarray(js, dtype=np.int64)])
+
+
+def _precompute_rollouts_unique(wdt, ds, device, spill_dir, label, K, batch, num_workers):
+    """_precompute_rollouts without computing (or storing) any window twice.
+
+    DeepOP's training set lists every window with an attack token twice (the
+    2x oversampling), so the cache computed and stored those rollouts twice:
+    at full scale the cache is ~0.5 KB per sample, tens of GB on disk.
+
+    Bit-identical to the original, which ran samples 0..n-1 in batches of
+    `batch` and a final partial batch of r = n % batch. Measured on the WDT
+    (tests/test_rollout_cache_unique.py): a sample's rollout does not depend
+    on WHICH samples share its batch at batch size 1024, but it can depend on
+    the batch SIZE (777, 64 and 1 differ by up to 4e-6). So:
+
+      * the full-batch region's distinct windows run in batches of exactly
+        `batch` -- the last one padded with repeats, discarded -- as before;
+      * the original final partial batch runs as it was: same samples, same
+        order, same size;
+      * each sample (duplicates included) maps to its row.
+    """
+    if not getattr(ds, "_batched_ready", False):
+        ds.enable_batched(spill_dir=os.environ.get("CYBERWORLD_SPILL_DIR"))
+    n = len(ds)
+    r = n % batch
+    full = n - r
+    d = int(ds[0]["h_history"].shape[-1])
+    key = (ds._host_idx[:full].astype(np.int64) << 32) | ds._pos[:full].astype(np.int64)
+    _u, first, inv = np.unique(key, return_index=True, return_inverse=True)
+    del key, _u
+    order = np.argsort(first, kind="stable")       # distinct windows in first-occurrence order
+    rank = np.empty(len(order), dtype=np.int64)
+    rank[order] = np.arange(len(order))
+    uniq = first[order]
+    nu = len(uniq)
+    pad = (-nu) % batch
+    todo = np.concatenate([uniq, np.repeat(uniq[-1:], pad)]) if nu else uniq
+    path = os.path.join(spill_dir or tempfile.gettempdir(),
+                        f"rollout_{label}_{os.getpid()}.f32")
+    rows = np.memmap(path, dtype=np.float32, mode="w+", shape=(max(nu + r, 1), K, d))
+    try:
+        os.unlink(path)          # reclaimed when the mapping is dropped
+    except OSError:
+        pass
+    t0, done = time.time(), 0
+    nb = (str(device) == "cuda")
+
+    def run(idx, dst):
+        nonlocal done
+        if len(idx) == 0:
+            return
+        put = dst
+        for b in _make_loader(_Indexed(ds, idx), batch, False, device, num_workers):
+            b = unpack_batch(b, device)
+            h = b["h_history"].to(device, non_blocking=nb)
+            t_h = b["t_history"].to(device, non_blocking=nb) if "t_history" in b else None
+            t_f = b["t_future"].to(device, non_blocking=nb) if "t_future" in b else None
+            out = wdt.rollout(h, K=K, t_history=t_h, t_future=t_f).detach().float().cpu().numpy()
+            keep = min(len(out), dst + (nu if dst == 0 else r) - put)
+            rows[put:put + keep] = out[:keep]
+            put += keep
+            done += len(out)
+            if done % (batch * 200) == 0:
+                rate = done / max(time.time() - t0, 1e-9)
+                print(f"  rollout cache [{label}] {done:,}/{len(todo) + r:,} "
+                      f"{rate:,.0f} samples/s", flush=True)
+
+    # The original made ONE DataLoader pass, and creating a DataLoader iterator
+    # draws its base seed from torch's global RNG. Two passes here would draw
+    # twice and shift every later draw (DeepOP's shuffle order): restore the
+    # state afterwards and make the original's single draw.
+    rng = torch.get_rng_state()
+    with torch.no_grad():
+        run(todo, 0)
+        run(np.arange(full, n), nu)
+    torch.set_rng_state(rng)
+    torch.empty((), dtype=torch.int64).random_()
+    rows.flush()
+    idx_map = np.concatenate([rank[inv], nu + np.arange(r, dtype=np.int64)])
+    idx_map = idx_map.astype(np.int32 if nu + r < 2 ** 31 else np.int64)
+    print(f"  rollout cache [{label}]: {n:,} samples, {nu + r:,} distinct rollouts computed "
+          f"in {(time.time()-t0)/60:.1f}m ({rows.nbytes/2**30:.2f} GiB instead of "
+          f"{n * K * d * 4 / 2**30:.2f}, unlinked)", flush=True)
+    return _RolloutCache(rows, idx_map)
 
 
 #: Probability of dropping each observed technique from DeepOP's encoder input
