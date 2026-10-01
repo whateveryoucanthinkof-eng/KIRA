@@ -63,7 +63,7 @@ from deepop_decoder.train_cwa_decoder import (
 )
 from cyberworld_v4.config import get_contract
 from cyberworld_v4.device_hist import device_hist
-from cyberworld_v4.graphed_step import GraphedLoss, graphs_enabled
+from cyberworld_v4.graphed_step import GraphedLoss, WholeStepGraph, graphs_enabled
 from data_unification.host_major import batched_loader
 
 
@@ -388,10 +388,10 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                       f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m", flush=True)
         guard.flush()
         _nb = int(_nb_dev)
-        if _graphed is not None and _graphed.enabled:
-            print(f"  cuda graph: {_graphed.n_graphed} graphed steps, {_graphed.n_eager} eager",
-                  flush=True)
-            _graphed.n_graphed = _graphed.n_eager = 0
+        if _graphed is not None and (_graphed.enabled or _graphed.error):
+            print(f"  cuda graph: {_graphed.n_graphed} graphed steps of {_k}"
+                  + (f" ({_graphed.error})" if _graphed.error else ""), flush=True)
+            _graphed.n_graphed = 0
         wdt.eval(); risk.eval()
         # Validation, measured against baselines that cost nothing to beat.
         #
@@ -782,8 +782,11 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                 l_, p_ = smoothed_and_plain_ce(logits_, tgt_, label_smoothing=0.04,
                                                support=_support, support_index=_support_idx)
                 return l_, p_.detach()
-            _graphed = GraphedLoss(_dp_loss, [decoder],
-                                   enabled=(str(device) == "cuda" and graphs_enabled()))
+            # the whole step (forward, loss, backward, clip, guard checks and
+            # snapshot) as one CUDA graph: TrainingGuard.deferred_step_graphed
+            _graphed = WholeStepGraph(_dp_loss, [decoder],
+                                      enabled=(str(device) == "cuda" and graphs_enabled()
+                                               and guard.deferred_supported()))
         _t0=time.time()
         for batch in train_loader:
             _k+=1
@@ -812,8 +815,12 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
             # generalisation gap. Identity: L_smooth = 0.96*plain + 0.04*U with
             # U >= ln(10), which put the real degradation at >= 0.2087 nats
             # against a printed 0.1404. Both are now reported.
-            loss, _plain = _graphed(h_aug, inp, tgt, obs_seq)
-            _ok=_step(loss)
+            if _graphed.enabled:
+                loss, _ok = guard.deferred_step_graphed(_graphed, [h_aug, inp, tgt, obs_seq])
+            else:
+                loss = _graphed.eager([h_aug, inp, tgt, obs_seq])
+                _ok = _step(loss)
+            _plain = _graphed.last_extras[0]
             if _ok is False:
                 continue
             _accumulate_ok(_ok, [(_tr_sum, loss.detach().double().sum()),
@@ -825,10 +832,10 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
                       f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m",flush=True)
         guard.flush()
         _nb=int(_nb_dev)
-        if _graphed is not None and _graphed.enabled:
-            print(f"  cuda graph: {_graphed.n_graphed} graphed steps, {_graphed.n_eager} eager",
-                  flush=True)
-            _graphed.n_graphed = _graphed.n_eager = 0
+        if _graphed is not None and (_graphed.enabled or _graphed.error):
+            print(f"  cuda graph: {_graphed.n_graphed} graphed steps of {_k}"
+                  + (f" ({_graphed.error})" if _graphed.error else ""), flush=True)
+            _graphed.n_graphed = 0
         decoder.eval()
         # Validation against the two predictors that require no model at all.
         #

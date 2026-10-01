@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--repo", default=str(HERE.parent.parent))
     ap.add_argument("--legacy", action="store_true", help="per-sample loader + syncing guard step")
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument("--whole", action="store_true", help="whole-step graph (deferred_step_graphed)")
     a = ap.parse_args()
     sys.path.insert(0, os.path.abspath(a.repo))
     sys.path.insert(0, str(HERE))
@@ -101,7 +102,11 @@ def main():
                           **({} if a.legacy else {'graph_undo': not getattr(a, 'no_graph', False)}))
     step = guard.backward_step if (a.legacy or not guard.deferred_supported()) else guard.backward_step_deferred
     fn = lossfn
-    if not (a.legacy or a.no_graph):
+    whole = None
+    if a.whole:
+        from cyberworld_v4.graphed_step import WholeStepGraph
+        whole = WholeStepGraph(lossfn, mods)
+    elif not (a.legacy or a.no_graph):
         from cyberworld_v4.graphed_step import GraphedLoss
         fn = GraphedLoss(lossfn, mods)
     for m in mods:
@@ -110,9 +115,12 @@ def main():
 
     def one(b):
         opt.zero_grad(set_to_none=True)
-        out = fn(*inputs(b))
-        loss = out[0] if isinstance(out, tuple) else out
-        ok = step(loss)
+        if whole is not None:
+            loss, ok = guard.deferred_step_graphed(whole, inputs(b))
+        else:
+            out = fn(*inputs(b))
+            loss = out[0] if isinstance(out, tuple) else out
+            ok = step(loss)
         if ok is True:
             acc.add_(loss.detach().double())
 
@@ -125,7 +133,7 @@ def main():
         one(next(it))
     torch.cuda.synchronize()
     el = time.perf_counter() - t0
-    tag = "legacy" if a.legacy else ("new" + ("" if a.no_graph else "+graph"))
+    tag = "legacy" if a.legacy else ("new" + ("+whole" if a.whole else ("" if a.no_graph else "+graph")))
     print(f"RESULT {a.model} {tag} w{a.workers} {a.batches / el:.1f} batch/s "
           f"({1e3 * el / a.batches:.2f} ms/batch)", flush=True)
 

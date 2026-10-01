@@ -314,7 +314,7 @@ class TrainingGuard:
             live, stepped = self._graph_live(whole)
         if live is None or not whole.ensure(args, live, self._snapshot_buffers(live), self,
                                             {live[i] for i in range(0, len(live), 3)}):
-            loss = whole.fn(*args)
+            loss = whole.eager(args)
             return loss, self.backward_step_deferred(loss)
         self.n_steps += 1
         whole.replay(args)

@@ -85,6 +85,9 @@ class _Wrap(torch.nn.Module):
 class GraphedLoss:
     """`GraphedLoss(fn, modules, example)(*inputs) == fn(*inputs)`, replayed as a graph.
 
+    (WholeStepGraph takes the same kind of `fn`; its monitors are in
+    `last_extras` after each step.)
+
     `fn` returns a scalar loss, or a tuple whose first element is the loss and
     whose other elements are DETACHED monitors (a monitor that required grad
     would get a zero grad_output in the graphed backward), from the tensors it
@@ -226,7 +229,8 @@ class WholeStepGraph:
         static = [a.detach().clone() for a in args]
 
         def body():
-            loss = self.fn(*static)
+            out = self.fn(*static)
+            loss, extras = (out[0], tuple(out[1:])) if isinstance(out, tuple) else (out, ())
             loss_ok = torch.isfinite(loss.detach()).all()
             # The gradients from autograd.grad, assigned to .grad: what
             # backward() does into a None .grad (AccumulateGrad hands the
@@ -243,7 +247,7 @@ class WholeStepGraph:
             ok = loss_ok & torch.isfinite(norm)
             with torch.no_grad():
                 torch._foreach_copy_(snap, live)
-            return loss.detach(), norm, ok, gp
+            return loss.detach(), norm, ok, gp, extras
 
         try:
             side = torch.cuda.Stream(device=dev)
@@ -265,7 +269,7 @@ class WholeStepGraph:
                 _ovr(True)
             try:
                 with torch.cuda.graph(g, stream=side, capture_error_mode="thread_local"):
-                    loss, norm, ok, gp = body()
+                    loss, norm, ok, gp, extras = body()
             finally:
                 if _ovr is not None:
                     _ovr(False)
@@ -273,6 +277,7 @@ class WholeStepGraph:
                 raise RuntimeError("the graph's gradient set differs from the optimizer's state")
             self._g, self._static = g, static
             self.loss, self.norm, self.ok = loss, norm, ok
+            self._extras = extras
             self._grad_of = [(p, p.grad) for p in gp]
             self.grad_params = set(gp)
             self._sig = GraphedLoss._signature(args)
@@ -288,4 +293,14 @@ class WholeStepGraph:
         self._g.replay()
         for p, gr in self._grad_of:
             p.grad = gr
+        self.last_extras = self._extras
         self.n_graphed += 1
+
+    def eager(self, args):
+        """`fn(*args)` eagerly; returns the loss, keeps any monitors in last_extras."""
+        out = self.fn(*args)
+        if isinstance(out, tuple):
+            self.last_extras = tuple(out[1:])
+            return out[0]
+        self.last_extras = ()
+        return out
