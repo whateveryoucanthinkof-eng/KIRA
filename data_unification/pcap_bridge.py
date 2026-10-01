@@ -190,6 +190,9 @@ def iter_day_records(
     `_packet_features` and dropped; nothing downstream had ever seen one.
     """
     resolver = resolver or get_default_resolver()
+    from data_unification.attack_windows import unscoped_label_policy
+    from data_unification.label_resolver import UNKNOWN_CATEGORY
+    unscoped_policy = unscoped_label_policy()
 
     for bucket, per_host in iter_merged_day_windows(
         day_dir,
@@ -205,6 +208,10 @@ def iter_day_records(
         raw_label = interval.label if interval else "BENIGN"
         coarse, technique_ids, is_attack = resolver.resolve(raw_label, source=LabelSource.CIC2018)
         scoped = bool(interval and interval.scoped and scope_labels_to_participants)
+        # An attack interval nobody can attribute: UNKNOWN by default (see
+        # attack_windows.unscoped_label_policy), never "every host attacked".
+        unknown = bool(is_attack and not scoped and scope_labels_to_participants
+                       and unscoped_policy == "unknown")
 
         records: List[UnifiedFlowRecord] = []
         for host_ip, (flows, packet_features) in per_host.items():
@@ -216,11 +223,23 @@ def iter_day_records(
             )
             for f in flows:
                 # A window-level label is an interval in TIME; whether this
-                # particular host was in it is a separate question, and the
-                # answer is the interval's participant set when it has one.
+                # particular flow was in it is a separate question, and the
+                # answer is the interval's attacking pairs (or, without pairs,
+                # its participant set) when it has one.
+                if unknown:
+                    rec = _flow_dict_to_record(
+                        f, is_attack=False, coarse_category=UNKNOWN_CATEGORY,
+                        technique_ids=[], raw_label=raw_label,
+                        scenario_id=scenario_id, metadata=meta)
+                    if rec is not None:
+                        records.append(rec)
+                    continue
                 if is_attack and scoped:
-                    hit = interval.involves(
-                        str(f.get("src_ip", "")), str(f.get("dst_ip", "")), host_ip)
+                    s_ip, d_ip = str(f.get("src_ip", "")), str(f.get("dst_ip", ""))
+                    if interval.pairs:
+                        hit = bool(interval.flow_hit(s_ip, d_ip))
+                    else:
+                        hit = interval.involves(s_ip, d_ip, host_ip)
                 else:
                     hit = is_attack
                 rec = _flow_dict_to_record(

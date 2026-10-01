@@ -109,6 +109,7 @@ _PARSE_MODULES = (
     "data_unification.cic2018_adapter",
     "data_unification.ctu13_adapter",
     "data_unification.attack_windows",
+    "data_unification.attack_participants",
     "data_unification.pcap_bridge",
     "data_unification.pcap_adapter",
     "telemetry.capture.sniffer",
@@ -127,7 +128,10 @@ class ColumnSpec:
                           downstream CIC-2017 test read): strided adapter read,
                           or PCAP windows, then drop_unresolved.
       "pcap_windows"   -- downstream's iter_pcap_day_records: PCAP windows
-                          concatenated, NO drop_unresolved.
+                          concatenated, then drop_unresolved. (It used to keep
+                          them; with unattributable attack intervals labelled
+                          UNKNOWN / is_attack=False, keeping them would turn
+                          every such interval into "benign" host windows.)
       "one_capture"    -- downstream's read_one_capture: CIC-2018 adapter for
                           *.csv, CTU-13 adapter otherwise, strided, NO drop.
     """
@@ -152,7 +156,7 @@ class ColumnSpec:
 
     @property
     def drops_unresolved(self) -> bool:
-        return self.reader == "read_capture"
+        return self.reader in ("read_capture", "pcap_windows")
 
     @property
     def source(self) -> str:
@@ -175,7 +179,14 @@ class ColumnSpec:
     def source_key(self) -> dict:
         """The parameters that decide the parsed records -- and only those."""
         if self.source == "pcap":
+            from data_unification.attack_participants import DEFAULT_MAP_PATH
+            from data_unification.attack_windows import unscoped_label_policy
+            import hashlib
+            _m = Path(DEFAULT_MAP_PATH)
             return {"source": "pcap", "path": self.path, "window_seconds": self.window_seconds,
+                    "unscoped_labels": unscoped_label_policy(),
+                    "participant_map": (hashlib.sha256(_m.read_bytes()).hexdigest()[:16]
+                                        if _m.exists() else None),
                     "label_dir": self.pcap_label_dir, "max_windows": self.pcap_max_windows,
                     "window_stride": self.pcap_window_stride,
                     "max_packets_per_host": self.max_packets_per_host}

@@ -159,6 +159,10 @@ def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_
                 print(f"skipping {day_dir.name}: implausible attack-window derivation ({dw.evidence})")
                 continue
             check_label_day(day, dw.intervals)
+            # Scope intervals the CSV could not (no IP columns) from the participant
+            # map. This had no caller, so a filled-in map changed nothing.
+            from data_unification.attack_participants import apply_participants
+            apply_participants(dw, day)
             n_windows = 0
             # window_stride keeps every Nth window across the WHOLE day rather than
             # truncating to a prefix. A prefix would drop late-starting campaigns
@@ -202,6 +206,10 @@ def iter_pcap_day_records(pcap_root, csv_label_dir, window_seconds, max_windows_
                                             max_packets_per_host):
             recs.extend(window)
             n_win += 1
+        # UNKNOWN rows (unattributable attack intervals, unmapped labels) are
+        # not "benign": keep them out, as read_capture does for Branch A.
+        from data_unification.label_filter import drop_unresolved
+        recs, _cov = drop_unresolved(recs)
         print(f"  [{cap.split}] {cap.name}: {n_win} windows, {len(recs)} records", flush=True)
         yield cap.split, cap.name, recs
 
@@ -1175,8 +1183,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
 def _downstream_column_jobs(args):
     """[(split, namespace, ColumnSpec)] in exactly the order, and with exactly
     the reads, of the record path in _pcap_trajectories_per_day: every PCAP day
-    sorted by name (iter_pcap_day_records: windows concatenated, no label
-    filter), then under cross_year_ctu the CTU-13 train and val scenarios
+    sorted by name (iter_pcap_day_records: windows concatenated, unresolved
+    labels dropped), then under cross_year_ctu the CTU-13 train and val scenarios
     (read_one_capture)."""
     from data_unification.capture_columns import ColumnSpec
     from data_unification.training_sources import discover_captures

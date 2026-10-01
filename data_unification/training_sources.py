@@ -173,6 +173,10 @@ def iter_pcap_day_windows(day_dir: Path, label_dir: Path, window_seconds: float,
         return
     day = _PCAP_DAY.match(day_dir.name).group("day")
     check_label_day(day, dw.intervals)
+    # Scope intervals the CSV could not (no IP columns) from the participant
+    # map. This had no caller, so a filled-in map changed nothing.
+    from data_unification.attack_participants import apply_participants
+    apply_participants(dw, day)
     n = 0
     for w_idx, (_s, _e, recs) in enumerate(iter_day_records(
             day_dir, dw, scenario_id=day, window_seconds=window_seconds,

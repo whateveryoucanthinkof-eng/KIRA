@@ -155,7 +155,11 @@ def test_every_synthetic_capture_matches(captures, corpus, tmp_path, use_memory)
 
 
 @pytest.mark.parametrize("role", ["either", "target", "source"])
-def test_attack_roles_match(captures, corpus, tmp_path, role):
+def test_attack_roles_match(captures, corpus, tmp_path, role, monkeypatch):
+    # The synthetic corpus's label CSVs carry no addresses, so under the default
+    # policy its attack windows are UNKNOWN and dropped; this test is about the
+    # two extraction paths agreeing on attack ROLES, so it labels by time.
+    monkeypatch.setenv("CYBERWORLD_UNSCOPED_LABELS", "time_only")
     caps = [c for c in captures["train"] if c.dataset == "PCAP2018"][:3]
     st = _check(_both(caps, tmp_path, use_memory=True, attack_role=role,
                       reader_kw={"pcap_label_dir": corpus["csv"]}))
