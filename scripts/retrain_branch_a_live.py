@@ -1420,11 +1420,19 @@ def main():
         from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
         from data_unification.label_filter import (
             format_unresolved_report, merge_unresolved_reports)
-        shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
         widx_base = 0
         total_recs = 0
         coverage: List[dict] = []
-        if _cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1:
+        if label in _prebuilt:
+            # Already extracted, together with the other splits, by
+            # _extract_all_splits; its neighbour-exposure counts become the
+            # extractor's, to be reported (and reset) below as before.
+            shared, total_recs, coverage, extractor._exposure = _prebuilt.pop(label)
+        else:
+            shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+        if label in _done_labels:
+            pass
+        elif _cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1:
             # Captures are independent (memory and host ids reset per capture),
             # so extract several at once and append them in capture order:
             # the same store -- see data_unification/parallel_extract.py.
@@ -1526,6 +1534,54 @@ def main():
               f"{summary['zero_fraction_after']:.4f} | {summary}", flush=True)
 
     import gc
+    _prebuilt: Dict[str, Any] = {}
+    _done_labels = set()
+
+    def _extract_all_splits():
+        """Extract train, val and test through ONE parallel queue.
+
+        Split by split, the extraction workers idled at the end of every
+        split (a split's last big PCAP days run alone). One queue keeps them
+        busy. Each split's captures still reach that split's builder in
+        capture order, with the same window offsets, and each split keeps its
+        own neighbour-exposure counts, so every store is the one the
+        split-by-split loop builds (data_unification/parallel_extract.py).
+        CYBERWORLD_EXTRACT_ONE_QUEUE=0 restores split by split.
+        """
+        from data_unification.parallel_extract import extract_parallel
+        from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
+        splits = (("train", list(train_files)), ("val", list(val_files)), ("test", list(test_files)))
+        builders = {l: TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+                    for l, _ in splits}
+        expo = {l: dict.fromkeys(extractor._exposure, 0) for l, _ in splits}
+        cov = {l: [] for l, _ in splits}
+        recs = {l: 0 for l, _ in splits}
+        jobs = [(l, i, f, len(fs)) for l, fs in splits for i, f in enumerate(fs)]
+
+        def _items():
+            for n, (f, _r, cols, cv) in enumerate(_iter_capture_inputs([j[2] for j in jobs])):
+                cov[jobs[n][0]].append(cv)
+                yield n, cols, capture_namespace(f)
+        t = time.time()
+        for n, info in extract_parallel(
+                _items(), extractor=extractor, builder_for=lambda k: builders[jobs[k][0]],
+                exposure_for=lambda k: expo[jobs[k][0]],
+                tgne=str(args.tgne) if args.tgne else None,
+                part_dir=Path(args.spill_dir) / "parts_all", workers=args.extract_workers):
+            l, i, f, n_l = jobs[n]
+            recs[l] += info["n_records"]
+            print(f"  [{l} {i+1}/{n_l}] {f.label}: {info['n_records']} recs, "
+                  f"store={builders[l]._n} snaps, extract {info['seconds']:.1f}s "
+                  f"(in a worker), merge {info['merge_seconds']:.1f}s", flush=True)
+        print(f"extraction of all splits (one queue, {args.extract_workers} workers): "
+              f"{time.time() - t:.1f}s", flush=True)
+        for l, _ in splits:
+            _prebuilt[l] = (builders[l], recs[l], cov[l], expo[l])
+            _done_labels.add(l)
+
+    if (_cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1
+            and os.environ.get("CYBERWORLD_EXTRACT_ONE_QUEUE", "1") not in ("0", "false", "False")):
+        _extract_all_splits()
     t0 = time.time()
     train_store = _store_per_capture(train_files, "train")
     _apply_risk_target(train_store, "train")
