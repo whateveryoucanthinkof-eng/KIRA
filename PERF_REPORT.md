@@ -1,6 +1,19 @@
 # Downstream performance report (Branch A, Branch B, DeepOP, extraction)
 
-Branch `perf/downstream-optimise` (from `v5.5o` @ 0173d2e). Not merged; for review.
+Branch `perf/downstream-optimise` (from `v5.5o` @ 0173d2e). Not merged, not
+pushed; for review. Last commit: see `git log -1` (this file is updated in it).
+
+## Summary
+
+| Stage | Before | After | How |
+|---|---|---|---|
+| Branch A training loop, full scale | 24.5-29 batch/s (~5 h/epoch) | **532 batch/s** (~17 min/epoch) | host-major batched loader, CUDA-graphed whole step, packed batches, 8 workers |
+| Branch A data prep (extraction) | 2.5 h + 52 min | ~30-35 min (projected) | encoder fast path in extraction, one queue for all splits |
+| Branch B loop | 47.8 batch/s (RAM) / loader 19.5 at full scale | 82 batch/s, GPU-bound | batched loader, graphs |
+| DeepOP loop | 78 batch/s (RAM) / loader 37 at full scale | 298 batch/s, GPU-bound | batched loader, vectorised index, whole-step graph |
+| Encoder | ~366-395 batch/s | unchanged | checked; no bit-identical change worth its risk |
+
+Everything is bit-identical to the baseline (section "How it was measured").
 
 **Rule kept throughout:** no quality trade-off. Batch sizes, data, epochs and
 models are unchanged, and every change below is **bit-identical** to the
@@ -53,8 +66,12 @@ Branch A loop overall (store in RAM, same input, interleaved): **211 -> 770
 batch/s (3.6x)**; at full scale the old loop was I/O-bound at 24.5-29 batch/s,
 so **~25x**. Host 1.30 ms/batch vs ~1 ms GPU: close to the GPU.
 
-**Projected full-scale epoch:** 529,723 batches at ~700 batch/s = **~13 min**
-(was ~5 h). Validation (139k batches) a few minutes.
+**Measured at full scale** (77.5M-row synthetic store, 8.4 GB memmap, 11 GB
+cgroup like the production trainer, the whole loop: loader + graphed step):
+4 workers 414, **8 workers 532**, 12 workers 540 batch/s. The plan now defaults
+to `NUM_WORKERS=8` (worker count never changes batches or order). A
+529,723-batch epoch: **~17 min** (was ~5 h); in RAM the loop reaches 770 batch/s,
+so the remaining limit at full scale is memmap reads (page cache).
 
 ## 2. Branch B
 
@@ -103,8 +120,10 @@ ran its *reference* streaming code -- 45 % in a per-node Python loop
 |---|---|---|
 | Extraction encoder on the encoder's own fast path, level 1 (`data_unification/fast_extract.py`) | CTU-13 #7 8.8 -> 5.1 s; CTU-13 #4 114.6 -> 55.6 s; PCAP fri_16 (12M records) **1,010 -> 352 s** | `tests/test_fast_extraction.py` (all formats + real CTU-13, chained) + end to end |
 
+| Train, val and test extracted through ONE parallel queue (`extract_parallel(exposure_for=...)`) | workers no longer idle at each split's tail | end to end, store/exposure log lines identical |
+
 **Projected:** ~12,500 CPU-s of extraction -> ~4,800 CPU-s; with the default
-3 workers ~27 min for train and ~7 min for val (was 2.5 h + 52 min).
+3 workers ~30 min for all three splits (was 2.5 h + 52 min + test).
 
 Rejected after measuring: more torch threads per extraction worker
 (2 threads: 2.3e-6 differences, only 10 % faster).
@@ -132,7 +151,9 @@ worth knowing for any future change to it.
 
 All on by default (all bit-identical):
 
-* `--legacy-loader` (both trainers): the old per-sample loaders.
+* `--legacy-loader` (both trainers): the old per-sample loaders (no packing).
+* `CYBERWORLD_EXTRACT_ONE_QUEUE=0`: Branch A extracts split by split.
+* `NUM_WORKERS=4` in the plan env: the previous loader worker count.
 * `--no-cuda-graph` (Branch A) or `CYBERWORLD_CUDA_GRAPH=0` (all): eager steps.
 * `CYBERWORLD_GUARD_SYNC=1`: the old syncing guard step.
 * `CYBERWORLD_FAST_EXTRACT=0`: the reference extraction path.
@@ -140,8 +161,25 @@ All on by default (all bit-identical):
 ## Tried and rejected (measured)
 
 * Background prefetch thread for the batch handoff: 412 -> 395 batch/s (GIL).
+* Guard snapshot/undo graphs for the encoder: no gain (it steps once per 8 batches).
 * More loader workers beyond 4-8: no gain once the main thread is the limit.
 * Multi-threaded extraction workers: not bit-identical.
+
+## Verification run at the end
+
+* `scripts/dry_run_plan.py` (the whole plan on the synthetic corpus: 4
+  encoders, 4 Branch A, Branch B, DeepOP): **DRY RUN PASSED**.
+* Full test suite: **1,207 passed**, 4 failed + 3 modules fail to collect.
+  All 7 also fail on the baseline: `test_split_manager_uses_the_lock` (2) only
+  because the suite ran as root with `HOME=/root` (pass with the real HOME);
+  `test_site_config` (2), `test_control_backend`, `test_serving_replay_isolation`,
+  `test_topology_service`: the served encoder `saved_models/...unified_final.pth`
+  is feature schema 1.0.0, the tree is 2.0.0 (already in
+  `do_this_in_next_session_ml_review.md`). The fix is promoting a schema-2.0.0
+  encoder, which the plan leaves to a human on purpose (run_training_plan.sh
+  prints the copy commands); the only 2.0.0 encoder on disk is the epoch-1 one
+  with the collapsed category head, so it was not promoted.
+* Parse-cache code hashes unchanged (ingest `6fd03474...`, columns `b056d0ee...`).
 
 ## Open issues / notes for the reviewer
 
