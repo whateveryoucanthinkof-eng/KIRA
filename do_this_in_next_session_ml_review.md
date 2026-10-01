@@ -4,6 +4,52 @@ This file lists what is already known to need an ML-engineering review. It was w
 run was paused, after epoch 1 exposed a category-head collapse. Review everything below
 as an ML engineer before trusting any metric from the run on branch v5.5o.
 
+## Status after the 2026-10-02 code review (branch `fix/ml-review`)
+
+Diagnosed from code only: no training, no real data (being re-fetched). Verified by
+unit tests and the synthetic end-to-end dry run. The full run (7 epochs, not 1) collapsed
+every epoch: val predicted InitialAccess for every edge, macro-F1 0.05-0.08, test Hits@3 ≈ 1.0.
+
+**Root causes of §1, fixed:**
+
+1. **Labels were the clock.** `config/attack_participants.json` ships empty and 9 of 10
+   CIC-2018 CSVs have no IP columns, so every flow of every captured host (~445/day)
+   inside an attack interval got the attack label. That gave 9.0M InitialAccess training
+   edges, against ~0.5M InitialAccess rows in the CSVs. Now: unattributable intervals are
+   `UNKNOWN` (excluded from every supervised target; legacy:
+   `CYBERWORLD_UNSCOPED_LABELS=time_only`). Scoped intervals label attacking
+   **pairs**, not "any flow touching a participant", which marked a victim server's
+   clients as attackers. `apply_participants` had **no caller**; it does now.
+2. **Training order ran capture after capture** (CTU-13, then the CIC days in date
+   order), so the head ended each epoch fitted to the last day. Edges are now
+   interleaved by within-capture progress, which is exact for TGN memory because nodes
+   are per capture.
+3. **Selection let a collapsed head win** (arithmetic mean, AP-dominated). Now the
+   harmonic mean of inductive AP and macro-F1.
+4. Per-class TRAIN accuracy is logged every epoch.
+
+**Other items:**
+
+| item | status |
+|---|---|
+| §2 selection metric | fixed (harmonic mean) |
+| §2 mid-epoch validation | not needed: an epoch is ~18 min at level 4, not 70 |
+| §2 UndefinedMetricWarning | fixed: single-class AUC slices are NaN; absent classes NaN, not "0.0 recall" |
+| §2 leakage audit | Branch A target is the window after the history (no overlap). Added the **onset** slice (last input window benign), because continuations are predicted by persistence alone |
+| §3 label scoping | fixed (above). Per-flow attack labels on the no-IP days need data: CSVs with Src/Dst IP, or a verified participant map |
+| §3 CIC-2017 CSV test vs PCAP train | **open (data decision)**: different flow extractors. Using PCAP-derived CIC-2017 flows would also unlock packet features on test |
+| §3 absent classes | handled: NaN per class; UNKNOWN never a class |
+| §4 time-ordered batches | fixed (interleaving) |
+| §4 inductive draw | UNKNOWN no longer drives class protection |
+| §5 Branch A | benchmark added: **logistic regression** (PS-mandated, same inputs/target/threshold rule), persistence, FPR, onset slice |
+| §5 Branch B | now a **distribution**: per-step Gaussian (variance head, NLL, 90% coverage), mean training unchanged |
+| PS packet-level features | **plumbed, opt-in** (`--packet-features`, 27-D → 57-D, columnar path bit-identical, serving + explanations). Needs PCAP-derived test captures |
+| §7 resume RNG | fixed |
+| §7 stale serving fixture | open: needs the retrained encoder |
+| §8 CredentialAccess in correlation | fixed (between Recon and InitialAccess, as the console draws it) |
+| §6, rest of §8 | open (evtx logs, LateralMovement labels, per-alternative rollouts, attention saliency, campaign heuristic evaluation) |
+| edge-feature ablation (`dst_port`) | open: needs a retrain |
+
 ## 1. Category head collapses at full scale (highest priority)
 
 - **Observed:** epoch 1 at full scale (130.6M edges, 3.49M nodes, 4 classes). Both encoders
