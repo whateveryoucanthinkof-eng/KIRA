@@ -836,16 +836,23 @@ class MultiTaskLSTM(nn.Module):
         # a real-valued y in [0, 1] is the cross-entropy between two
         # Bernoullis; it is minimised at p == y, so it stays proper and the
         # sigmoid head stays calibrated against a continuous target.
+        # A NaN risk target is CENSORED (TrajectoryStore._censor_unknown: it
+        # looks ahead into traffic whose label is unknown) and carries no loss.
+        # With no NaN in the batch this is exactly the plain mean.
+        raw_risk = batch["risk"].to(predictions["risk_score"].dtype)
+        known = torch.isfinite(raw_risk)
+        w = known.to(raw_risk.dtype)
+        raw_risk = torch.where(known, raw_risk, torch.zeros_like(raw_risk))
+        pr = predictions["risk_score"]
         if self.risk_objective == "bce":
-            risk_target = (batch["risk"] > 0).to(predictions["risk_score"].dtype)
-            risk_loss = F.binary_cross_entropy(
-                predictions["risk_score"].clamp(1e-6, 1 - 1e-6), risk_target)
+            risk_target = (raw_risk > 0).to(pr.dtype)
+            el = F.binary_cross_entropy(pr.clamp(1e-6, 1 - 1e-6), risk_target, reduction="none")
         elif self.risk_objective == "soft_bce":
-            risk_target = batch["risk"].to(predictions["risk_score"].dtype).clamp(0.0, 1.0)
-            risk_loss = F.binary_cross_entropy(
-                predictions["risk_score"].clamp(1e-6, 1 - 1e-6), risk_target)
+            risk_target = raw_risk.clamp(0.0, 1.0)
+            el = F.binary_cross_entropy(pr.clamp(1e-6, 1 - 1e-6), risk_target, reduction="none")
         else:
-            risk_loss = F.smooth_l1_loss(predictions["risk_score"], batch["risk"])
+            el = F.smooth_l1_loss(pr, raw_risk, reduction="none")
+        risk_loss = (el * w).sum() / w.sum().clamp_min(1.0)
 
         # Focal loss on the RAW logits.
         #

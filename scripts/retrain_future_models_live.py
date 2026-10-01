@@ -294,6 +294,14 @@ def _masked_mse(pred, target, valid):
     return ((pred - target) ** 2 * v).sum() / (v.sum() * pred.shape[-1]).clamp_min(1.0)
 
 
+def _risk_known(target_risk, valid):
+    """(target with censored NaNs zeroed, weight): weight is 1 on real AND
+    known steps. A NaN hazard target depends on traffic whose label is
+    unknown (TrajectoryStore._censor_unknown) and carries no loss."""
+    k = torch.isfinite(target_risk)
+    return torch.where(k, target_risk, torch.zeros_like(target_risk)), valid * k.to(valid.dtype)
+
+
 def _future_valid(batch, K, device, nblk):
     """The batch's [B, K] real-step mask (all ones for a loader that has none)."""
     v = batch.get("future_valid")
@@ -335,20 +343,21 @@ def _bb_val_body(wdt, risk, K, step_offset, positive_above=0.0):
         acc["cov90_by_step"] += (_inside * _v).sum(dim=(0, 2)) / (
             _v.sum(dim=(0, 2)) * _inside.shape[-1]).clamp_min(1.0)
         pred_risk, _ = risk.forward_trajectory(pred)
+        target_risk, _wr = _risk_known(target_risk, valid)
         _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
         acc["resid_hist"] += device_hist((_rb.view(-1, K) + step_offset).reshape(-1),
-                                         K * FORECAST_RISK_BINS, valid.reshape(-1).long())
+                                         K * FORECAST_RISK_BINS, _wr.reshape(-1).long())
         _sb = (pred_risk.clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long().reshape(-1)
         _pos = (target_risk > positive_above).reshape(-1)
-        _vl = valid.reshape(-1) > 0
+        _vl = _wr.reshape(-1) > 0
         acc["op_pos"] += device_hist(_sb, FORECAST_RISK_BINS, (_pos & _vl).long())
         acc["op_neg"] += device_hist(_sb, FORECAST_RISK_BINS, (~_pos & _vl).long())
         # Every metric over REAL future steps only: padded steps repeat the
         # last state, which persistence predicts perfectly by construction.
-        _w = valid.double()
+        _w = _wr.double()
         _nw = _w.sum().clamp_min(1.0)
         _mm = _masked_mse(pred, target, valid).double()
-        acc["v_sum"] += _mm + risk.risk_loss(pred_risk, target_risk, weight=valid).double()
+        acc["v_sum"] += _mm + risk.risk_loss(pred_risk, target_risk, weight=_wr).double()
         # persistence: repeat the last observed step across the horizon
         _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
         acc["mse_model"] += _mm
@@ -576,8 +585,9 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                 pred_risk_, _ = risk.forward_trajectory(pred_)
                 loss_ = sum((0.9 ** k) * _masked_mse(pred_[:, k], target_[:, k], valid_[:, k])
                             for k in range(_c.forecast_steps))
+                _tr, _wr = _risk_known(target_risk_, valid_)
                 return (loss_ + _bb_variance_loss(pred_, logv_, target_, valid_)
-                        + risk.risk_loss(pred_risk_, target_risk_, weight=valid_))
+                        + risk.risk_loss(pred_risk_, _tr, weight=_wr))
             _graphed = GraphedLoss(_bb_loss, [wdt, risk],
                                    enabled=(str(device) == "cuda" and graphs_enabled()))
         _t0 = time.time()
@@ -631,7 +641,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             # Measured on a synthetic hazard target: BCE 0.244, MSE 0.244,
             # Huber(beta=0.1) 0.216 against a zero baseline of 0.230 -- only
             # Huber beats it.
-            loss = loss + risk.risk_loss(pred_risk, target_risk, weight=valid)
+            _tr, _wr = _risk_known(target_risk, valid)
+            loss = loss + risk.risk_loss(pred_risk, _tr, weight=_wr)
             _ok = _step(loss)
             if _ok is False:
                 continue

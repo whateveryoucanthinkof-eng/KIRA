@@ -143,9 +143,12 @@ def branch_b_on_store(wdt, risk_head, store, device, T: int, K: int, batch_size:
             if risk_head is not None:
                 pr, _ = risk_head.forward_trajectory(pred)
                 rt = b["risk_future"].to(device)
-                r_err += float(((pr - rt).abs() * v).sum())
-                r_zero += float((rt.abs() * v).sum())
-                r_cnt += float(v.sum())
+                kn = torch.isfinite(rt)                  # censored targets: no claim
+                vk = v * kn.to(v.dtype)
+                rt = torch.where(kn, rt, torch.zeros_like(rt))
+                r_err += float(((pr - rt).abs() * vk).sum())
+                r_zero += float((rt.abs() * vk).sum())
+                r_cnt += float(vk.sum())
             n += tgt.shape[0]
     mse_m, mse_p = se_m / max(cnt, 1.0), se_p / max(cnt, 1.0)
     out = {"n": n, "mse_model": mse_m, "mse_persistence": mse_p,

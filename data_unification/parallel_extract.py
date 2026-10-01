@@ -127,6 +127,10 @@ def extract_parallel(
                              initargs=(tgne, kw, threads_per_worker, repo)) as pool:
         try:
             for n, (key, cols, ns) in enumerate(items):
+                # The spans dropped as UNKNOWN, for the hazard target's
+                # censoring (TrajectoryStore._censor_unknown).
+                builder_for(key).add_unknown_intervals(
+                    (cols.meta or {}).get("unknown_intervals"), namespace=ns)
                 out = part_dir / f"part-{os.getpid()}-{n}"
                 fut = pool.submit(_extract_one, str(cols.path),
                                   cols.coverage is not None, ns, str(out))

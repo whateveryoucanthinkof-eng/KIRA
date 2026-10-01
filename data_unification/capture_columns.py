@@ -304,6 +304,12 @@ class CaptureColumns:
         pkt_table = np.load(d / "pkt_feats.npy", mmap_mode=mode)
         if drop_unresolved:
             if meta["n_unresolved"]:
+                # WHEN the dropped traffic happened, before it is gone: targets
+                # that look ahead into these spans are unknown, not negative
+                # (TrajectoryStore.hazard_risk censors them).
+                bad = np.asarray(cols["unresolved"])
+                meta["unknown_intervals"] = unknown_intervals(
+                    np.asarray(cols["start"])[bad], np.asarray(cols["end"])[bad])
                 keep = ~np.asarray(cols["unresolved"])
                 cols = {k: np.asarray(v)[keep] for k, v in cols.items()}
                 edge = np.asarray(edge)[keep]
@@ -313,6 +319,22 @@ class CaptureColumns:
         out = cls(cols, edge, meta, d)
         out.pkt_table = pkt_table
         return out
+
+
+def unknown_intervals(starts, ends, merge_gap: float = 4.0) -> list:
+    """[[start, end], ...] covering the given flows' times, merged when closer
+    than `merge_gap` seconds: the spans whose labels are UNKNOWN."""
+    starts = np.asarray(starts, dtype=np.float64)
+    if starts.size == 0:
+        return []
+    ends = np.maximum(np.asarray(ends, dtype=np.float64), starts)
+    o = np.argsort(starts, kind="stable")
+    s, e = starts[o], ends[o]
+    run_end = np.maximum.accumulate(e)
+    brk = np.flatnonzero(s[1:] > run_end[:-1] + merge_gap) + 1
+    lo = np.r_[0, brk]
+    hi = np.r_[brk, len(s)] - 1
+    return [[float(s[a]), float(run_end[b])] for a, b in zip(lo, hi)]
 
 
 @contextmanager

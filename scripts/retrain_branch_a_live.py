@@ -964,6 +964,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     non_blocking = (device == "cuda")
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     abs_err_sum = torch.zeros((), device=device, dtype=torch.float64)
+    # samples with a KNOWN risk target (censored ones are NaN and left out)
+    n_known = torch.zeros((), device=device, dtype=torch.float64)
     n_risk = 0
     conf_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.float64)
     pos_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
@@ -1011,7 +1013,7 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     onset_neg_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
     # persistence baseline (predict "attack" iff the last input window was one): tp, fp, fn, tn
     persist = torch.zeros(4, device=device, dtype=torch.long)
-    acc = {"loss_sum": loss_sum, "abs_err_sum": abs_err_sum, "conf_hist": conf_hist,
+    acc = {"loss_sum": loss_sum, "abs_err_sum": abs_err_sum, "n_known": n_known, "conf_hist": conf_hist,
            "pos_hist": pos_hist, "neg_hist": neg_hist, "brier_sum": brier_sum,
            "prob_sum": prob_sum, "resid_hist": resid_hist, "confusion": confusion,
            "grad_correct": grad_correct, "grad_confusion": grad_confusion,
@@ -1035,28 +1037,35 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             _v = parts.get(_k)
             if _v is not None:
                 a["ts_" + _k] += _v.double().reshape(())
-        err = (predictions["risk_score"] - targets["risk"]).abs()
-        a["abs_err_sum"] += err.double().sum()
+        # Censored targets (NaN, TrajectoryStore._censor_unknown) are in no
+        # risk metric: _k marks the known ones.
+        _rt = targets["risk"]
+        _kk = torch.isfinite(_rt)
+        _rt = torch.where(_kk, _rt, torch.zeros_like(_rt))
+        _k = _kk.reshape(-1)
+        err = (predictions["risk_score"] - _rt).abs()
+        a["abs_err_sum"] += (err * _kk).double().sum()
+        a["n_known"] += _k.double().sum()
         _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-        a["resid_hist"] += _hist(_rb.reshape(-1), RISK_BINS)
+        a["resid_hist"] += _hist(_rb.reshape(-1), RISK_BINS, _k.long())
 
         # Risk as a probability: AUC, Brier and calibration, accumulated
         # from a fixed histogram so 1.02M samples cost O(bins) memory and
         # no host-device sync. `risk_positive_above` is the cut that makes a
         # window positive (> 0 for severity, >= exp(-1) for the hazard target).
         _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
-        _y = (targets["risk"] > risk_positive_above).reshape(-1)
-        a["brier_sum"] += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
+        _y = (_rt > risk_positive_above).reshape(-1)
+        a["brier_sum"] += (((_p - _y.to(_p.dtype)) ** 2) * _k).double().sum()
         _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-        a["pos_hist"] += _hist(_b, RISK_BINS, _y.long())
-        a["neg_hist"] += _hist(_b, RISK_BINS, (~_y).long())
+        a["pos_hist"] += _hist(_b, RISK_BINS, (_y & _k).long())
+        a["neg_hist"] += _hist(_b, RISK_BINS, (~_y & _k).long())
         # Sum of the predicted probabilities per bin, so ECE can use each
         # bin's ACTUAL mean confidence rather than its nominal centre.
-        a["conf_hist"] += _hist(_b, RISK_BINS, _p.double())
-        a["prob_sum"] += _p.double().sum()
+        a["conf_hist"] += _hist(_b, RISK_BINS, (_p * _k).double())
+        a["prob_sum"] += (_p * _k).double().sum()
         if prev_t is not None:
-            _prev = prev_t.reshape(-1) != 0
-            _on = ~_prev
+            _prev = (prev_t.reshape(-1) != 0) & _k
+            _on = (prev_t.reshape(-1) == 0) & _k
             a["onset_pos_hist"] += _hist(_b, RISK_BINS, (_y & _on).long())
             a["onset_neg_hist"] += _hist(_b, RISK_BINS, ((~_y) & _on).long())
             a["persist"] += torch.stack([(_prev & _y).sum(), (_prev & ~_y).sum(),
@@ -1161,7 +1170,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     out_tasks = {k: (float((v / nb).item()) if nb else 0.0) for k, v in task_sums.items()}
     return {
         "loss": float((loss_sum / nb).item()) if nb else 0.0,
-        "risk_mae": float((abs_err_sum / n_risk).item()) if n_risk else 0.0,
+        "risk_mae": float((abs_err_sum / n_known.clamp_min(1)).item()) if n_risk else 0.0,
+        "risk_censored_fraction": (1.0 - float(n_known.item()) / n_risk) if n_risk else 0.0,
         "tech_accuracy": accuracy,
         # -- risk as a probability, judged the way a probability must be --
         "risk_auc": risk_auc,

@@ -870,6 +870,10 @@ class HostTrajectoryExtractor:
         timestamps = np.asarray(cols.start, dtype=np.float64)
         n_ips = len(cols.ips)
         pkt_table = getattr(cols, "pkt_table", None)
+        if builder is not None:
+            # When this capture's dropped UNKNOWN traffic happened: targets
+            # that look ahead into it are censored (TrajectoryStore.hazard_risk).
+            builder.add_unknown_intervals((getattr(cols, "meta", None) or {}).get("unknown_intervals"))
         if self.include_packet_features and pkt_table is None:
             raise ValueError("include_packet_features needs capture columns of format >= 3 "
                              "(the 'pkt' column and pkt_feats.npy); rebuild the column cache")

@@ -90,11 +90,15 @@ def train_logistic_baseline(loader, unpack, device, *, seq_len: int, input_dim: 
             batch = unpack(batch, device)
             x = batch["features"].to(device, non_blocking=nb)
             th = batch["t_history"].to(device, non_blocking=nb) if "t_history" in batch else None
-            y = (batch["risk"].to(device, non_blocking=nb) > risk_positive_above).float().reshape(-1)
+            rt = batch["risk"].to(device, non_blocking=nb).reshape(-1)
+            known = torch.isfinite(rt)              # censored targets carry no loss
+            y = (torch.where(known, rt, torch.zeros_like(rt)) > risk_positive_above).float()
             f = model.features(x, th)
             model.update_stats(f)
             logit = model.linear(model.standardise(f)).squeeze(-1)
-            loss = F.binary_cross_entropy_with_logits(logit, y)
+            w = known.float()
+            loss = (F.binary_cross_entropy_with_logits(logit, y, reduction="none") * w).sum() \
+                / w.sum().clamp_min(1.0)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -120,14 +124,16 @@ def score_histograms(model: SequenceLogisticBaseline, loader, unpack, device, *,
         batch = unpack(batch, device)
         x = batch["features"].to(device, non_blocking=nb)
         th = batch["t_history"].to(device, non_blocking=nb) if "t_history" in batch else None
-        y = (batch["risk"].to(device, non_blocking=nb) > risk_positive_above).reshape(-1)
+        rt = batch["risk"].to(device, non_blocking=nb).reshape(-1)
+        kn = torch.isfinite(rt)
+        y = (torch.where(kn, rt, torch.zeros_like(rt)) > risk_positive_above) & kn
         p = torch.sigmoid(model(x, th)).clamp(0, 1)
         b = (p * (bins - 1)).long().clamp_(0, bins - 1)
         h["pos"] += device_hist(b, bins, y.long())
-        h["neg"] += device_hist(b, bins, (~y).long())
+        h["neg"] += device_hist(b, bins, (~y & kn).long())
         if "prev_attack" in batch:
             has_prev = True
-            on = batch["prev_attack"].to(device, non_blocking=nb).reshape(-1) == 0
+            on = (batch["prev_attack"].to(device, non_blocking=nb).reshape(-1) == 0) & kn
             h["onset_pos"] += device_hist(b, bins, (y & on).long())
             h["onset_neg"] += device_hist(b, bins, (~y & on).long())
     out = {k: v.cpu().numpy() for k, v in h.items()}
