@@ -108,12 +108,12 @@ class TrainingGuard:
         #: CUDA graphs (one launch each instead of one per tensor). Same
         #: kernels on the same tensors: bit-identical. Re-captured whenever the
         #: tensors move (e.g. a step-back reloads the optimizer state).
-        #: None: on unless CYBERWORLD_CUDA_GRAPH=0 (it only acts on CUDA, in the
-        #: deferred step). Every trainer, the encoder included, gets it without
-        #: an argument -- bita/train.py is part of the shared-setup cache key.
+        #: Off by default: measured on the encoder at full scale (one guard step
+        #: per 8 batches there) it gained nothing -- 365.9/394.7 batch/s off vs
+        #: 361.4/365.9 on -- so the encoder is left exactly as it was. The
+        #: downstream trainers, which step every batch, pass it explicitly.
         if graph_undo is None:
-            import os as _os
-            graph_undo = _os.environ.get("CYBERWORLD_CUDA_GRAPH", "1") not in ("0", "false", "False", "")
+            graph_undo = False
         self.graph_undo = bool(graph_undo)
         self._undo_graphs = None
         self._reset_epoch_stats()

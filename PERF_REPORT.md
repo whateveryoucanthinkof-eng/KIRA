@@ -117,13 +117,16 @@ pegged at ~97 % of one core** -- host-bound like the downstream trainers were.
 Main-thread profile: memory-overlay reads (`fast_read`) ~15 %, waiting on the
 planner ~9 %, the guard's per-tensor undo loop ~5 %, eager BiTA transformer.
 
-Done: the guard's snapshot/undo graphs are on by default for every trainer
-(`CYBERWORLD_CUDA_GRAPH`), the encoder included, without touching
-`bita/train.py` (it is part of the shared-setup cache key). Bit-identity is
-proven by the deterministic unit test; on the encoder itself the baseline is
-not GPU-deterministic (two baseline runs differ by up to 2.2e-5, median
-3.7e-9, from atomics), and baseline-vs-new sits in that same band (3.4e-5,
-median 7.5e-9). Speed: see the A/B below.
+Tried: the guard's snapshot/undo graphs for the encoder. Interleaved at full
+scale (production flags, 30k-batch steady-state windows): off 365.9 / 394.7,
+on 361.4 / 365.9 batch/s -- no gain (the encoder steps its optimizer once per
+8 batches, `backprop_every=8`, so the guard is not on its critical path).
+**Reverted: the encoder runs exactly as before.** Its remaining host costs
+(memory-overlay reads, planner hand-off, eager BiTA transformer) are inside the
+previously tuned fast path; I did not find a change there that is both
+bit-identical and worth its risk. The encoder baseline is not GPU-deterministic
+(two baseline runs differ by up to 2.2e-5 in weights from atomics), which is
+worth knowing for any future change to it.
 
 ## How to switch things off
 
