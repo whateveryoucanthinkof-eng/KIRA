@@ -180,3 +180,19 @@ def test_cache_keys_change_with_the_policy(monkeypatch):
     a = spec.source_key()
     monkeypatch.setenv("CYBERWORLD_UNSCOPED_LABELS", "time_only")
     assert spec.source_key() != a
+
+
+def test_ctu_background_policy(monkeypatch):
+    from data_unification.label_resolver import LabelResolver
+    r = LabelResolver()
+    monkeypatch.delenv("CYBERWORLD_CTU_BACKGROUND", raising=False)
+    assert r.resolve("flow=Background-UDP-Established", source="CTU13")[0] == "Benign"
+    monkeypatch.setenv("CYBERWORLD_CTU_BACKGROUND", "unknown")
+    assert r.resolve("flow=Background-UDP-Established", source="CTU13")[0] == "UNKNOWN"
+    assert r.resolve("flow=From-Botnet-V42-TCP", source="CTU13")[0] == "C2"
+    assert r.resolve("flow=From-Normal-V42-Grill", source="CTU13")[0] == "Benign"
+    from data_unification.capture_columns import ColumnSpec
+    spec = ColumnSpec("one_capture", "CTU13", "x", "/x.binetflow", 2.0)
+    a = spec.source_key()
+    monkeypatch.setenv("CYBERWORLD_CTU_BACKGROUND", "benign")
+    assert spec.source_key() != a

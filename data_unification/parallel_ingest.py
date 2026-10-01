@@ -520,6 +520,9 @@ def cache_key(kind, path, *, stride, max_rows, edge_dim, pcap_label_dir, window_
     parser = effective_parser(kind, pcap_parser or "python", stride, max_rows)
     if parser is not None:
         extra["parser"] = parser
+    if kind == "CTU13":
+        from data_unification.label_resolver import ctu_background_policy
+        extra["ctu_background"] = ctu_background_policy()
     if kind == "PCAP2018":
         # PCAP labels also depend on the unscoped-interval policy and on the
         # participant map (attack_windows / attack_participants): a cached day

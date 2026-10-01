@@ -193,8 +193,12 @@ class ColumnSpec:
                     "label_dir": self.pcap_label_dir, "max_windows": self.pcap_max_windows,
                     "window_stride": self.pcap_window_stride,
                     "max_packets_per_host": self.max_packets_per_host}
-        return {"source": self.source, "path": self.path,
-                "rows_per_file": self.rows_per_file, "stride": self.stride}
+        out = {"source": self.source, "path": self.path,
+               "rows_per_file": self.rows_per_file, "stride": self.stride}
+        if self.source == "ctu13":
+            from data_unification.label_resolver import ctu_background_policy
+            out["ctu_background"] = ctu_background_policy()
+        return out
 
 
 def iter_spec_records(spec: ColumnSpec) -> Iterator[Any]:
