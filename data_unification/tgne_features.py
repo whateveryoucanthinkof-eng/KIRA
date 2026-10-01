@@ -28,13 +28,16 @@ from data_unification.host_attributes import HOST_ATTRIBUTES
 #: input distribution it never learned, with no shape error to catch it --
 #: which is the failure mode `build_or_load_tgne_ta` refuses on.
 #:
+#: 2.1.0  host attributes fwd/bwd bytes and packets are oriented to the host
+#:        (sent / received), not the flow's forward direction: a victim used to
+#:        report a flood's bytes as "sent".
 #: 2.0.0  dst_port is log-scaled instead of divided by 65535, and the host
 #:        attributes unique_peers / unique_dst_ports no longer saturate at 147
 #:        (data_unification/host_attributes.py). Both change every stored
 #:        feature value, so every checkpoint built under 1.0.0 must be
 #:        retrained; none can be loaded under this schema.
 #: 1.0.0  original canonical schema.
-SCHEMA_VERSION: str = "2.0.0"
+SCHEMA_VERSION: str = "2.1.0"
 
 # Authoritative 12-D Edge Feature Names
 EDGE_FEATURE_NAMES: List[str] = [

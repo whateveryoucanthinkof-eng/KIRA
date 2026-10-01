@@ -278,3 +278,22 @@ def test_scales_are_not_duplicated_as_literals_in_the_computation():
             f"{literal!r} is a hardcoded normalisation divisor; import it from "
             "host_attributes so the spec table stays authoritative"
         )
+
+
+def test_byte_and_packet_attributes_are_oriented_to_the_host():
+    """'fwd_bytes: bytes sent by this host'. A victim receiving a flood used to
+    report the attacker's forward bytes as its own sent bytes."""
+    from data_unification.multi_dataset_stream import HostTrajectoryExtractor
+    from data_unification.unified_schema import UnifiedFlowRecord
+    r = UnifiedFlowRecord(src_ip="1.1.1.1", dst_ip="2.2.2.2", src_port=5, dst_port=80, protocol=6,
+                          start_time=0.0, end_time=1.0, fwd_bytes=10_000, bwd_bytes=10,
+                          fwd_packets=100, bwd_packets=1, raw_label="x", raw_label_source="CIC2018",
+                          is_attack=False, coarse_category="Benign")
+    ex = HostTrajectoryExtractor.__new__(HostTrajectoryExtractor)
+    ex.n_temporal_attrs, ex.include_packet_features = 15, False
+    att = ex.compute_host_temporal_attributes("1.1.1.1", [r], 2.0)
+    vic = ex.compute_host_temporal_attributes("2.2.2.2", [r], 2.0)
+    i_sent = HOST_ATTRIBUTES.index("fwd_bytes")
+    i_recv = HOST_ATTRIBUTES.index("bwd_bytes")
+    assert att[i_sent] == vic[i_recv] and att[i_recv] == vic[i_sent]
+    assert att[i_sent] > att[i_recv]          # the attacker sent the bulk

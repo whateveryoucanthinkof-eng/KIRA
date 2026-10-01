@@ -545,11 +545,16 @@ class HostTrajectoryExtractor:
         if n == 0:
             return attrs
 
-        fwd_b = sum(r.fwd_bytes for r in window_records)
-        bwd_b = sum(r.bwd_bytes for r in window_records)
+        # Oriented to THIS host: "sent" is the flow's forward direction when
+        # the host is its source and the backward direction when it is the
+        # destination. Summing fwd_bytes regardless of role counted a flood's
+        # bytes as "sent" by the victim receiving it, so an attacker and its
+        # target had the same values -- the direction that tells them apart.
+        fwd_b = sum(r.fwd_bytes if r.src_ip == host_ip else r.bwd_bytes for r in window_records)
+        bwd_b = sum(r.bwd_bytes if r.src_ip == host_ip else r.fwd_bytes for r in window_records)
         tot_b = fwd_b + bwd_b
-        fwd_p = sum(r.fwd_packets for r in window_records)
-        bwd_p = sum(r.bwd_packets for r in window_records)
+        fwd_p = sum(r.fwd_packets if r.src_ip == host_ip else r.bwd_packets for r in window_records)
+        bwd_p = sum(r.bwd_packets if r.src_ip == host_ip else r.fwd_packets for r in window_records)
         tot_p = fwd_p + bwd_p
 
         peers = set()
@@ -1008,10 +1013,16 @@ class HostTrajectoryExtractor:
             np.cumsum(counts[:-1], out=starts[1:])
             g = j + s_idx                       # row in the columns
 
-            fwd_b = np.add.reduceat(np.asarray(cols.fwd_bytes[s_idx:e_idx])[j], starts)
-            bwd_b = np.add.reduceat(np.asarray(cols.bwd_bytes[s_idx:e_idx])[j], starts)
-            fwd_p = np.add.reduceat(np.asarray(cols.fwd_packets[s_idx:e_idx])[j], starts)
-            bwd_p = np.add.reduceat(np.asarray(cols.bwd_packets[s_idx:e_idx])[j], starts)
+            # Oriented to the host (see compute_host_temporal_attributes):
+            # as_src rows are the record's src side, so forward = sent.
+            _fb = np.asarray(cols.fwd_bytes[s_idx:e_idx])[j]
+            _bb = np.asarray(cols.bwd_bytes[s_idx:e_idx])[j]
+            _fp = np.asarray(cols.fwd_packets[s_idx:e_idx])[j]
+            _bp = np.asarray(cols.bwd_packets[s_idx:e_idx])[j]
+            fwd_b = np.add.reduceat(np.where(as_src, _fb, _bb), starts)
+            bwd_b = np.add.reduceat(np.where(as_src, _bb, _fb), starts)
+            fwd_p = np.add.reduceat(np.where(as_src, _fp, _bp), starts)
+            bwd_p = np.add.reduceat(np.where(as_src, _bp, _fp), starts)
             tot_b = fwd_b + bwd_b
             tot_p = fwd_p + bwd_p
             proto = np.asarray(cols.protocol[s_idx:e_idx])[j]
