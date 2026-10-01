@@ -663,10 +663,14 @@ class MultiTaskLSTM(nn.Module):
         nothing and applying it would be a silent change to what the currently
         served model outputs.
         """
-        if float(self.temperature_fitted) <= 0.0:
-            return torch.ones((), device=self.temperature.device,
-                              dtype=self.temperature.dtype)
-        return self.temperature.clamp(min=1e-3)
+        # Selected on the device. `float(self.temperature_fitted)` was a
+        # host-device sync, and forward + compute_loss read this twice per
+        # training step. Same values: 1.0 exactly when unfitted (<= 0), the
+        # clamped T otherwise (a NaN flag compares False either way); always
+        # 0-dim (T is one element).
+        t = self.temperature.reshape(())
+        return torch.where(self.temperature_fitted.reshape(()) <= 0.0,
+                           torch.ones_like(t), t.clamp(min=1e-3))
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):

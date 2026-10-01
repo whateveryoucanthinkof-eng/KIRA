@@ -26,6 +26,9 @@ from branch_a_gnn_lstm.sequence_dataset import (
     HostSequenceDataset,
     create_host_sequence_samples,
     LazyHostSequenceDataset,
+    BatchedSequenceView,
+    PermutationBatchSampler,
+    collate_prebatched,
 )
 from branch_a_gnn_lstm.train_branch_a import build_or_load_tgne_ta
 from data_unification.multi_dataset_stream import HostTrajectoryExtractor
@@ -1277,6 +1280,11 @@ def main():
                              "this corpus has one window, so the default drops a lot "
                              "and says so).")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--legacy-loader", action="store_true",
+                        help="Per-sample __getitem__ + default collate (the pre-2026-10 "
+                             "loader). The default batched loader yields bit-identical "
+                             "batches in the same order from a host-major feature copy "
+                             "(tests/test_branch_a_batched_loader.py); this is a fallback.")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -1579,18 +1587,31 @@ def main():
     _loader_kw = dict(num_workers=args.num_workers, pin_memory=(device == "cuda"))
     if args.num_workers > 0:
         _loader_kw.update(persistent_workers=True, prefetch_factor=4)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        **_loader_kw,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        **_loader_kw,
-    )
+    def _make_loader(ds, shuffle):
+        """One loader policy for train, validation and test.
+
+        The batched path builds each batch with one vectorised gather from a
+        host-major copy of the feature block (data_unification/host_major.py)
+        instead of 128 per-sample memmap gathers, each of which was ~13 random
+        disk reads at full scale. Same batches, same order, same RNG draws as
+        DataLoader(ds, shuffle=...): tests/test_branch_a_batched_loader.py.
+        """
+        if args.legacy_loader:
+            return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, **_loader_kw)
+        if not hasattr(ds, "_flat"):
+            _t = time.time()
+            ds.enable_batched(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+            print(f"  batched loader ready in {time.time() - _t:.1f}s "
+                  f"(host-major features: {ds._feats_hm is not None})", flush=True)
+        if shuffle:
+            return DataLoader(BatchedSequenceView(ds),
+                              batch_sampler=PermutationBatchSampler(len(ds), args.batch_size),
+                              collate_fn=collate_prebatched, **_loader_kw)
+        return DataLoader(BatchedSequenceView(ds), batch_size=args.batch_size, shuffle=False,
+                          collate_fn=collate_prebatched, **_loader_kw)
+
+    train_loader = _make_loader(train_ds, shuffle=True)
+    val_loader = _make_loader(val_ds, shuffle=False)
 
     # Per-class focal alpha, computed from the TRAINING split only.
     #
@@ -1694,8 +1715,7 @@ def main():
         # collapsed head, a distribution shift between capture days, or a
         # checkpoint picked on an outlier epoch, so both are printed side by
         # side with the same metric set.
-        _tl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                         **_loader_kw)
+        _tl = _make_loader(test_ds, shuffle=False)
         _fits = None
         for _name, _ldr in (("validation", val_loader), ("held-out test", _tl)):
             # Logits are collected on validation only: that is the split a
@@ -1779,7 +1799,7 @@ def main():
     # Crash recovery (cyberworld_v4/training_guard.ResumePoint). Extraction
     # re-runs on a restart; the finished epochs do not.
     resume = ResumePoint(args.output.with_name(args.output.stem + "_resume.pt"),
-                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers")),
+                         run_fingerprint(args, ignore=("epochs", "num_workers", "capture_cache", "ingest_workers", "extract_workers", "legacy_loader")),
                          enabled=not args.no_resume, log=lambda m: print(m, flush=True))
     first_epoch = 1
     _rp = resume.load()
@@ -1803,9 +1823,25 @@ def main():
         # batches.
         _nb = 0
         _loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        # Steps taken, counted on the device: with the deferred guard step the
+        # verdict of a step is a device bool, read by the guard one step later.
+        _nb_dev = torch.zeros((), device=device, dtype=torch.long)
+        _k = 0
+        # "no step taken yet this epoch" (the old `_nb == 0`). Until the first
+        # successful step the guard steps synchronously and returns a Python
+        # bool, so this is known on the host exactly when the old test was.
+        _stepped = False
         _t_epoch = time.time()
         _non_blocking = (device == "cuda")
+        # No host-device sync per step (TrainingGuard.backward_step_deferred):
+        # the step is taken on the device and undone there if the loss or the
+        # gradient is not finite. Same decisions, counters and weights bit for
+        # bit (tests/test_training_guard_one_sync.py); CYBERWORLD_GUARD_SYNC=1
+        # restores the syncing step.
+        _guard_step = (guard.backward_step_deferred if guard.deferred_supported()
+                       else guard.backward_step)
         for batch in train_loader:
+            _k += 1
             x = batch["features"].to(device, non_blocking=_non_blocking)
             targets = {
                 "risk": batch["risk"].to(device, non_blocking=_non_blocking),
@@ -1817,7 +1853,7 @@ def main():
             # steps 2 s apart and fifteen spread over hours looked identical.
             t_hist = (batch["t_history"].to(device, non_blocking=_non_blocking)
                       if "t_history" in batch else None)
-            if _nb == 0:
+            if not _stepped:
                 # Once per epoch, before the step: do the tasks fight over the
                 # shared LSTM? Measured instead of assumed (see
                 # MultiTaskLSTM.task_gradient_conflict); writes no .grad.
@@ -1832,22 +1868,34 @@ def main():
             loss, _ = model.compute_loss(predictions, targets)
             # backward + clip + step. A non-finite loss is skipped and counted,
             # never stepped on; the guard turns a run of them into a step back.
-            if not guard.backward_step(loss):
+            _ok = _guard_step(loss)
+            if _ok is False:
                 continue
             # Keep the log-variances in range in the saved weights too: a step
             # can leave one epsilon outside the bound, and that is the value a
-            # checkpoint written this epoch would record.
+            # checkpoint written this epoch would record. (After a step the
+            # device undid, the weights are the previous, already-projected
+            # ones, and the clamp leaves them unchanged.)
             model.uncertainty_loss.project_()
-            _loss_sum += loss.detach().double().sum()
-            _nb += 1
-            if args.log_every and _nb % args.log_every == 0:
+            _stepped = True
+            if _ok is True:
+                _loss_sum += loss.detach().double().sum()
+                _nb_dev += 1
+            else:
+                # adds exactly 0.0 / 0 for a skipped step, as `continue` did
+                _loss_sum += torch.where(_ok, loss.detach().double().sum(),
+                                         torch.zeros((), device=device, dtype=torch.float64))
+                _nb_dev += _ok.to(torch.long)
+            if args.log_every and _k % args.log_every == 0:
                 _el = time.time() - _t_epoch
-                _rate = _nb / max(_el, 1e-9)
-                _eta = (_n_train_batches - _nb) / max(_rate, 1e-9)
-                print(f"  epoch={epoch} batch={_nb}/{_n_train_batches} "
-                      f"({100.0 * _nb / max(_n_train_batches, 1):.1f}%) "
+                _rate = _k / max(_el, 1e-9)
+                _eta = (_n_train_batches - _k) / max(_rate, 1e-9)
+                print(f"  epoch={epoch} batch={_k}/{_n_train_batches} "
+                      f"({100.0 * _k / max(_n_train_batches, 1):.1f}%) "
                       f"{_rate:.1f} batch/s elapsed={_el / 60:.1f}m "
                       f"eta={_eta / 60:.1f}m", flush=True)
+        guard.flush()
+        _nb = int(_nb_dev)
 
         metrics = _evaluate(model, val_loader, device,
                             num_techniques=len(TECHNIQUE_VOCAB),
@@ -1997,8 +2045,7 @@ def main():
     ckpt["risk_conformal"] = fits.get("risk_conformal")
     ckpt["validation_metrics_at_fit"] = slim(_val_metrics)
 
-    test_loader = DataLoader(test_ds,
-                             batch_size=args.batch_size, shuffle=False, **_loader_kw)
+    test_loader = _make_loader(test_ds, shuffle=False)
     test_metrics = _evaluate(model, test_loader, device,
                              num_techniques=len(TECHNIQUE_VOCAB),
                              risk_positive_above=risk_positive_above)
