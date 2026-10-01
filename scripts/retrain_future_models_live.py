@@ -64,7 +64,7 @@ from deepop_decoder.train_cwa_decoder import (
 from cyberworld_v4.config import get_contract
 from cyberworld_v4.device_hist import device_hist
 from cyberworld_v4.graphed_step import GraphedLoss, WholeStepGraph, graphs_enabled
-from data_unification.host_major import batched_loader
+from data_unification.host_major import batched_loader, unpack_batch
 
 
 def _strided(gen, stride: int, want=None):
@@ -243,7 +243,8 @@ def _make_loader(ds, batch_size, shuffle, device, num_workers):
         base.enable_batched(spill_dir=os.environ.get("CYBERWORLD_SPILL_DIR"))
         print(f"  batched loader ready in {time.time() - t:.1f}s (host-major features: "
               f"{getattr(base, '_feats_hm', None) is not None})", flush=True)
-    return batched_loader(ds, batch_size, shuffle, **lk)
+    # one buffer per batch (host_major.pack_batch); the loops unpack_batch it
+    return batched_loader(ds, batch_size, shuffle, pack=True, **lk)
 
 
 def _guard_step_fn(guard):
@@ -333,6 +334,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _t0 = time.time()
         for batch in train_loader:
             _k += 1
+            batch = unpack_batch(batch, device)
             h = batch["h_history"].to(device, non_blocking=_nblk)
             target = batch["h_future"].to(device, non_blocking=_nblk)
             target_risk = batch["risk_future"].to(device, non_blocking=_nblk)
@@ -417,6 +419,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _step_offset = (torch.arange(_K, device=device) * FORECAST_RISK_BINS).view(1, _K)
         with torch.no_grad():
             for batch in val_loader:
+                batch = unpack_batch(batch, device)
                 h=batch["h_history"].to(device, non_blocking=_nblk)
                 target=batch["h_future"].to(device, non_blocking=_nblk)
                 target_risk=batch["risk_future"].to(device, non_blocking=_nblk)
@@ -658,6 +661,7 @@ def _precompute_rollouts(wdt, ds, device, spill_dir, label, K, batch=1024, num_w
     t0, done = time.time(), 0
     with torch.no_grad():
         for b in loader:
+            b = unpack_batch(b, device)
             _nb = (str(device) == "cuda")
             h = b["h_history"].to(device, non_blocking=_nb)
             # Same real elapsed times Branch B is trained with, so the cached
@@ -790,6 +794,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _t0=time.time()
         for batch in train_loader:
             _k+=1
+            batch = unpack_batch(batch, device)
             h=batch["h_future"].to(device,non_blocking=_nblk)
             inp=batch["input_tokens"].to(device,non_blocking=_nblk)
             tgt=batch["target_tokens"].to(device,non_blocking=_nblk)
@@ -859,6 +864,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _tgt_hist = torch.zeros(V, device=device, dtype=torch.long)
         with torch.no_grad():
             for batch in val_loader:
+                batch = unpack_batch(batch, device)
                 hv=batch["h_future"].to(device,non_blocking=_nblk)
                 if "h_rollout" in batch:
                     hv=batch["h_rollout"].to(device,non_blocking=_nblk)

@@ -38,6 +38,7 @@ from cyberworld_v4.training_guard import (IMPROVED, STOP, ResumePoint, TrainingG
                                           default_warmup_steps, run_fingerprint)
 from cyberworld_v4.config import get_contract, DEFAULT_CONFIG
 from cyberworld_v4.graphed_step import WholeStepGraph, graphs_enabled
+from data_unification.host_major import batched_loader, unpack_batch
 from cyberworld_v4.manifest import ExperimentManifest, set_all_seeds
 
 
@@ -907,6 +908,7 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
 
     with torch.no_grad():
         for batch in loader:
+            batch = unpack_batch(batch, device)
             x = batch["features"].to(device, non_blocking=non_blocking)
             targets = {
                 "risk": batch["risk"].to(device, non_blocking=non_blocking),
@@ -1613,12 +1615,9 @@ def main():
             ds.enable_batched(spill_dir=str(args.spill_dir) if args.spill_dir else None)
             print(f"  batched loader ready in {time.time() - _t:.1f}s "
                   f"(host-major features: {ds._feats_hm is not None})", flush=True)
-        if shuffle:
-            return DataLoader(BatchedSequenceView(ds),
-                              batch_sampler=PermutationBatchSampler(len(ds), args.batch_size),
-                              collate_fn=collate_prebatched, **_loader_kw)
-        return DataLoader(BatchedSequenceView(ds), batch_size=args.batch_size, shuffle=False,
-                          collate_fn=collate_prebatched, **_loader_kw)
+        # One buffer per batch (host_major.pack_batch): one shared-memory
+        # handle, one pin, one host-to-device copy; the loops unpack_batch it.
+        return batched_loader(ds, args.batch_size, shuffle, pack=True, **_loader_kw)
 
     train_loader = _make_loader(train_ds, shuffle=True)
     val_loader = _make_loader(val_ds, shuffle=False)
@@ -1868,6 +1867,7 @@ def main():
                          and guard.deferred_supported()))
         for batch in train_loader:
             _k += 1
+            batch = unpack_batch(batch, device)
             x = batch["features"].to(device, non_blocking=_non_blocking)
             targets = {
                 "risk": batch["risk"].to(device, non_blocking=_non_blocking),

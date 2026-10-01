@@ -155,10 +155,13 @@ class BatchedView:
 
     Use with `collate_fn=collate_prebatched`. The samplers see the same length,
     so they draw the same indices in the same order as over `ds` itself.
+    `pack=True` ships each batch as one buffer (pack_batch); the consumer calls
+    unpack_batch.
     """
 
-    def __init__(self, ds):
+    def __init__(self, ds, pack: bool = False):
         self.ds = ds
+        self.pack = pack
 
     def __len__(self) -> int:
         return len(self.ds)
@@ -167,7 +170,8 @@ class BatchedView:
         return self.ds[idx]
 
     def __getitems__(self, indices):
-        return self.ds.gather_batch(indices)
+        b = self.ds.gather_batch(indices)
+        return pack_batch(b) if self.pack else b
 
 
 def collate_prebatched(batch):
@@ -208,11 +212,70 @@ class PermutationBatchSampler:
             yield perm[i:i + bs]
 
 
-def batched_loader(ds, batch_size: int, shuffle: bool, **loader_kw):
-    """DataLoader over `ds.gather_batch`, drawing what DataLoader(ds, ...) would."""
+def batched_loader(ds, batch_size: int, shuffle: bool, pack: bool = False, **loader_kw):
+    """DataLoader over `ds.gather_batch`, drawing what DataLoader(ds, ...) would.
+    `pack=True`: one buffer per batch; call unpack_batch on what it yields."""
     from torch.utils.data import DataLoader
     if shuffle:
-        return DataLoader(BatchedView(ds), batch_sampler=PermutationBatchSampler(len(ds), batch_size),
+        return DataLoader(BatchedView(ds, pack), batch_sampler=PermutationBatchSampler(len(ds), batch_size),
                           collate_fn=collate_prebatched, **loader_kw)
-    return DataLoader(BatchedView(ds), batch_size=batch_size, shuffle=False,
+    return DataLoader(BatchedView(ds, pack), batch_size=batch_size, shuffle=False,
                       collate_fn=collate_prebatched, **loader_kw)
+
+
+# -- one buffer per batch ------------------------------------------------------
+#
+# A batch dict of k tensors crosses from a DataLoader worker as k shared-memory
+# storages (k file descriptors to receive and map), is pinned as k copies and
+# reaches the GPU as k host-to-device copies. Profiled on Branch A after the
+# CUDA-graph work, receiving and copying the batch was ~40-50% of the trainer's
+# main thread. Packed, it is one storage, one pin and one copy; the trainer
+# takes typed views of the device buffer. The bytes are the same, so every
+# tensor is identical (tests/test_branch_a_batched_loader.py).
+
+PACKED = "__packed__"
+
+
+def pack_batch(batch: dict) -> dict:
+    """Every tensor of `batch` into one uint8 buffer (8-byte aligned slots)."""
+    import torch
+    keys = [k for k, v in batch.items() if torch.is_tensor(v)]
+    layout, off = [], 0
+    for k in keys:
+        t = batch[k]
+        layout.append((k, str(t.dtype).replace("torch.", ""), tuple(t.shape), off))
+        off += (t.numel() * t.element_size() + 7) & ~7
+    buf = torch.empty(max(off, 8), dtype=torch.uint8)
+    for k, _dt, _sh, o in layout:
+        t = batch[k].contiguous()
+        n = t.numel() * t.element_size()
+        buf[o:o + n] = t.reshape(-1).view(torch.uint8)
+    out = {k: v for k, v in batch.items() if not torch.is_tensor(v)}
+    out[PACKED] = (buf, tuple(layout), tuple(batch))     # tuple(batch): the key order
+    return out
+
+
+def unpack_batch(batch: dict, device=None, non_blocking: bool = True) -> dict:
+    """The tensors back as views of ONE (device) buffer; non-tensor entries unchanged.
+    A batch that was not packed is moved tensor by tensor, as before."""
+    import torch
+    if PACKED not in batch:
+        if device is None:
+            return batch
+        return {k: (v.to(device, non_blocking=non_blocking) if torch.is_tensor(v) else v)
+                for k, v in batch.items()}
+    buf, layout, order = batch[PACKED]
+    if device is not None:
+        buf = buf.to(device, non_blocking=non_blocking)
+    out = {}
+    for k, dt, shape, o in layout:
+        dtype = getattr(torch, dt)
+        n = 1
+        for s in shape:
+            n *= s
+        nbytes = n * torch.empty((), dtype=dtype).element_size()
+        out[k] = buf[o:o + nbytes].view(dtype).view(shape)
+    for k, v in batch.items():
+        if k != PACKED:
+            out[k] = v
+    return {k: out[k] for k in order}

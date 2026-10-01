@@ -128,3 +128,37 @@ def test_host_major_copy_multi_bucket_from_memmap(tmp_path):
     out = host_major_copy(ro, flat, str(tmp_path), bucket_bytes=27 * 4 * 3_333)
     assert isinstance(out, np.memmap)
     assert np.array_equal(np.asarray(out), np.asarray(ro)[flat])
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_packed_batches_unpack_to_identical_tensors(store, device):
+    from torch.utils.data._utils.pin_memory import pin_memory
+    from data_unification.host_major import batched_loader, pack_batch, unpack_batch
+    ds = LazyHostSequenceDataset(store, seq_len=15, min_trajectory_len=1, min_history_steps=3)
+    ds.enable_batched()
+    idx = np.arange(0, len(ds), 3)[:200]
+    ref = ds.gather_batch(idx)
+    p = pack_batch(ref)
+    if torch.cuda.is_available():
+        p = pin_memory(p)                      # what the DataLoader's pin thread does to it
+    got = unpack_batch(p, device)
+    assert list(got) == list(ref)
+    for k in ref:
+        if torch.is_tensor(ref[k]):
+            assert got[k].device.type == device
+            assert got[k].dtype == ref[k].dtype and got[k].shape == ref[k].shape
+            assert torch.equal(got[k].cpu(), ref[k]), k
+        else:
+            assert got[k] == ref[k]
+    # and through a real loader with workers and pinning, in the same order
+    torch.manual_seed(3)
+    a = [b for _, b in zip(range(20), batched_loader(ds, 128, True, num_workers=2))]
+    torch.manual_seed(3)
+    b = [unpack_batch(x, device) for _, x in zip(range(20), batched_loader(
+        ds, 128, True, pack=True, num_workers=2, pin_memory=torch.cuda.is_available()))]
+    for x, y in zip(a, b):
+        for k in x:
+            if torch.is_tensor(x[k]):
+                assert torch.equal(x[k], y[k].cpu()), k
+            else:
+                assert x[k] == y[k]

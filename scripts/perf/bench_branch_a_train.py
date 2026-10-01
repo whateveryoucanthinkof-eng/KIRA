@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--cuda-graph", action="store_true")
     ap.add_argument("--whole", action="store_true", help="whole-step graph (deferred_step_graphed)")
+    ap.add_argument("--pack", action="store_true", help="one buffer per batch (host_major.pack_batch)")
     a = ap.parse_args()
     repo = os.path.abspath(a.repo)
     sys.path.insert(0, repo)
@@ -55,8 +56,8 @@ def main():
         dl = DataLoader(ds, batch_size=128, shuffle=True, **kw)
     else:
         ds.enable_batched()
-        dl = DataLoader(sd.BatchedSequenceView(ds), collate_fn=sd.collate_prebatched,
-                        batch_sampler=sd.PermutationBatchSampler(len(ds), 128), **kw)
+        from data_unification.host_major import batched_loader
+        dl = batched_loader(ds, 128, True, pack=a.pack, **kw)
     model = MultiTaskLSTM(input_dim=27, num_techniques=14, num_gradations=4,
                           risk_objective="soft_bce", **MultiTaskLSTM.PAPER_ARCH).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -82,8 +83,12 @@ def main():
     nb = torch.zeros((), device=dev, dtype=torch.long)
     model.train()
 
+    from data_unification.host_major import unpack_batch
+
     def one(batch):
         nonlocal loss_sum
+        if a.pack:
+            batch = unpack_batch(batch, dev)
         x = batch["features"].to(dev, non_blocking=True)
         tg = [batch[k].to(dev, non_blocking=True) for k in ("risk", "technique", "gradation")]
         th = batch["t_history"].to(dev, non_blocking=True)
@@ -127,7 +132,7 @@ def main():
         n += 1
     torch.cuda.synchronize()
     el = time.perf_counter() - t0
-    print(f"RESULT {'legacy' if a.legacy else 'new'}{'+graph' if a.cuda_graph else ''}{'+whole' if a.whole else ''} w{a.workers} {n / el:.1f} batch/s "
+    print(f"RESULT {'legacy' if a.legacy else 'new'}{'+graph' if a.cuda_graph else ''}{'+whole' if a.whole else ''}{'+pack' if a.pack else ''} w{a.workers} {n / el:.1f} batch/s "
           f"({1e3 * el / n:.2f} ms/batch)", flush=True)
 
 
