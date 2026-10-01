@@ -5,9 +5,15 @@
 #   RUN_DRY_RUN=1 ./final_runner.sh  # run the synthetic end-to-end dry run first
 #
 # Settings come from ~/.config/cyberworld/plan_env.sh (template:
-# scripts/ops/plan_env.example.sh): dataset paths, LANES, and
-# PLAN_ENCODER_EXTRA (production: --fast_step --fast_step_level 3 --batch_planner;
-# see how_to_test_and_apply_level4.md before switching to level 4).
+# scripts/ops/plan_env.example.sh): dataset paths and PLAN_ENCODER_EXTRA
+# (fast-path level / batch planner; see how_to_test_and_apply_level4.md).
+#
+# LANES is forced to 1 below, regardless of what plan_env.sh sets. Measured
+# 2026-09-25: two lanes at fast-path level 4 (CUDA-graph pools for BiTA +
+# the memory updater on both encoders at once) drove the 8 GB GPU to
+# OutOfMemoryError mid-epoch-3. One lane at level 4 alone uses under 5 GB and
+# runs at ~387 batch/s -- comparable throughput to two level-3 lanes, without
+# the OOM risk. Revisit only after re-measuring two-lane GPU memory headroom.
 #
 # No resource caps: jobs may use all RAM, CPU and GPU. The one thing kept is
 # MemorySwapMax=0 on the training jobs: this laptop's only swap is zram, and a
@@ -37,6 +43,7 @@ fi
 source "$ENV_FILE"
 export MEM_MAX="${MEM_MAX_OVERRIDE:-infinity}"            # no memory cap
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export LANES=1   # hard override -- see the note above; do not raise without re-testing GPU memory
 
 echo "[runner] building Rust components"
 (cd rust/pcap_fast && cargo build --release -q)
@@ -51,9 +58,9 @@ echo "=== launch $(date) commit $(git log --oneline -1) extra=[${PLAN_ENCODER_EX
 systemctl --user reset-failed train-plan 2>/dev/null || true
 systemd-run --user --unit=train-plan --working-directory="$REPO" \
     --setenv=PATH="$PATH" --setenv=RUNNER_MEM_MAX="$MEM_MAX" --setenv=ENV_FILE="$ENV_FILE" \
-    --setenv=PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+    --setenv=PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" --setenv=RUNNER_LANES="$LANES" \
     -p StandardOutput=append:"$REPO/plan.log" -p StandardError=append:"$REPO/plan.log" \
-    bash -c 'source "$ENV_FILE" && export MEM_MAX="$RUNNER_MEM_MAX" PYTORCH_CUDA_ALLOC_CONF && SKIP_DRY_RUN=1 exec bash scripts/run_training_plan.sh all'
+    bash -c 'source "$ENV_FILE" && export MEM_MAX="$RUNNER_MEM_MAX" PYTORCH_CUDA_ALLOC_CONF LANES="$RUNNER_LANES" && SKIP_DRY_RUN=1 exec bash scripts/run_training_plan.sh all'
 
 cat <<EOF
 
