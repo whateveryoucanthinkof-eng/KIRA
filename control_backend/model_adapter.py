@@ -8,6 +8,7 @@ runs TGNE-TA → Branch A / Branch B (WDT) / DeepOP CWA, and emits PredictionEve
 
 from datetime import datetime, timezone
 import logging
+import math
 import os
 import threading
 import time
@@ -734,8 +735,15 @@ class AntigravityModelAdapter:
         feature_history.append(
             torch.from_numpy(feature_vector).float().to(self.device)
         )
+        # The window's position on the window grid, as training measures it
+        # (t_history = window_idx difference x window_seconds, exact multiples
+        # of the window). The max END time of the flows drifted with whatever
+        # long flow was in the batch, so the model was told its steps were
+        # unevenly spaced when they were not.
+        _w = float(self.window_seconds)
         h_time_history.append(
-            float(max(r.end_time for r in flows)) if flows else float(time.time()))
+            math.floor(max(r.start_time for r in flows) / _w) * _w if flows
+            else math.floor(time.time() / _w) * _w)
         if len(feature_history) > self.history_steps:
             feature_history.pop(0)
             h_time_history.pop(0)
