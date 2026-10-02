@@ -105,7 +105,8 @@ def test_deepop_trainer_runs_an_epoch(store, tmp_path):
     rfm.train_deepop_live(store, store, tmp_path / "deepop.pt", epochs=1,
                           device="cpu", wdt=wdt, num_workers=0)
     ck = torch.load(tmp_path / "deepop.pt", map_location="cpu", weights_only=False)
-    assert ck.get("selection_metric") in ("macro_f1_free", "neg_val_ce")
+    assert ck.get("selection_metric") in ("hm(macro_f1_free, macro_f1_transitions)",
+                                         "macro_f1_free", "neg_val_ce")
     sup = ck.get("label_smoothing_support")
     assert sup is not None and sum(sup) < len(sup), \
         "smoothing support should exclude tokens that never occur"
