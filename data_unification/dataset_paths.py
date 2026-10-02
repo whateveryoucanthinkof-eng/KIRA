@@ -20,26 +20,18 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: Note the TRAILING SPACE in the CIC-2017 directory name -- it is real.
-CIC2017_DIR = Path(os.environ.get(
-    "CIC2017_DIR",
-    os.path.expanduser("~/Documents/SIH/test/extracted_flows/TrafficLabelling "),
-))
+#: Default layout: the datasets under `data/` in the repository (README.md,
+#: "Datasets"). Each path can be overridden with the environment variable of
+#: the same name, so data kept elsewhere needs no move and no code change.
+_DATA = Path(__file__).resolve().parents[1] / "data"
 
-CIC2018_DIR = Path(os.environ.get(
-    "CIC2018_DIR",
-    os.path.expanduser("~/Documents/SIH/DATA/CSV"),
-))
+CIC2017_DIR = Path(os.environ.get("CIC2017_DIR", str(_DATA / "cic2017" / "TrafficLabelling")))
 
-CTU13_DIR = Path(os.environ.get(
-    "CTU13_DIR",
-    os.path.expanduser("~/Documents/SIH/CTU-13-Dataset"),
-))
+CIC2018_DIR = Path(os.environ.get("CIC2018_DIR", str(_DATA / "cic2018" / "csv")))
 
-PCAP2018_DIR = Path(os.environ.get(
-    "PCAP2018_DIR",
-    os.path.expanduser("~/Documents/SIH/DATA/pcap"),
-))
+CTU13_DIR = Path(os.environ.get("CTU13_DIR", str(_DATA / "ctu13")))
+
+PCAP2018_DIR = Path(os.environ.get("PCAP2018_DIR", str(_DATA / "cic2018" / "pcap")))
 
 GLOB = {
     "CIC2017": str(CIC2017_DIR / "*.csv"),

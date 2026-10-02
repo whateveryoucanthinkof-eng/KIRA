@@ -1,130 +1,121 @@
-# CyberWorld v4 — ML Architecture
+# K.I.R.A. (Kinetic Intrusion Risk Anticipator) — Architecture
 
-**Scope:** the learned system — state, dynamics, heads, uncertainty, evaluation. Code:
-`cyberworld_v4/`. Cyber range, SPAN and capture: `docs/CYBER_RANGE.md`. Audit:
-`claude_latest_analysis/07_v4_audit_and_migration_plan.md`.
+**Problem Statement 26153 (NTRO): AI-based network attack forecasting from network traffic.**
+K.I.R.A. learns how the state of every host in a network evolves from SPAN traffic, simulates that
+state forward, and reports the probability and stage of an attack *before* it completes, with the
+features that drive each forecast. Status: pipeline complete and tested; models in active development.
 
-## 1. Formulation
+## 1. Pipeline
 
-A host is identified by `(dataset, scenario, capture, host)`, never by raw IP: private ranges recur
-across captures. Traffic is aggregated into non-overlapping `Δ = 2 s` windows. Per host per window:
-
-```
-s(t) = [ z(t) ; a(t) ] ∈ R^27,   z ∈ R^12 TGNE-TA latent,  a ∈ R^15 flow attributes
-```
-
-`a` = flow count; forward/backward/total bytes and packets (log1p); unique peers; unique destination
-ports; TCP and UDP ratios; mean duration; byte rate; packet rate; connection density.
-
-**Temporal contract** (single source, `cyberworld_v4/config.py`): history `L = 15` windows of 2 s
-(30 s), horizon `K = 5` forecast steps of 30 s each (150 s; each step OR-aggregates 15 input windows).
-The input is `s(t−L+1 … t)`; every target lies at `t+1` or later. The shipped checkpoints were trained
-with 2 s forecast steps (10 s ahead) and are refused at load until retrained; each checkpoint's actual
-contract is in its generated `*.manifest.json`.
-
-**Scope.** This is near-term forecasting. Branches A and B see 30 s of explicit history. The TGNE-TA
-encoder attends over the current window's graph and carries older context only in its TGN memory,
-which the BiTA aggregator updates window by window (memory on by default; the shipped encoder predates
-this and ran without it). A compact GRU memory per host is not campaign reasoning over days.
-
-**Models.** Encoder = BiTA, Branch A = GNN-LSTM (Vitulyova et al. 2025), decoder = DeepOP (Zhang et al.
-2025). Equation-to-code map and deviations: `docs/PAPER_CONFORMANCE.md`.
-
-**Verdict.** The served risk, technique and alert are the model's output. A hand-written SOC rule layer
-can be enabled (`CYBERWORLD_ENABLE_RULES=1`) as an advisory opinion shown beside it; it never overwrites
-the model, and operator controls (ARM EXTERNAL, recorded mitigations) are never scoring inputs.
-
-| Output | Meaning | Loss semantics |
-|---|---|---|
-| `P(A_t)` | attack active now | BCE — nowcast, scored separately from forecasting |
-| `P(A_{t+k})` | attack active at `t+k`, `k=1..K` | per-step BCE |
-| `h_k` | `P(onset = t+k \| no onset before)` | BCE masked to the at-risk set (discrete survival) |
-| `y_{t+k,j}` | ATT&CK technique `j` active at `t+k` | multilabel BCE over the full label set |
-| `sev` | operator ranking aid | SmoothL1 — explicitly **not** a probability |
-| `ŝ(t+k)` | next-state distribution | Gaussian NLL over `(μ, log σ²)` |
-
-Cumulative onset is derived, never predicted and never `max()`:
-`P(onset ≤ t+K) = 1 − Π_k (1 − h_k)`.
-
-## 2. Component chain
-
-```
- SPAN mirror  /  PCAP replay
-        │ packets
-        ▼
- 2.0 s window ─► 5-tuple flow snapshot        (sensor only: no features, no inference)
-        │
-        ▼ ───────────────── control_backend  /  offline dataset builder ──────────────┐
- │  TGNE-TA (BiTA) temporal graph encoder ─► z ∈ R^12                                 │
- │  per-host flow aggregation             ─► a ∈ R^15      concat ─► s(t) ∈ R^27      │
- │                                   history buffer [1, 15, 27]                       │
- │                          ┌───────────────────┴───────────────────┐                 │
- │                          ▼                                       ▼                 │
- │            Branch A — LSTM forecaster            Branch B — world model            │
- │            ├ current attack        BCE           Transformer, residual delta:      │
- │            ├ future attack   × K   BCE             ŝ(t+1) = s(t) + δ(s)            │
- │            ├ hazard          × K   masked BCE    autoregressive K-step rollout     │
- │            ├ techniques  × K × N   multilabel    emits (μ, log σ²), Gaussian NLL   │
- │            └ severity              SmoothL1                      │                 │
- │                          │                                       ▼                 │
- │                          │                          DeepOP CWA decoder ─► future   │
- │                          │                          ATT&CK technique tokens        │
- │                          └───────────────────┬───────────────────┘                 │
- │           temperature scaling (calibration split) ─► split / adaptive conformal     │
- └────────────────────────────────────┬───────────────────────────────────────────────┘
-                                      ▼
-              risk curve + technique forecast + attribution ─► dashboard
+```text
+SPAN / PCAP ─► flow table ─► 2 s windows ─► TGNE encoder (BiTA) ─► host state s(t)
+(telemetry/, rust/)          (graph per window)   graph attention + memory     latent ⊕ host attributes
+                                                                                   │
+                     ┌─────────────────────────────────────────────────────────────┤
+                     ▼                                                             ▼
+    Branch A: risk · technique · stage now          Branch B: P(s(t+1..t+5) | s(≤t))  (world model)
+                     │                                       │ predicted states ─► infiltration risk per step
+                     └──────────────► DeepOP decoder ◄───────┘
+                                      next ATT&CK stages ─► SOC console (control_backend/, web_dashboard/)
 ```
 
-**TGNE-TA** encodes the host-interaction graph into a 12-D latent; neighbour lookup respects the
-window cutoff (verified: no future-neighbour leakage) and is limited to the current window; older
-context arrives through the BiTA-updated TGN memory. **Branch A** is the GNN-LSTM of Vitulyova et al.:
-one 256-unit LSTM layer over s(t), linear risk / technique / gradation heads. **Branch B**
-is the world model proper: it learns `P(s_{t+1} | s_t)` as a distribution, not a point estimate with
-an error bar attached afterwards. **DeepOP** is an encoder-decoder: its encoder reads Branch A's
-technique for each history window, and its causal-window decoder cross-attends to that and to Branch
-B's predicted states to emit future ATT&CK tokens.
-Heads emit logits; sigmoid is applied at the serving boundary so temperature scaling has logits.
+| Contract | Value |
+|---|---|
+| Window / history / forecast | 2 s windows · 15 windows (30 s) of history · 5 steps × 30 s = **150 s** ahead |
+| Edge features (per flow) | 12: log fwd/bwd bytes and packets, duration, byte and packet rate, TCP/UDP/ICMP, log port, direction asymmetry; all scaled to [0, 1] |
+| Host attributes (per window) | 15 flow attributes (volumes sent/received, peers, ports, protocol mix, duration, rates, fan-out) + optional 30 packet-level (TTL, TCP window, retransmissions, inter-arrival time, payload, SYN/RST ratios, scan signatures) |
+| Host state `s(t)` | 12-D encoder latent + 15 attributes = 27-D (57-D with packet features) |
 
-**Uncertainty.** Temperature is fitted on a *calibration* split disjoint from validation.
-`conformal.py` provides split conformal (finite-sample coverage under exchangeability) and ACI
-(long-run coverage without it). Stated limit: ACI guarantees coverage, not detection — a patient
-adversary who shapes the residual stream can widen the band, so `min_width` bounds it.
+## 2. Data and labels
 
-## 3. Evaluation protocol
+* **Training:** CSE-CIC-IDS2018 from **raw PCAP** (real host addresses) plus CTU-13 botnet NetFlow.
+  **Held-out test:** CIC-IDS2017, a different year, network and attack mix, scored once.
+  Every capture's train/validation/test assignment is frozen in `data_unification/splits.lock.json`.
+* **PCAP parsing** is a bit-exact Rust port of the Python reference (12× faster), cached per capture
+  and keyed by the parsing code, so a code change can never reuse stale features.
+* **Labels.** CIC-2018 publishes attack *time windows*. A flow is labelled with the attack only if
+  its {source, destination} pair appears on the attack rows; windows that name no participants are
+  `UNKNOWN` and excluded from supervision, never stamped onto every host active at that moment.
+* **Leakage guards:** nodes are scoped per capture; train precedes validation precedes test inside
+  every capture; the encoder never sees validation or test captures; no label reaches serving.
 
-Four splits, grouped by capture/host so no group crosses a boundary: train, validation
-(selection and thresholds), calibration (temperature and conformal quantiles only), test (touched
-once, after freezing). Two regimes: chronological, and scenario-held-out for unseen attack families.
+## 3. Models
 
-Metrics: PR-AUC, ROC-AUC, precision, recall, F1, false alarms/hour; PR-AUC@k, Brier@k, NLL@k for
-`k=1..5` plus the horizon-degradation curve; ECE/Brier/NLL before and after calibration; lead time
-`t_onset − t_first_valid_alert` (not `K·Δ`); technique micro/macro-F1, mAP, P@1, P@3, R@3.
-Mandatory baselines: persistence, last-label, first-order Markov, logistic regression, GBDT, plain
-LSTM. Five seeds; confidence intervals by bootstrap over capture/host groups, never over
-overlapping windows. If a baseline wins, that is reported as the result.
+**TGNE encoder (BiTA, `bita/`).** A temporal graph network: for each host, graph attention (2 heads)
+over its 10 most recent interactions, plus a 12-D memory updated by BiTA's BiGRU-Transformer
+aggregator over the messages each host received, so context older than the window persists.
+Self-supervised by temporal link prediction, with an auxiliary flow-category head (focal loss,
+inverse-frequency class weights). Model selection: harmonic mean of link-prediction AP on *unseen*
+hosts and category macro-F1, so neither can hide a collapse of the other.
 
-## 4. Limitations (stated, not omitted)
+**Branch A (GNN-LSTM, `branch_a_gnn_lstm/`).** LSTM (1 × 256) over the last 15 host states. Three heads:
+infiltration risk, ATT&CK technique (14 classes), and kill-chain stage. Loss 0.5 · risk + 0.3 ·
+technique + 0.2 · stage. Post-hoc temperature scaling and a split-conformal interval on the risk; the
+alert threshold maximises F1 within an alert budget of 2× the base rate (fitted on validation only).
 
-1. **No trained v4 checkpoint exists.** The contract change is intentional and invalidates the four
-   v3 checkpoints. **No benchmark numbers exist yet**; the harness is built, unrun.
-2. **Packet-level features are not wired.** `telemetry/packet/pcap_engine.py` computes ~30 features
-   (TTL, TCP window, retransmission, payload distribution, vertical/horizontal scan scores). No
-   model consumes them. PS 26153 asks for both levels; only the flow level is currently modelled.
-3. **The multi-host world model is defined but never trained.** `MultiHostInteractionLayer` and
-   `rollout_multi_host` exist and are never called. Dynamics are per-host today.
-4. **Training-data identity defects.** CIC-2018 IPs are fabricated on 9 of 10 days, so host
-   trajectories there are synthetic; CTU-13's parquet path encodes the label in the destination IP.
-   Both must be fixed before any host-graph claim is defensible.
-5. **v3 DeepOP was trained on oracle future states**; v4 requires training on world-model output.
-6. **Explainability** (attention and feature attribution) is specified and partially present; it
-   must run in `eval()` mode on real inputs to be reproducible.
-7. **Campaign correlation is heuristic, not learned, and not in the live path.** `correlation/` links
-   alerts with hand-set kill-chain priors (`HEURISTIC_PARAMS`, none fitted). It previously ran an
-   untrained MLP and linked events up to an hour apart; it is now deterministic and bounded to the
-   models' evidence horizon (history + forecast = 180 s). A learned scorer would need labelled campaign
-   chains, which do not exist here.
-8. **Edge-feature choice is unablated.** `dst_port_norm_65535` may let the encoder learn "port ⇒ class".
-   The ablation is recorded in the encoder config and enforced at load; the comparison run is pending.
-9. **Class coverage.** The validation split has 2 technique classes against 7 in training, and the corpus
-   is ~82.5% Benign. Accuracy is therefore not a meaningful headline; report macro-F1, PR-AUC and Brier.
+**Branch B: world model (`branch_b_world_model/`).** A causal transformer (3 layers, 4 heads) over the
+history with continuous-time encoding of the real gaps between windows. It predicts the next state as a
+residual and a log-variance, giving a **Gaussian predictive distribution** per step, and rolls out
+autoregressively for 5 steps. A risk head reads each predicted state. It must beat the
+copy-the-last-state baseline by 2% before DeepOP is trained on it.
+
+**DeepOP (`deepop_decoder/`).** An encoder over the observed technique sequence (Branch A) and a decoder
+with cascaded window attention over Branch B's predicted states; it emits the next ATT&CK tokens
+(Recon, Credential Access, Initial Access, C2, Exfiltration, Impact, Benign). It is trained on Branch
+B's own rollouts with corrupted observed history (10% dropped, 10% substituted), the conditions it
+meets in production.
+
+## 4. Training targets and procedure
+
+* **Risk = hazard of onset:** `exp(−Δt/τ)`, with Δt the time to the host's next attack window and
+  τ = 150 s, the forecast horizon. Targets whose future falls in unobserved traffic (dropped `UNKNOWN`
+  spans, the end of a capture) are **censored**, not counted as safe.
+* Encoder batches stay time-ordered (memory requires it) but interleave all captures by
+  within-capture progress, so each update sees every attack type; each host's own sequence is unchanged.
+* One **training guard** for all models: warm-up, gradient clipping, non-finite steps skipped,
+  roll-back to the best epoch at half the learning rate, early stopping, crash-safe resume.
+* **Speed:** Rust parsing and neighbour sampling, columnar caches, a batch planner in a separate process,
+  and whole training steps replayed as CUDA graphs. Results are identical to the reference
+  implementation (bit for bit, or within fp32 rounding).
+
+## 5. Evaluation
+
+* **Baselines on identical inputs and targets:** logistic regression (the problem statement's
+  benchmark) and persistence. Reported: precision, recall, F1, **false-positive rate** and AUC.
+* **Early warning** is scored separately: hosts benign in their last observed window. Continuations
+  of an ongoing attack are trivial (persistence gets them right), so headline numbers never mix the two.
+  DeepOP is likewise scored on stage *transitions*, which persistence cannot predict.
+* Macro-F1 over present classes, never accuracy (the traffic is >80% benign); classes absent from
+  training are reported separately on the cross-year test; three seeds, mean and spread.
+
+## 6. Explainability and serving
+
+* **Driving features:** Input × Gradient attribution of the risk over every input window and feature,
+  grouped for analysts (TCP flags, scan signature, timing, volume, protocol, encoder latent), and which
+  windows drove the forecast.
+* **Serving** (`control_backend/`, FastAPI + WebSocket): passive `AF_PACKET` capture on the SPAN NIC, the
+  same window grid, padding, feature code and time encoding as training (pinned by parity tests),
+  a discovery-only topology, per-step risk with conformal bands, the forecast tree of the top-3 DeepOP
+  continuations, and heuristic campaign correlation (labelled as such). The verdict shown is always
+  the model's; analyst actions never feed back into scoring. Runs fully offline.
+
+## 7. Problem-statement coverage
+
+| Requirement | Where it is met |
+|---|---|
+| Flow- and packet-level features | 12 edge + 15 host flow features; 30 packet-level host features (Rust PCAP parser) |
+| State as feature vector / graph | interaction graph per 2 s window → TGNE host state `s(t)` |
+| Learn `P(S(t+1) ∣ S(t))` | Branch B: Gaussian predictive distribution, causal transformer (+ GNN encoder, LSTM) |
+| K-step forward simulation | 5-step autoregressive rollout over 150 s |
+| Infiltration probability over time | per-step hazard risk with conformal bands |
+| MITRE ATT&CK stage | Branch A (current stage), DeepOP (next stages along the rollout) |
+| Driving features | Input × Gradient attribution, grouped by flags / ports / scans / timing / volume |
+| Generalise to unseen attacks | cross-year test (train 2018 → test 2017), unseen classes reported separately |
+| Logistic-regression benchmark | same inputs and target; F1, precision, recall, FPR, AUC |
+| Offline interface, PCAP input | SOC console, PCAP replay through the sensor path, no cloud dependency |
+
+## 8. Status and next steps
+
+The pipeline, console and 1,296 tests are complete. Model retraining on the corrected labelling is in
+progress. Next: per-host attribution of the remaining unlabelled CIC-2018 days, PCAP-derived test
+flows to evaluate packet-level features, and lateral-movement data.

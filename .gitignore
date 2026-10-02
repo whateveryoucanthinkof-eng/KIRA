@@ -73,7 +73,7 @@ nornir-simple-inventory.yml
 # --- Datasets & Heavy Telemetry ---
 DATA/
 CTU-13-Dataset/
-data/
+/data/*
 datasets/
 raw_data/
 raw_pcaps/
@@ -163,7 +163,7 @@ Desktop.ini
 
 # Regenerable from scripts/make_parity_fixture.py; 21MB of replayed capture.
 captures/parity_states.jsonl
-.claude/worktrees/
+.claude/
 
 # --- Training outputs (results/) ---
 # results/ keeps what a run CONCLUDES: comparison.json/.md, per-run results
@@ -183,3 +183,8 @@ results/**/store/
 *.npz
 *.memmap
 results/**/*.tmp-*
+
+# Datasets and training outputs (see README.md): never committed
+/data/*
+!/data/README.md
+/results/

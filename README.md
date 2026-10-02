@@ -1,424 +1,258 @@
-# cyberworld — Predictive Network SOC (SPAN → Topology → Dual-Branch / DeepOP)
+<div align="center">
 
-cyberworld turns a **SPAN / port-mirror feed** into a **live host graph** and **ATT&CK-aware risk forecasts** for operators.
+<img src="web_dashboard/public/kira-mark.png" alt="K.I.R.A." width="96" />
 
-> Passively watch live traffic → discover who is talking to whom → score each host and forecast the next few minutes → show it on a SOC console.
+# K.I.R.A.
 
-It is **not** an inline firewall/IPS, and it does **not** rely on a hardcoded attacker glyph or a fixed 15-node cartoon topology. Topology is **discovery-first**: nodes and edges appear only when SPAN observes them.
+### Kinetic Intrusion Risk Anticipator
 
-**The risk score, technique and alert on the dashboard are the model's output, unmodified.** An optional,
-hand-written SOC rule layer exists (`CYBERWORLD_ENABLE_RULES=1`, off by default). When enabled it is shown
-*beside* the model as an advisory opinion and never replaces the model's risk, technique or alert. The
-ARM EXTERNAL button only labels the console; it is never an input to scoring.
+**AI-based network attack forecasting from network traffic: a world model for predictive cyber defence**
 
-It is **near-term forecasting, not campaign forecasting.** The models see 30 s of history and forecast at most
-150 s ahead. Longer history reaches the model only through the graph encoder's memory. See
-[Scope and limitations](#scope-and-limitations).
+Smart India Hackathon 2026 · Problem Statement **26153** (NTRO) · Theme: Blockchain & Cybersecurity
 
-Each model implements a published method: **BiTA** (encoder), **GNN-LSTM** (Branch A) and **DeepOP** (forecast
-decoder). [docs/PAPER_CONFORMANCE.md](docs/PAPER_CONFORMANCE.md) maps every equation to code and lists each
-deliberate deviation with its reason.
-
-**Evaluation protocol:** trained and tuned on CIC-IDS-2018 (from PCAP), scored once on CIC-IDS-2017, with
-classes 2018 never contained reported separately. Which encoder to use (Warden, CIC-2018, or Warden
-fine-tuned on CIC-2018) is decided by a measured comparison. See
-[docs/CROSS_YEAR_PROTOCOL.md](docs/CROSS_YEAR_PROTOCOL.md).
+</div>
 
 ---
 
-## One-sentence product
+K.I.R.A. watches a network through a **SPAN / port-mirror feed**, learns how each host's state evolves
+over time, and **forecasts** where an attack is heading: the probability of compromise over the next
+150 seconds, the next MITRE ATT&CK stages, and the traffic features driving each prediction, all on a
+live SOC console.
 
-**cyberworld turns a SPAN/mirror feed into a live host graph and predictive ATT&CK-aware risk forecasts for SOC operators.**
+It is a world model, not a static classifier. A temporal graph network encodes the evolving network
+state, a transformer learns the state-transition dynamics `P(S(t+1) | S(t))` as a predictive
+distribution, and a decoder turns the rolled-out future into ATT&CK stages.
 
----
+> [!IMPORTANT]
+> **The models are still in active development.** The full pipeline (data ingestion, training,
+> evaluation, serving and the console) is complete and covered by 1,296 automated tests. Retraining on
+> the corrected labelling and training pipeline is in progress. Until a retrained model is promoted, the
+> console runs with the sensor and topology live and reports **Models not loaded**. The **demo
+> dashboard** shows the full interface on sample data.
 
-## What you get
+> [!NOTE]
+> **Linux only.** Live capture uses Linux `AF_PACKET` sockets on the mirror interface, the cyber range
+> runs on Containerlab, and training jobs run under systemd memory limits. Network sensors and SOC
+> servers run Linux, and so does K.I.R.A. Only the demo dashboard runs anywhere Python and Node.js do.
 
-| Capability | Behavior |
-|------------|----------|
-| Capture | Local AF_PACKET sniff on the mirror NIC (lab sensor netns or real interface) |
-| Topology | Empty until traffic; fills from observed IPs/edges; external hosts appear only when seen |
-| ML | Dual-Branch + DeepOP on 2.0s flow windows (inference in control backend, not on the sniffer). The displayed verdict is the model's output |
-| Predictions | Bind to `focus_ips` / edges — never hardcoded `dmz-web` / `attacker` IDs |
-| Lab Mode | Optional Containerlab deploy/destroy/workloads when `lab_mode: true` |
-| Portability | Same model path for Containerlab **and** a real SPAN NIC via site YAML |
+## Contents
 
----
+[Deliverables](#deliverables) ·
+[What it does](#what-it-does) ·
+[Architecture](#architecture) ·
+[Repository layout](#repository-layout) ·
+[Setup](#setup) ·
+[Datasets](#datasets) ·
+[Train the models](#train-the-models) ·
+[Run the console](#run-the-console) ·
+[Live capture over SPAN](#live-capture-over-span) ·
+[Tests](#tests) ·
+[Status and limitations](#status-and-limitations)
+
+## Deliverables
+
+| Deliverable | Where |
+|---|---|
+| Source code | this repository |
+| README with setup instructions | this file |
+| Architecture document (2 pages) | [`docs/ARCHITECTURE.pdf`](docs/ARCHITECTURE.pdf) · [Markdown](docs/ARCHITECTURE.md) |
+| Demo video (2 min) | repository root and the [Releases](https://github.com/SIH-2026-SSSVBT/KIRA/releases) page (files over GitHub's 100 MB limit) |
+| Technical presentation (5 slides) | repository root |
+| Problem statement | [`docs/PROBLEM_STATEMENT.md`](docs/PROBLEM_STATEMENT.md) |
+
+## What it does
+
+| The problem statement asks for | K.I.R.A. |
+|---|---|
+| Flow-level **and** packet-level features | 12 flow features per edge (bytes, packets, duration, rates, protocol, port, direction) and 15 flow attributes per host; 30 packet-level attributes per host (TTL mean and variance, TCP window, retransmissions, inter-arrival statistics, payload sizes, SYN/RST patterns, vertical and horizontal scan signatures) parsed from PCAP in Rust |
+| Network state as a graph | every 2 s window is an interaction graph: hosts are nodes, flows are edges |
+| Learn `P(S(t+1) \| S(t))` | **Branch B**, a world-model transformer: a Gaussian predictive distribution over the next 5 host states, with per-step uncertainty |
+| K-step forward simulation | autoregressive rollout, 5 steps × 30 s = 150 s ahead |
+| Infiltration probability over time | hazard-based risk: probability of attack onset within the horizon, per step |
+| ATT&CK stage mapping | **Branch A** (technique and kill-chain stage now) and **DeepOP** (next ATT&CK techniques along the rollout) |
+| Driving features | Input × Gradient attribution over every input window and feature, grouped (TCP flags, scan signature, timing, volume, …), plus which windows mattered |
+| Logistic-regression benchmark | trained on identical inputs and target; precision, recall, F1, false-positive rate and AUC on the held-out test, overall and for **early warning** (hosts not yet under attack) |
+| Offline interface with PCAP input | the console replays a PCAP through the real sensor path; fully offline |
 
 ## Architecture
 
 ```text
-[ Enterprise / lab hosts ]
-          │
-     SPAN / mirror
-          ▼
-┌─────────────────────────────────────┐
-│ LOCAL CAPTURE  (telemetry/)         │
-│ AF_PACKET → flow table → 2s windows │
-│ JSONL stream (--no-inference)       │
-└─────────────────┬───────────────────┘
-                  ▼
-┌─────────────────────────────────────┐
-│ CONTROL BACKEND                     │
-│  • topology_service → discovery graph│
-│  • model_adapter → Dual-Branch+DeepOP│
-│  • site_config → CIDRs / lab_mode   │
-│  • commands → Lab Mode (optional)   │
-└─────────────────┬───────────────────┘
-                  ▼
-┌─────────────────────────────────────┐
-│ WEB DASHBOARD  (web_dashboard/)     │
-│ Live graph + forecasts + controls   │
-└─────────────────────────────────────┘
+ SPAN / mirror port ──► telemetry/  (AF_PACKET → flows → 2 s windows)
+                                     │
+                                     ▼
+              ┌───────────────────────────────────────────────┐
+              │ TGNE encoder (BiTA)                  bita/    │
+              │ temporal graph attention + TGN memory,        │
+              │ updated by a BiGRU-Transformer aggregator     │
+              └──────────────────────┬────────────────────────┘
+                                     │  host state s(t) = 12-D latent ⊕ host attributes
+                    ┌────────────────┴───────────────┐
+                    ▼                                ▼
+     Branch A (GNN-LSTM)                  Branch B (world model)
+     risk · technique · stage now         P(s(t+1..t+5) | s(t-14..t))
+                    │                                │ predicted states + uncertainty
+                    └──────────────┬─────────────────┘
+                                   ▼
+                     DeepOP decoder ──► next ATT&CK stages
+                                   │
+                                   ▼
+          control_backend/ (FastAPI) ──► K.I.R.A. console (web_dashboard/)
+          risk timeline · forecast tree · kill chain · explanations · campaigns
 ```
 
-### Live ML stack
+Each model follows a published method: **BiTA** for the encoder, **GNN-LSTM** for Branch A and
+**DeepOP** for the decoder. [`docs/PAPER_CONFORMANCE.md`](docs/PAPER_CONFORMANCE.md) maps their
+equations to the code. The two-page design summary is [`docs/ARCHITECTURE.pdf`](docs/ARCHITECTURE.pdf).
 
-```text
-SPAN 5-tuple flows, grouped into 2 s windows
-        │
-        ▼
-Data unification → UnifiedFlowRecord  (labels never used live)
-        │
-        ▼  interaction graph of the window (nodes = IPs, edges = flows)
-TGNE-TA (BiTA): graph attention over the window + TGN memory updated by the
-                BiGRU-Transformer aggregator (carries history across windows)
-        │
-        ▼  12-D host latent z(t)  ⊕  15 host attributes a(t)
-s(t) ∈ R^27  ─────────────┬─────────────────────┐
-        ▼                                        ▼
-  Branch A (GNN-LSTM)                      Branch B (world model)
-  LSTM over s(t-14..t)                     s(t-14..t) → ŝ(t+1..t+5)
-  risk · technique · gradation                   │
-        │ technique per window                   │ predicted states
-        ▼                                        ▼
-  DeepOP encoder (observed sequence) ──► DeepOP decoder (causal window attention)
-                                                 │
-                                                 ▼
-                                  next ATT&CK techniques → PredictionEvent → dashboard
-```
-
-The shipped checkpoints predate this wiring and load in their earlier architectures (12-D Branch B,
-decoder-only DeepOP, memoryless encoder). See "Reproducing" in
-[docs/PAPER_CONFORMANCE.md](docs/PAPER_CONFORMANCE.md) for the retrain order.
-
-| Contract | Value |
-|----------|-------|
-| Latent size | 12 |
-| Temporal attrs | 15 |
-| Model input (Branch A) | **27-D** (12 + 15) |
-| Window \(\Delta t\) | **2.0 s** |
-| History | **15** steps (30 s) |
-| Forecast horizon \(K\) | **5** steps; see the v4 section for step size |
-| Label leakage | Forbidden on live path |
-
-The temporal contract has **one** source, `cyberworld_v4/config.py`. The old `config/temporal_contract.json`
-(5 / 8 / 16 s) was read by nothing and has been deleted.
-
-Retired: root `model/` V3.1 72-D PCAP transformer is **not** the live path.
-
----
-
-## CyberWorld v4
-
-v4 is the in-progress rework of the learned system: future-dated targets instead of nowcasting,
-separate heads with matching loss semantics, a distributional world model, real conformal
-prediction, post-hoc calibration, and mandatory baselines.
-
-**v4 temporal contract** — single source of truth, `cyberworld_v4/config.py`:
-
-| | Value |
-|---|---|
-| Window `Δt` | **2.0 s** |
-| History `L` | **15** steps (30 s) |
-| Forecast `K` | **5** steps × **30 s** = **150 s** |
-| Model input | **27-D** (12-D TGNE-TA latent + 15 flow attributes) |
-
-**The shipped checkpoints do not match this contract yet.** Branch A, Branch B and DeepOP in
-`saved_models/` were trained with 15 × 2 s history and 5 × **2 s** forecast steps (10 s ahead), before
-the forecast step was coarsened to 30 s. The serving adapter refuses to load them unless
-`CYBERWORLD_ALLOW_CONTRACT_MISMATCH=1`. Each checkpoint's real contract, metrics and warnings are in its
-`*.manifest.json`, generated from the weights by `python scripts/write_model_manifests.py`.
-
-| Where | What |
-|---|---|
-| `cyberworld_v4/` | config, contract, identity, targets, splits, models, conformal, benchmark, manifest, `metrics/`, `baselines/` |
-| `docs/ARCHITECTURE.md` | the 2-page ML architecture document |
-| `docs/CYBER_RANGE.md` | Containerlab range, SPAN tap, capture path |
-| `claude_latest_analysis/` | verified audits; `28_accuracy_changes.md` is the current-state record |
-
----
+**Evaluation protocol.** Trained on CSE-CIC-IDS2018 (from raw PCAP) and CTU-13, tuned on held-out 2018
+days, and scored **once** on CIC-IDS2017, a different year, network and attack mix. The numbers then
+measure generalisation rather than memorised signatures
+([`docs/CROSS_YEAR_PROTOCOL.md`](docs/CROSS_YEAR_PROTOCOL.md)).
 
 ## Repository layout
 
-| Path | Role |
-|------|------|
-| `telemetry/` | Packets → windows → flows (no ML) |
-| `control_backend/` | FastAPI, WS bus, topology, Dual-Branch adapter, Lab commands |
-| `web_dashboard/` | React SOC UI (Vite) |
-| `config/sites/` | Per-deployment YAML (CIDRs, sensor iface, `lab_mode`) |
-| `bita/` | TGNE-TA encoder |
-| `branch_a_gnn_lstm/` | Multi-task LSTM |
-| `branch_b_world_model/` | World Dynamics Transformer + risk head |
-| `deepop_decoder/` | CWA forecast decoder |
-| `data_unification/` | UnifiedFlowRecord + temporal features |
-| `saved_models/` | Production checkpoints (Branch A/B, DeepOP) |
-| `containerlab/` | Optional enterprise cyber-range |
-| `scripts/` | Deploy, destroy, telemetry, dashboard helpers |
-| `docs/LOCAL_SPAN_RUNBOOK.md` | Lab + generic NIC bring-up |
-
----
-
-## Requirements
-
-- **OS**: Linux (Fedora / RHEL / Ubuntu / Debian)
-- **Python**: 3.10+
-- **Node.js**: v20+ and `npm` to build the web dashboard — on `PATH`, or inside a toolbox named by
-  `CYBERWORLD_NPM_TOOLBOX` (default `claude-dev`). The launcher builds the UI itself when needed.
-- **For Lab Mode**: Podman (or Docker) + Containerlab ≥ 0.50, `iproute2` / `tc`
-- **For live capture**: `CAP_NET_RAW` (or root) on the mirror interface; promiscuous mode often required
-
----
-
-## Installation
-
-1. **Clone the repository:**
-   ```bash
-   git clone <repository_url>
-   cd cyberworld
-   ```
-
-2. **Install Python dependencies:**
-   We recommend using a virtual environment.
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-3. **Frontend:** nothing to do by hand. `run_dashboard.py` installs the UI's dependencies and builds
-   it on first run, and rebuilds whenever its sources change. To do it manually:
-   ```bash
-   cd web_dashboard
-   npm ci
-   npm run build        # the console      -> dist/
-   npm run build:demo   # the demo dashboard -> dist-demo/
-   cd ..
-   ```
-
----
-
-## Site configuration
-
-Profiles live under `config/sites/`:
-
-| Profile | `lab_mode` | Use |
-|---------|------------|-----|
-| `containerlab-enterprise` | `true` | Cyber-range + orchestration UI |
-| `local-default` | `false` | Real / generic local SPAN |
-
-Override with:
-
-```bash
-export CYBERWORLD_SITE=local-default
-# or
-export CYBERWORLD_SITE_CONFIG=/path/to/site.yaml
-export CYBERWORLD_SENSOR_IFACE=eth1
+```text
+KIRA/
+├── train.sh                  one command: check data → train every model → promote to serving
+├── run_dashboard.py          one command: the live console, or --demo
+├── requirements.txt
+├── data/                     your datasets (layout in data/README.md; git-ignored)
+├── docs/                     architecture, evaluation protocol, cyber range, SPAN runbook
+│
+├── telemetry/                packet capture → flow table → 2 s windows (no ML)
+├── data_unification/         dataset adapters (CIC-2017/2018, CTU-13, PCAP), labels, features, splits
+├── rust/                     pcap_fast (PCAP parser) and tgn_host (neighbour sampler), bit-exact ports
+├── bita/                     TGNE encoder: temporal graph network + BiTA aggregator
+├── branch_a_gnn_lstm/        Branch A: LSTM risk / technique / stage heads + logistic baseline
+├── branch_b_world_model/     Branch B: world-dynamics transformer + infiltration risk head
+├── deepop_decoder/           DeepOP: ATT&CK forecast decoder
+├── cyberworld_v4/            temporal contract, targets, metrics, conformal prediction, training guard
+├── correlation/              campaign correlation over alerts (heuristic)
+├── explainability/           feature attribution and explanation payloads
+├── control_backend/          FastAPI backend: sensor, topology, model serving, WebSocket bus
+├── web_dashboard/            the K.I.R.A. SOC console (React + Vite)
+├── saved_models/             checkpoints the console serves
+│
+├── containerlab/  nodes/  workloads/  config/    enterprise cyber range and site profiles
+├── captures/                 sample PCAP for replay
+├── scripts/                  training, evaluation, dataset checks, range helpers
+├── world_model/              research baselines (logistic regression, LSTM, static GCN)
+└── tests/                    1,296 automated tests
 ```
 
-> The older lowercase spellings (`cyberworld_SITE`, …) still work but are deprecated — the backend
-> logs a warning naming the variable. Prefer the uppercase form.
+## Setup
 
-Minimal fields: `enterprise_cidrs`, `sensor.interface`, `topology.node_ttl_sec` / `edge_ttl_sec` / `max_nodes`, optional `assets_of_interest`.
-
----
-
-## Quickstart
-
-### A. SOC console — K.I.R.A. (recommended)
+| Requirement | Needed for |
+|---|---|
+| Linux (Fedora, Ubuntu, Debian, RHEL) | everything except the demo |
+| Python 3.10+ (3.12 tested) | everything |
+| Node.js 20+ and npm | building the console UI (automatic on first launch) |
+| NVIDIA GPU with CUDA, 8 GB+ | training (CPU works, far slower); inference runs on CPU |
+| Rust (`cargo`) | training from PCAP (12× faster parsing; a Python fallback exists) |
+| root or `CAP_NET_RAW` | live capture on a SPAN interface |
+| Podman or Docker + Containerlab ≥ 0.50 | the optional enterprise cyber range |
 
 ```bash
-# Lab profile
+git clone git@github.com:SIH-2026-SSSVBT/KIRA.git
+cd KIRA
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+The console UI is built automatically on first launch. If `npm` lives inside a toolbox rather than on
+`PATH`, set `CYBERWORLD_NPM_TOOLBOX=<toolbox name>`.
+
+## Datasets
+
+All public. Download them and place them under `data/` exactly as described in
+**[`data/README.md`](data/README.md)**:
+
+```text
+data/cic2018/pcap/<day>_pcap/…        CSE-CIC-IDS2018 raw PCAPs            (training)
+data/cic2018/csv/<day>_csv.csv        CSE-CIC-IDS2018 labels for the PCAPs (training)
+data/cic2017/TrafficLabelling/*.csv   CIC-IDS2017 labelled flows           (held-out test)
+data/ctu13/<1..13>/*.binetflow        CTU-13 botnet scenarios              (training)
+```
+
+To keep the data elsewhere, symlink these folders, or set `PCAP_ROOT`, `CIC2018_CSV_DIR`,
+`CIC2017_DIR` and `CTU_DIR`. Check the layout with `./train.sh check`.
+
+## Train the models
+
+```bash
+./train.sh check      # datasets present and correctly named, toolchain OK
+./train.sh dryrun     # optional: the whole pipeline on a tiny synthetic corpus, in minutes
+./train.sh            # train everything
+./train.sh summary    # results: mean and spread over seeds, held-out benchmark
+./train.sh promote    # install the trained models into saved_models/ for the console
+```
+
+`./train.sh` runs, in order:
+
+1. dataset preflight, then parsing every capture once into a cache (Rust);
+2. the TGNE encoder, with and without IP-identity features, over three seeds;
+3. Branch A and its logistic-regression benchmark;
+4. Branch B, then DeepOP, but only if Branch B beats the copy-the-last-state baseline.
+
+Every model trains under the same guard: learning-rate warm-up, gradient clipping, roll-back to the
+best epoch at half the learning rate, and early stopping. A crashed job resumes from its last finished
+epoch. Outputs, logs and comparison tables go to `results/training_plan/`.
+
+A full run takes many hours and about 50 GB of free disk. Heavy jobs are capped at `MEM_MAX` (default
+17G). Optional settings are listed in [`scripts/ops/plan_env.example.sh`](scripts/ops/plan_env.example.sh).
+
+## Run the console
+
+### Demo dashboard: see the interface
+
+```bash
+python run_dashboard.py --demo                 # → http://localhost:8443
+```
+
+The full K.I.R.A. interface on scripted sample data, with in-app attack scenarios. No backend, sensor
+or model runs, and the header reads **DEMO DATA**.
+
+### Real console
+
+```bash
+python run_dashboard.py --replay captures/live.pcap                      # replay a capture
+sudo -E python run_dashboard.py --site local-default --interface eth1    # live SPAN capture
+python run_dashboard.py --site containerlab-enterprise                   # the cyber range
+```
+
+Opens `http://localhost:8000`. Real traffic, real models, and no attack buttons: attacks are run
+against the network from outside. In the console: **START SENSOR → START ML** (on the cyber range,
+**START NETWORK** first). Every number on screen is a model output. Panels for capabilities no model
+provides yet are marked *Under development* ([`docs/DASHBOARD_INTEGRATION.md`](docs/DASHBOARD_INTEGRATION.md)).
+
+The console binds to `127.0.0.1`. `--host 0.0.0.0` exposes it and prints a generated access token.
+
+## Live capture over SPAN
+
+1. Mirror the traffic to watch onto a NIC of the K.I.R.A. host (switch SPAN / port-mirror, or a TAP).
+2. Describe the site in [`config/sites/local-default.yaml`](config/sites/local-default.yaml): your
+   internal CIDRs and the capture interface.
+3. Start the console with capture privileges:
+
+   ```bash
+   sudo -E python run_dashboard.py --site local-default --interface eth1
+   ```
+
+4. In the console: **START SENSOR → START ML**.
+
+K.I.R.A. is passive. It only reads the mirror, so a sensor failure never affects the network. Hosts and
+connections appear as traffic is observed, and addresses outside the site's CIDRs are shown as external.
+
+**Cyber range.** [`containerlab/`](containerlab/) builds a small enterprise network (DMZ, servers,
+workstations, database, identity server) with its own SPAN mirror and realistic background workloads:
+
+```bash
+./scripts/build.sh && ./scripts/deploy.sh      # bring the range up
 python run_dashboard.py --site containerlab-enterprise
-
-# Local SPAN (needs privileges on the mirror NIC)
-sudo -E python run_dashboard.py --site local-default --interface eth1
-
-# Replay a capture through the real sensor path
-python run_dashboard.py --site local-default --replay captures/live.pcap
+./scripts/destroy.sh                           # tear it down
 ```
 
-Opens `http://localhost:8000`. This is the real console: real traffic, real models, Containerlab
-controls, and no attack buttons — attacks are run against the lab from outside it. Without trained
-checkpoints it still runs (sensor, topology, lab controls) and says **Models not loaded**.
-
-### Demo dashboard — only to see the UI
-
-```bash
-python run_dashboard.py --demo
-```
-
-Opens `http://localhost:8443`: the same UI on sample data, with no backend, sensor or models, and
-in-app attack-scenario buttons. Nothing on it is a model output, and the header says **DEMO DATA**.
-Use the console above for anything real. Panel-by-panel sources: `docs/DASHBOARD_INTEGRATION.md`.
-
-**Lab UI flow:** START NETWORK → START SENSOR → START ML  
-
-**Local UI flow:** START SENSOR → START ML (no deploy/destroy)
-
-### B. Containerlab range only
-
-```bash
-./scripts/build.sh
-./scripts/deploy.sh          # topology + SPAN mirrors → eth_sensor
-./scripts/healthcheck.sh
-./scripts/destroy.sh         # teardown
-```
-
-### C. Capture-only telemetry (ML stays in backend)
-
-```bash
-# From dashboard: START SENSOR
-# Or manually (lab sensor netns):
-./scripts/run_telemetry.sh --record-state /tmp/cyberworld_live_stream.jsonl --no-inference
-```
-
-Capture remains **`--no-inference`**. Dual-Branch / DeepOP runs in `control_backend`.
-
-More detail: [docs/LOCAL_SPAN_RUNBOOK.md](docs/LOCAL_SPAN_RUNBOOK.md).
-
----
-
-## Checkpoints
-
-Serving reads **only** `saved_models/`. Per-epoch encoder snapshots go to `.spill/encoder_epochs/`
-(scratch, gitignored); promote one with `scripts/select_best_encoder.py --copy`. The old top-level
-`saved_checkpoints/` folder has been removed: a retrain writing to the wrong one of two
-similar-looking folders has already happened once.
-
-| Component | Path |
-|-----------|------|
-| TGNE-TA (BiTA) | `saved_models/bita_bigru_transformer-unified_final.pth` (falls back to the legacy `bita/saved_models/bita_bigru_transformer-warden_alerts.pth`) |
-| Branch A LSTM | `saved_models/branch_a/branch_a_lstm.pt` |
-| Branch B WDT | `saved_models/branch_b/host_wdt.pt` |
-| DeepOP CWA | `saved_models/deepop/cwa_forecast_decoder.pt` |
-
-`scripts/ensure_checkpoints.py` can verify presence. Each `*.manifest.json` states the checkpoint's
-temporal contract, the metrics it carries (and which expected ones it does not), and its credibility
-verdict. Regenerate them after every retrain with `python scripts/write_model_manifests.py`.
-
----
-
-## Dynamic topology rules
-
-1. Nodes/edges come only from observed flows.
-2. No permanent attacker node — outside IPs appear as `role: external` when traffic is seen, then expire after TTL.
-3. Internal vs external from **site CIDRs**, not topology fixtures.
-4. Predictions highlight **IPs / edges** via `focus_ips` / `focus_edges`.
-
-API: `GET /api/topology` · WS event: `topology_update` · Site: `GET /api/site` · Status: `GET /api/status` (includes `lab_mode`).
-
----
-
-## Lab Mode vs production site
-
-| | Lab Mode (`lab_mode: true`) | Local SPAN (`lab_mode: false`) |
-|--|-----------------------------|-------------------------------|
-| Deploy / destroy / workloads | Shown & allowed | Hidden & rejected by API |
-| “Online” | Containerlab container count | Sensor streaming / window heartbeat |
-| Sensor | `clab-enterprise-sensor` / `eth_sensor` | Configured NIC (`eth1`, …) |
-
----
-
-## Normal enterprise workloads (Lab)
-
-| Node | Profile |
-|------|---------|
-| `ws-office` | General office browsing / DNS / idle |
-| `ws-web` | High-frequency HTTP to DMZ + internal |
-| `ws-file` | Bursty file transfer to `srv-file` |
-| `ws-app` | API traffic to `srv-app` (+ backend tiers) |
-
-External campaigns are **operator-driven** (ARM EXTERNAL). The UI does not inject synthetic attack packets as topology truth,
-and arming changes **no** score: it is echoed on the event for display only.
-
-SOAR actions (isolate, block IP/port, revoke) are **recorded, not enforced**. The model keeps scoring the traffic it
-actually sees after a mitigation is recorded. If flows that the recorded block should have stopped are still on the
-wire, the verdict panel shows **Mitigation not effective** instead of reporting the host as quiet.
-
----
-
-## Security posture (lab firewall)
-
-Typical Containerlab policy (see `docs/CYBER_RANGE.md` for diagrams):
-
-- Outside range can reach public DMZ services; east-west to Users/Servers is blocked at the edge.
-- Database accepts only the app tier.
-- SPAN is a **mirror** (`tc mirred`) — sensor failure does not affect forwarding.
-
----
-
-## Access and exposure
-
-The console shows the internal host map and can record mitigations, so it is **loopback-only by default**
-(`127.0.0.1`). CORS allows only the local console origins (`CYBERWORLD_CORS_ORIGINS` adds more).
-
-To expose it deliberately:
-
-```bash
-python run_dashboard.py --host 0.0.0.0                            # prints a URL with a generated access token
-CYBERWORLD_API_TOKEN=... python run_dashboard.py --host 0.0.0.0   # or bring your own
-```
-
-With a token set, every request and the WebSocket must carry it (`Authorization: Bearer`, or open
-`/?token=…` once, which sets an HttpOnly cookie).
-
-`python run_dashboard.py --demo` (or `npm run demo` for a dev server) runs the UI on scripted fixtures
-(`web_dashboard/src/api/mock.ts`) with no backend. The header shows **DEMO DATA** in that mode so it
-cannot be mistaken for the live system, and the live build contains none of those fixtures.
-
----
-
-## Scope and limitations
-
-Stated here so nobody has to discover them.
-
-**What the models can and cannot see**
-
-- **Near-term only.** 30 s of history (15 × 2 s windows); forecast at most 150 s ahead under the current
-  contract, and 10 s for the checkpoints actually shipped. If reconnaissance happened three days ago the
-  model cannot know. This is a scope gap against "attack forecasting", recorded in
-  `claude_latest_analysis/28_scope_and_feature_concerns.md`.
-- **Long-range history lives only in the encoder's memory.** The encoder attends over the current 2 s
-  window's graph; what happened earlier reaches the embedding through the TGN memory that BiTA's
-  aggregator updates (12-D per host, GRU-gated). That is BiTA's design, and it is on by default for
-  every new encoder. It makes training time-ordered (no batch shuffling) and serving stateful (memory
-  is per session and cleared on reset). **The shipped encoder was trained with memory off**, which meant
-  its BiTA aggregator never ran; it must be retrained to be a BiTA encoder at all.
-- **Campaign correlation is a heuristic.** `correlation/` links alerts with hand-set kill-chain priors
-  (every constant is in `causal_edge_scorer.HEURISTIC_PARAMS`; none were fitted). It is bounded to the
-  models' evidence horizon (history + forecast) and splits campaigns on time gaps. The live backend runs
-  it over the scored windows (`control_backend/correlation_service.py`) to fill the Campaign and
-  Incidents pages; the payload labels it as heuristic.
-- **Branch B may not be learning.** Its first run flatlined at epoch 1. Retraining now records its skill
-  against persistence (copying the last embedding forward) in the checkpoint, and DeepOP refuses to train
-  on a Branch B that does not beat it. The shipped Branch B predates that check.
-- **Edge-feature ablation has not been run.** `dst_port_norm_65535` is a shortcut risk: a model that can
-  read the port can learn "port ⇒ class" instead of behaviour. The ablation
-  (`CYBERWORLD_ABLATE_EDGE_FEATURES`) is now recorded in the encoder config and enforced at load, but the
-  comparison needs an encoder retrain that has not been done.
-
-**Training data problems that cannot be fixed in code**
-
-- 9 of 10 CIC-IDS-2018 CSV days fabricate host IPs from the row number, so host trajectories built from
-  them are synthetic. The PCAP path fixes this and is not yet wired into training.
-- All 158,930 CIC-IDS-2017 PortScan (recon) records come from a single host, `172.16.0.1`.
-- The held-out validation split has 2 technique classes against 7 in training, so performance on the
-  other 5 cannot be measured.
-- The corpus is ~82.5% Benign, so accuracy cannot visibly fail on it. **Quote macro-F1, AUC and Brier,
-  not accuracy.** The shipped Branch A checkpoint records only accuracy, and its manifest says so.
-
----
+More: [`docs/LOCAL_SPAN_RUNBOOK.md`](docs/LOCAL_SPAN_RUNBOOK.md), [`docs/CYBER_RANGE.md`](docs/CYBER_RANGE.md).
 
 ## Tests
 
@@ -426,29 +260,29 @@ Stated here so nobody has to discover them.
 python -m pytest tests/ -q
 ```
 
-`tests/test_verdict_is_the_model.py` pins the behaviour above: external traffic is not forced to
-ELEVATED, internal risk is not damped, the ARM button does not move the score, rules are advisory, and a
-recorded mitigation does not hide ongoing traffic.
+1,296 tests, covering feature parity between training and serving, Rust/Python parser equivalence,
+label scoping, leakage guards, metric correctness and the console's contracts. GPU-only tests skip
+without CUDA, and dataset-dependent tests skip without `data/`.
 
----
+## Status and limitations
 
-## Troubleshooting
+- **Models in development.** The checkpoints in `saved_models/` predate the current feature schema and
+  are not served. Retraining on the corrected pipeline is under way, and the console reports *Models
+  not loaded* until `./train.sh promote` installs new ones.
+- **Labels.** CSE-CIC-IDS2018 publishes attack *time windows*, and nine of its ten label files carry no
+  IP addresses. Traffic in an attack window that cannot be attributed to a host is left out of
+  training rather than guessed (`CYBERWORLD_UNSCOPED_LABELS`).
+- **Horizon.** 30 s of history and 150 s of forecast. Longer context reaches the model only through the
+  encoder's memory, so multi-day campaigns are out of scope.
+- **Not modelled yet:** the lateral-movement and execution stages (no labelled training data), traffic
+  volume forecasts, and per-alternative risk curves. The console marks these *Under development*.
+- **Campaign correlation** is a hand-tuned heuristic over model outputs, and is labelled as one.
+- **Packet-level features** are opt-in (`--packet-features`). The CIC-IDS2017 test set has flows only,
+  so they need a PCAP-derived test set to be evaluated fairly.
 
-| Issue | What to check |
-|-------|----------------|
-| Empty topology | Sensor running? Any flows in the mirror? Wait for conversations. |
-| Sensor won’t start (lab) | `./scripts/deploy.sh` so `clab-enterprise-sensor` is up. |
-| Sensor won’t start (local) | Root/`CAP_NET_RAW`, correct `--interface`, interface exists. |
-| Lab buttons missing | `lab_mode: false` — expected for `local-default`. |
-| `start_network` rejected | Site is not Lab Mode — switch to `containerlab-enterprise`. |
-| No packets on tap | `podman exec clab-enterprise-sensor tcpdump -c 10 -ni eth_sensor` |
-| Frontend missing | `python run_dashboard.py --rebuild`, or `cd web_dashboard && npm ci && npm run build` |
-| "Models not loaded" in the header | No loadable checkpoints in `saved_models/`; the tooltip and Controls page give the reason. Retrain, then press Start Inference. |
-| Checkpoint errors | Ensure `saved_models/` and `bita/saved_models/` files exist |
+## Acknowledgements
 
----
-
-## License / notes
-
-Research and competition-oriented cyber-range + predictive SOC observation stack. Blocking/SOAR actions in the UI are **recorded intents** unless wired to real enforcement.
-                                                                                                   
+Datasets: CSE-CIC-IDS2018 and CIC-IDS2017 (Canadian Institute for Cybersecurity, University of New
+Brunswick); CTU-13 (Stratosphere Lab, Czech Technical University). Methods: BiTA (Makki Nayeri and
+Rezvani); GNN-LSTM attack-vector reconstruction (Vitulyova et al., 2025); DeepOP (Zhang, Xue and Su,
+2025); Temporal Graph Networks (Rossi et al., 2020); MITRE ATT&CK.

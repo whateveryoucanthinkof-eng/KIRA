@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the training plan agreed in claude_latest_analysis/30_training_decisions.md.
+# Runs the full training plan (README.md, "Train the models"; ./train.sh wraps it).
 #
 #   PCAP_ROOT=... CIC2018_CSV_DIR=... CIC2017_DIR=... CTU_DIR=... \
 #       scripts/run_training_plan.sh [preflight|dryrun|compare|seeds|downstream|summary|all]
@@ -23,12 +23,13 @@
 #   downstream  Branch B then DeepOP on the seed-42 cross_network encoder.
 #               DeepOP is skipped if Branch B does not beat persistence by 2%.
 #   summary     mean / spread over the three seeds, and the promotion commands.
+#   promote     install the trained models into saved_models/ for the console.
 #
 # Nothing here writes to saved_models/. Promoting a result to serving is a
 # deliberate step, printed by `summary`.
 #
 # Every heavy step runs under a memory cap (MemoryMax, no swap): an uncapped
-# job has frozen the training machine twice (analysis 27). Re-running a stage
+# job has frozen the training machine twice. Re-running a stage
 # skips any step whose output already exists, and a step that crashed resumes
 # after its last finished epoch (each trainer's --no-resume/--no_resume opts out).
 set -euo pipefail
@@ -36,10 +37,12 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-: "${PCAP_ROOT:?set PCAP_ROOT to the CIC-2018 <day>_pcap directories}"
-: "${CIC2018_CSV_DIR:?set CIC2018_CSV_DIR to the CIC-2018 <day>_csv.csv label files}"
-: "${CIC2017_DIR:?set CIC2017_DIR to the CIC-2017 TrafficLabelling CSVs}"
-: "${CTU_DIR:?set CTU_DIR to the CTU-13 <scenario>/*.binetflow directory}"
+# Datasets: data/ in the repository by default (README.md, "Datasets");
+# override any of the four with an environment variable.
+PCAP_ROOT="${PCAP_ROOT:-$REPO/data/cic2018/pcap}"            # CIC-2018 <day>_pcap directories
+CIC2018_CSV_DIR="${CIC2018_CSV_DIR:-$REPO/data/cic2018/csv}"  # CIC-2018 <day>_csv.csv label files
+CIC2017_DIR="${CIC2017_DIR:-$REPO/data/cic2017/TrafficLabelling}"  # CIC-2017 *.pcap_ISCX.csv
+CTU_DIR="${CTU_DIR:-$REPO/data/ctu13}"                        # CTU-13 <scenario>/*.binetflow
 OUT="${OUT:-results/training_plan}"
 MEM_MAX="${MEM_MAX:-17G}"
 PYTHON="${PYTHON:-python}"
@@ -68,7 +71,7 @@ SHARED_SETUP="${SHARED_SETUP:-$OUT/.shared_setup}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCHEME=cross_year_ctu
-CHOSEN_IP=cross_network            # decided in advance; see analysis 30, "winner"
+CHOSEN_IP=cross_network            # decided in advance, before any test score was seen
 SEEDS_EXTRA=(123 2024)             # with 42 from `compare`: cyberworld_v4.config.SEEDS[:3]
 # Every model trains under cyberworld_v4/training_guard.py: LR warmup, gradient
 # clipping, non-finite steps skipped; after 2 epochs without improvement it
@@ -96,10 +99,17 @@ encoder_of() {  # seed ip -> encoder checkpoint written by run_encoder_compariso
 }
 
 capped() {
-    if command -v systemd-run >/dev/null 2>&1; then
+    if command -v systemd-run >/dev/null 2>&1 && ! systemd-run --user --scope --quiet true >/dev/null 2>&1 \
+            && [ "${ALLOW_UNCAPPED:-0}" != 1 ]; then
+        echo "[plan] systemd-run cannot reach your user session (no user D-Bus; e.g. under sudo, su" >&2
+        echo "       or ssh without a login session), so heavy jobs cannot be memory-capped." >&2
+        echo "       Run from a normal login session, or set ALLOW_UNCAPPED=1 to run uncapped." >&2
+        exit 2
+    fi
+    if command -v systemd-run >/dev/null 2>&1 && [ "${ALLOW_UNCAPPED:-0}" != 1 ]; then
         systemd-run --user --scope --quiet -p MemoryMax="$MEM_MAX" -p MemorySwapMax=0 -- "$@"
     elif [ "${ALLOW_UNCAPPED:-0}" = 1 ]; then
-        echo "[plan] WARNING: no systemd-run; running UNCAPPED because ALLOW_UNCAPPED=1" >&2
+        echo "[plan] WARNING: running UNCAPPED because ALLOW_UNCAPPED=1" >&2
         "$@"
     else
         echo "[plan] systemd-run not found: refusing to start a heavy job without a memory cap." >&2
@@ -282,6 +292,29 @@ EOF
 EOF
 }
 
+promote() {
+    # Install the trained models where the console loads them (saved_models/)
+    # and write their manifests. The seed-42 encoder of the chosen variant and
+    # its Branch A; Branch B and DeepOP from the downstream stage.
+    local enc; enc="$(encoder_of 42 "$CHOSEN_IP")"
+    local ba; ba="$(compare_dir 42)/branch_a/cic2018__$CHOSEN_IP.pt"
+    for f in "$enc" "${enc%.pth}_config.json" "$ba" "$OUT/downstream/branch_b/host_wdt.pt"; do
+        [ -f "$f" ] || { echo "[plan] $f missing: train first (./train.sh)" >&2; exit 2; }
+    done
+    mkdir -p saved_models/branch_a saved_models/branch_b saved_models/deepop
+    cp "$enc" saved_models/bita_bigru_transformer-unified_final.pth
+    cp "${enc%.pth}_config.json" saved_models/bita_bigru_transformer-unified_final_config.json
+    cp "$ba" saved_models/branch_a/branch_a_lstm.pt
+    cp "$OUT/downstream/branch_b/host_wdt.pt" saved_models/branch_b/host_wdt.pt
+    if [ -f "$OUT/downstream/deepop/cwa_forecast_decoder.pt" ]; then
+        cp "$OUT/downstream/deepop/cwa_forecast_decoder.pt" saved_models/deepop/cwa_forecast_decoder.pt
+    else
+        echo "[plan] DeepOP was not trained (Branch B did not clear its skill gate); keeping the old decoder" >&2
+    fi
+    "$PYTHON" scripts/write_model_manifests.py
+    echo "[plan] promoted. Serve with: export CYBERWORLD_ABLATE_NODE_FEATURES=$CHOSEN_IP"
+}
+
 dryrun() {
     # The whole plan on a tiny synthetic corpus in the real formats, before the
     # real run spends hours: a crash here costs minutes. It found the TGN-memory
@@ -304,6 +337,7 @@ case "$stage" in
     seeds)      seeds ;;
     downstream) downstream ;;
     summary)    summary ;;
+    promote)    promote ;;
     all)        preflight; dryrun; warm; train; summary ;;
-    *) echo "usage: $0 [preflight|dryrun|warm|train|compare|seeds|downstream|summary|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [preflight|dryrun|warm|train|compare|seeds|downstream|summary|promote|all]" >&2; exit 2 ;;
 esac

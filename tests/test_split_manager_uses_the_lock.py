@@ -90,7 +90,16 @@ def test_strict_false_downgrades_to_a_logged_error(monkeypatch):
 
 # ------------------------------------------------------------- prefix bias
 
+def _need_val_data():
+    """These two read real validation captures; skip on a checkout without data/."""
+    from data_unification import dataset_paths as dp
+    if not any(d.is_dir() and any(d.iterdir()) for d in (dp.CIC2017_DIR, dp.CIC2018_DIR,
+                                                          dp.CTU13_DIR, dp.PCAP2018_DIR)):
+        pytest.skip("datasets not present under data/ (see README.md, Datasets)")
+
+
 def test_stride_beats_a_chronological_prefix_for_label_coverage(sm):
+    _need_val_data()
     """A prefix sample of the val split measured 0% attack: these captures are
     benign in the morning. Stride must recover positives."""
     prefix = sm.records_for("val", max_per_source=300, stride=1)
@@ -106,6 +115,7 @@ def test_stride_beats_a_chronological_prefix_for_label_coverage(sm):
 
 
 def test_a_prefix_capped_request_warns_about_bias(sm, caplog):
+    _need_val_data()
     import logging
     with caplog.at_level(logging.WARNING, logger="data_unification.split_manager"):
         sm.records_for("val", max_per_source=50, stride=1)
