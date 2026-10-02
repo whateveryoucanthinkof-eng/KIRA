@@ -84,6 +84,24 @@ features; encoder loader enforces schema, ablations and dimensions; conformal
 order statistic; batch planner + fast path level 4 + capture interleaving
 (GPU run); UNKNOWN class inside the CUDA-graph training step (GPU run).
 
+**Deep pass (sixth to ninth), 2026-10-02, GPU unavailable (dGPU off the PCI bus after
+a warm reboot; cold boot needed) so verification was on CPU:**
+
+| area | bug | fix |
+|---|---|---|
+| DeepOP selection | overall token F1 rewards copying the present (0.94 persistence accuracy) | scorer counts transitions (target ≠ last observed token); selection = harmonic mean with transition macro-F1; cross-year reports transition accuracy |
+| serving time channel | `t_history` from the max END time of the flows passed in (drifts with long flows) | window grid, as trained |
+| correlation assembler | DeepOP's observed token from the snapshot LABEL (ground truth in replays); no observed-sequence input; histories hard-coded 27/12-D (crashes a 27-D Branch B) and padded to the batch, not 15; +2 s forecast grid | Branch A token only, observed sequence, model widths, trained lengths/padding, 30 s grid |
+| checkpoint contract | no trainer saved `forecast_window_seconds`: serving would forecast on a 2 s grid against a 150 s target | saved everywhere (+ hazard tau, real input width) |
+| CTU-13 | packets split 50/50 (one-way flows got invented replies) | split by byte direction |
+| hazard target | a capture's last windows (future unobserved) read 0 | censored like UNKNOWN spans |
+| explanations | paper Branch A's "attention" is a constant one-hot | per-window gradient attribution |
+| credibility check | risk mean NaN under censoring | NaN-safe |
+| process | serving purged bita's own `model.*` modules (duplicate classes; the long-standing parallel-extraction test failure) | purge only a foreign package |
+
+Ninth pass: clean. Remaining failures are the two split-manager tests that read the real
+dataset under the user's home (environment, not code).
+
 Reviewed and left as is (by design or pinned by tests): guard gives one epoch after a
 step-back; BiTA cross-edge context; TGN attention/neighbour finder (strictly before t);
 DeepOP repetition penalty/continuity bonus (off for paper checkpoints).
