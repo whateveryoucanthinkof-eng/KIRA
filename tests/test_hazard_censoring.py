@@ -92,3 +92,15 @@ def test_column_load_records_when_unknown_traffic_was_dropped(tmp_path):
     cols = cc.CaptureColumns.load(tmp_path / "c", drop_unresolved=True)
     assert len(cols) == 2
     assert cols.meta["unknown_intervals"] == [[100.0, 101.5]]
+
+
+def test_every_trainer_records_the_forecast_step():
+    """Serving takes seconds-per-forecast-step from the checkpoints and fell
+    back to the 2 s input window when none recorded it -- all of them -- so new
+    checkpoints would have been served on a 2 s grid against a 150 s target."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    a = (root / "scripts" / "retrain_branch_a_live.py").read_text()
+    b = (root / "scripts" / "retrain_future_models_live.py").read_text()
+    assert '"forecast_window_seconds": _c.forecast_window_seconds' in a
+    assert b.count('"forecast_window_seconds":_c.forecast_window_seconds') == 2

@@ -728,7 +728,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                       + (f"+/-{_c_k['half_width']:.4f} (empirical {_c_k['empirical_coverage']:.3f}, "
                          f"n={_c_k['n']:,})" if _c_k["fitted"] else f"NOT FITTED -- {_c_k['reason']}"),
                       flush=True)
-            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf,"operating_point":_op},output)
+            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"forecast_window_seconds":_c.forecast_window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf,"operating_point":_op},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
         if resume is not None:
             resume.save(epoch + 1, wdt=wdt.state_dict(), risk=risk.state_dict(),
@@ -1311,7 +1311,7 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         _history[-1]["guard_action"] = _action
         if _action == IMPROVED:
             best=_sel; best_epoch=epoch+1
-            output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"vocab_size":vocab.vocab_size,"d_state":d_state,"arch":decoder.arch_config(),"train_token_counts":_train_token_counts,"epoch_history":list(_history),"selection_metric":_sel_metric,"label_smoothing_support":_support.cpu().tolist(),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
+            output.parent.mkdir(parents=True,exist_ok=True); torch.save({"decoder_state_dict":decoder.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"forecast_window_seconds":_c.forecast_window_seconds,"vocab_size":vocab.vocab_size,"d_state":d_state,"arch":decoder.arch_config(),"train_token_counts":_train_token_counts,"epoch_history":list(_history),"selection_metric":_sel_metric,"label_smoothing_support":_support.cpu().tolist(),"baselines":{"acc_persistence":acc_persist,"acc_majority":acc_majority}},output)
         if resume is not None:
             resume.save(epoch + 1, decoder=decoder.state_dict(), optimizer=optimizer.state_dict(),
                         guard=guard.state_dict(), best=best, best_epoch=best_epoch,
