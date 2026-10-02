@@ -8,6 +8,8 @@
 
 **AI-based network attack forecasting from network traffic: a world model for predictive cyber defence**
 
+▶ [Product demo](https://youtu.be/pUHwS8UNEDU) · ▶ [ML model explained](https://youtu.be/21zskAGmkDk)
+
 Smart India Hackathon 2026 · Problem Statement **26153** (NTRO) · Theme: Blockchain & Cybersecurity
 
 </div>
@@ -56,7 +58,7 @@ distribution, and a decoder turns the rolled-out future into ATT&CK stages.
 | Source code | this repository |
 | README with setup instructions | this file |
 | Architecture document (2 pages) | [`docs/ARCHITECTURE.pdf`](docs/ARCHITECTURE.pdf) · [Markdown](docs/ARCHITECTURE.md) |
-| Demo video (2 min) | [`SIH_FULL_VIDEO.mp4`](SIH_FULL_VIDEO.mp4) (full), [`Product_Demo.mp4`](Product_Demo.mp4) and [`ML_Model_explained.mp4`](ML_Model_explained.mp4), stored with Git LFS (`git lfs pull` after cloning) |
+| Demo video (2 min) | ▶ [Product demo](https://youtu.be/pUHwS8UNEDU) · ▶ [ML model explained](https://youtu.be/21zskAGmkDk) on YouTube; the files are in the repository root ([`SIH_FULL_VIDEO.mp4`](SIH_FULL_VIDEO.mp4), [`Product_Demo.mp4`](Product_Demo.mp4), [`ML_Model_explained.mp4`](ML_Model_explained.mp4), Git LFS) |
 | Technical presentation (5 slides) | repository root |
 | Problem statement | [`docs/PROBLEM_STATEMENT.md`](docs/PROBLEM_STATEMENT.md) |
 
