@@ -330,11 +330,25 @@ class TrajectoryStore(Mapping):
         enough to matter (exp(-du/tau) >= CENSOR_EPS), the true target is
         unknown: NaN, which every trainer masks. A window that is itself an
         attack (dt == 0) is known and kept."""
-        if not self.unknown_intervals:
-            return 0
         start = np.asarray(self.window_start, dtype=np.float64)
+        # The end of each capture is where observation stops: everything after
+        # it is unobserved, exactly like a dropped UNKNOWN span. A window near
+        # the end with no later attack read hazard 0 -- a negative about
+        # traffic nobody recorded. Each capture (namespace) gets an open span
+        # from just after its last window.
+        ends: Dict[Optional[str], float] = {}
+        for host, rows in self._rows_by_host.items():
+            ns = host.split("@", 1)[1] if "@" in host else None
+            r = np.asarray(rows)
+            if r.size:
+                ends[ns] = max(ends.get(ns, -np.inf), float(start[r].max()))
+        spans = {ns: list(iv) for ns, iv in self.unknown_intervals.items()}
+        w = float(np.median(np.asarray(self.window_end, dtype=np.float64)[:1000]
+                            - start[:1000])) if len(start) else 0.0
+        for ns, t_end in ends.items():
+            spans.setdefault(ns, []).append([t_end + w, np.inf])
         merged = {}
-        for ns, iv in self.unknown_intervals.items():
+        for ns, iv in spans.items():
             a = np.asarray(iv, dtype=np.float64).reshape(-1, 2)
             a = a[np.argsort(a[:, 0], kind="stable")]
             # merge overlaps so the ends are sorted too
