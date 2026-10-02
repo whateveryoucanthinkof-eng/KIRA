@@ -69,6 +69,21 @@ every epoch: val predicted InitialAccess for every edge, macro-F1 0.05-0.08, tes
 | rollout callers | standalone DeepOP trainer also omitted elapsed times | fixed; AST test covers every caller |
 | CTU-13 labels | `Background` (unlabelled per the dataset authors) resolved to Benign | `CYBERWORLD_CTU_BACKGROUND=unknown` switch (default unchanged) |
 
+**Fourth pass:**
+
+| area | bug | fix |
+|---|---|---|
+| hazard target | windows just before dropped UNKNOWN traffic saw no "next attack" and got hazard 0 (false negatives on pre-attack windows) | column loading records the dropped spans; hazard is NaN (censored) where they could matter; every consumer masks NaN |
+| edge features | log1p bytes/packets reached ~20 while every other encoder input is in [-1, 1] | scaled to [0, 1] (schema 2.1.0), all implementations bit-identical |
+| ingest cache | `attack_participants.py` not in the parse-code hash (lazy import) | added |
+| encoder promotion | `select_best_encoder.py` re-scored with the old arithmetic mean | harmonic, as the trainer |
+| plan summary | reported overall AUC only | + onset AUC and the LR/persistence benchmark |
+
+**Fifth pass: clean.** Verified: serving event adapter uses the canonical edge
+features; encoder loader enforces schema, ablations and dimensions; conformal
+order statistic; batch planner + fast path level 4 + capture interleaving
+(GPU run); UNKNOWN class inside the CUDA-graph training step (GPU run).
+
 Reviewed and left as is (by design or pinned by tests): guard gives one epoch after a
 step-back; BiTA cross-edge context; TGN attention/neighbour finder (strictly before t);
 DeepOP repetition penalty/continuity bonus (off for paper checkpoints).
