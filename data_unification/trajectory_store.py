@@ -3,7 +3,7 @@
 Replaces `Dict[str, List[HostWindowSnapshot]]`, which cost ~647 bytes per
 snapshot to hold ~108 bytes of actual numbers. At full corpus density that is
 ~25M snapshots = ~16 GB of Python object and numpy-header overhead, which is
-what froze the dev laptop twice (see claude_latest_analysis + memory notes).
+what froze the dev laptop twice (on a 22 GiB machine).
 
 Measured: 647 B/snapshot as Python objects vs 132 B/snapshot columnar -- 4.9x.
 With `spill_dir` set, the bulk array (27 float32 per row) is written to disk and

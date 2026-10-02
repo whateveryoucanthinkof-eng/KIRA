@@ -24,7 +24,7 @@ csv_local + 4:00:00` was verified to the second on two independent days.
 
 Reads are streaming and bounded — these files are ~9 hours and hundreds of MB
 each, and 5.9% of the corpus carries mid-file record corruption (see
-`claude_latest_analysis/06_pcap_corruption_scan.md`), so parsing stops cleanly
+`scripts/dataset_integrity/pcap_scan_results.tsv`), so parsing stops cleanly
 at the first bad record and keeps the valid prefix rather than aborting a day.
 """
 
@@ -72,8 +72,7 @@ class AttackWindow:
         return self.start_utc <= ts <= self.end_utc
 
 
-# CSV local time -> packet UTC. Verified to the second on two independent days
-# in claude_latest_analysis/05_cic2018_pcap_completeness.md.
+# CSV local time -> packet UTC. Verified to the second on two independent days.
 CSV_TO_PCAP_UTC_OFFSET_SECONDS = 4 * 3600
 
 

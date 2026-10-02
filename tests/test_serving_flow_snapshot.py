@@ -2,7 +2,7 @@
 tests/test_serving_flow_snapshot.py
 
 Pins for telemetry/flow/flow_table.py defects found in the serving-path
-review (claude_latest_analysis/29_serving_review.md, "Reported, not fixed"):
+review ("Reported, not fixed"):
 
   * snapshot_flows() used to export CUMULATIVE bytes/packets since flow
     start, not the traffic seen in that window. A steady flow's exported

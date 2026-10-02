@@ -264,7 +264,7 @@ class LazyHostSequenceDataset(Dataset):
         #:
         #: None (the default) keeps every sample, as the no-dilution rule asks.
         #: Enabling it removes samples whose target lies beyond a gap, which
-        #: can be a large share -- see claude_latest_analysis/30_time_gaps.md.
+        #: can be a large share of a sparse corpus.
         self.max_gap_seconds = max_gap_seconds
         self.n_dropped_by_gap = 0
         from cyberworld_v4.config import get_contract as _gc

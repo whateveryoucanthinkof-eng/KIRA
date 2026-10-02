@@ -134,7 +134,7 @@ const CAMPAIGN_NODES: (Omit<CampaignNode, "provenance" | "start_time" | "end_tim
   { node_id: 2, host_ip: TARGET, coarse_category: "InitialAccess", technique_id: "T1190", hit_count: 23, max_risk_score: 0.78, mean_confidence: 0.86, at: 28 },
   { node_id: 3, host_ip: TARGET, coarse_category: "C2", technique_id: "T1071", hit_count: 64, max_risk_score: 0.91, mean_confidence: 0.9, at: 40 },
   // A second host beaconing out: what the models CAN say about spread. No head
-  // emits lateral movement itself (do_this_in_next_session_ml_review.md §8).
+  // emits lateral movement itself yet.
   { node_id: 4, host_ip: "10.0.2.40", coarse_category: "C2", technique_id: "T1071.001", hit_count: 12, max_risk_score: 0.83, mean_confidence: 0.77, at: 46 },
   { node_id: 5, host_ip: "10.0.2.50", coarse_category: "Exfiltration", technique_id: "T1005", hit_count: 7, max_risk_score: 0.88, mean_confidence: 0.71, at: 52 },
   { node_id: 6, host_ip: TARGET, coarse_category: "Impact", technique_id: "T1498", hit_count: 2104, max_risk_score: 0.96, mean_confidence: 0.94, at: 54 },

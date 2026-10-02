@@ -7,7 +7,7 @@ Branch A read every *.csv with the CIC-2018 parser, CIC-2017 files included.
 Why PCAP for CIC-2018
 ---------------------
 Nine of the ten CIC-2018 CSV days carry host addresses fabricated from the row
-number (claude_latest_analysis/08_why_the_csv_path_cannot_benchmark.md). A
+number. A
 host graph built from them is synthetic, so any encoder or trajectory model
 trained on it learns a graph that never existed. The PCAPs carry the real
 addresses; the paired CSV supplies only the attack windows, applied by

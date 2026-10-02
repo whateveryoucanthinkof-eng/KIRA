@@ -329,7 +329,7 @@ def main() -> int:
     # ROC-AUC and PR-AUC while selecting the epoch with the lowest multi-task
     # loss -- a sum of five terms, four of which the headline numbers do not
     # measure. The same defect was already fixed for Branch A (composite
-    # selection, claude_latest_analysis/27) and not here.
+    # selection) and not here.
     #
     # The score is the mean of nowcast ROC-AUC and forecast ROC-AUC, both on
     # VALIDATION. ROC rather than PR because the base rate moves between

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Watchdog for the train-plan service. Each stdout line is an alert/event.
 
-    python3 -u scripts/ops/watchdog.py   # e.g. as a Claude Code Monitor
+    python3 -u scripts/ops/watchdog.py   # e.g. in a second terminal
 
 State (log offsets, alert levels) persists beside this file so re-arming the
 monitor does not replay old lines. Lives outside /tmp: /tmp is tmpfs here and

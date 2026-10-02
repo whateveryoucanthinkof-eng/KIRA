@@ -1362,7 +1362,7 @@ def main():
                              "Rows are ACTIVE windows, not clock ticks: a CTU-13 "
                              "host's next window is a median 736 s away, against a "
                              "10 s contract horizon. Enabling this drops samples -- "
-                             "see claude_latest_analysis/30_time_gaps.md.")
+                             "see docs/ARCHITECTURE.md (temporal contract).")
     parser.add_argument("--patience", type=int, default=3,
                         help="Stop after N epochs without improving --select-on. "
                              "The best checkpoint is already written, so this "

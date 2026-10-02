@@ -2431,7 +2431,7 @@ if __name__ == '__main__':
     # Per-epoch snapshots are scratch, not models: nothing serves from here.
     # This used to be a top-level saved_checkpoints/ that sat beside
     # saved_models/ looking equally authoritative, and a retrain writing to the
-    # wrong one of the two has already been shipped once (analysis doc 23).
+    # wrong one of the two has already been shipped once.
     # Promote a winner with scripts/select_best_encoder.py --copy.
     parser.add_argument('--checkpoint_dir', type=str, default='.spill/encoder_epochs')
     parser.add_argument('--log_dir', type=str, default='logs')

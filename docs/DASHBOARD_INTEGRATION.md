@@ -4,7 +4,6 @@ The SOC console in `web_dashboard/` is the Cyber World (K.I.R.A.) frontend, wire
 backend (`control_backend/`) and models. This document says, panel by panel, where every number comes
 from, and which panels are waiting on a model that does not exist yet.
 
-How it got here, and why each decision was made: `claude_latest_analysis/33_kira_dashboard_port.md`.
 
 ## Two ways to run it
 
@@ -23,7 +22,7 @@ python run_dashboard.py --site local-default --replay captures/live.pcap # repla
 
 Both modes build their UI on demand (`web_dashboard/dist/`, `web_dashboard/dist-demo/`) when the build is
 missing or older than the sources. That needs `npm` on `PATH`, or a toolbox that has it
-(`CYBERWORLD_NPM_TOOLBOX`, default `claude-dev`). `--rebuild` forces a build.
+(`CYBERWORLD_NPM_TOOLBOX`, optional). `--rebuild` forces a build.
 
 ### What differs between the two builds
 
@@ -74,8 +73,7 @@ through the same function.
 | Mitigation status | Recorded intent; flows a block should have stopped are counted, never hidden | Real (recorded, **not enforced**) |
 | Rule-layer opinion | `advisory_rule_opinion`, only with `CYBERWORLD_ENABLE_RULES=1`; never changes `risk` | Real, off by default |
 
-Model gaps behind the "Under development" marks are listed for the ML review in
-`do_this_in_next_session_ml_review.md` §8.
+Model gaps behind the "Under development" marks are listed in README.md, "Status and limitations".
 
 ## What the console needs from the backend, and where it lives
 

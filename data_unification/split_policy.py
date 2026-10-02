@@ -88,7 +88,7 @@ def load_lock() -> Dict[str, Dict[str, str]]:
 #               (the same rule CIC-2018 gets), and nothing of it is ever
 #               tested. The test set is still all of CIC-2017, so the score
 #               keeps its meaning. Why: C2 is carried by ~10 hosts in CIC-2018
-#               (analysis 27), and CTU-13 is botnet C2 traffic -- the class
+#              , and CTU-13 is botnet C2 traffic -- the class
 #               CIC-2017's Bot days test. Kept as its own scheme rather than
 #               folded into cross_year so the pure 2018->2017 protocol
 #               (docs/CROSS_YEAR_PROTOCOL.md) stays reproducible.

@@ -5,7 +5,7 @@
  * `tactic_lane` on the verdict and on each forecast step. CredentialAccess is
  * a lane because DeepOP emits CredentialAccess.T1110 (brute force).
  * Execution and LateralMovement are drawn but `dev`: neither Branch A nor
- * DeepOP has a token for them (do_this_in_next_session_ml_review.md §8).
+ * DeepOP has a token for them.
  */
 
 export interface Lane {

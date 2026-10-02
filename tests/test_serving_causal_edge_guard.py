@@ -59,8 +59,8 @@ def test_the_heuristic_is_deterministic_and_bounded():
 
 #: Callers that exist deliberately. control_backend/correlation_service.py
 #: feeds the console's Campaign and Incidents pages (2026-10-01); the payload
-#: is labelled heuristic, and evaluating HEURISTIC_PARAMS is an open item in
-#: do_this_in_next_session_ml_review.md §8. Anything else is a new live path.
+#: is labelled heuristic, and evaluating HEURISTIC_PARAMS is an open item.
+#: Anything else is a new live path.
 KNOWN_CALLERS = {os.path.join("control_backend", "correlation_service.py")}
 
 

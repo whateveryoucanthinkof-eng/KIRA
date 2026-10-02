@@ -25,7 +25,7 @@ Two things would otherwise make it differ, and both are handled:
 
 tests/test_graphed_step.py checks losses and every weight against eager over
 hundreds of steps with dropout live; the trainers' end-to-end runs are
-compared leaf by leaf (see PERF_REPORT.md).
+compared leaf by leaf.
 
 Training mode is captured; call the eager module for evaluation.
 """

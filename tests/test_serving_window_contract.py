@@ -2,7 +2,7 @@
 tests/test_serving_window_contract.py
 
 Pin for the hardcoded-window-divisor defect in the serving-path review
-(claude_latest_analysis/29_serving_review.md): several places in
+of the serving path: several places in
 telemetry/** defaulted their window size to a literal `2.0` instead of
 `cyberworld_v4.config.get_contract().window_seconds`, the single
 authoritative source (cyberworld_v4/config.py: "Anything that hardcodes a

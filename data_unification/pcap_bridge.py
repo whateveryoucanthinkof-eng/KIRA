@@ -8,8 +8,7 @@ Two things pcap_adapter.PcapFlowExtractor.windows() doesn't give us directly:
     file's own first-packet timestamp, so per-file window boundaries drift
     from a shared clock by up to one window. HostTrajectoryExtractor embeds
     one multi-host graph per window (TGNE needs every host active in that
-    window, not a single host's edges -- claude_latest_analysis/
-    07_v4_audit_and_migration_plan.md, finding E7), so a single PCAP file
+    window, not a single host's edges), so a single PCAP file
     processed alone would starve it of neighbours. Windows here are instead
     bucketed on absolute UTC time (floor(ts / window_seconds)), so the same
     bucket index means the same wall-clock interval for every host.

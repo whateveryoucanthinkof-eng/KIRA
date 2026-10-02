@@ -4,8 +4,7 @@ Every rule here rejects a row the *upstream corpus* is wrong about, not a row we
 dislike. Each is documented with the evidence that justifies it, because a guard
 that silently drops real traffic is worse than the defect it fixes.
 
-Measured on the corpora in this repository (see
-claude_latest_analysis/09_data_integrity_audit.md).
+Measured on the corpora in this repository.
 """
 
 from __future__ import annotations

@@ -17,7 +17,7 @@ number of contiguous blocks rather than scattering. `derive_windows` returns
 that evidence alongside the intervals so a caller can refuse bad input.
 
 Offset: `pcap_utc = csv_local + 4:00:00`, verified to the second on two
-independent days in claude_latest_analysis/05_cic2018_pcap_completeness.md.
+independent days.
 """
 
 from __future__ import annotations
@@ -180,8 +180,7 @@ def derive_windows(
             return DerivedWindows(evidence={"error": "no Timestamp/Label column", "plausible": False})
 
         # Src/Dst IP where the corpus has them. Nine of the ten CIC-2018 CSVs
-        # ship with 80 columns and no addresses at all (see
-        # claude_latest_analysis/15_downloads_csv_audit.md), so this is
+        # ship with 80 columns and no addresses at all, so this is
         # opportunistic: when the columns exist the interval can name its
         # participants, and when they do not the interval stays a pure time
         # range and says so.

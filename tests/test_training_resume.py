@@ -2,7 +2,7 @@
 
 Before this, a crash at hour five of the encoder restarted it from epoch 0.
 The end-to-end version (every real trainer killed and resumed on the dry-run
-corpus) is in analysis 32; these pin the mechanism.
+corpus); these pin the mechanism.
 """
 
 import argparse

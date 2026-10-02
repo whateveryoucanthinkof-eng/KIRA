@@ -153,7 +153,7 @@ def build_or_load_tgne_ta(
                     f"host attributes no longer saturate at 147. Every stored "
                     f"feature value is different, so the encoder must be "
                     f"retrained -- there is no conversion.\n\n"
-                    f"Retrain:  see claude_latest_analysis/16_downstream_retrain_runbook.md"
+                    f"Retrain:  ./train.sh (see README.md, 'Train the models')"
                 )
             if loaded_cfg.get("edge_feat_dim") != 12 or loaded_cfg.get("node_feat_dim") != 12:
                 raise ValueError("TGNE checkpoint dimensions do not match the canonical 12-D contract")
@@ -270,8 +270,8 @@ def build_or_load_tgne_ta(
                 f"head. The old head was a single Linear on summed node "
                 f"embeddings, which could not distinguish two flows between the "
                 f"same pair of hosts and collapsed to a constant prediction. "
-                f"Retrain the encoder (see claude_latest_analysis/"
-                f"16_downstream_retrain_runbook.md).\n\nUnderlying: {exc}"
+                f"Retrain the encoder: ./train.sh, then ./train.sh promote (README.md, "
+                f"'Train the models').\n\nUnderlying: {exc}"
             ) from exc
         raise
     tgn.eval()

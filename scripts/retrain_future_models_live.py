@@ -125,7 +125,7 @@ def load_records(cic_dir, ctu_dir, rows_per_file, stride=1):
 
 def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_day=None, max_packets_per_host=None, window_stride=1):
     """Real per-host host-trajectory data (fixes D1: CIC-2018 CSV fabricates host IPs by row-index
-    for 9/10 days -- see claude_latest_analysis/08_why_the_csv_path_cannot_benchmark.md).
+    for 9/10 days).
 
     pcap_root holds one subdirectory per capture day, named "<day>_pcap" (e.g. tue_20_pcap),
     matching the corpus layout under ~/Documents/SIH/DATA/pcap/. csv_label_dir holds the paired

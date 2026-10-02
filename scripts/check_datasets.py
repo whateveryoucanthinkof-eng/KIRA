@@ -14,7 +14,7 @@ Reads headers only, so it takes seconds. It checks:
   * CIC-2017 is the TrafficLabelling variant (it has Source IP -- the
     MachineLearningCVE variant does not, and the host graph needs addresses);
   * CTU-13 files are the labelled bidirectional .binetflow ones;
-  * which of the 263 PCAPs found corrupt on 2026-09-19 (analysis 06) are still
+  * which of the 263 PCAPs found corrupt on 2026-09-19 are still
     byte-for-byte the corrupt copy.
 
 Exit 0 when nothing required is missing. The corrupt-PCAP count is reported,
@@ -35,7 +35,7 @@ from data_unification.pcap_adapter import iter_day_captures  # noqa: E402
 from data_unification.split_policy import SCHEMES, load_lock, split_of  # noqa: E402
 from data_unification.training_sources import _pcap_label_csv  # noqa: E402
 
-ANALYSIS = REPO / "claude_latest_analysis"
+ANALYSIS = REPO / "scripts" / "dataset_integrity"
 
 
 def header(path: Path) -> set:
@@ -130,13 +130,13 @@ def main() -> int:
                 still.append(rel)
             else:
                 changed.append(rel)
-        print(f"== known-corrupt PCAPs (analysis 06): {len(still)} still the corrupt copy, "
-              f"{len(changed)} changed since (verify: claude_latest_analysis/verify_pcap_day.sh), "
+        print(f"== known-corrupt PCAPs (upstream release): {len(still)} still the corrupt copy, "
+              f"{len(changed)} changed since (verify: scripts/dataset_integrity/verify_pcap_day.sh), "
               f"{len(gone)} absent")
         if still:
             notes.append(f"{len(still)} PCAPs are still the corrupt copy: each loses the part of "
                          f"its day after the damaged record. Re-fetch: "
-                         f"claude_latest_analysis/refetch_corrupt.sh")
+                         f"scripts/dataset_integrity/refetch_corrupt.sh")
 
     print()
     for n in notes:

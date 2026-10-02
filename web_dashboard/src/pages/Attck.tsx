@@ -70,7 +70,7 @@ const MATRIX: { tactic: string; id: string; techniques: Tech[] }[] = [
     tactic: "Lateral Movement",
     id: "TA0008",
     // Neither Branch A's 14 classes nor DeepOP's joint vocabulary has a
-    // lateral-movement token (do_this_in_next_session_ml_review.md §8).
+    // lateral-movement token.
     techniques: [{ id: "T1021", name: "Remote Services", heads: "no head yet", dev: true }],
   },
   {

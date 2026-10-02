@@ -27,8 +27,7 @@ and its val and test scenarios go to validation (the same rule CIC-2018 gets). N
 tested. The test set is still all of CIC-2017. The reason is that C2 is carried by ~10 hosts in
 CIC-2018, and CTU-13 is botnet C2 traffic, the class CIC-2017's Bot captures test. Pass
 `--ctu13_dir` to the encoder and `--ctu-dir` to Branch A and Branch B/DeepOP. It is a separate
-scheme so the pure 2018 → 2017 numbers above stay reproducible. Decided in
-`claude_latest_analysis/30_training_decisions.md`.
+scheme so the pure 2018 → 2017 numbers above stay reproducible.
 
 ## The four rules and where they are enforced
 

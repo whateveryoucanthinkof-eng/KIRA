@@ -16,7 +16,7 @@ backend, no sensor, no models; nothing it shows is a model output:
 
 The UI is built on demand (web_dashboard/dist for the console, dist-demo for
 the demo) whenever its sources are newer than the build. Building needs npm on
-PATH, or a toolbox named in CYBERWORLD_NPM_TOOLBOX (default: claude-dev).
+PATH, or inside a toolbox named in CYBERWORLD_NPM_TOOLBOX (optional).
 
 Env:
   CYBERWORLD_SITE, CYBERWORLD_SITE_CONFIG, CYBERWORLD_SENSOR_IFACE
@@ -107,7 +107,7 @@ def _npm_command():
     """npm on PATH, else npm inside a toolbox; None when neither is available."""
     if shutil.which("npm"):
         return ["npm"]
-    box = os.environ.get("CYBERWORLD_NPM_TOOLBOX", "claude-dev")
+    box = os.environ.get("CYBERWORLD_NPM_TOOLBOX", "")
     if box and shutil.which("toolbox"):
         probe = subprocess.run(["toolbox", "run", "-c", box, "npm", "--version"],
                                capture_output=True, text=True)

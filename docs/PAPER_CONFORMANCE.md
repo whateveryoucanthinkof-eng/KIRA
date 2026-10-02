@@ -186,12 +186,7 @@ python bita/train.py --dataset_dir <Warden March CSVs> --data_name warden_alerts
 Compare the logged per-epoch transductive and inductive AUC/AP with the paper's Table 6
 (BiGRU-Transformer row). Pass `--no_memory` to measure the memoryless ablation.
 
-**Retraining the system after these changes.** Every shipped checkpoint predates them and loads in its
-legacy architecture (`from_checkpoint`), so serving works but is not the paper models. Retrain in
-dependency order:
-
-1. encoder: `python bita/train.py --cic2018_dir ... --ctu13_dir ...`, then promote the best epoch with
-   `scripts/select_best_encoder.py --copy saved_models/bita_bigru_transformer-unified_final.pth`;
-2. Branch A and Branch B (independent of each other): `run.sh` stages 1–2;
-3. DeepOP: `run.sh` stage 3 (refuses to start if Branch B does not beat persistence);
-4. `python scripts/write_model_manifests.py`.
+**Retraining.** `./train.sh` trains everything in dependency order (encoder → Branch A and
+Branch B → DeepOP, which refuses to start if Branch B does not beat persistence), and
+`./train.sh promote` installs the result into `saved_models/` and writes the manifests. See the
+README, "Train the models".
