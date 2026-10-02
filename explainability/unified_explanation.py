@@ -242,8 +242,18 @@ class UnifiedExplainer:
                     else np.zeros((x.shape[1], len(names)), dtype=np.float32)
                 )
                 inputs = x[0].detach().cpu().numpy()
-                attributions = np.abs(grads * inputs).sum(axis=0)
-                attn_weights = [float(w) for w in out["attention_weights"][0].detach().cpu().numpy()]
+                per_cell = np.abs(grads * inputs)
+                attributions = per_cell.sum(axis=0)
+                if getattr(self.branch_a, "readout", "attention") == "last":
+                    # The paper model reads out the last LSTM step: its
+                    # "attention" is a constant one-hot on the newest window
+                    # and says nothing. Which windows drove the prediction is
+                    # the attribution summed over features, per window.
+                    per_step = per_cell.sum(axis=1)
+                    tot = float(per_step.sum())
+                    attn_weights = [float(v / tot) if tot > 0 else 0.0 for v in per_step]
+                else:
+                    attn_weights = [float(w) for w in out["attention_weights"][0].detach().cpu().numpy()]
 
             # Normalize and sort feature attributions
             total_attr = float(attributions.sum())
