@@ -56,7 +56,7 @@ distribution, and a decoder turns the rolled-out future into ATT&CK stages.
 | Source code | this repository |
 | README with setup instructions | this file |
 | Architecture document (2 pages) | [`docs/ARCHITECTURE.pdf`](docs/ARCHITECTURE.pdf) · [Markdown](docs/ARCHITECTURE.md) |
-| Demo video (2 min) | repository root and the [Releases](https://github.com/SIH-2026-SSSVBT/KIRA/releases) page (files over GitHub's 100 MB limit) |
+| Demo video (2 min) | [`SIH_FULL_VIDEO.mp4`](SIH_FULL_VIDEO.mp4) (full), [`Product_Demo.mp4`](Product_Demo.mp4) and [`ML_Model_explained.mp4`](ML_Model_explained.mp4), stored with Git LFS (`git lfs pull` after cloning) |
 | Technical presentation (5 slides) | repository root |
 | Problem statement | [`docs/PROBLEM_STATEMENT.md`](docs/PROBLEM_STATEMENT.md) |
 

@@ -156,6 +156,8 @@ Desktop.ini
 *.webm
 *.mov
 *.mkv
+# Submission videos in the repository root, stored with Git LFS (.gitattributes)
+!/*.mp4
 
 # Transient training spill: memmapped feature blocks, 500MB+ each,
 # rewritten continuously by a live run. Never an artefact worth versioning.
