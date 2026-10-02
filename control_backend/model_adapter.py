@@ -212,9 +212,17 @@ class AntigravityModelAdapter:
         sys.path.insert(0, bita)
         if repo not in sys.path:
             sys.path.insert(0, repo)
-        for k in list(sys.modules):
-            if k == "model" or k.startswith("model."):
-                del sys.modules[k]
+        # Evict a FOREIGN `model` package only. Purging bita's own as well left
+        # two copies of its classes in the process (modules.* kept references
+        # to the old ones), so an encoder built earlier no longer pickled --
+        # "not the same object as model.temporal_attention...".
+        _m = sys.modules.get("model")
+        _paths = list(getattr(_m, "__path__", []) or []) + [getattr(_m, "__file__", "") or ""]
+        if _m is not None and not any(
+                p and os.path.abspath(p).startswith(os.path.abspath(bita)) for p in _paths):
+            for k in list(sys.modules):
+                if k == "model" or k.startswith("model."):
+                    del sys.modules[k]
 
         from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
         from branch_a_gnn_lstm.sequence_dataset import TECHNIQUE_VOCAB
