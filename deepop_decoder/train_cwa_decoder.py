@@ -305,8 +305,10 @@ def train_cwa_decoder(
             #                 covariate shift, not a fix for it.
             if wdt is not None and "h_history" in batch:
                 with torch.no_grad():
-                    h_in = wdt.rollout(batch["h_history"].to(device),
-                                       K=h_fut.shape[1]).detach()
+                    h_in = wdt.rollout(batch["h_history"].to(device), K=h_fut.shape[1],
+                                       t_history=batch["t_history"].to(device) if "t_history" in batch else None,
+                                       t_future=batch["t_future"].to(device) if "t_future" in batch else None,
+                                       ).detach()
             else:
                 K_curr = h_fut.shape[1]
                 step_sigma = torch.linspace(0.015, 0.055, steps=K_curr, device=device).unsqueeze(0).unsqueeze(-1)
@@ -348,8 +350,10 @@ def train_cwa_decoder(
                 tgt_tok = batch["target_tokens"].to(device)
                 obs_tok = batch["obs_token"].to(device)
                 if wdt is not None and "h_history" in batch:
-                    h_fut = wdt.rollout(batch["h_history"].to(device),
-                                        K=h_fut.shape[1]).detach()
+                    h_fut = wdt.rollout(batch["h_history"].to(device), K=h_fut.shape[1],
+                                        t_history=batch["t_history"].to(device) if "t_history" in batch else None,
+                                        t_future=batch["t_future"].to(device) if "t_future" in batch else None,
+                                        ).detach()
 
                 obs_seq = batch["obs_tokens"].to(device) if "obs_tokens" in batch else None
                 logits = decoder(h_fut, inp_tok, obs_tokens=obs_seq)

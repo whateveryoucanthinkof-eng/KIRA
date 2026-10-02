@@ -117,24 +117,45 @@ def branch_b_on_store(wdt, risk_head, store, device, T: int, K: int, batch_size:
     from torch.utils.data import DataLoader
     from branch_b_world_model.train_branch_b import LazyHostRolloutDataset
 
-    ds = LazyHostRolloutDataset(store, T=T, K=K)
+    # The same samples and inputs as training and validation: short histories
+    # (edge-padded), real elapsed times, padded future steps masked. This
+    # called rollout(h, K) with no times -- telling a model trained on real
+    # elapsed seconds that every step was 2 s apart -- and scored padded
+    # future copies, which persistence predicts perfectly.
+    ds = LazyHostRolloutDataset(store, T=T, K=K, min_history_steps=1)
     if len(ds) == 0:
         return {"n": 0}
-    mse_m = mse_p = 0.0
+    se_m = se_p = cnt = 0.0
+    r_err = r_zero = r_cnt = 0.0
     n = 0
     wdt.eval()
     with torch.no_grad():
         for b in DataLoader(ds, batch_size=batch_size):
             h, tgt = b["h_history"].to(device), b["h_future"].to(device)
-            pred = wdt.rollout(h, K=K)
+            v = b["future_valid"].to(device)
+            pred = wdt.rollout(h, K=K, t_history=b["t_history"].to(device),
+                               t_future=b["t_future"].to(device))
             last = h[:, -1:, :].expand_as(tgt)
-            m = tgt.shape[0]
-            mse_m += float(((pred - tgt) ** 2).mean()) * m
-            mse_p += float(((last - tgt) ** 2).mean()) * m
-            n += m
-    mse_m, mse_p = mse_m / n, mse_p / n
-    return {"n": n, "mse_model": mse_m, "mse_persistence": mse_p,
-            "skill": (1.0 - mse_m / mse_p) if mse_p > 0 else float("nan")}
+            w = v.unsqueeze(-1)
+            se_m += float((((pred - tgt) ** 2) * w).sum())
+            se_p += float((((last - tgt) ** 2) * w).sum())
+            cnt += float(w.sum()) * tgt.shape[-1]
+            if risk_head is not None:
+                pr, _ = risk_head.forward_trajectory(pred)
+                rt = b["risk_future"].to(device)
+                kn = torch.isfinite(rt)                  # censored targets: no claim
+                vk = v * kn.to(v.dtype)
+                rt = torch.where(kn, rt, torch.zeros_like(rt))
+                r_err += float(((pr - rt).abs() * vk).sum())
+                r_zero += float((rt.abs() * vk).sum())
+                r_cnt += float(vk.sum())
+            n += tgt.shape[0]
+    mse_m, mse_p = se_m / max(cnt, 1.0), se_p / max(cnt, 1.0)
+    out = {"n": n, "mse_model": mse_m, "mse_persistence": mse_p,
+           "skill": (1.0 - mse_m / mse_p) if mse_p > 0 else float("nan")}
+    if r_cnt:
+        out.update({"risk_mae_model": r_err / r_cnt, "risk_mae_predict_zero": r_zero / r_cnt})
+    return out
 
 
 def deepop_on_store(decoder, wdt, store, vocab, device, train_token_counts, T: int, K: int,
@@ -155,7 +176,9 @@ def deepop_on_store(decoder, wdt, store, vocab, device, train_token_counts, T: i
     with torch.no_grad():
         for b in DataLoader(ds, batch_size=batch_size):
             hist = b["h_history"].to(device)
-            h_fut = wdt.rollout(hist, K=K)
+            h_fut = wdt.rollout(hist, K=K, t_history=b["t_history"].to(device)
+                                if "t_history" in b else None,
+                                t_future=b["t_future"].to(device) if "t_future" in b else None)
             obs = b["obs_token"].to(device)
             pred, _ = decoder.forecast_sequence(
                 h_fut, max_steps=K, observed_token=obs,

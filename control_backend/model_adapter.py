@@ -126,9 +126,27 @@ if _missing or _extra:
         f"missing={_missing} unknown={_extra}"
     )
 
+def _packet_group(name: str) -> str:
+    """Console group of one PCAP packet-level attribute (--packet-features)."""
+    for prefix, group in (("ttl_", "Packet: TTL"), ("tcp_window", "Packet: TCP window"),
+                          ("tcp_retransmission", "Packet: Retransmission"),
+                          ("pkt_iat", "Packet: Timing"), ("payload_", "Packet: Payload"),
+                          ("syn_", "Packet: TCP flags"), ("rst_after_syn", "Packet: TCP flags"),
+                          ("tcp_handshake", "Packet: TCP flags"),
+                          ("vertical_scan", "Packet: Scan signature"),
+                          ("horizontal_scan", "Packet: Scan signature"),
+                          ("http_", "Packet: HTTP"), ("dns_", "Packet: DNS")):
+        if name.startswith(prefix):
+            return group
+    return "Packet: Fan-out"
+
+
+from data_unification.host_attributes import PACKET_ATTRIBUTES  # noqa: E402
+
 FEATURE_GROUP_MAP = {
     **{f"H_emb_{i}": "TGNE Latent" for i in range(12)},
     **_ATTR_GROUPS,
+    **{n: _packet_group(n) for n in PACKET_ATTRIBUTES},
 }
 
 class AntigravityModelAdapter:
@@ -226,6 +244,20 @@ class AntigravityModelAdapter:
         # model (1 x 256 LSTM, linear heads) or the older 2 x 64 variant.
         self.branch_a = MultiTaskLSTM.from_checkpoint(ckpt, device=self.device)
         self.branch_a.eval()
+        # A Branch A trained with --packet-features reads 12 + 45 per window.
+        # The live extractor must then append the same 30 packet-level
+        # attributes, or every window would arrive 30 columns short.
+        from data_unification.host_attributes import EXTENDED_HOST_ATTR_DIM, HOST_ATTR_DIM
+        _want = int(self.branch_a.input_dim) - 12
+        from explainability.unified_explanation import feature_names_for
+        self.feature_names = feature_names_for(int(self.branch_a.input_dim))
+        if _want == EXTENDED_HOST_ATTR_DIM:
+            self.extractor = HostTrajectoryExtractor(
+                tgne_ta_model=self.tgn, window_size_sec=self.window_seconds,
+                persist_memory=True, include_packet_features=True)
+        elif _want != HOST_ATTR_DIM:
+            raise RuntimeError(f"Branch A expects {_want} host attributes per window; the "
+                               f"extractor produces {HOST_ATTR_DIM} or {EXTENDED_HOST_ATTR_DIM}")
         self._adopt_contract(ckpt, "branch_a")
         self._warn_if_not_credible(ckpt, "branch_a")
 
@@ -246,6 +278,12 @@ class AntigravityModelAdapter:
         self._warn_if_not_credible(ckpt, "branch_b")
         self.wdt.load_state_dict(ckpt["wdt_state_dict"])
         self.risk_head.load_state_dict(ckpt["risk_head_state_dict"])
+        # Branch B's forecast risk has its own calibration; its checkpoint
+        # carries a threshold fitted on its own validation scores. None ->
+        # fall back to Branch A's (the previous behaviour, for old checkpoints).
+        _bop = ckpt.get("operating_point") or {}
+        self.future_alert_threshold = (float(_bop["alert_threshold"])
+                                       if _bop.get("fitted") else None)
         self.wdt.eval()
         self.risk_head.eval()
         self.forecast_risk_halfwidths = forecast_band_halfwidths(ckpt)
@@ -489,8 +527,8 @@ class AntigravityModelAdapter:
            torch.backends.cudnn.flags(enabled=False) achieves the same thing
            while the module stays in eval().
 
-        Attribution is over the last timestep of the real sequence, with
-        gradients flowing through the full history.
+        Attribution is |grad * input| summed over every timestep of the scored
+        sequence, per feature.
         """
         x = x_tensor.detach().clone().to(self.device)
         x.requires_grad_(True)
@@ -510,13 +548,17 @@ class AntigravityModelAdapter:
                 self.branch_a.zero_grad(set_to_none=True)
                 risk.backward()
 
+            # Every timestep, not just the last: the risk is a function of the
+            # whole 15-window history, and what drives a FORECAST is often an
+            # earlier window (a scan 20 s ago). |grad * input| summed over time
+            # per feature; padded steps are zeros and add nothing.
             grads = (
-                x.grad[0, -1, :].detach().cpu().numpy()
+                x.grad[0].detach().cpu().numpy()
                 if x.grad is not None
-                else np.zeros(x.shape[-1], dtype=np.float32)
+                else np.zeros(tuple(x.shape[1:]), dtype=np.float32)
             )
-            inputs = x[0, -1, :].detach().cpu().numpy()
-            attributions = np.abs(grads * inputs)
+            inputs = x[0].detach().cpu().numpy()
+            attributions = np.abs(grads * inputs).sum(axis=0)
         finally:
             if was_training:
                 self.branch_a.train()
@@ -527,7 +569,7 @@ class AntigravityModelAdapter:
         group_scores: Dict[str, float] = {}
         top_features: List[ExplainabilityFeature] = []
         ranked = sorted(
-            zip(FEATURE_NAMES, attributions.tolist()),
+            zip(getattr(self, "feature_names", FEATURE_NAMES), attributions.tolist()),
             key=lambda t: t[1],
             reverse=True,
         )
@@ -634,15 +676,17 @@ class AntigravityModelAdapter:
         #
         # A recorded mitigation does not empty `flows`: the model scores the
         # traffic it actually sees (see the docstring).
+        # The window is the flows that STARTED in its last window_seconds --
+        # how training extraction buckets them (_window_boundaries, by start
+        # time, each flow in exactly one window). This kept every flow that
+        # merely ENDED in the window, so a 60 s flow's whole byte and packet
+        # count re-entered every window it overlapped: flow counts, volumes and
+        # rates the host attributes were never trained on.
         window_flows = flows
         if flows:
-            window_end = max(record.end_time for record in flows)
-            window_start = window_end - self.window_seconds
-            window_flows = [
-                record
-                for record in flows
-                if record.end_time >= window_start or record.start_time >= window_start
-            ]
+            last_start = max(record.start_time for record in flows)
+            window_start = last_start - self.window_seconds
+            window_flows = [record for record in flows if record.start_time > window_start]
 
         host_flows = [
             record
@@ -762,8 +806,11 @@ class AntigravityModelAdapter:
         # The Branch A feature history two blocks above already takes a copy;
         # this one did not, and that was the whole difference.
         padded_h = list(h_state_history)
+        # Edge padding (the first real state repeated), as Branch B is trained
+        # on short histories and as DeepOP's conditioning rollouts are built.
+        # Zero states were never in any training input.
         while len(padded_h) < self.history_steps:
-            padded_h.insert(0, torch.zeros_like(curr_h))
+            padded_h.insert(0, padded_h[0])
         h_seq = torch.stack(padded_h, dim=1)
 
         # Real elapsed seconds of each history step, relative to the latest
@@ -856,7 +903,10 @@ class AntigravityModelAdapter:
             obs_technique,
             ("Unknown", obs_technique, "TA0000", "Model-predicted technique"),
         )
-        alert = obs_risk >= self.alert_threshold or max_future >= self.alert_threshold
+        fut_thr = (self.future_alert_threshold
+                   if getattr(self, "future_alert_threshold", None) is not None
+                   else self.alert_threshold)
+        alert = obs_risk >= self.alert_threshold or max_future >= fut_thr
 
         # Early warning: how far ahead the FORECAST first crosses the threshold.
         # This used to be the constant forecast_steps * window_seconds on every
@@ -870,7 +920,7 @@ class AntigravityModelAdapter:
             lead_time = 0.0
         else:
             for k, r in enumerate(fut_risks):
-                if r >= self.alert_threshold:
+                if r >= fut_thr:
                     lead_time = (k + 1) * step_s
                     break
 
@@ -882,7 +932,8 @@ class AntigravityModelAdapter:
             mitigation_status = "recorded_quiet"
 
         explain, attributions = self._explain_full(x_tensor, t_history)
-        state_dims = state_vector(FEATURE_NAMES, FEATURE_GROUP_MAP, feature_vector, attributions)
+        state_dims = state_vector(getattr(self, "feature_names", FEATURE_NAMES), FEATURE_GROUP_MAP,
+                                  feature_vector, attributions)
         branches = self._forecast_branches(
             h_future, observed_seq, obs_token_tensor, lane_of(obs_technique))
         inf_ms = (time.perf_counter() - t0) * 1000.0
@@ -928,7 +979,7 @@ class AntigravityModelAdapter:
             model=ModelMetadata(
                 name="Antigravity-DualBranch-DeepOP",
                 version="3.2-SOC",
-                feature_count=27,
+                feature_count=len(getattr(self, "feature_names", FEATURE_NAMES)),
                 history_steps=self.history_steps,
                 window_seconds=self.window_seconds,
                 forecast_steps=self.forecast_steps,

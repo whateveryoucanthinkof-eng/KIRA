@@ -17,7 +17,7 @@ selecting on it alone picks epoch 5 and gives away the better classifier.
 
 This scores every epoch on
 
-    0.5 * inductive AP  +  0.5 * macro recall over the per-class accuracies
+    harmonic mean of inductive AP and macro recall over the per-class accuracies
 
 * **inductive**, because deployment meets unseen hosts constantly and the
   transductive figure sits at 0.997 with no discriminative power left;
@@ -78,8 +78,16 @@ def score_log(log_text: str):
         if not vals:
             continue
         macro = sum(vals) / len(vals)
-        out.append((int(ep), float(ap), macro, 0.5 * float(ap) + 0.5 * macro))
+        out.append((int(ep), float(ap), macro, _harmonic(float(ap), macro)))
     return out
+
+
+def _harmonic(ap: float, macro: float) -> float:
+    """The trainer's selection rule (bita/train.py::selection_score): the
+    harmonic mean, so a collapsed head cannot be promoted on AP alone. This
+    used 0.5*AP + 0.5*macro and could promote a different epoch than the
+    trainer kept."""
+    return 0.0 if ap + macro <= 0 else 2.0 * ap * macro / (ap + macro)
 
 
 #: The encoder build_or_load_tgne_ta() prefers. Relative to the repo root.

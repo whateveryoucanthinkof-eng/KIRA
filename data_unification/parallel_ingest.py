@@ -430,6 +430,10 @@ _PARSE_ENTRY_MODULES = (
     "data_unification.label_resolver",
     "data_unification.training_sources",
     "data_unification.attack_windows",
+    # imported lazily by the day loaders, so never loaded by the imports
+    # above: without it here, a change to how participants scope labels
+    # would not invalidate cached parses
+    "data_unification.attack_participants",
     "data_unification.pcap_bridge",
     "data_unification.pcap_adapter",
     "telemetry.capture.sniffer",
@@ -520,6 +524,21 @@ def cache_key(kind, path, *, stride, max_rows, edge_dim, pcap_label_dir, window_
     parser = effective_parser(kind, pcap_parser or "python", stride, max_rows)
     if parser is not None:
         extra["parser"] = parser
+    if kind == "CTU13":
+        from data_unification.label_resolver import ctu_background_policy
+        extra["ctu_background"] = ctu_background_policy()
+    if kind == "PCAP2018":
+        # PCAP labels also depend on the unscoped-interval policy and on the
+        # participant map (attack_windows / attack_participants): a cached day
+        # labelled under one must never be read under the other.
+        from data_unification.attack_participants import DEFAULT_MAP_PATH
+        from data_unification.attack_windows import unscoped_label_policy
+        _m = Path(DEFAULT_MAP_PATH)
+        extra["labels"] = {
+            "unscoped": unscoped_label_policy(),
+            "participant_map": (hashlib.sha256(_m.read_bytes()).hexdigest()[:16]
+                                if _m.exists() else None),
+        }
     blob = json.dumps({**extra,
         "format": _CACHE_FORMAT, "kind": kind, "name": Path(path).name,
         "inputs": _input_fingerprint(kind, path, pcap_label_dir),

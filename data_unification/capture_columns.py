@@ -81,7 +81,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 
 #: Bump when the on-disk layout or the meaning of a column changes.
-FORMAT = 2
+FORMAT = 3   # 3: the "pkt" column + pkt_feats.npy (packet-level features per host-window)
 
 #: (name, dtype). Every column has one row per kept record, sorted by start.
 COLUMNS: Tuple[Tuple[str, str], ...] = (
@@ -92,6 +92,9 @@ COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("protocol", "int64"), ("dst_port", "int64"),
     ("is_attack", "bool"), ("cat", "int32"), ("tech", "int32"),
     ("unresolved", "bool"),
+    # Row of pkt_feats.npy holding this record's host-window packet-level
+    # features (30, normalised as normalize_packet_features does), or -1.
+    ("pkt", "int32"),
 )
 EDGE_DIM = 12
 _CHUNK = 1 << 16
@@ -109,6 +112,7 @@ _PARSE_MODULES = (
     "data_unification.cic2018_adapter",
     "data_unification.ctu13_adapter",
     "data_unification.attack_windows",
+    "data_unification.attack_participants",
     "data_unification.pcap_bridge",
     "data_unification.pcap_adapter",
     "telemetry.capture.sniffer",
@@ -127,7 +131,10 @@ class ColumnSpec:
                           downstream CIC-2017 test read): strided adapter read,
                           or PCAP windows, then drop_unresolved.
       "pcap_windows"   -- downstream's iter_pcap_day_records: PCAP windows
-                          concatenated, NO drop_unresolved.
+                          concatenated, then drop_unresolved. (It used to keep
+                          them; with unattributable attack intervals labelled
+                          UNKNOWN / is_attack=False, keeping them would turn
+                          every such interval into "benign" host windows.)
       "one_capture"    -- downstream's read_one_capture: CIC-2018 adapter for
                           *.csv, CTU-13 adapter otherwise, strided, NO drop.
     """
@@ -152,7 +159,7 @@ class ColumnSpec:
 
     @property
     def drops_unresolved(self) -> bool:
-        return self.reader == "read_capture"
+        return self.reader in ("read_capture", "pcap_windows")
 
     @property
     def source(self) -> str:
@@ -175,12 +182,23 @@ class ColumnSpec:
     def source_key(self) -> dict:
         """The parameters that decide the parsed records -- and only those."""
         if self.source == "pcap":
+            from data_unification.attack_participants import DEFAULT_MAP_PATH
+            from data_unification.attack_windows import unscoped_label_policy
+            import hashlib
+            _m = Path(DEFAULT_MAP_PATH)
             return {"source": "pcap", "path": self.path, "window_seconds": self.window_seconds,
+                    "unscoped_labels": unscoped_label_policy(),
+                    "participant_map": (hashlib.sha256(_m.read_bytes()).hexdigest()[:16]
+                                        if _m.exists() else None),
                     "label_dir": self.pcap_label_dir, "max_windows": self.pcap_max_windows,
                     "window_stride": self.pcap_window_stride,
                     "max_packets_per_host": self.max_packets_per_host}
-        return {"source": self.source, "path": self.path,
-                "rows_per_file": self.rows_per_file, "stride": self.stride}
+        out = {"source": self.source, "path": self.path,
+               "rows_per_file": self.rows_per_file, "stride": self.stride}
+        if self.source == "ctu13":
+            from data_unification.label_resolver import ctu_background_policy
+            out["ctu_background"] = ctu_background_policy()
+        return out
 
 
 def iter_spec_records(spec: ColumnSpec) -> Iterator[Any]:
@@ -244,6 +262,9 @@ class CaptureColumns:
             cov = dict(cov)
             cov["top_unresolved_labels"] = [tuple(x) for x in cov["top_unresolved_labels"]]
         self.coverage = cov
+        #: (n_host_windows, 30) float32, normalised packet-level features;
+        #: the "pkt" column indexes it. Empty for flow-only corpora.
+        self.pkt_table: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return int(self.meta["n"])
@@ -280,15 +301,40 @@ class CaptureColumns:
         mode = "r" if mmap else None
         cols = {name: np.load(d / f"{name}.npy", mmap_mode=mode) for name, _ in COLUMNS}
         edge = np.load(d / "edge.npy", mmap_mode=mode)
+        pkt_table = np.load(d / "pkt_feats.npy", mmap_mode=mode)
         if drop_unresolved:
             if meta["n_unresolved"]:
+                # WHEN the dropped traffic happened, before it is gone: targets
+                # that look ahead into these spans are unknown, not negative
+                # (TrajectoryStore.hazard_risk censors them).
+                bad = np.asarray(cols["unresolved"])
+                meta["unknown_intervals"] = unknown_intervals(
+                    np.asarray(cols["start"])[bad], np.asarray(cols["end"])[bad])
                 keep = ~np.asarray(cols["unresolved"])
                 cols = {k: np.asarray(v)[keep] for k, v in cols.items()}
                 edge = np.asarray(edge)[keep]
                 meta["n"] = int(keep.sum())
         else:
             meta["coverage"] = None
-        return cls(cols, edge, meta, d)
+        out = cls(cols, edge, meta, d)
+        out.pkt_table = pkt_table
+        return out
+
+
+def unknown_intervals(starts, ends, merge_gap: float = 4.0) -> list:
+    """[[start, end], ...] covering the given flows' times, merged when closer
+    than `merge_gap` seconds: the spans whose labels are UNKNOWN."""
+    starts = np.asarray(starts, dtype=np.float64)
+    if starts.size == 0:
+        return []
+    ends = np.maximum(np.asarray(ends, dtype=np.float64), starts)
+    o = np.argsort(starts, kind="stable")
+    s, e = starts[o], ends[o]
+    run_end = np.maximum.accumulate(e)
+    brk = np.flatnonzero(s[1:] > run_end[:-1] + merge_gap) + 1
+    lo = np.r_[0, brk]
+    hi = np.r_[brk, len(s)] - 1
+    return [[float(s[a]), float(run_end[b])] for a, b in zip(lo, hi)]
 
 
 @contextmanager
@@ -328,6 +374,7 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
     from data_unification.label_filter import _category
     from data_unification.label_resolver import is_unresolved
     from data_unification.tgne_features import extract_flow_record_edge_features
+    from data_unification.host_attributes import PACKET_ATTR_DIM, normalize_packet_features
 
     t0 = time.time()
     out_dir = Path(out_dir)
@@ -340,8 +387,16 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
     n_total = n_bad = n = 0
     fh = {name: open(out_dir / f"{name}.bin", "wb") for name, _ in COLUMNS}
     fh_edge = open(out_dir / "edge.bin", "wb")
+    fh_pkt = open(out_dir / "pkt_feats.bin", "wb")
     buf: Dict[str, list] = {name: [] for name, _ in COLUMNS}
     ebuf: List[np.ndarray] = []
+    pbuf: List[np.ndarray] = []
+    # pcap_bridge attaches ONE dict per host-window to that host-window's
+    # records, which arrive contiguously: a new object is a new table row.
+    # (Identity of the previous object only -- it is still referenced, so its
+    # id cannot have been reused.)
+    pkt_last = [None, -1]
+    n_pkt = 0
 
     def flush():
         for name, dt in COLUMNS:
@@ -351,6 +406,9 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
         if ebuf:
             np.stack(ebuf).astype(np.float32, copy=False).tofile(fh_edge)
             ebuf.clear()
+        if pbuf:
+            np.stack(pbuf).astype(np.float32, copy=False).tofile(fh_pkt)
+            pbuf.clear()
 
     it = records if records is not None else iter_spec_records(spec)
     b_src, b_dst = buf["src"], buf["dst"]
@@ -358,6 +416,7 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
     b_fb, b_bb, b_fp, b_bp = buf["fwd_bytes"], buf["bwd_bytes"], buf["fwd_packets"], buf["bwd_packets"]
     b_proto, b_port, b_atk = buf["protocol"], buf["dst_port"], buf["is_attack"]
     b_cat, b_tech, b_unres = buf["cat"], buf["tech"], buf["unresolved"]
+    b_pkt = buf["pkt"]
     try:
         with _edge_ablation_off():
             for r in it:
@@ -399,6 +458,17 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
                     i = tech_index[tt] = len(tech_index)
                 b_tech.append(i)
                 ebuf.append(extract_flow_record_edge_features(r))
+                md = getattr(r, "metadata", None)
+                pf = md.get("packet_features") if md else None
+                if not pf:
+                    b_pkt.append(-1)
+                elif pf is pkt_last[0]:
+                    b_pkt.append(pkt_last[1])
+                else:
+                    pbuf.append(normalize_packet_features(pf))
+                    pkt_last[0], pkt_last[1] = pf, n_pkt
+                    b_pkt.append(n_pkt)
+                    n_pkt += 1
                 n += 1
                 if len(b_src) >= _CHUNK:
                     flush()
@@ -407,7 +477,11 @@ def build_columns(spec: ColumnSpec, out_dir: Path, records: Optional[Iterable[An
         for f in fh.values():
             f.close()
         fh_edge.close()
+        fh_pkt.close()
     t_parse = time.time() - t0
+    np.save(out_dir / "pkt_feats.npy",
+            np.fromfile(out_dir / "pkt_feats.bin", dtype=np.float32).reshape(-1, PACKET_ATTR_DIM))
+    os.unlink(out_dir / "pkt_feats.bin")
 
     # Stable sort by start time: the order process_records' and
     # extract_trajectories' `sorted(records, key=start_time)` produce.

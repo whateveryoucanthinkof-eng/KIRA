@@ -87,7 +87,8 @@ def _selection_score(metrics, mode):
     A selection metric has to mean the same thing at every epoch. Macro F1 and
     risk MAE do; the weighted loss does not.
 
-    - ``composite`` (default): ``0.5 * macro_f1 + 0.5 * risk_auc`` -- balances
+    - ``early_warning`` (default): see below.
+    - ``composite`` (the default until 2026-10-02): ``0.5 * macro_f1 + 0.5 * risk_auc`` -- balances
       the two heads that carry the task, both bounded in [0, 1] and both
       independent of the loss weighting. AUC replaces the risk MAE that was
       here first: MAE is median-seeking, so on a target that is 0 for 82.5% of
@@ -97,6 +98,19 @@ def _selection_score(metrics, mode):
     - ``val_loss``: the previous behaviour, kept so a run can be reproduced.
       Negated here because this function is maximised.
     """
+    if mode == "early_warning":
+        # Harmonic mean of technique macro-F1 and the ONSET risk head's Gini
+        # (2*AUC - 1, so chance is 0). Onset = last input window benign: the
+        # early-warning case the PS asks for. The overall AUC is dominated by
+        # continuations of ongoing attacks, which persistence gets right with
+        # no model, so it rewarded copying the present; and an arithmetic mean
+        # let a strong term hide a collapsed one (the encoder's failure).
+        f1 = float(metrics.get("tech_macro_f1", 0.0))
+        auc = float(metrics.get("risk_onset_auc", float("nan")))
+        if auc != auc:
+            auc = float(metrics.get("risk_auc", float("nan")))
+        gini = max(0.0, 2.0 * auc - 1.0) if auc == auc else 0.0
+        return 0.0 if f1 + gini <= 0 else 2.0 * f1 * gini / (f1 + gini)
     if mode == "val_loss":
         return -float(metrics["loss"])
     if mode == "macro_f1":
@@ -228,6 +242,7 @@ def target_label_counts(dataset):
 #: checkpoint that carried them per epoch would be gigabytes.
 BULKY_METRIC_KEYS = (
     "risk_pos_hist", "risk_neg_hist", "risk_resid_hist",
+    "risk_onset_pos_hist", "risk_onset_neg_hist", "persistence_counts",
     "technique_logits", "technique_labels", "tech_confusion",
 )
 
@@ -458,15 +473,90 @@ def _pr_curve_from_histograms(pos_hist, neg_hist, bins=RISK_BINS):
 
 def _point(curve, b):
     """One operating point off the curve, as plain floats."""
+    fp, tn = float(curve["fp"][b]), float(curve["tn"][b])
     return {
         "alert_threshold": float(curve["threshold"][b]),
         "precision": float(curve["precision"][b]),
         "recall": float(curve["recall"][b]),
         "f1": float(curve["f1"][b]),
+        # The PS asks for the false positive rate by name; alert_rate is not it.
+        "fpr": fp / (fp + tn) if (fp + tn) > 0 else float("nan"),
         "alert_rate": float(curve["alert_rate"][b]),
         "tp": int(curve["tp"][b]), "fp": int(curve["fp"][b]),
         "fn": int(curve["fn"][b]), "tn": int(curve["tn"][b]),
     }
+
+
+def _auc_from_histograms(pos_hist, neg_hist):
+    """Exact ROC AUC on the score grid (ties count half), or NaN with one class."""
+    ph = np.asarray(pos_hist, dtype=np.float64)
+    nh = np.asarray(neg_hist, dtype=np.float64)
+    P, N = ph.sum(), nh.sum()
+    if P <= 0 or N <= 0:
+        return float("nan")
+    neg_below = np.concatenate([[0.0], np.cumsum(nh)[:-1]])
+    return float((ph * (neg_below + 0.5 * nh)).sum() / (P * N))
+
+
+def _counts_point(tp, fp, fn, tn):
+    """Precision / recall / F1 / FPR of a fixed decision rule from its counts."""
+    tp, fp, fn, tn = (float(v) for v in (tp, fp, fn, tn))
+    prec = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    rec = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    f1 = (2 * prec * rec / (prec + rec)) if (prec == prec and rec == rec and prec + rec > 0) else 0.0
+    return {"precision": prec, "recall": rec, "f1": f1,
+            "fpr": fp / (fp + tn) if (fp + tn) > 0 else float("nan"),
+            "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn)}
+
+
+def benchmark_table(op_threshold_by_model, hists_by_model, persistence_counts, bins=None):
+    """PS 26153 benchmark rows on ONE split: each model at ITS validation-fitted
+    threshold (never re-fitted here), overall and on the onset slice, plus the
+    persistence rule. `hists_by_model[name] = (pos, neg, onset_pos, onset_neg)`."""
+    bins = bins or RISK_BINS
+    rows = {}
+    for name, (ph, nh, oph, onh) in hists_by_model.items():
+        thr = op_threshold_by_model.get(name)
+        if thr is None:
+            continue
+        b = int(round(thr * (bins - 1)))
+
+        def _pt(pos_, neg_):
+            pt = _point(_pr_curve_from_histograms(pos_, neg_, bins), b)
+            if pt["tp"] + pt["fp"] == 0:
+                # No alert at all. The curve's precision 1.0 there is sklearn's
+                # convention for picking thresholds; in a results table it
+                # would read as a perfect score for a model that said nothing.
+                pt["precision"] = float("nan")
+            return pt
+
+        r = {"threshold": thr, "overall": _pt(ph, nh), "auc": _auc_from_histograms(ph, nh)}
+        if oph is not None:
+            r["onset"] = _pt(oph, onh)
+            r["onset_auc"] = _auc_from_histograms(oph, onh)
+        rows[name] = r
+    if persistence_counts is not None:
+        tp, fp, fn, tn = (int(v) for v in persistence_counts)
+        # persistence predicts "attack" only after an attack window, so on the
+        # onset slice it never alerts: recall 0 there by construction.
+        rows["persistence"] = {"overall": _counts_point(tp, fp, fn, tn),
+                               "onset": _counts_point(0, 0, fn, tn)}
+    return rows
+
+
+def format_benchmark(rows, where):
+    lines = [f"BENCHMARK ({where}) -- thresholds fitted on validation, applied unchanged:",
+             f"  {'model':<22}{'slice':<9}{'precision':>10}{'recall':>9}{'F1':>8}{'FPR':>9}{'AUC':>8}"]
+    for name, r in rows.items():
+        for sl in ("overall", "onset"):
+            if sl not in r:
+                continue
+            m = r[sl]
+            auc = r.get("auc" if sl == "overall" else "onset_auc", float("nan"))
+            lines.append(f"  {name:<22}{sl:<9}{m['precision']:>10.4f}{m['recall']:>9.4f}"
+                         f"{m['f1']:>8.4f}{m['fpr']:>9.4f}{auc:>8.4f}")
+    lines.append("  onset = samples whose last input window is benign: the early-warning case.")
+    return "\n".join(lines)
 
 
 def _downsample_pr_curve(curve, n_points=101):
@@ -875,6 +965,8 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     non_blocking = (device == "cuda")
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     abs_err_sum = torch.zeros((), device=device, dtype=torch.float64)
+    # samples with a KNOWN risk target (censored ones are NaN and left out)
+    n_known = torch.zeros((), device=device, dtype=torch.float64)
     n_risk = 0
     conf_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.float64)
     pos_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
@@ -912,14 +1004,27 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
     # The batch / element counters are host-side and stay outside the body; the
     # calibration pass (collect_logits) copies logits to the host per batch and
     # runs eagerly.
-    acc = {"loss_sum": loss_sum, "abs_err_sum": abs_err_sum, "conf_hist": conf_hist,
+    # Early warning, separately. A sample whose LAST INPUT window is already an
+    # attack is a continuation: its next window is almost always an attack too,
+    # and "copy the last window" (persistence) gets it right without any
+    # model. The PS asks for prediction BEFORE compromise, which is the onset
+    # slice -- host benign at t, attack within the horizon or not. Without
+    # this split the headline mixes the two and mostly measures persistence.
+    onset_pos_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
+    onset_neg_hist = torch.zeros(RISK_BINS, device=device, dtype=torch.long)
+    # persistence baseline (predict "attack" iff the last input window was one): tp, fp, fn, tn
+    persist = torch.zeros(4, device=device, dtype=torch.long)
+    acc = {"loss_sum": loss_sum, "abs_err_sum": abs_err_sum, "n_known": n_known, "conf_hist": conf_hist,
            "pos_hist": pos_hist, "neg_hist": neg_hist, "brier_sum": brier_sum,
            "prob_sum": prob_sum, "resid_hist": resid_hist, "confusion": confusion,
            "grad_correct": grad_correct, "grad_confusion": grad_confusion,
+           "onset_pos_hist": onset_pos_hist, "onset_neg_hist": onset_neg_hist,
+           "persist": persist,
            **{"ts_" + k: v for k, v in task_sums.items()}}
     has_grad = {}
+    has_prev = {}
 
-    def body(a, x, t_hist, risk_t, tech_t, grad_t):
+    def body(a, x, t_hist, risk_t, tech_t, grad_t, prev_t=None):
         targets = {"risk": risk_t, "technique": tech_t, "gradation": grad_t}
         predictions = model(x, t_history=t_hist)
         loss, parts = model.compute_loss(predictions, targets)
@@ -933,25 +1038,39 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             _v = parts.get(_k)
             if _v is not None:
                 a["ts_" + _k] += _v.double().reshape(())
-        err = (predictions["risk_score"] - targets["risk"]).abs()
-        a["abs_err_sum"] += err.double().sum()
+        # Censored targets (NaN, TrajectoryStore._censor_unknown) are in no
+        # risk metric: _k marks the known ones.
+        _rt = targets["risk"]
+        _kk = torch.isfinite(_rt)
+        _rt = torch.where(_kk, _rt, torch.zeros_like(_rt))
+        _k = _kk.reshape(-1)
+        err = (predictions["risk_score"] - _rt).abs()
+        a["abs_err_sum"] += (err * _kk).double().sum()
+        a["n_known"] += _k.double().sum()
         _rb = (err.clamp(0, 1) * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-        a["resid_hist"] += _hist(_rb.reshape(-1), RISK_BINS)
+        a["resid_hist"] += _hist(_rb.reshape(-1), RISK_BINS, _k.long())
 
         # Risk as a probability: AUC, Brier and calibration, accumulated
         # from a fixed histogram so 1.02M samples cost O(bins) memory and
         # no host-device sync. `risk_positive_above` is the cut that makes a
         # window positive (> 0 for severity, >= exp(-1) for the hazard target).
         _p = predictions["risk_score"].clamp(0, 1).reshape(-1)
-        _y = (targets["risk"] > risk_positive_above).reshape(-1)
-        a["brier_sum"] += ((_p - _y.to(_p.dtype)) ** 2).double().sum()
+        _y = (_rt > risk_positive_above).reshape(-1)
+        a["brier_sum"] += (((_p - _y.to(_p.dtype)) ** 2) * _k).double().sum()
         _b = (_p * (RISK_BINS - 1)).long().clamp_(0, RISK_BINS - 1)
-        a["pos_hist"] += _hist(_b, RISK_BINS, _y.long())
-        a["neg_hist"] += _hist(_b, RISK_BINS, (~_y).long())
+        a["pos_hist"] += _hist(_b, RISK_BINS, (_y & _k).long())
+        a["neg_hist"] += _hist(_b, RISK_BINS, (~_y & _k).long())
         # Sum of the predicted probabilities per bin, so ECE can use each
         # bin's ACTUAL mean confidence rather than its nominal centre.
-        a["conf_hist"] += _hist(_b, RISK_BINS, _p.double())
-        a["prob_sum"] += _p.double().sum()
+        a["conf_hist"] += _hist(_b, RISK_BINS, (_p * _k).double())
+        a["prob_sum"] += (_p * _k).double().sum()
+        if prev_t is not None:
+            _prev = (prev_t.reshape(-1) != 0) & _k
+            _on = (prev_t.reshape(-1) == 0) & _k
+            a["onset_pos_hist"] += _hist(_b, RISK_BINS, (_y & _on).long())
+            a["onset_neg_hist"] += _hist(_b, RISK_BINS, ((~_y) & _on).long())
+            a["persist"] += torch.stack([(_prev & _y).sum(), (_prev & ~_y).sum(),
+                                         (_on & _y).sum(), (_on & ~_y).sum()])
 
         pred_t = predictions["technique_logits"].argmax(dim=-1)
         # No separate hit counter: the confusion matrix's trace IS the
@@ -978,15 +1097,19 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             # MultiTaskLSTM.time_proj. Validation must see what training sees.
             t_hist = (batch["t_history"].to(device, non_blocking=non_blocking)
                       if "t_history" in batch else None)
+            prev_t = (batch["prev_attack"].to(device, non_blocking=non_blocking)
+                      if "prev_attack" in batch else None)
+            has_prev["v"] = prev_t is not None
+            _extra = (prev_t,) if prev_t is not None else ()
             if collect_logits:
-                predictions = body(acc, x, t_hist, r_t, tc_t, g_t)
+                predictions = body(acc, x, t_hist, r_t, tc_t, g_t, *_extra)
                 _raw = predictions.get("technique_logits_raw")
                 if _raw is None:
                     _raw = predictions["technique_logits"]
                 keep_logits.append(_raw.detach().float().cpu())
                 keep_labels.append(tc_t.detach().cpu())
             else:
-                run(x, t_hist, r_t, tc_t, g_t)
+                run(x, t_hist, r_t, tc_t, g_t, *_extra)
             nb += 1
             n_risk += int(r_t.numel())
             if has_grad.get("v"):
@@ -1032,21 +1155,29 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
             acc_in_bin = np.where(cnt > 0, ph / np.maximum(cnt, 1), 0.0)
             conf = np.where(cnt > 0, ch / np.maximum(cnt, 1), 0.0)
         risk_ece = float((cnt * np.abs(acc_in_bin - conf)).sum() / max(cnt.sum(), 1))
+        if has_prev.get("v"):
+            risk_onset_auc = _auc_from_histograms(onset_pos_hist.cpu().numpy(),
+                                                  onset_neg_hist.cpu().numpy())
     else:
         # AUC and ECE need both classes; the BASE RATE does not, and reporting
         # it as 0.0 on an all-attack split (every CTU-13 scenario is one) said
         # the opposite of the truth and drove `risk_brier_baseline` to 0, which
         # made the "no better than the base rate" warning fire unconditionally.
         risk_auc, risk_ece = float("nan"), float("nan")
+    if not has_prev.get("v") or not (P > 0 and N > 0):
+        risk_onset_auc = float("nan")
     base_rate = P / (P + N) if (P + N) > 0 else 0.0
     n_prob = max(int(P + N), 1)
     out_tasks = {k: (float((v / nb).item()) if nb else 0.0) for k, v in task_sums.items()}
     return {
         "loss": float((loss_sum / nb).item()) if nb else 0.0,
-        "risk_mae": float((abs_err_sum / n_risk).item()) if n_risk else 0.0,
+        "risk_mae": float((abs_err_sum / n_known.clamp_min(1)).item()) if n_risk else 0.0,
+        "risk_censored_fraction": (1.0 - float(n_known.item()) / n_risk) if n_risk else 0.0,
         "tech_accuracy": accuracy,
         # -- risk as a probability, judged the way a probability must be --
         "risk_auc": risk_auc,
+        # early warning: AUC over samples whose last input window is benign
+        "risk_onset_auc": risk_onset_auc,
         "risk_brier": float((brier_sum / n_prob).item()),
         "risk_brier_baseline": base_rate * (1 - base_rate),   # always predict the base rate
         "risk_ece": risk_ece,
@@ -1079,6 +1210,11 @@ def _evaluate(model, loader, device, num_techniques=None, num_gradations=4,
         # second pass over the split. 2 x 2000 int64 -- 32 KB.
         "risk_pos_hist": pos_hist.cpu().numpy(),
         "risk_neg_hist": neg_hist.cpu().numpy(),
+        # Onset slice (last input window benign) and the persistence baseline;
+        # None when the loader does not carry prev_attack.
+        "risk_onset_pos_hist": onset_pos_hist.cpu().numpy() if has_prev.get("v") else None,
+        "risk_onset_neg_hist": onset_neg_hist.cpu().numpy() if has_prev.get("v") else None,
+        "persistence_counts": persist.cpu().numpy() if has_prev.get("v") else None,
         "risk_resid_hist": resid_hist.cpu().numpy(),
         "risk_positive_above": float(risk_positive_above),
         "technique_logits": (torch.cat(keep_logits) if keep_logits else None),
@@ -1120,6 +1256,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows-per-file", type=int, default=None,
                         help="Cap records kept per capture. Default None = FULL DENSITY.")
+    parser.add_argument("--packet-features", action="store_true",
+                        help="Append the 30 PCAP packet-level host attributes (TTL, IAT, TCP "
+                             "window, retransmissions, SYN/scan signatures): state 27-D -> 57-D. "
+                             "Needs PCAP-derived train AND test captures.")
     parser.add_argument("--spill-dir", type=Path, default=None, help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--stride", type=int, default=1, help="Sample every Nth record across a wider read, instead of a plain file-prefix (applied in data_unification/training_sources.read_capture)")
     parser.add_argument("--epochs", type=int, default=5)
@@ -1153,8 +1293,8 @@ def main():
                              "a measured A/B, not a silent default.")
     parser.add_argument("--hazard-tau", type=float, default=None,
                         help="Decay scale for --risk-target hazard, in seconds. "
-                             "Default forecast_steps * window_seconds (= 10.0s "
-                             "under v4), so a host exactly one forecast horizon "
+                             "Default: the contract's forecast horizon, forecast_steps x "
+                             "forecast_window_seconds (= 150 s), so a host exactly one forecast horizon "
                              "from an attack scores exp(-1) = 0.368 -- which is "
                              "also the cut that defines the positive class for "
                              "AUC/Brier/the operating point under this target.")
@@ -1200,6 +1340,11 @@ def main():
                              "true one at full recall. Scale-free, so it keeps "
                              "its meaning on a corpus with a different attack "
                              "density.")
+    parser.add_argument("--no-lr-baseline", action="store_true",
+                        help="Skip the PS 26153 logistic-regression baseline (trained after "
+                             "Branch A on the same inputs and target; one pass of the train loader)")
+    parser.add_argument("--lr-baseline-epochs", type=int, default=1,
+                        help="Passes over the training split for the logistic baseline")
     parser.add_argument("--no-fit-temperature", action="store_true",
                         help="Skip post-hoc temperature scaling of the technique "
                              "logits. Fitting is on by default and happens after "
@@ -1234,10 +1379,12 @@ def main():
                         help="Gradient-norm clip; 0 disables clipping (norms still logged)")
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="Linear LR warmup; default ~5%% of the first epoch, at most 500")
-    parser.add_argument("--select-on", choices=("composite", "macro_f1", "val_loss"),
-                        default="composite",
+    parser.add_argument("--select-on", choices=("early_warning", "composite", "macro_f1", "val_loss"),
+                        default="early_warning",
                         help="Which validation metric picks the kept checkpoint. "
-                             "Default 'composite' = 0.5*macro_f1 + 0.5*risk_auc. "
+                             "Default 'early_warning' = harmonic mean of technique macro-F1 and "
+                             "the onset slice's risk Gini (2*AUC-1); see _selection_score. "
+                             "'composite' (the default until 2026-10-02) = 0.5*macro_f1 + 0.5*risk_auc. "
                              "(It read '0.5*(1-risk_mae)' until 2026-09-22; that "
                              "was the first version and the help text outlived "
                              "it. MAE is median-seeking, so on a target that is "
@@ -1373,7 +1520,14 @@ def main():
     # produces history_steps=15, so it yields a v4 checkpoint, not a v3 one.
     _c = get_contract()
     extractor = HostTrajectoryExtractor(tgne_ta_model=tgn, window_size_sec=_c.window_seconds,
-                                        spill_dir=str(args.spill_dir) if args.spill_dir else None)
+                                        spill_dir=str(args.spill_dir) if args.spill_dir else None,
+                                        include_packet_features=args.packet_features)
+    if args.packet_features:
+        print("PACKET-LEVEL FEATURES ON: host state = 12 latent + 15 flow + 30 packet "
+              "attributes (TTL, IAT, TCP window, retransmissions, SYN/scan signatures, ...). "
+              "Only PCAP captures carry them; flow-only captures (CTU-13 NetFlow, "
+              "CICFlowMeter CSVs) get an all-zero packet block, which a model can read as "
+              "'which corpus is this'. Train and test on PCAP-derived captures.", flush=True)
     # Load -> extract -> free, one split at a time. Holding both record lists
     # at once costs an extra ~2.8 GB at full density for no reason: the val
     # records are not needed until the train split has already been reduced to
@@ -1438,7 +1592,7 @@ def main():
             # extractor's, to be reported (and reset) below as before.
             shared, total_recs, coverage, extractor._exposure = _prebuilt.pop(label)
         else:
-            shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+            shared = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None, feat_dim=12 + extractor.n_temporal_attrs)
         if label in _done_labels:
             pass
         elif _cplan.enabled and _cplan.cache_dir is not None and args.extract_workers > 1:
@@ -1514,8 +1668,13 @@ def main():
 
     # tau defaults to the horizon the model is actually asked about, so a host
     # exactly one forecast horizon from an attack scores exp(-1) = 0.368.
+    # forecast_seconds = forecast_steps x forecast_window_seconds (150 s), the
+    # horizon serving forecasts over. This was forecast_steps x window_seconds
+    # = 10 s, left from the single-scale contract: the target asked "attack
+    # within ~10 s", nearly a nowcast at 2 s windows, while the console reports
+    # risk at 30..150 s.
     hazard_tau = (args.hazard_tau if args.hazard_tau is not None
-                  else _c.forecast_steps * _c.window_seconds)
+                  else _c.forecast_seconds)
     #: The cut that makes a window "positive" for AUC / Brier / ECE / the
     #: operating point. For the severity target, any non-zero score means the
     #: window contains attack traffic. For the hazard target, `> 0` would mean
@@ -1560,7 +1719,7 @@ def main():
         from data_unification.parallel_extract import extract_parallel
         from data_unification.trajectory_store import TrajectoryStoreBuilder, capture_namespace
         splits = (("train", list(train_files)), ("val", list(val_files)), ("test", list(test_files)))
-        builders = {l: TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+        builders = {l: TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None, feat_dim=12 + extractor.n_temporal_attrs)
                     for l, _ in splits}
         expo = {l: dict.fromkeys(extractor._exposure, 0) for l, _ in splits}
         cov = {l: [] for l, _ in splits}
@@ -1734,7 +1893,7 @@ def main():
         _arch["focal_gamma"] = args.focal_gamma
     print(f"Branch A architecture: {args.architecture} {_arch}", flush=True)
     model = MultiTaskLSTM(
-        input_dim=27,
+        input_dim=12 + extractor.n_temporal_attrs,
         num_techniques=len(TECHNIQUE_VOCAB),
         num_gradations=4,
         risk_objective=args.risk_objective,
@@ -2189,6 +2348,40 @@ def main():
               f"recall={_t['recall']:.4f} f1={_t['f1']:.4f} "
               f"alert_rate={_t['alert_rate']:.4f} "
               f"(test base rate {_tcurve['base_rate']:.4f})", flush=True)
+    # The PS 26153 benchmark: Branch A against a logistic regression on the
+    # same inputs and target, and against persistence -- overall and on the
+    # onset slice -- each at its own validation-fitted threshold.
+    benchmark = None
+    if not args.no_lr_baseline:
+        from branch_a_gnn_lstm.logistic_baseline import score_histograms, train_logistic_baseline
+        print("\nlogistic-regression baseline (PS 26153): same [L, 27] inputs and time channel, "
+              "same target, same operating-point rule", flush=True)
+        _lr = train_logistic_baseline(train_loader, unpack_batch, device,
+                                      seq_len=_c.history_steps, input_dim=12 + extractor.n_temporal_attrs,
+                                      risk_positive_above=risk_positive_above,
+                                      epochs=args.lr_baseline_epochs,
+                                      log=lambda m: print(m, flush=True))
+        _lr_val = score_histograms(_lr, val_loader, unpack_batch, device,
+                                   risk_positive_above=risk_positive_above, bins=RISK_BINS)
+        _lr_op = fit_operating_point(_lr_val["pos"], _lr_val["neg"],
+                                     criterion=args.operating_point_criterion,
+                                     alert_budget=args.alert_budget)
+        _lr_test = score_histograms(_lr, test_loader, unpack_batch, device,
+                                    risk_positive_above=risk_positive_above, bins=RISK_BINS)
+        _thr = {"branch_a": _op["alert_threshold"] if _op.get("fitted") else None,
+                "logistic_regression": _lr_op["alert_threshold"] if _lr_op.get("fitted") else None}
+        _hists = {
+            "branch_a": (test_metrics["risk_pos_hist"], test_metrics["risk_neg_hist"],
+                         test_metrics.get("risk_onset_pos_hist"),
+                         test_metrics.get("risk_onset_neg_hist")),
+            "logistic_regression": (_lr_test["pos"], _lr_test["neg"],
+                                    _lr_test.get("onset_pos"), _lr_test.get("onset_neg")),
+        }
+        benchmark = benchmark_table(_thr, _hists, test_metrics.get("persistence_counts"))
+        print(format_benchmark(benchmark, "held-out test"), flush=True)
+        ckpt["logistic_baseline"] = {"state_dict": _lr.state_dict(), "operating_point": _lr_op,
+                                     "seq_len": _c.history_steps,
+                                     "input_dim": 12 + extractor.n_temporal_attrs}
     test_metrics = slim(test_metrics)
     test_metrics["tech_per_class"] = _per_class
     test_metrics["gradation_per_class"] = _grad_per_class
@@ -2220,6 +2413,7 @@ def main():
         print(f"test credibility check skipped: {_e}", flush=True)
 
     ckpt["test_metrics"] = test_metrics
+    ckpt["benchmark"] = benchmark
     ckpt["credibility"] = credibility
     ckpt["split_scheme"] = args.split_scheme
     ckpt["encoder"] = str(args.tgne) if args.tgne else "served default"
@@ -2241,6 +2435,7 @@ def main():
             "test": {k: v for k, v in test_metrics.items()
                      if isinstance(v, (int, float, str, dict))},
             "operating_point": ckpt.get("operating_point"),
+            "benchmark_held_out_test": benchmark,
             "credibility": credibility,
         }, indent=2, default=str))
         print(f"results written to {args.results_json}", flush=True)

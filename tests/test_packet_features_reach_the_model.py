@@ -253,3 +253,19 @@ def test_a_missing_map_file_is_normal_not_an_error():
     m = load_participant_map(pytest.importorskip("pathlib").Path("does_not_exist.json"))
     assert not m
     assert m.lookup("wed_14", "Hulk") == set()
+
+
+def test_explanations_name_the_packet_attributes():
+    """A --packet-features Branch A is 57-D; its attributions must name the 30
+    packet-level attributes (SYN/scan signatures, TTL, timing...) in the
+    extractor's order, each with a console group."""
+    from data_unification.host_attributes import EXTENDED_HOST_ATTRIBUTES, PACKET_ATTRIBUTES
+    from explainability.unified_explanation import FEATURE_NAMES, feature_names_for
+    assert feature_names_for(27) == FEATURE_NAMES
+    names = feature_names_for(57)
+    assert names[12:] == list(EXTENDED_HOST_ATTRIBUTES)
+    src = open("control_backend/model_adapter.py").read()
+    ns = {}
+    exec(compile(src.split("class AntigravityModelAdapter")[0], "ma", "exec"), ns)
+    groups = {ns["FEATURE_GROUP_MAP"][n] for n in PACKET_ATTRIBUTES}
+    assert "Packet: TCP flags" in groups and "Packet: Scan signature" in groups

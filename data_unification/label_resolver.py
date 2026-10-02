@@ -93,6 +93,10 @@ class LabelResolver:
         if "ctu" in norm_source.lower():
             if "botnet" in norm_key:
                 return ("C2", ["T1071"], True)
+            if "background" in norm_key and ctu_background_policy() == "unknown":
+                # CTU-13's authors label Background as UNLABELLED traffic, not
+                # verified benign; ~97% of its flows. Opt-in: no claim.
+                return (UNKNOWN_CATEGORY, [], False)
             if "normal" in norm_key or "background" in norm_key or "benign" in norm_key:
                 return ("Benign", [], False)
 
@@ -137,6 +141,23 @@ class LabelResolver:
             "mapped_rate": 1.0 - (self._unresolved_calls / total),
             "distinct_unresolved_labels": sorted(self._unresolved)[:100],
         }
+
+
+def ctu_background_policy() -> str:
+    """CYBERWORLD_CTU_BACKGROUND: 'benign' (default) or 'unknown'.
+
+    CTU-13 labels three things: Botnet (verified infected hosts), Normal
+    (verified clean hosts) and Background -- everything else, which the
+    dataset's authors describe as unlabelled. Background is most of every
+    scenario. 'benign' treats it as clean (the common practice, and what keeps
+    CTU hosts' traffic in the downstream trajectories); 'unknown' keeps it out
+    of every supervised target (downstream readers then drop those flows).
+    """
+    import os
+    v = os.environ.get("CYBERWORLD_CTU_BACKGROUND", "benign").strip().lower() or "benign"
+    if v not in ("benign", "unknown"):
+        raise ValueError(f"CYBERWORLD_CTU_BACKGROUND must be 'benign' or 'unknown', got {v!r}")
+    return v
 
 
 _DEFAULT_RESOLVER = None

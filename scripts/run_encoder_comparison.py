@@ -108,6 +108,19 @@ def run(step: str, cmd, output: Path, env_extra: dict, a) -> bool:
     return True
 
 
+def _benchmark_cols(bench) -> dict:
+    """F1 / FPR of Branch A, the logistic regression and persistence on the
+    held-out test, overall and onset (retrain_branch_a_live.benchmark_table)."""
+    out = {}
+    for name, short in (("branch_a", "a"), ("logistic_regression", "lr"), ("persistence", "persist")):
+        rowb = (bench or {}).get(name) or {}
+        for sl in ("overall", "onset"):
+            m = rowb.get(sl) or {}
+            out[f"test_2017_{short}_{sl}_f1"] = m.get("f1")
+            out[f"test_2017_{short}_{sl}_fpr"] = m.get("fpr")
+    return out
+
+
 def summarise(a, arms, ips) -> dict:
     rows = []
     for ip in ips:
@@ -126,6 +139,10 @@ def summarise(a, arms, ips) -> dict:
                     "test_2017_accuracy": t.get("tech_accuracy"),
                     "test_2017_majority_baseline": t.get("tech_majority_baseline"),
                     "test_2017_risk_auc": t.get("risk_auc"),
+                    # early warning: hosts benign in their last input window
+                    "test_2017_risk_onset_auc": t.get("risk_onset_auc"),
+                    # PS benchmark at the validation-fitted thresholds
+                    **_benchmark_cols(r.get("benchmark_held_out_test")),
                     "test_2017_risk_brier": t.get("risk_brier"),
                     "test_2017_risk_brier_baseline": t.get("risk_brier_baseline"),
                     "test_2017_unseen_share": u.get("test_fraction_in_unseen_classes"),

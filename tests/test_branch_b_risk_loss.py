@@ -247,3 +247,21 @@ def test_the_old_severity_target_does_not_have_this_failure_mode():
     assert (sev == 0.0).all()
     cum, peak = _cum_and_peak(sev)
     assert cum == 0.0 and peak == 0.0
+
+
+
+def test_hazard_tau_is_the_contract_forecast_horizon_in_both_trainers():
+    """Both trainers decayed the hazard over forecast_steps x window_seconds
+    (10 s) after the contract moved to 30 s forecast steps (150 s horizon):
+    the risk target asked about 10 s while the console reports 30..150 s.
+    The CIC-2017 test store must get the same target as training."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    a = (root / "scripts" / "retrain_branch_a_live.py").read_text()
+    b = (root / "scripts" / "retrain_future_models_live.py").read_text()
+    assert "else _c.forecast_seconds)" in a
+    assert "return float(get_contract().forecast_seconds)" in b
+    assert "test_store.use_hazard_target(hazard_tau_seconds())" in b
+    from cyberworld_v4.config import get_contract
+    c = get_contract()
+    assert c.forecast_seconds == c.forecast_steps * c.forecast_window_seconds

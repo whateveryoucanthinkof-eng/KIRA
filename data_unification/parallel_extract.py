@@ -115,7 +115,8 @@ def extract_parallel(
     kw = dict(window_size_sec=extractor.window_size_sec,
               n_temporal_attrs=extractor.n_temporal_attrs,
               attack_role=extractor.attack_role,
-              n_neighbors=extractor.n_neighbors)
+              n_neighbors=extractor.n_neighbors,
+              include_packet_features=extractor.include_packet_features)
     repo = str(Path(__file__).resolve().parents[1])
     part_dir = Path(part_dir)
     part_dir.mkdir(parents=True, exist_ok=True)
@@ -126,6 +127,10 @@ def extract_parallel(
                              initargs=(tgne, kw, threads_per_worker, repo)) as pool:
         try:
             for n, (key, cols, ns) in enumerate(items):
+                # The spans dropped as UNKNOWN, for the hazard target's
+                # censoring (TrajectoryStore._censor_unknown).
+                builder_for(key).add_unknown_intervals(
+                    (cols.meta or {}).get("unknown_intervals"), namespace=ns)
                 out = part_dir / f"part-{os.getpid()}-{n}"
                 fut = pool.submit(_extract_one, str(cols.path),
                                   cols.coverage is not None, ns, str(out))

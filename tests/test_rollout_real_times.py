@@ -97,6 +97,19 @@ def test_every_rollout_in_the_live_trainer_passes_real_times():
     assert not missing, f"wdt.rollout() without t_history at lines {missing}"
 
 
+@pytest.mark.parametrize("path", ["cyberworld_v4/cross_dataset.py",
+                                  "deepop_decoder/train_cwa_decoder.py",
+                                  "branch_b_world_model/train_branch_b.py"])
+def test_every_other_rollout_caller_passes_real_times(path):
+    """The held-out CIC-2017 scoring and the standalone DeepOP trainer made the
+    same omission after the live trainer was fixed."""
+    tree = ast.parse(open(path).read())
+    missing = [n.lineno for n in ast.walk(tree)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "rollout" and "t_history" not in {k.arg for k in n.keywords}]
+    assert not missing, f"{path}: rollout() without t_history at lines {missing}"
+
+
 def test_both_serving_paths_pass_real_history_times():
     for path in ("control_backend/model_adapter.py", "correlation/trajectory_assembler.py"):
         tree = ast.parse(open(path).read())

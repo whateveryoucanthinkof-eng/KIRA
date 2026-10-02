@@ -49,6 +49,15 @@ class AttackInterval:
     #: trained on that can score well by learning what time of day it is,
     #: which is why it has to be scoped wherever the corpus allows.
     participants: frozenset = field(default_factory=frozenset)
+    #: The attacking CONVERSATIONS: unordered {ip, ip} pairs seen on the attack
+    #: rows (or attackers x victims from a participant map). EMPTY = not known.
+    #:
+    #: A participant SET over-labels. In CIC-2018 the victim is a server
+    #: (172.31.69.25 for the brute-force and DoS days), and "any flow with a
+    #: participant endpoint" marks every legitimate client of that server as an
+    #: attacker for the whole interval. A pair is what the CSV row actually
+    #: asserts: this source attacked this destination.
+    pairs: frozenset = field(default_factory=frozenset)
 
     @property
     def duration_seconds(self) -> float:
@@ -57,7 +66,19 @@ class AttackInterval:
     @property
     def scoped(self) -> bool:
         """True when this interval knows who took part."""
-        return bool(self.participants)
+        return bool(self.participants) or bool(self.pairs)
+
+    def flow_hit(self, src_ip: str, dst_ip: str) -> Optional[bool]:
+        """Whether the flow src -> dst belongs to this attack.
+
+        Pairs when known (exact conversation), else the participant set (either
+        endpoint), else None: the interval cannot say, and the caller must not
+        invent an answer (see `unscoped_label_policy`)."""
+        if self.pairs:
+            return frozenset((src_ip, dst_ip)) in self.pairs
+        if self.participants:
+            return src_ip in self.participants or dst_ip in self.participants
+        return None
 
     def contains(self, ts_utc: float) -> bool:
         return self.start_utc <= ts_utc <= self.end_utc
@@ -145,6 +166,7 @@ def derive_windows(
     path = Path(csv_path)
     per_label: Dict[str, List[float]] = {}
     per_label_ips: Dict[str, set] = {}
+    per_label_pairs: Dict[str, set] = {}
     malformed = 0
     total = 0
 
@@ -193,6 +215,8 @@ def derive_windows(
                     ips.add(a)
                 if b:
                     ips.add(b)
+                if a and b:
+                    per_label_pairs.setdefault(lab, set()).add(frozenset((a, b)))
 
     intervals: List[AttackInterval] = []
     for lab, times in per_label.items():
@@ -201,13 +225,14 @@ def derive_windows(
         # boundaries come from `merge_gap_seconds`, while the campaign they
         # belong to is the label.
         who = frozenset(per_label_ips.get(lab, ()))
+        pairs = frozenset(per_label_pairs.get(lab, ()))
         run_start, prev, n = times[0], times[0], 1
         for t in times[1:]:
             if t - prev > merge_gap_seconds:
-                intervals.append(AttackInterval(lab, run_start, prev, n, who))
+                intervals.append(AttackInterval(lab, run_start, prev, n, who, pairs))
                 run_start, n = t, 0
             prev, n = t, n + 1
-        intervals.append(AttackInterval(lab, run_start, prev, n, who))
+        intervals.append(AttackInterval(lab, run_start, prev, n, who, pairs))
 
     intervals.sort(key=lambda iv: iv.start_utc)
 
@@ -244,3 +269,31 @@ def derive_windows(
         ev["plausible"] = False
 
     return DerivedWindows(intervals=intervals, evidence=ev)
+
+
+#: What a flow inside an attack interval that names no participants is labelled.
+#:
+#:   "unknown"   (default) UNKNOWN / is_attack=False: no claim is made, so
+#:               label_filter.drop_unresolved keeps it out of every supervised
+#:               target downstream, and the encoder keeps the edge for link
+#:               prediction but excludes it from the category loss.
+#:   "time_only" the old behaviour: every flow of every captured host in the
+#:               interval gets the attack label.
+#:
+#: Why "unknown" is the default. config/attack_participants.json ships empty
+#: and nine of ten CIC-2018 label CSVs carry no addresses, so on those days
+#: "time_only" stamped the attack label on all ~445 hosts of the day for the
+#: whole interval. The 2026-09-25 encoder run trained on 9.0M InitialAccess
+#: edges (the CSVs hold ~0.5M InitialAccess flows) and its category head
+#: predicted InitialAccess for every validation edge: the target it was given
+#: was "what time is it", not "what is this flow". Supply addresses (a CSV with
+#: Src/Dst IP columns, or the participant map) to label those days.
+UNSCOPED_POLICIES = ("unknown", "time_only")
+
+
+def unscoped_label_policy() -> str:
+    import os
+    v = os.environ.get("CYBERWORLD_UNSCOPED_LABELS", "unknown").strip().lower() or "unknown"
+    if v not in UNSCOPED_POLICIES:
+        raise ValueError(f"CYBERWORLD_UNSCOPED_LABELS must be one of {UNSCOPED_POLICIES}, got {v!r}")
+    return v

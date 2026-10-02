@@ -21,9 +21,16 @@ import pytest
 from bita.utils.utils import EarlyStopMonitor
 
 
+def _score(ap, f1):
+    import sys
+    sys.path.insert(0, "bita")
+    from bita.train import selection_score
+    return selection_score(ap, f1)
+
+
 def test_selection_uses_inductive_ap_and_macro_f1():
     src = open("bita/train.py").read()
-    assert "_sel = 0.5 * float(nn_val_ap) + 0.5 * float(val_f1_macro)" in src
+    assert "_sel = selection_score(nn_val_ap, val_f1_macro)" in src
     # The TrainingGuard (cyberworld_v4/training_guard.py) replaced EarlyStopMonitor.
     assert "guard.end_epoch(_sel," in src, "the new metric is not used"
     assert "early_stop_check(val_ap)" not in src, "still selecting on val_ap alone"
@@ -50,8 +57,24 @@ def test_the_combined_metric_prefers_a_later_epoch_when_f1_improves():
     inductive_ap = [0.9926, 0.9921, 0.9918]
     macro_f1 = [0.60, 0.62, 0.71]
     for ap, f1 in zip(inductive_ap, macro_f1):
-        m.early_stop_check(0.5 * ap + 0.5 * f1)
+        m.early_stop_check(_score(ap, f1))
     assert m.best_epoch == 2, "the improving epoch should win"
+
+
+def test_a_collapsed_head_cannot_win_on_link_ap_noise():
+    """2026-09-25: every epoch predicted ONE class for all of validation
+    (macro-F1 0.05-0.08) and the arithmetic mean still called epochs IMPROVED
+    on AP's third decimal. The harmonic mean is held down by the weaker term."""
+    collapsed = _score(0.9877, 0.0767)
+    working = _score(0.9500, 0.6000)
+    assert collapsed < 0.15
+    assert working > collapsed
+    # arithmetic mean would have scored the collapsed epoch 0.53
+    assert 0.5 * 0.9877 + 0.5 * 0.0767 > 0.5
+
+
+def test_unlabelled_split_falls_back_to_link_ap():
+    assert _score(0.9, float("nan")) == 0.9
 
 
 def test_macro_f1_is_used_not_aggregate_accuracy():

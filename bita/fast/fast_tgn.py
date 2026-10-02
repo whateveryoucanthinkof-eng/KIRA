@@ -633,6 +633,7 @@ class FastTGNMixin:
             edge_loss = edge_criterion(pos.squeeze(-1), pos_label) + edge_criterion(neg.squeeze(-1), neg_label)
             if labels_g is None:
                 labels_g = upload(np.asarray(labels), dev, torch.long)
+            self._last_labels_g = labels_g      # bita/train.py's per-class training accuracy
             cat_loss = category_criterion(logits, labels_g)
             return edge_loss, cat_loss, (pos, neg, logits)
         # memory update + message store exactly as _fast_cte, then the region
@@ -649,6 +650,7 @@ class FastTGNMixin:
         host = "ef_n_host" in c
         if labels_g is None:
             labels_g = upload(np.asarray(labels), dev, torch.long)
+        self._last_labels_g = labels_g          # bita/train.py's per-class training accuracy
         inputs = (rows, bt.nodes_g, c["nbr_g"], c["deltas_g"], c["mask_g"], c["invalid_g"], labels_g,
                   bt.ef if host else bt.eidx_g, c["ef_n_host"] if host else c["eidx_n_g"])
         slot = self._graph_slot((B, n_neighbors, host), region, inputs)

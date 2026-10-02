@@ -166,7 +166,7 @@ class TrajectoryStore(Mapping):
 
     def __init__(self, feats, host_name_id, node_id, window_idx, window_start, window_end,
                  is_attack, risk_score, cat_id, tech_off, tech_flat,
-                 categories, techniques, host_names, rows_by_host):
+                 categories, techniques, host_names, rows_by_host, unknown_intervals=None):
         self.feats = feats
         self.host_name_id = host_name_id   # index into host_names
         self.node_id = node_id             # the graph node id from adapter.ip_to_id
@@ -182,6 +182,8 @@ class TrajectoryStore(Mapping):
         self.techniques = techniques
         self.host_names = host_names
         self._rows_by_host = rows_by_host
+        #: capture namespace -> sorted [[start, end], ...] of UNKNOWN traffic
+        self.unknown_intervals = dict(unknown_intervals or {})
 
     # -- Mapping surface -------------------------------------------------
     def __getitem__(self, host: str) -> _TrajectoryView:
@@ -310,7 +312,58 @@ class TrajectoryStore(Mapping):
         with np.errstate(over="ignore"):
             out = np.exp(-dt / float(tau_seconds))
         out[~np.isfinite(dt)] = 0.0
+        self._censor_unknown(out, dt, float(tau_seconds))
         return out.astype(np.float32)
+
+    #: A target is censored only if the unknown span could move it by at least
+    #: this much: beyond ~4.6 tau the hazard is < 0.01 whatever happened there.
+    CENSOR_EPS = 0.01
+
+    def _censor_unknown(self, out, dt, tau) -> int:
+        """NaN where the target depends on traffic whose label is UNKNOWN.
+
+        UNKNOWN traffic (an attack interval nobody can attribute, an unmapped
+        label) is dropped before extraction, so a host's window just before
+        such a span sees no "next attack" and its hazard read 0 -- a confident
+        NEGATIVE for exactly the pre-attack windows early warning learns from.
+        Where an unknown span starts before the next known attack and close
+        enough to matter (exp(-du/tau) >= CENSOR_EPS), the true target is
+        unknown: NaN, which every trainer masks. A window that is itself an
+        attack (dt == 0) is known and kept."""
+        if not self.unknown_intervals:
+            return 0
+        start = np.asarray(self.window_start, dtype=np.float64)
+        merged = {}
+        for ns, iv in self.unknown_intervals.items():
+            a = np.asarray(iv, dtype=np.float64).reshape(-1, 2)
+            a = a[np.argsort(a[:, 0], kind="stable")]
+            # merge overlaps so the ends are sorted too
+            s_, e_ = [], []
+            for lo, hi in a:
+                if s_ and lo <= e_[-1]:
+                    e_[-1] = max(e_[-1], hi)
+                else:
+                    s_.append(lo)
+                    e_.append(hi)
+            merged[ns] = (np.asarray(s_), np.asarray(e_))
+        n = 0
+        for host, rows in self._rows_by_host.items():
+            ns = host.split("@", 1)[1] if "@" in host else None
+            if ns not in merged:
+                continue
+            a, b = merged[ns]
+            r = np.asarray(rows)
+            t = start[r]
+            k = np.searchsorted(b, t, side="left")          # first span not over before t
+            inside = k < len(a)
+            du = np.full(t.shape, np.inf)
+            du[inside] = np.maximum(a[k[inside]] - t[inside], 0.0)
+            d = dt[r]
+            cens = (du <= d) & (np.exp(-du / tau) >= self.CENSOR_EPS) & (d != 0)
+            out[r[cens]] = np.nan
+            n += int(cens.sum())
+        self.n_censored = n
+        return n
 
     def use_hazard_target(self, tau_seconds: float) -> dict:
         """Replace `risk_score` with the hazard target, in place.
@@ -341,7 +394,9 @@ class TrajectoryStore(Mapping):
             "distinct_before": int(len(np.unique(np.round(sev, 4)))),
             "distinct_after": int(len(np.unique(np.round(haz, 4)))),
             "mean_before": float(sev.mean()),
-            "mean_after": float(haz.mean()),
+            "mean_after": float(np.nanmean(haz)) if haz.size else 0.0,
+            # targets that depend on dropped UNKNOWN traffic: NaN, masked
+            "censored": int(np.isnan(haz).sum()),
         }
 
     @property
@@ -440,6 +495,9 @@ class TrajectoryStoreBuilder:
         self.spill_dir = spill_dir
         self.feat_dim = int(feat_dim)
         self._namespace: Optional[str] = None
+        #: namespace -> [[start, end], ...] spans whose traffic was dropped as
+        #: UNKNOWN (capture_columns.unknown_intervals); see hazard_risk.
+        self._unknown: Dict[Optional[str], list] = {}
         self._spill_path: Optional[str] = None
         self._spill_fh = None
         self._block = np.zeros((_BLOCK, self.feat_dim), dtype=np.float32)
@@ -509,6 +567,13 @@ class TrajectoryStoreBuilder:
         capture before extracting it; `None` restores bare-IP keys.
         """
         self._namespace = None if namespace is None else str(namespace)
+
+    def add_unknown_intervals(self, intervals, namespace="__current__") -> None:
+        """Record spans of this capture whose labels are unknown (their traffic
+        was dropped as UNKNOWN). Targets that look ahead into them are censored."""
+        ns = self._namespace if namespace == "__current__" else namespace
+        if intervals:
+            self._unknown.setdefault(ns, []).extend([float(a), float(b)] for a, b in intervals)
 
     def append(self, *, host_ip, host_id, window_idx, window_start, window_end,
                embedding, temporal_attrs, is_attack, coarse_category,
@@ -760,4 +825,5 @@ class TrajectoryStoreBuilder:
             techniques=self._techniques,
             host_names=self._host_names,
             rows_by_host=rows_by_host,
+            unknown_intervals={k: sorted(v) for k, v in self._unknown.items()},
         )

@@ -81,9 +81,14 @@ def _norm(text: str) -> str:
 class ParticipantMap:
     """{day: {attack_label: set(ips)}}, matched leniently on the label."""
 
-    def __init__(self, days: Dict[str, Dict[str, Set[str]]], provenance: str = ""):
+    def __init__(self, days: Dict[str, Dict[str, Set[str]]], provenance: str = "",
+                 pairs: Optional[Dict[str, Dict[str, Set[frozenset]]]] = None):
         self.days = days
         self.provenance = provenance
+        #: {day: {label: {frozenset({attacker, victim}), ...}}} for entries that
+        #: give both roles. Those label at the conversation level (see
+        #: AttackInterval.pairs); entries without roles fall back to the set.
+        self.pairs = pairs or {}
 
     def __bool__(self) -> bool:
         return bool(self.days)
@@ -99,6 +104,10 @@ class ParticipantMap:
             if n and (n in key or key in n):
                 return table
         return {}
+
+    def lookup_pairs(self, day: str, label: str) -> Set[frozenset]:
+        """Attacker x victim pairs for (day, label); empty when roles are not given."""
+        return ParticipantMap(self.pairs, self.provenance).lookup(day, label) if self.pairs else set()
 
     def lookup(self, day: str, label: str) -> Set[str]:
         table = self.for_day(day)
@@ -137,20 +146,28 @@ def load_participant_map(path: Optional[Path] = None) -> ParticipantMap:
         return ParticipantMap({}, provenance=f"unreadable: {path}")
 
     days: Dict[str, Dict[str, Set[str]]] = {}
+    pair_days: Dict[str, Dict[str, Set[frozenset]]] = {}
     for day, table in (doc.get("days") or {}).items():
         out: Dict[str, Set[str]] = {}
+        out_pairs: Dict[str, Set[frozenset]] = {}
         for label, entry in (table or {}).items():
             ips: Set[str] = set()
             if isinstance(entry, dict):
                 for key in ("attackers", "victims", "hosts", "ips"):
                     ips |= {str(x).strip() for x in (entry.get(key) or ()) if str(x).strip()}
+                att = [str(x).strip() for x in (entry.get("attackers") or ()) if str(x).strip()]
+                vic = [str(x).strip() for x in (entry.get("victims") or ()) if str(x).strip()]
+                if att and vic:
+                    out_pairs[label] = {frozenset((a, v)) for a in att for v in vic if a != v}
             elif isinstance(entry, (list, tuple, set)):
                 ips |= {str(x).strip() for x in entry if str(x).strip()}
             if ips:
                 out[label] = ips
         if out:
             days[day] = out
-    return ParticipantMap(days, provenance=str(doc.get("provenance", "")))
+        if out_pairs:
+            pair_days[day] = out_pairs
+    return ParticipantMap(days, provenance=str(doc.get("provenance", "")), pairs=pair_days)
 
 
 def participants_from_derived(derived: Any) -> Dict[str, Set[str]]:
@@ -185,6 +202,7 @@ def apply_participants(
         ips = mapping.lookup(day, iv.label)
         if ips:
             iv.participants = frozenset(ips)
+            iv.pairs = frozenset(mapping.lookup_pairs(day, iv.label))
             filled += 1
         elif not iv.scoped:
             unmatched.append(iv.label)
@@ -200,9 +218,9 @@ def apply_participants(
     }
     if unmatched:
         LOG.warning(
-            "%s: %d interval(s) have no known participants (%s). Every host "
-            "active in those windows will be labelled attacked. Add them to "
-            "%s to scope the labels to the hosts actually involved.",
+            "%s: %d interval(s) have no known participants (%s). Their flows "
+            "are labelled per CYBERWORLD_UNSCOPED_LABELS (default UNKNOWN: "
+            "excluded from supervised targets). Add them to %s to label them.",
             day, len(unmatched), ", ".join(report["time_only_labels"][:6]),
             DEFAULT_MAP_PATH,
         )

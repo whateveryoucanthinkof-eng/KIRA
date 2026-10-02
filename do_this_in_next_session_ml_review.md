@@ -4,6 +4,90 @@ This file lists what is already known to need an ML-engineering review. It was w
 run was paused, after epoch 1 exposed a category-head collapse. Review everything below
 as an ML engineer before trusting any metric from the run on branch v5.5o.
 
+## Status after the 2026-10-02 code review (branch `fix/ml-review`)
+
+Diagnosed from code only: no training, no real data (being re-fetched). Verified by
+unit tests and the synthetic end-to-end dry run. The full run (7 epochs, not 1) collapsed
+every epoch: val predicted InitialAccess for every edge, macro-F1 0.05-0.08, test Hits@3 ≈ 1.0.
+
+**Root causes of §1, fixed:**
+
+1. **Labels were the clock.** `config/attack_participants.json` ships empty and 9 of 10
+   CIC-2018 CSVs have no IP columns, so every flow of every captured host (~445/day)
+   inside an attack interval got the attack label. That gave 9.0M InitialAccess training
+   edges, against ~0.5M InitialAccess rows in the CSVs. Now: unattributable intervals are
+   `UNKNOWN` (excluded from every supervised target; legacy:
+   `CYBERWORLD_UNSCOPED_LABELS=time_only`). Scoped intervals label attacking
+   **pairs**, not "any flow touching a participant", which marked a victim server's
+   clients as attackers. `apply_participants` had **no caller**; it does now.
+2. **Training order ran capture after capture** (CTU-13, then the CIC days in date
+   order), so the head ended each epoch fitted to the last day. Edges are now
+   interleaved by within-capture progress, which is exact for TGN memory because nodes
+   are per capture.
+3. **Selection let a collapsed head win** (arithmetic mean, AP-dominated). Now the
+   harmonic mean of inductive AP and macro-F1.
+4. Per-class TRAIN accuracy is logged every epoch.
+
+**Other items:**
+
+| item | status |
+|---|---|
+| §2 selection metric | fixed (harmonic mean) |
+| §2 mid-epoch validation | not needed: an epoch is ~18 min at level 4, not 70 |
+| §2 UndefinedMetricWarning | fixed: single-class AUC slices are NaN; absent classes NaN, not "0.0 recall" |
+| §2 leakage audit | Branch A target is the window after the history (no overlap). Added the **onset** slice (last input window benign), because continuations are predicted by persistence alone |
+| §3 label scoping | fixed (above). Per-flow attack labels on the no-IP days need data: CSVs with Src/Dst IP, or a verified participant map |
+| §3 CIC-2017 CSV test vs PCAP train | **open (data decision)**: different flow extractors. Using PCAP-derived CIC-2017 flows would also unlock packet features on test |
+| §3 absent classes | handled: NaN per class; UNKNOWN never a class |
+| §4 time-ordered batches | fixed (interleaving) |
+| §4 inductive draw | UNKNOWN no longer drives class protection |
+| §5 Branch A | benchmark added: **logistic regression** (PS-mandated, same inputs/target/threshold rule), persistence, FPR, onset slice |
+| §5 Branch B | now a **distribution**: per-step Gaussian (variance head, NLL, 90% coverage), mean training unchanged |
+| PS packet-level features | **plumbed, opt-in** (`--packet-features`, 27-D → 57-D, columnar path bit-identical, serving + explanations). Needs PCAP-derived test captures |
+| §7 resume RNG | fixed |
+| §7 stale serving fixture | open: needs the retrained encoder |
+| §8 CredentialAccess in correlation | fixed (between Recon and InitialAccess, as the console draws it) |
+| §6, rest of §8 | open (evtx logs, LateralMovement labels, per-alternative rollouts, attention saliency, campaign heuristic evaluation) |
+| edge-feature ablation (`dst_port`) | open: needs a retrain |
+
+**Second and third pass (same day), each fixed and tested:**
+
+| area | bug | fix |
+|---|---|---|
+| encoder test | the best epoch's weights were tested on the **last** epoch's memory (epoch 4 weights + epoch 7 memory on 2026-09-25); a run resumed after its last epoch died with a NameError | keep the best epoch's post-validation memory; forward-only replay when none exists |
+| hazard target | tau = 5 × 2 s = **10 s** while the contract forecasts 5 × 30 s = 150 s (the target was nearly a nowcast) | tau = `forecast_seconds` in both trainers |
+| CIC-2017 test | Branch B risk scored against the severity column (store never converted to hazard) | converted like train/val |
+| cross-year scoring | `rollout()` without elapsed times (model told every step is 2 s); padded steps counted; risk head never scored | real times, masked steps, risk MAE vs predict-zero |
+| Branch B data | edge-padded future copies trained and scored as targets (free win for persistence) | `future_valid` mask in losses, validation, conformal |
+| train/serve | serving scored new hosts with zero-padded histories that no model trained on; Branch B was zero-padded, DeepOP's rollouts edge-padded | Branch A trains with `--min-history-steps 1`; Branch B learns short edge-padded histories; serving edge-pads |
+| train/serve | serving took flows by END time (long flows counted in every window); training buckets by START time | serving buckets by start time |
+| host attributes | sent/received bytes and packets not oriented to the host (a flood's victim "sent" the flood) | oriented, both paths; schema 2.1.0 |
+| Branch A selection | arithmetic mean of macro-F1 and overall AUC (dominated by continuations) | `early_warning`: harmonic mean of macro-F1 and onset Gini |
+| Branch B alerts | forecast risk thresholded with Branch A's operating point | Branch B fits and ships its own |
+| explanations | Input×Gradient read only the last of 15 windows; batch API defaulted to "input magnitude" | summed over all timesteps; gradient attribution by default |
+| DeepOP | trained on clean history tokens, served Branch A's predictions; noise only removed tokens | + 10% substitution noise |
+| rollout callers | standalone DeepOP trainer also omitted elapsed times | fixed; AST test covers every caller |
+| CTU-13 labels | `Background` (unlabelled per the dataset authors) resolved to Benign | `CYBERWORLD_CTU_BACKGROUND=unknown` switch (default unchanged) |
+
+**Fourth pass:**
+
+| area | bug | fix |
+|---|---|---|
+| hazard target | windows just before dropped UNKNOWN traffic saw no "next attack" and got hazard 0 (false negatives on pre-attack windows) | column loading records the dropped spans; hazard is NaN (censored) where they could matter; every consumer masks NaN |
+| edge features | log1p bytes/packets reached ~20 while every other encoder input is in [-1, 1] | scaled to [0, 1] (schema 2.1.0), all implementations bit-identical |
+| ingest cache | `attack_participants.py` not in the parse-code hash (lazy import) | added |
+| encoder promotion | `select_best_encoder.py` re-scored with the old arithmetic mean | harmonic, as the trainer |
+| plan summary | reported overall AUC only | + onset AUC and the LR/persistence benchmark |
+
+**Fifth pass: clean.** Verified: serving event adapter uses the canonical edge
+features; encoder loader enforces schema, ablations and dimensions; conformal
+order statistic; batch planner + fast path level 4 + capture interleaving
+(GPU run); UNKNOWN class inside the CUDA-graph training step (GPU run).
+
+Reviewed and left as is (by design or pinned by tests): guard gives one epoch after a
+step-back; BiTA cross-edge context; TGN attention/neighbour finder (strictly before t);
+DeepOP repetition penalty/continuity bonus (off for paper checkpoints).
+
 ## 1. Category head collapses at full scale (highest priority)
 
 - **Observed:** epoch 1 at full scale (130.6M edges, 3.49M nodes, 4 classes). Both encoders

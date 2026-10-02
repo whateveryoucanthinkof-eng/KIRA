@@ -334,6 +334,10 @@ def test_branch_b_and_deepop_score_on_a_store():
     risk = InfiltrationRiskHead(d_latent=27, hidden_dim=32)
     bb = branch_b_on_store(wdt, risk, store, "cpu", T=15, K=5)
     assert bb["n"] > 0 and bb["mse_persistence"] > 0
+    # the risk head is scored too, against the predict-zero baseline
+    assert "risk_mae_model" in bb and bb["risk_mae_predict_zero"] > 0
+    # short histories are in (min_history_steps=1): 30 windows, K=5 -> 29 samples
+    assert bb["n"] == 29
     vocab = get_joint_vocab(network_observable_only=True)
     dec = DeepOPForecastDecoder(d_latent=27, vocab_size=vocab.vocab_size)
     counts = np.zeros(vocab.vocab_size, dtype=np.int64)

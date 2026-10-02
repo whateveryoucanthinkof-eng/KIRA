@@ -368,7 +368,7 @@ def test_dataset_emits_the_real_elapsed_time_of_each_step():
 
     # opting out restores exactly the old three keys
     lean = LazyHostRolloutDataset(store, T=15, K=5, emit_times=False)[0]
-    assert set(lean) == {"h_history", "h_future", "risk_future"}
+    assert set(lean) == {"h_history", "h_future", "risk_future", "future_valid"}
 
 
 def test_dataset_times_feed_straight_into_the_rollout():

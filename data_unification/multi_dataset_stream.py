@@ -545,11 +545,16 @@ class HostTrajectoryExtractor:
         if n == 0:
             return attrs
 
-        fwd_b = sum(r.fwd_bytes for r in window_records)
-        bwd_b = sum(r.bwd_bytes for r in window_records)
+        # Oriented to THIS host: "sent" is the flow's forward direction when
+        # the host is its source and the backward direction when it is the
+        # destination. Summing fwd_bytes regardless of role counted a flood's
+        # bytes as "sent" by the victim receiving it, so an attacker and its
+        # target had the same values -- the direction that tells them apart.
+        fwd_b = sum(r.fwd_bytes if r.src_ip == host_ip else r.bwd_bytes for r in window_records)
+        bwd_b = sum(r.bwd_bytes if r.src_ip == host_ip else r.fwd_bytes for r in window_records)
         tot_b = fwd_b + bwd_b
-        fwd_p = sum(r.fwd_packets for r in window_records)
-        bwd_p = sum(r.bwd_packets for r in window_records)
+        fwd_p = sum(r.fwd_packets if r.src_ip == host_ip else r.bwd_packets for r in window_records)
+        bwd_p = sum(r.bwd_packets if r.src_ip == host_ip else r.fwd_packets for r in window_records)
         tot_p = fwd_p + bwd_p
 
         peers = set()
@@ -818,8 +823,6 @@ class HostTrajectoryExtractor:
         across calls, or draws random numbers in a different order (uniform
         neighbour sampling).
         """
-        if self.include_packet_features:
-            return "include_packet_features reads record.metadata, which the columns do not keep"
         if self.heuristic_label_augmentation or heuristic_label_override_enabled():
             return "the heuristic label override fingerprints whole records"
         if self.auth_events:
@@ -866,6 +869,14 @@ class HostTrajectoryExtractor:
         dst_c = np.asarray(cols.dst)
         timestamps = np.asarray(cols.start, dtype=np.float64)
         n_ips = len(cols.ips)
+        pkt_table = getattr(cols, "pkt_table", None)
+        if builder is not None:
+            # When this capture's dropped UNKNOWN traffic happened: targets
+            # that look ahead into it are censored (TrajectoryStore.hazard_risk).
+            builder.add_unknown_intervals((getattr(cols, "meta", None) or {}).get("unknown_intervals"))
+        if self.include_packet_features and pkt_table is None:
+            raise ValueError("include_packet_features needs capture columns of format >= 3 "
+                             "(the 'pkt' column and pkt_feats.npy); rebuild the column cache")
 
         # Node ids exactly as FlowToTemporalEventAdapter.get_or_create_node_id
         # assigns them over time-sorted records: src then dst, first seen first.
@@ -1006,10 +1017,16 @@ class HostTrajectoryExtractor:
             np.cumsum(counts[:-1], out=starts[1:])
             g = j + s_idx                       # row in the columns
 
-            fwd_b = np.add.reduceat(np.asarray(cols.fwd_bytes[s_idx:e_idx])[j], starts)
-            bwd_b = np.add.reduceat(np.asarray(cols.bwd_bytes[s_idx:e_idx])[j], starts)
-            fwd_p = np.add.reduceat(np.asarray(cols.fwd_packets[s_idx:e_idx])[j], starts)
-            bwd_p = np.add.reduceat(np.asarray(cols.bwd_packets[s_idx:e_idx])[j], starts)
+            # Oriented to the host (see compute_host_temporal_attributes):
+            # as_src rows are the record's src side, so forward = sent.
+            _fb = np.asarray(cols.fwd_bytes[s_idx:e_idx])[j]
+            _bb = np.asarray(cols.bwd_bytes[s_idx:e_idx])[j]
+            _fp = np.asarray(cols.fwd_packets[s_idx:e_idx])[j]
+            _bp = np.asarray(cols.bwd_packets[s_idx:e_idx])[j]
+            fwd_b = np.add.reduceat(np.where(as_src, _fb, _bb), starts)
+            bwd_b = np.add.reduceat(np.where(as_src, _bb, _fb), starts)
+            fwd_p = np.add.reduceat(np.where(as_src, _fp, _bp), starts)
+            bwd_p = np.add.reduceat(np.where(as_src, _bp, _fp), starts)
             tot_b = fwd_b + bwd_b
             tot_p = fwd_p + bwd_p
             proto = np.asarray(cols.protocol[s_idx:e_idx])[j]
@@ -1040,6 +1057,16 @@ class HostTrajectoryExtractor:
             attrs[:, 12] = np.minimum(1.0, np.log1p(f64(tot_b) / dur_window) / BYTE_RATE_LOG_SCALE)
             attrs[:, 13] = np.minimum(1.0, np.log1p(f64(tot_p) / dur_window) / COUNT_LOG_SCALE)
             attrs[:, 14] = np.minimum(1.0, f64(n_peers) / nf)
+            if self.include_packet_features:
+                # The record path's _packet_features_of(host_recs): the FIRST
+                # of the host's records in this window (window order) that
+                # carries packet features. Groups are in (host, record) order,
+                # so that is each host's first such row.
+                pk = np.asarray(cols.pkt[s_idx:e_idx])[j]
+                has = np.flatnonzero(pk >= 0)
+                if has.size:
+                    hh, first = np.unique(h[has], return_index=True)
+                    attrs[hh, HOST_ATTR_DIM:] = np.asarray(pkt_table)[pk[has[first]]]
 
             atk_rec = np.asarray(cols.is_attack[s_idx:e_idx])[j]
             if role == "target":

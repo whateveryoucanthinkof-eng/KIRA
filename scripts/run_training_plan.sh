@@ -79,10 +79,15 @@ SEEDS_EXTRA=(123 2024)             # with 42 from `compare`: cyberworld_v4.confi
 # PLAN_ENCODER_EXTRA / PLAN_BRANCH_A_EXTRA / PLAN_DOWNSTREAM_EXTRA are appended
 # to each stage's arguments (later flags win). scripts/dry_run_plan.py uses
 # them to run this exact plan on a tiny synthetic corpus.
+# PCAP packet-level features (TTL, IAT, TCP window, retransmissions, SYN/scan
+# signatures; 27-D -> 57-D state) are opt-in: add --packet-features to BOTH
+# PLAN_BRANCH_A_EXTRA and PLAN_DOWNSTREAM_EXTRA, and only with PCAP-derived
+# test captures (flow-only corpora get an all-zero packet block).
 ENCODER_ARGS="--use_memory --n_degree 10 --n_epoch 50 --patience 3 --step_back_after 2 \
 --ingest_workers $INGEST_WORKERS --ingest_cache $INGEST_CACHE --shared_setup_dir $SHARED_SETUP ${PLAN_ENCODER_EXTRA:-}"
 BRANCH_A_ARGS="--architecture paper --risk-objective soft_bce --risk-target hazard \
 --epochs 15 --patience 3 --step-back-after 2 --operating-point-criterion budgeted_f1 --alert-budget 2.0 \
+--min-history-steps 1 \
 --spill-dir $OUT/.spill --num-workers $NUM_WORKERS ${PLAN_BRANCH_A_EXTRA:-}"
 
 compare_dir() { echo "$OUT/compare_seed$1"; }
@@ -236,7 +241,11 @@ import json, math, sys
 from pathlib import Path
 out, ip = Path(sys.argv[1]), sys.argv[2]
 keys = ("test_2017_macro_f1_seen", "test_2017_macro_f1_all", "test_2017_risk_auc",
-        "test_2017_risk_brier", "val_2018_macro_f1")
+        "test_2017_risk_onset_auc", "test_2017_risk_brier", "val_2018_macro_f1",
+        # PS 26153 benchmark: Branch A vs logistic regression vs persistence
+        "test_2017_a_overall_f1", "test_2017_lr_overall_f1", "test_2017_persist_overall_f1",
+        "test_2017_a_onset_f1", "test_2017_lr_onset_f1",
+        "test_2017_a_overall_fpr", "test_2017_lr_overall_fpr")
 print("\n== both IP variants, seed 42 (reported, not selected on) ==")
 cmp42 = out / "compare_seed42" / "comparison.md"
 print(cmp42.read_text() if cmp42.exists() else f"  {cmp42} missing")

@@ -112,7 +112,7 @@ def _both(caps, tmp_path, *, use_memory, reader_kw=None, spill=None, **ex_kw):
     out = []
     for mode in ("records", "columns"):
         ex = _extractor(use_memory, spill_dir=spill, **dict(ex_kw))
-        b = TrajectoryStoreBuilder(spill_dir=spill)
+        b = TrajectoryStoreBuilder(spill_dir=spill, feat_dim=12 + ex.n_temporal_attrs)
         base = 0
         covs = []
         for cap in caps:
@@ -155,7 +155,11 @@ def test_every_synthetic_capture_matches(captures, corpus, tmp_path, use_memory)
 
 
 @pytest.mark.parametrize("role", ["either", "target", "source"])
-def test_attack_roles_match(captures, corpus, tmp_path, role):
+def test_attack_roles_match(captures, corpus, tmp_path, role, monkeypatch):
+    # The synthetic corpus's label CSVs carry no addresses, so under the default
+    # policy its attack windows are UNKNOWN and dropped; this test is about the
+    # two extraction paths agreeing on attack ROLES, so it labels by time.
+    monkeypatch.setenv("CYBERWORLD_UNSCOPED_LABELS", "time_only")
     caps = [c for c in captures["train"] if c.dataset == "PCAP2018"][:3]
     st = _check(_both(caps, tmp_path, use_memory=True, attack_role=role,
                       reader_kw={"pcap_label_dir": corpus["csv"]}))
@@ -301,7 +305,8 @@ def test_columns_plan():
     assert not cc.columns_plan(None, None, ex).enabled
     wide = HostTrajectoryExtractor(tgne_ta_model=_encoder(False), window_size_sec=WS,
                                    include_packet_features=True)
-    assert not cc.columns_plan(None, "/x", wide).enabled
+    # packet-level features travel in the columns now (format 3)
+    assert cc.columns_plan(None, "/x", wide).enabled
 
 
 # ------------------------------------------------------------------ helpers
@@ -447,3 +452,15 @@ def test_parallel_extraction_equals_serial(captures, corpus, tmp_path, use_memor
     par_exp = ex2.neighbor_exposure_report(reset=True)
     assert str(serial_exp) == str(par_exp)
     assert not any((tmp_path / "parts").iterdir()), "parts left behind"
+
+
+def test_packet_features_match_through_the_columns(captures, corpus, tmp_path):
+    """include_packet_features on the columnar path: the 45-wide attribute
+    vector (15 flow + 30 packet-level) equals the record path's, bit for bit,
+    and the packet block is not all zero on PCAP days."""
+    caps = [c for c in captures["train"] if c.dataset == "PCAP2018"][:2]
+    st = _check(_both(caps, tmp_path, use_memory=True, include_packet_features=True,
+                      reader_kw={"pcap_label_dir": corpus["csv"]}))
+    feats = np.asarray(st.feats)
+    assert feats.shape[1] == 12 + 45
+    assert (feats[:, 12 + 15:] != 0).any(), "no packet-level feature reached the store"

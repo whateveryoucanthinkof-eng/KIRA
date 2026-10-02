@@ -123,17 +123,20 @@ def make_pcap_day(root: Path, labels_dir: Path, day: str, date, csv_day: str, at
         _write_pcap(d / f"UCAP{ip}", pk)
 
     # Label CSV: local time on the 12-hour dial the real files use, no AM/PM.
+    # With Src/Dst IP columns (as tue_20's 84-column CSV has), so the attack
+    # intervals are scoped to the attacking pair: without addresses they are
+    # UNKNOWN under the default label policy (attack_windows.unscoped_label_policy).
     local0 = datetime(*date, 10, 0, 0)
     with open(labels_dir / f"{csv_day}_csv.csv", "w", newline="", encoding="latin1") as fh:
         w = csv.writer(fh)
-        w.writerow(["Dst Port", "Protocol", "Timestamp", "Flow Duration", "Tot Fwd Pkts",
-                    "Tot Bwd Pkts", "TotLen Fwd Pkts", "TotLen Bwd Pkts", "Label"])
+        w.writerow(["Src IP", "Dst IP", "Dst Port", "Protocol", "Timestamp", "Flow Duration",
+                    "Tot Fwd Pkts", "Tot Bwd Pkts", "TotLen Fwd Pkts", "TotLen Bwd Pkts", "Label"])
         for s in range(0, DUR, 2):
             ts = (local0 + timedelta(seconds=s)).strftime("%d/%m/%Y %H:%M:%S")
-            w.writerow([443, 6, ts, 10000, 1, 1, 220, 900, "Benign"])
+            w.writerow([clients[s % len(clients)], server, 443, 6, ts, 10000, 1, 1, 220, 900, "Benign"])
         for s in range(ATTACK[0], ATTACK[1]):
             ts = (local0 + timedelta(seconds=s)).strftime("%d/%m/%Y %H:%M:%S")
-            w.writerow([21, 6, ts, 500, 1, 0, 0, 0, attack])
+            w.writerow([attacker, victim, 21, 6, ts, 500, 1, 0, 0, 0, attack])
 
 
 # --------------------------------------------------------------- CIC-2017

@@ -28,13 +28,17 @@ from data_unification.host_attributes import HOST_ATTRIBUTES
 #: input distribution it never learned, with no shape error to catch it --
 #: which is the failure mode `build_or_load_tgne_ta` refuses on.
 #:
+#: 2.1.0  edge features 0-3 (log1p bytes / packets) are scaled into [0, 1];
+#:        host attributes fwd/bwd bytes and packets are oriented to the host
+#:        (sent / received), not the flow's forward direction: a victim used to
+#:        report a flood's bytes as "sent".
 #: 2.0.0  dst_port is log-scaled instead of divided by 65535, and the host
 #:        attributes unique_peers / unique_dst_ports no longer saturate at 147
 #:        (data_unification/host_attributes.py). Both change every stored
 #:        feature value, so every checkpoint built under 1.0.0 must be
 #:        retrained; none can be loaded under this schema.
 #: 1.0.0  original canonical schema.
-SCHEMA_VERSION: str = "2.0.0"
+SCHEMA_VERSION: str = "2.1.0"
 
 # Authoritative 12-D Edge Feature Names
 EDGE_FEATURE_NAMES: List[str] = [
@@ -143,6 +147,12 @@ def reset_ablation_cache():
     _ABLATION_MASK, _ABLATION_READ = None, False
 
 
+#: Divisors for the four volume edge features (= host_attributes' BYTE/COUNT
+#: log scales): min(1, log1p(x) / D) saturates at e^20 bytes / e^10 packets.
+EDGE_BYTE_LOG_SCALE: float = 20.0
+EDGE_COUNT_LOG_SCALE: float = 10.0
+
+
 def extract_canonical_edge_features(
     fwd_bytes: float,
     bwd_bytes: float,
@@ -159,10 +169,15 @@ def extract_canonical_edge_features(
     Exact, deterministic formula applied uniformly across all datasets.
     """
     feat = np.zeros(12, dtype=np.float32)
-    feat[0] = np.float32(np.log1p(max(0.0, float(fwd_bytes))))
-    feat[1] = np.float32(np.log1p(max(0.0, float(bwd_bytes))))
-    feat[2] = np.float32(np.log1p(max(0.0, float(fwd_packets))))
-    feat[3] = np.float32(np.log1p(max(0.0, float(bwd_packets))))
+    # Scaled into [0, 1] with the host attributes' divisors (20 for bytes, 10
+    # for packets). Raw log1p reached ~20 while every other input of the
+    # encoder -- memory, node features, time encoding, the other edge
+    # features -- lies in [-1, 1]: these four dominated the attention keys and
+    # the category head's input from initialisation. Schema 2.1.0.
+    feat[0] = np.float32(min(1.0, np.log1p(max(0.0, float(fwd_bytes))) / EDGE_BYTE_LOG_SCALE))
+    feat[1] = np.float32(min(1.0, np.log1p(max(0.0, float(bwd_bytes))) / EDGE_BYTE_LOG_SCALE))
+    feat[2] = np.float32(min(1.0, np.log1p(max(0.0, float(fwd_packets))) / EDGE_COUNT_LOG_SCALE))
+    feat[3] = np.float32(min(1.0, np.log1p(max(0.0, float(bwd_packets))) / EDGE_COUNT_LOG_SCALE))
     feat[4] = np.float32(min(max(0.0, float(duration_sec)), 300.0) / 300.0)
     feat[5] = np.float32(min(1.0, np.log1p(max(0.0, float(byte_rate))) / 20.0))
     feat[6] = np.float32(min(1.0, np.log1p(max(0.0, float(packet_rate))) / 10.0))

@@ -151,10 +151,11 @@ def _edge_features(fb, bb, fp, bp, start, end, proto, dport) -> np.ndarray:
     pkt_rate = np.where(pos, tp / safe, tp)
     n = len(fb)
     feat = np.zeros((n, 12), dtype=np.float32)
-    feat[:, 0] = np.log1p(np.maximum(0.0, fbf)).astype(np.float32)
-    feat[:, 1] = np.log1p(np.maximum(0.0, bbf)).astype(np.float32)
-    feat[:, 2] = np.log1p(np.maximum(0.0, fp.astype(np.float64))).astype(np.float32)
-    feat[:, 3] = np.log1p(np.maximum(0.0, bp.astype(np.float64))).astype(np.float32)
+    # tgne_features.extract_canonical_edge_features, vectorised (schema 2.1.0)
+    feat[:, 0] = np.minimum(1.0, np.log1p(np.maximum(0.0, fbf)) / 20.0).astype(np.float32)
+    feat[:, 1] = np.minimum(1.0, np.log1p(np.maximum(0.0, bbf)) / 20.0).astype(np.float32)
+    feat[:, 2] = np.minimum(1.0, np.log1p(np.maximum(0.0, fp.astype(np.float64))) / 10.0).astype(np.float32)
+    feat[:, 3] = np.minimum(1.0, np.log1p(np.maximum(0.0, bp.astype(np.float64))) / 10.0).astype(np.float32)
     feat[:, 4] = (np.minimum(np.maximum(0.0, dur), 300.0) / 300.0).astype(np.float32)
     feat[:, 5] = np.minimum(1.0, np.log1p(np.maximum(0.0, byte_rate)) / 20.0).astype(np.float32)
     feat[:, 6] = np.minimum(1.0, np.log1p(np.maximum(0.0, pkt_rate)) / 10.0).astype(np.float32)
@@ -190,6 +191,11 @@ class DayColumnBuilder:
         self.ips: List[str] = []
         self.cat_local: Dict[str, int] = {}
         self._member: Dict[int, np.ndarray] = {}      # id(interval) -> bool per rust string id
+        self._pairs: Dict[int, tuple] = {}            # id(interval) -> (participant idx per string, pair matrix)
+        from data_unification.attack_windows import unscoped_label_policy
+        self._policy = unscoped_label_policy()
+        from data_unification.label_resolver import UNKNOWN_CATEGORY
+        self._unknown = UNKNOWN_CATEGORY
         self.source = LabelSource.CIC2018.value
         self.n = 0
 
@@ -225,7 +231,27 @@ class DayColumnBuilder:
                 h += n_hw
                 continue
             scoped = bool(interval and interval.scoped)
-            if is_attack and scoped:
+            if is_attack and not scoped and self._policy == "unknown":
+                # attack_windows.unscoped_label_policy: nobody can say which
+                # flows were the attack, so none is called one (or benign).
+                coarse = self._unknown
+            if is_attack and scoped and interval.pairs:
+                # Conversation-level: the flow's {src, dst} must be an attacking pair.
+                key = id(interval)
+                pm = self._pairs.get(key)
+                if pm is None or len(pm[0]) < len(strings):
+                    who = sorted({ip for pr in interval.pairs for ip in pr})
+                    at = {ip: k for k, ip in enumerate(who)}
+                    pidx = np.fromiter((at.get(st, -1) for st in strings),
+                                       dtype=np.int64, count=len(strings))
+                    mat = np.zeros((len(who) + 1, len(who) + 1), dtype=bool)
+                    for pr in interval.pairs:
+                        x, y = (tuple(pr) * 2)[:2]
+                        mat[at[x], at[y]] = mat[at[y], at[x]] = True
+                    pm = self._pairs[key] = (pidx, mat)
+                pidx, mat = pm
+                hit = mat[pidx[src[a:b]], pidx[dst[a:b]]]   # -1 indexes the all-False last row/col
+            elif is_attack and scoped:
                 key = id(interval)
                 mem = self._member.get(key)
                 if mem is None or len(mem) < len(strings):
@@ -294,6 +320,10 @@ def load_day_labels(day_dir, label_dir):
         return None
     day = _PCAP_DAY.match(day_dir.name).group("day")
     check_label_day(day, dw.intervals)
+    # Scope intervals the CSV could not (no IP columns) from the participant
+    # map. This had no caller, so a filled-in map changed nothing.
+    from data_unification.attack_participants import apply_participants
+    apply_participants(dw, day)
     return dw, day
 
 

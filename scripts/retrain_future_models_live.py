@@ -159,6 +159,10 @@ def load_pcap_records(pcap_root, csv_label_dir, window_seconds, max_windows_per_
                 print(f"skipping {day_dir.name}: implausible attack-window derivation ({dw.evidence})")
                 continue
             check_label_day(day, dw.intervals)
+            # Scope intervals the CSV could not (no IP columns) from the participant
+            # map. This had no caller, so a filled-in map changed nothing.
+            from data_unification.attack_participants import apply_participants
+            apply_participants(dw, day)
             n_windows = 0
             # window_stride keeps every Nth window across the WHOLE day rather than
             # truncating to a prefix. A prefix would drop late-starting campaigns
@@ -202,6 +206,10 @@ def iter_pcap_day_records(pcap_root, csv_label_dir, window_seconds, max_windows_
                                             max_packets_per_host):
             recs.extend(window)
             n_win += 1
+        # UNKNOWN rows (unattributable attack intervals, unmapped labels) are
+        # not "benign": keep them out, as read_capture does for Branch A.
+        from data_unification.label_filter import drop_unresolved
+        recs, _cov = drop_unresolved(recs)
         print(f"  [{cap.split}] {cap.name}: {n_win} windows, {len(recs)} records", flush=True)
         yield cap.split, cap.name, recs
 
@@ -279,33 +287,132 @@ def _accumulate_ok(ok, acc_pairs, nb):
 # and token counts) are kept outside the bodies: a graph replays device work
 # only. Same kernels, same order: identical accumulators.
 
-def _bb_val_body(wdt, risk, K, step_offset):
-    def body(acc, h, target, target_risk, t_hist, t_fut):
-        pred = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut)
+def _masked_mse(pred, target, valid):
+    """MSE over the real (non-padded) forecast steps. pred/target [B, K, D] or
+    [B, D] with valid [B, K] or [B]."""
+    v = valid.unsqueeze(-1).to(pred.dtype)
+    return ((pred - target) ** 2 * v).sum() / (v.sum() * pred.shape[-1]).clamp_min(1.0)
+
+
+def _risk_known(target_risk, valid):
+    """(target with censored NaNs zeroed, weight): weight is 1 on real AND
+    known steps. A NaN hazard target depends on traffic whose label is
+    unknown (TrajectoryStore._censor_unknown) and carries no loss."""
+    k = torch.isfinite(target_risk)
+    return torch.where(k, target_risk, torch.zeros_like(target_risk)), valid * k.to(valid.dtype)
+
+
+def _future_valid(batch, K, device, nblk):
+    """The batch's [B, K] real-step mask (all ones for a loader that has none)."""
+    v = batch.get("future_valid")
+    if v is None:
+        return torch.ones(batch["h_future"].shape[0], K, device=device)
+    return v.to(device, non_blocking=nblk)
+
+
+def _bb_variance_loss(pred, logvar, target, valid=None):
+    """Gaussian NLL of the step-k residual under the predicted variance.
+
+    The mean is detached (and logvar_head reads a detached trunk), so this
+    trains ONLY the variance: the mean -- the forecast the persistence gate
+    judges -- trains exactly as it did under MSE alone."""
+    from branch_b_world_model.rollout_encoder_decoder import gaussian_nll
+    if valid is None:
+        return sum((0.9 ** k) * gaussian_nll(pred[:, k].detach(), logvar[:, k], target[:, k])
+                   for k in range(pred.shape[1]))
+    out = 0.0
+    for k in range(pred.shape[1]):
+        lv, mu = logvar[:, k], pred[:, k].detach()
+        el = 0.5 * (lv + (target[:, k] - mu) ** 2 * torch.exp(-lv) + 1.8378770664093453)
+        v = valid[:, k].unsqueeze(-1).to(el.dtype)
+        out = out + (0.9 ** k) * (el * v).sum() / (v.sum() * el.shape[-1]).clamp_min(1.0)
+    return out
+
+
+#: z for a two-sided 90% Gaussian interval: coverage of mean +/- 1.645 sigma.
+_Z90 = 1.6448536269514722
+
+
+def _bb_val_body(wdt, risk, K, step_offset, positive_above=0.0):
+    def body(acc, h, target, target_risk, t_hist, t_fut, valid):
+        pred, logv = wdt.rollout(h, K=K, t_history=t_hist, t_future=t_fut, return_logvar=True)
+        _v = valid.unsqueeze(-1).double()
+        _el = 0.5 * (logv + (target - pred) ** 2 * torch.exp(-logv) + 1.8378770664093453)
+        acc["nll_model"] += (_el.double() * _v).sum() / (_v.sum() * _el.shape[-1]).clamp_min(1.0)
+        _inside = ((target - pred).abs() <= _Z90 * torch.exp(0.5 * logv)).double()
+        acc["cov90_by_step"] += (_inside * _v).sum(dim=(0, 2)) / (
+            _v.sum(dim=(0, 2)) * _inside.shape[-1]).clamp_min(1.0)
         pred_risk, _ = risk.forward_trajectory(pred)
+        target_risk, _wr = _risk_known(target_risk, valid)
         _rb = ((pred_risk - target_risk).abs().clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long()
         acc["resid_hist"] += device_hist((_rb.view(-1, K) + step_offset).reshape(-1),
-                                         K * FORECAST_RISK_BINS)
-        acc["v_sum"] += (F.mse_loss(pred, target) + risk.risk_loss(pred_risk, target_risk)).double().sum()
+                                         K * FORECAST_RISK_BINS, _wr.reshape(-1).long())
+        _sb = (pred_risk.clamp(0, 1) * (FORECAST_RISK_BINS - 1)).long().reshape(-1)
+        _pos = (target_risk > positive_above).reshape(-1)
+        _vl = _wr.reshape(-1) > 0
+        acc["op_pos"] += device_hist(_sb, FORECAST_RISK_BINS, (_pos & _vl).long())
+        acc["op_neg"] += device_hist(_sb, FORECAST_RISK_BINS, (~_pos & _vl).long())
+        # Every metric over REAL future steps only: padded steps repeat the
+        # last state, which persistence predicts perfectly by construction.
+        _w = _wr.double()
+        _nw = _w.sum().clamp_min(1.0)
+        _mm = _masked_mse(pred, target, valid).double()
+        acc["v_sum"] += _mm + risk.risk_loss(pred_risk, target_risk, weight=_wr).double()
         # persistence: repeat the last observed step across the horizon
         _last = h[:, -1:, :].expand(-1, target.shape[1], -1)
-        acc["mse_model"] += F.mse_loss(pred, target).double()
-        acc["mse_persist"] += F.mse_loss(_last, target).double()
-        acc["bce_model"] += F.binary_cross_entropy(pred_risk, target_risk).double()
-        acc["risk_mae_model"] += (pred_risk - target_risk).abs().double().mean()
-        acc["risk_sum"] += target_risk.double().mean()
+        acc["mse_model"] += _mm
+        acc["mse_persist"] += _masked_mse(_last, target, valid).double()
+        acc["bce_model"] += (F.binary_cross_entropy(pred_risk, target_risk, reduction="none").double()
+                             * _w).sum() / _nw
+        acc["risk_mae_model"] += ((pred_risk - target_risk).abs().double() * _w).sum() / _nw
+        acc["risk_sum"] += (target_risk.double() * _w).sum() / _nw
     return body
 
 
-def validate_branch_b(wdt, risk, loader, device, K):
+def fit_forecast_operating_point(pos_hist, neg_hist) -> dict:
+    """Branch B's own alert threshold: max F1 over its forecast risk scores on
+    validation (real future steps; positive = the same event Branch A's
+    threshold is fitted to). Serving used Branch A's threshold for these
+    scores, though the two heads are calibrated independently."""
+    ph = np.asarray(pos_hist, dtype=np.float64)
+    nh = np.asarray(neg_hist, dtype=np.float64)
+    P, N = ph.sum(), nh.sum()
+    if P <= 0 or N <= 0:
+        return {"fitted": False, "reason": f"validation has {int(P)} positive and {int(N)} "
+                                           f"negative forecast steps; a threshold needs both"}
+    tp = np.cumsum(ph[::-1])[::-1]
+    fp = np.cumsum(nh[::-1])[::-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prec = np.where(tp + fp > 0, tp / np.maximum(tp + fp, 1), 0.0)
+        rec = tp / P
+        f1 = np.where(prec + rec > 0, 2 * prec * rec / np.maximum(prec + rec, 1e-12), 0.0)
+    rate = (tp + fp) / (P + N)
+    usable = (rate > 0) & (rate < 1)
+    if not usable.any():
+        return {"fitted": False, "reason": "the forecast risk head emits a constant"}
+    b = int(np.argmax(np.where(usable, f1, -1.0)))
+    bins = len(ph)
+    return {"fitted": True, "alert_threshold": b / (bins - 1), "precision": float(prec[b]),
+            "recall": float(rec[b]), "f1": float(f1[b]),
+            "fpr": float(fp[b] / N), "criterion": "max F1, validation, real steps"}
+
+
+def validate_branch_b(wdt, risk, loader, device, K, positive_above=0.0):
     """Branch B's validation pass: the accumulators the epoch summary reads."""
     z = lambda: torch.zeros((), device=device, dtype=torch.float64)
     acc = {"v_sum": z(), "mse_model": z(), "mse_persist": z(), "bce_model": z(),
            "risk_mae_model": z(), "risk_sum": z(),
+           # the predictive distribution: mean NLL, and per-step coverage of the
+           # nominal 90% interval (calibrated <=> ~0.90 at every step)
+           "nll_model": z(), "cov90_by_step": torch.zeros(K, device=device, dtype=torch.float64),
+           # forecast risk scores of positive / negative real steps, for the
+           # head's OWN operating point (fit_forecast_operating_point)
+           "op_pos": torch.zeros(FORECAST_RISK_BINS, device=device, dtype=torch.long),
+           "op_neg": torch.zeros(FORECAST_RISK_BINS, device=device, dtype=torch.long),
            # per-step |risk residual| histograms for the forecast's conformal band
            "resid_hist": torch.zeros(K * FORECAST_RISK_BINS, device=device, dtype=torch.long)}
     step_offset = (torch.arange(K, device=device) * FORECAST_RISK_BINS).view(1, K)
-    run = GraphedBody(_bb_val_body(wdt, risk, K, step_offset), acc,
+    run = GraphedBody(_bb_val_body(wdt, risk, K, step_offset, positive_above), acc,
                       enabled=(str(device) == "cuda" and graphs_enabled()))
     nblk = (str(device) == "cuda")
     vn = risk_n = 0
@@ -317,7 +424,7 @@ def validate_branch_b(wdt, risk, loader, device, K):
             target_risk = batch["risk_future"].to(device, non_blocking=nblk)
             t_hist = batch["t_history"].to(device, non_blocking=nblk) if "t_history" in batch else None
             t_fut = batch["t_future"].to(device, non_blocking=nblk) if "t_future" in batch else None
-            run(h, target, target_risk, t_hist, t_fut)
+            run(h, target, target_risk, t_hist, t_fut, _future_valid(batch, K, device, nblk))
             vn += 1
             risk_n += 1
     return {**acc, "vn": vn, "risk_n": risk_n, "graphed_batches": run.n_graphed}
@@ -422,8 +529,12 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
     # h_future [5,12] and risk_future [5] per sample -- 1,164 bytes each, and
     # ~38 GiB at the 35M samples full corpus density produces. The store
     # already holds every embedding in one memmapped block.
-    train_ds = LazyHostRolloutDataset(train_traj, T=_c.history_steps, K=_c.forecast_steps)
-    val_ds = LazyHostRolloutDataset(val_traj, T=_c.history_steps, K=_c.forecast_steps)
+    # min_history_steps=1: serving scores a host from its first window, so the
+    # world model must learn short (edge-padded) histories too.
+    train_ds = LazyHostRolloutDataset(train_traj, T=_c.history_steps, K=_c.forecast_steps,
+                                      min_history_steps=1)
+    val_ds = LazyHostRolloutDataset(val_traj, T=_c.history_steps, K=_c.forecast_steps,
+                                    min_history_steps=1)
     print(f"Branch B samples: train={len(train_ds)} val={len(val_ds)}", flush=True)
     _lk = _loader_kwargs(device, num_workers)
     train_loader = _make_loader(train_ds, 128, True, device, num_workers)
@@ -468,12 +579,15 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _nb_dev = torch.zeros((), device=device, dtype=torch.long); _k = 0
         _step = _guard_step_fn(guard)
         if _graphed is None:
-            def _bb_loss(h_, target_, target_risk_, t_hist_, t_fut_):
-                pred_ = wdt.rollout(h_, K=_c.forecast_steps, t_history=t_hist_, t_future=t_fut_)
+            def _bb_loss(h_, target_, target_risk_, t_hist_, t_fut_, valid_):
+                pred_, logv_ = wdt.rollout(h_, K=_c.forecast_steps, t_history=t_hist_,
+                                           t_future=t_fut_, return_logvar=True)
                 pred_risk_, _ = risk.forward_trajectory(pred_)
-                loss_ = sum((0.9 ** k) * F.mse_loss(pred_[:, k], target_[:, k])
+                loss_ = sum((0.9 ** k) * _masked_mse(pred_[:, k], target_[:, k], valid_[:, k])
                             for k in range(_c.forecast_steps))
-                return loss_ + risk.risk_loss(pred_risk_, target_risk_)
+                _tr, _wr = _risk_known(target_risk_, valid_)
+                return (loss_ + _bb_variance_loss(pred_, logv_, target_, valid_)
+                        + risk.risk_loss(pred_risk_, _tr, weight=_wr))
             _graphed = GraphedLoss(_bb_loss, [wdt, risk],
                                    enabled=(str(device) == "cuda" and graphs_enabled()))
         _t0 = time.time()
@@ -483,6 +597,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             h = batch["h_history"].to(device, non_blocking=_nblk)
             target = batch["h_future"].to(device, non_blocking=_nblk)
             target_risk = batch["risk_future"].to(device, non_blocking=_nblk)
+            valid = _future_valid(batch, _c.forecast_steps, device, _nblk)
             # Real elapsed times. LazyHostRolloutDataset has emitted these all
             # along and rollout() encodes them, but this -- the trainer that
             # produces the SERVED checkpoint -- never passed them, so the
@@ -497,7 +612,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                 # forward + loss + backward replayed as a CUDA graph (cyberworld_v4/
                 # graphed_step.py): identical losses and weights, a fraction of the
                 # launch overhead. Same computation as the eager lines below.
-                loss = _graphed(h, target, target_risk, t_hist, t_fut)
+                loss = _graphed(h, target, target_risk, t_hist, t_fut, valid)
                 _ok = _step(loss)
                 if _ok is False:
                     continue
@@ -508,9 +623,12 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
                           f"({100.0*_k/max(_nb_total,1):.1f}%) {_r:.1f} batch/s "
                           f"eta={(_nb_total-_k)/max(_r,1e-9)/60:.1f}m", flush=True)
                 continue
-            pred = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut)
+            pred, logv = wdt.rollout(h, K=_c.forecast_steps, t_history=t_hist, t_future=t_fut,
+                                     return_logvar=True)
             pred_risk, _ = risk.forward_trajectory(pred)
-            loss = sum((0.9 ** k) * F.mse_loss(pred[:, k], target[:, k]) for k in range(_c.forecast_steps))
+            loss = sum((0.9 ** k) * _masked_mse(pred[:, k], target[:, k], valid[:, k])
+                       for k in range(_c.forecast_steps))
+            loss = loss + _bb_variance_loss(pred, logv, target, valid)
             # Huber, not BCE.
             #
             # BCE(p,t) is linear in t, so its minimiser is E[t|x] -- the same
@@ -523,7 +641,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             # Measured on a synthetic hazard target: BCE 0.244, MSE 0.244,
             # Huber(beta=0.1) 0.216 against a zero baseline of 0.230 -- only
             # Huber beats it.
-            loss = loss + risk.risk_loss(pred_risk, target_risk)
+            _tr, _wr = _risk_known(target_risk, valid)
+            loss = loss + risk.risk_loss(pred_risk, _tr, weight=_wr)
             _ok = _step(loss)
             if _ok is False:
                 continue
@@ -551,7 +670,8 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         # that converged instantly or with one that never learned anything, and
         # nothing reported could tell those apart.
         _K = _c.forecast_steps
-        _va = validate_branch_b(wdt, risk, val_loader, device, _K)
+        _va = validate_branch_b(wdt, risk, val_loader, device, _K,
+                                positive_above=(math.exp(-1.0) - 1e-6 if risk_target == "hazard" else 0.0))
         _v_sum, _vn = _va["v_sum"], _va["vn"]
         _mse_model, _mse_persist = _va["mse_model"], _va["mse_persist"]
         _bce_model, _risk_mae_model = _va["bce_model"], _va["risk_mae_model"]
@@ -569,8 +689,12 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
         _p = min(max(_rbar, 1e-7), 1 - 1e-7)
         _bce_base = -(_rbar * math.log(_p) + (1 - _rbar) * math.log(1 - _p))
         _skill = (1.0 - _mm / _mp) if _mp > 0 else float("nan")
+        _nll = float((_va["nll_model"] / _n).item())
+        _cov = [round(float(c), 4) for c in (_va["cov90_by_step"] / _n).tolist()]
         print(f"Branch B epoch={epoch+1} train_loss={_trl:.4f} val_loss={score:.4f} "
               f"wall={(time.time()-_t0)/60:.1f}m", flush=True)
+        print(f"  predictive distribution: nll={_nll:.4f} "
+              f"90%-interval coverage by step={_cov} (calibrated ~0.90)", flush=True)
         print(f"  embeddings: mse_model={_mm:.6f} mse_persistence={_mp:.6f} "
               f"skill={_skill:+.3f}"
               f"{'  <-- WORSE THAN COPYING THE LAST STEP' if _mm >= _mp else ''}", flush=True)
@@ -578,6 +702,7 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
               f"mae_model={_rmae:.4f} mae_predict_zero={_rbar:.4f}"
               f"{'  <-- WORSE THAN PREDICTING ZERO' if _rmae >= _rbar else ''}", flush=True)
         _history.append({"epoch": epoch + 1, "train_loss": _trl, "val_loss": score,
+                         "nll_model": _nll, "coverage90_by_step": _cov,
                          "mse_model": _mm, "mse_persistence": _mp, "skill": _skill,
                          "bce_model": _bm, "bce_constant": _bce_base,
                          "risk_mae_model": _rmae, "risk_mae_zero": _rbar})
@@ -596,12 +721,14 @@ def train_branch_b_live(train_traj, val_traj, output, epochs, device, num_worker
             # Fitted from THIS epoch's validation residuals, so the band always
             # belongs to the weights saved beside it.
             _conf = _forecast_risk_conformal(_resid_hist.view(_K, FORECAST_RISK_BINS).cpu().numpy())
+            _op = fit_forecast_operating_point(_va["op_pos"].cpu().numpy(), _va["op_neg"].cpu().numpy())
+            print(f"  forecast risk operating point: {_op}", flush=True)
             for _k, _c_k in enumerate(_conf["by_step"], start=1):
                 print(f"  forecast risk band step {_k}: "
                       + (f"+/-{_c_k['half_width']:.4f} (empirical {_c_k['empirical_coverage']:.3f}, "
                          f"n={_c_k['n']:,})" if _c_k["fitted"] else f"NOT FITTED -- {_c_k['reason']}"),
                       flush=True)
-            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf},output)
+            torch.save({"wdt_state_dict":wdt.state_dict(),"risk_head_state_dict":risk.state_dict(),"epoch":epoch+1,"history_steps":_c.history_steps,"forecast_steps":_c.forecast_steps,"window_seconds":_c.window_seconds,"d_state":d_state,"epoch_history":list(_history),"risk_target":risk_target,"baselines":{"mse_persistence":_mp,"risk_mae_zero":_rbar},"forecast_risk_conformal":_conf,"operating_point":_op},output)
             best_state={k:v.detach().clone() for k,v in wdt.state_dict().items()}
         if resume is not None:
             resume.save(epoch + 1, wdt=wdt.state_dict(), risk=risk.state_dict(),
@@ -925,12 +1052,27 @@ def _precompute_rollouts_unique(wdt, ds, device, spill_dir, label, K, batch, num
 #: experiment (Section 4.4, Fig. 7) removes a fraction of the observed
 #: techniques to simulate detection failure; this trains against the same.
 OBS_TOKEN_DROPOUT = 0.1
+#: Probability of REPLACING an observed technique with another real token.
+#: Branch A's errors at serve time are mostly substitutions -- an attack
+#: window read as Benign, or the wrong technique -- not omissions, and dropout
+#: alone only ever showed DeepOP clean-or-missing history.
+OBS_TOKEN_SUBSTITUTION = 0.1
 
 
-def _drop_observed(obs, vocab, p: float):
+def _drop_observed(obs, vocab, p: float, p_sub: float = OBS_TOKEN_SUBSTITUTION):
+    if p <= 0.0 and p_sub <= 0.0:
+        return obs
+    special = torch.tensor([vocab.pad_idx, vocab.bos_idx, vocab.eos_idx], device=obs.device)
+    droppable = ~torch.isin(obs, special)
+    if p_sub > 0.0:
+        real = torch.tensor([i for i in range(vocab.vocab_size)
+                             if i not in (vocab.pad_idx, vocab.bos_idx, vocab.eos_idx)],
+                            device=obs.device)
+        sub = (torch.rand(obs.shape, device=obs.device) < p_sub) & droppable
+        repl = real[torch.randint(0, len(real), obs.shape, device=obs.device)]
+        obs = torch.where(sub, repl, obs)
     if p <= 0.0:
         return obs
-    droppable = (obs != vocab.pad_idx) & (obs != vocab.bos_idx)
     drop = (torch.rand(obs.shape, device=obs.device) < p) & droppable
     return obs.masked_fill(drop, vocab.pad_idx)
 
@@ -1175,8 +1317,8 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
 def _downstream_column_jobs(args):
     """[(split, namespace, ColumnSpec)] in exactly the order, and with exactly
     the reads, of the record path in _pcap_trajectories_per_day: every PCAP day
-    sorted by name (iter_pcap_day_records: windows concatenated, no label
-    filter), then under cross_year_ctu the CTU-13 train and val scenarios
+    sorted by name (iter_pcap_day_records: windows concatenated, unresolved
+    labels dropped), then under cross_year_ctu the CTU-13 train and val scenarios
     (read_one_capture)."""
     from data_unification.capture_columns import ColumnSpec
     from data_unification.training_sources import discover_captures
@@ -1247,7 +1389,7 @@ def _pcap_trajectories_per_day(args, extractor):
     # -- worse, if defaulted -- be folded into training. It is extracted and
     # kept separate so a held-out PCAP evaluation is possible, and it is never
     # returned to the trainers.
-    builders = {k: TrajectoryStoreBuilder(spill_dir=spill)
+    builders = {k: TrajectoryStoreBuilder(spill_dir=spill, feat_dim=12 + extractor.n_temporal_attrs)
                 for k in ("train", "val", "test")}
     wbase = {"train": 0, "val": 0, "test": 0}
     from data_unification.capture_columns import columns_plan
@@ -1329,6 +1471,10 @@ def main():
     parser.add_argument("--rows-per-file",type=int,default=None,
                         help="Cap records kept per capture. Default None = FULL DENSITY.")
     parser.add_argument("--stride",type=int,default=1)
+    parser.add_argument("--packet-features", action="store_true",
+                        help="Append the 30 PCAP packet-level host attributes (TTL, IAT, TCP "
+                             "window, retransmissions, SYN/scan signatures): state 27-D -> 57-D. "
+                             "Needs PCAP-derived train AND test captures.")
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=12,
                         help="Upper bound; the training guard stops each model once "
@@ -1397,7 +1543,14 @@ def main():
     enable_fast_extraction(tgn)   # serial extraction paths; workers do the same
     extractor=HostTrajectoryExtractor(
         tgne_ta_model=tgn, window_size_sec=get_contract().window_seconds,
-        spill_dir=str(args.spill_dir) if args.spill_dir else None)
+        spill_dir=str(args.spill_dir) if args.spill_dir else None,
+        include_packet_features=args.packet_features)
+    if args.packet_features:
+        print("PACKET-LEVEL FEATURES ON: host state = 12 latent + 15 flow + 30 packet "
+              "attributes (TTL, IAT, TCP window, retransmissions, SYN/scan signatures, ...). "
+              "Only PCAP captures carry them; flow-only captures (CTU-13 NetFlow, "
+              "CICFlowMeter CSVs) get an all-zero packet block, which a model can read as "
+              "'which corpus is this'. Train and test on PCAP-derived captures.", flush=True)
 
     require_full_density(
         'Branch B + DeepOP retrain',
@@ -1456,7 +1609,7 @@ def main():
         _spill = str(args.spill_dir) if args.spill_dir else None
 
         def _store_per_capture(files, label):
-            shared = TrajectoryStoreBuilder(spill_dir=_spill)
+            shared = TrajectoryStoreBuilder(spill_dir=_spill, feat_dim=12 + extractor.n_temporal_attrs)
             widx_base, total = 0, 0
             for i, f in enumerate(files):
                 t = time.time()
@@ -1546,7 +1699,7 @@ def main():
         # functions, and using it in main() raised NameError after a 40-minute
         # extraction had already been paid for.
         _hc = get_contract()
-        _tau = _hc.forecast_steps * _hc.window_seconds
+        _tau = hazard_tau_seconds()
         for _nm, _st in (("train", train_traj), ("val", val_traj)):
             _info = _st.use_hazard_target(_tau)
             print(f"risk target [{_nm}]: severity -> hazard(tau={_tau}s) | "
@@ -1603,6 +1756,12 @@ def main():
     dp_resume.clear()
 
 
+def hazard_tau_seconds() -> float:
+    """The hazard target's decay scale: the contract's forecast horizon
+    (forecast_steps x forecast_window_seconds), the same as Branch A's."""
+    return float(get_contract().forecast_seconds)
+
+
 def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
     """Score the best Branch B / DeepOP checkpoints ONCE on all of CIC-2017.
 
@@ -1617,7 +1776,7 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
 
     _c = get_contract()
     caps = discover_captures(scheme="cross_year", cic2017_dir=args.cic2017_dir)["test"]
-    b = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None)
+    b = TrajectoryStoreBuilder(spill_dir=str(args.spill_dir) if args.spill_dir else None, feat_dim=12 + extractor.n_temporal_attrs)
     wbase = 0
     from data_unification.capture_columns import ColumnSpec, columns_plan, iter_capture_columns
     plan = columns_plan(args.capture_cache, args.spill_dir, extractor)
@@ -1641,7 +1800,13 @@ def _score_cross_year(args, extractor, train_traj, bb_out, dp_out, device):
         del recs
         gc.collect()
     test_store = b.finalize()
-    out = {"split_scheme": "cross_year", "test_snapshots": int(test_store.n_snapshots)}
+    if args.risk_target == "hazard":
+        # The models were trained and selected on the hazard target; scoring
+        # them against the extraction-time SEVERITY column (this store was
+        # never converted) compared two different quantities.
+        test_store.use_hazard_target(hazard_tau_seconds())
+    out = {"split_scheme": "cross_year", "test_snapshots": int(test_store.n_snapshots),
+           "risk_target": args.risk_target}
 
     if bb_out.exists():
         ck = torch.load(bb_out, map_location=device, weights_only=False)

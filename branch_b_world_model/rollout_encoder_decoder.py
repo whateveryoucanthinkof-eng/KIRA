@@ -177,6 +177,18 @@ class MultiHostInteractionLayer(nn.Module):
         return updated_states
 
 
+#: Bounds on the predicted log-variance: exp(-9) ~ 1.2e-4 to exp(4) ~ 55, wide
+#: against the [0, 1]-scaled state, and they keep the NLL finite early on.
+LOGVAR_MIN, LOGVAR_MAX = -9.0, 4.0
+
+
+def gaussian_nll(mean: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean per-element negative log-likelihood of `target` under
+    N(mean, exp(logvar)), constant 0.5*log(2*pi) included."""
+    return 0.5 * (logvar + (target - mean) ** 2 * torch.exp(-logvar)
+                  + 1.8378770664093453).mean()
+
+
 class HostWorldDynamicsTransformer(nn.Module):
     """
     Causal autoregressive Transformer for per-host embedding rollouts.
@@ -228,6 +240,26 @@ class HostWorldDynamicsTransformer(nn.Module):
             nn.Linear(dim_feedforward, d_latent),
         )
 
+        # Predictive variance: log sigma^2 of each coordinate of H_{t+k}.
+        #
+        # The problem statement asks the world model for P(S_t+1 | S_t), a
+        # DISTRIBUTION over the next state. out_head alone gives its mean --
+        # a point forecast with no statement of how sure it is. This head
+        # makes each step a diagonal Gaussian N(mean_k, exp(logvar_k)).
+        #
+        # It reads the transformer state DETACHED and is trained by Gaussian
+        # NLL against the mean's actual residual (detached as well), so the
+        # mean path -- and the persistence gate it is judged by -- trains
+        # exactly as before; the variance only learns how wrong the mean is
+        # at each horizon. Checkpoints without it still load (backfilled,
+        # `variance_trained` False) and serve the mean unchanged.
+        self.logvar_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_latent),
+        )
+        self.variance_trained = True
+
         # Multi-host lateral interaction layer.
         #
         # WARNING: these 948 parameters are never trained. The only path that
@@ -277,6 +309,17 @@ class HostWorldDynamicsTransformer(nn.Module):
         """
         key = "_time_encoding_version"
         sd = state_dict
+        missing_var = [k for k in self.state_dict() if k.startswith("logvar_head.") and k not in sd]
+        if missing_var:
+            # A checkpoint from before the variance head: its mean is all it
+            # has. Backfill the fresh head so strict loading still works, and
+            # say that its variances mean nothing.
+            sd = dict(sd)
+            for k in missing_var:
+                sd[k] = self.state_dict()[k]
+            self.variance_trained = False
+        else:
+            self.variance_trained = True
         if key not in sd:
             sd = dict(state_dict)
             sd[key] = torch.tensor(1, dtype=torch.int64)
@@ -403,9 +446,14 @@ class HostWorldDynamicsTransformer(nn.Module):
         max_context_len: int = None,   # None -> contract history_steps (15); 10 silently truncated it
         t_history: Optional[torch.Tensor] = None,
         t_future: Optional[torch.Tensor] = None,
+        return_logvar: bool = False,
     ) -> torch.Tensor:
         """
         Autoregressive multi-step latent rollout predicting H_{t+1..t+K}.
+
+        With `return_logvar=True` returns (mean [B, K, D], logvar [B, K, D]):
+        the per-step diagonal Gaussian predictive distribution. The rollout
+        itself always feeds back the MEAN.
 
         Args:
             h_seq: [batch_size, seq_len, d_latent]
@@ -437,6 +485,7 @@ class HostWorldDynamicsTransformer(nn.Module):
                 f"t_future has {t_future.shape[-1]} steps but K={K}")
         curr_seq = h_seq.clone()
         predictions = []
+        logvars = []
 
         for k in range(K):
             context_window = curr_seq[:, -max_context_len:, :]
@@ -452,6 +501,9 @@ class HostWorldDynamicsTransformer(nn.Module):
             h_trans = self.transformer(x, mask=causal_mask, is_causal=True)
 
             delta_h = self.out_head(h_trans[:, -1, :])
+            if return_logvar:
+                logvars.append(self.logvar_head(h_trans[:, -1, :].detach())
+                               .clamp(LOGVAR_MIN, LOGVAR_MAX).unsqueeze(1))
 
             # Horizon-anchored stabilization damping.
             #
@@ -481,6 +533,8 @@ class HostWorldDynamicsTransformer(nn.Module):
             predictions.append(h_next.unsqueeze(1))
             curr_seq = torch.cat([curr_seq, h_next.unsqueeze(1)], dim=1)
 
+        if return_logvar:
+            return torch.cat(predictions, dim=1), torch.cat(logvars, dim=1)
         return torch.cat(predictions, dim=1)  # [B, K, d_latent]
 
     def calibrate_radii(
