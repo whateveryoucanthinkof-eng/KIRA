@@ -144,12 +144,20 @@ class AttackTrajectoryAssembler:
             B = len(chunk)
 
             # Determine maximum lengths for this minibatch
-            max_la = max(len(snaps[-max_seq_len_a:]) for _, snaps in chunk)
-            max_lw = max(len(snaps[-max_seq_len_wdt:]) for _, snaps in chunk)
+            # Exactly history_steps, not the minibatch's longest host: both
+            # models were trained on full-length, left-padded windows, and a
+            # shorter sequence is a different number of LSTM / attention steps
+            # than any training input. Widths come from the models (27 or 57
+            # for Branch A; Branch B's state is the same full vector, 12 only
+            # for a legacy latent-only checkpoint) -- they were hard-coded
+            # 27 / 12, which a current 27-D Branch B cannot even accept.
+            max_la, max_lw = max_seq_len_a, max_seq_len_wdt
+            d_a = int(getattr(self.branch_a, "input_dim", 27))
+            d_w = int(getattr(self.wdt, "d_latent", 12))
 
             # Pre-allocate numpy batch buffers
-            x_batch = np.zeros((B, max_la, 27), dtype=np.float32)
-            h_hist_batch = np.zeros((B, max_lw, 12), dtype=np.float32)
+            x_batch = np.zeros((B, max_la, d_a), dtype=np.float32)
+            h_hist_batch = np.zeros((B, max_lw, d_w), dtype=np.float32)
             t_hist_batch = np.zeros((B, max_lw), dtype=np.float32)
             t_a_batch = np.zeros((B, max_la), dtype=np.float32)   # Branch A history times
 
@@ -184,7 +192,12 @@ class AttackTrajectoryAssembler:
                     t_a_batch[i, off_a:] = _ta
                     t_a_batch[i, :off_a] = _ta[0]
                 for j, s in enumerate(recent_w):
-                    h_hist_batch[i, off_w + j] = s.embedding
+                    h_hist_batch[i, off_w + j] = (
+                        np.concatenate([s.embedding, s.temporal_attrs])
+                        if d_w != len(s.embedding) else s.embedding)
+                if recent_w and off_w:
+                    # edge padding, as Branch B is trained (first real state repeated)
+                    h_hist_batch[i, :off_w] = h_hist_batch[i, off_w]
                 # Real elapsed seconds relative to the latest snapshot, in the
                 # convention Branch B is trained with (<= 0, last entry 0).
                 # Left-padded slots repeat the earliest real time.
@@ -218,17 +231,29 @@ class AttackTrajectoryAssembler:
                 ]
 
                 # 2. Branch B & DeepOP: Batched rollout & decoding
-                obs_token_ids = [
-                    self.deepop.vocab.encode(snaps[-1].coarse_category, obs_techs[i])
-                    for i, (_, snaps) in enumerate(chunk)
-                ]
+                # Branch A's prediction ONLY. This encoded the snapshot's
+                # coarse_category -- its LABEL -- which in a replay is the
+                # ground truth fed straight into the forecast.
+                obs_token_ids = [self.deepop.vocab.encode("", obs_techs[i]) for i in range(B)]
                 obs_t_tensor = torch.tensor(obs_token_ids, dtype=torch.long, device=self.device)
+                # DeepOP's observed-sequence encoder was always trained with an
+                # input; without one it ran a branch it never saw. Only the last
+                # window's Branch A token is known here: [PAD.., BOS, token], a
+                # shape training produces through its observed-token dropout.
+                from deepop_decoder.forecast_decoder import observed_sequence_tokens
+                obs_seq_tensor = torch.tensor(
+                    [observed_sequence_tokens([t], _CONTRACT.history_steps, self.deepop.vocab)
+                     for t in obs_token_ids], dtype=torch.long, device=self.device)
 
-                # Real history spacing -- Branch B is trained on it (median gap
-                # 14 s, not the 2 s grid). t_future stays None: the uniform grid
-                # IS the question being asked, "+2, +4, ... +10 s from now".
+                # Real history spacing -- Branch B is trained on it. The future
+                # is asked on the contract's forecast grid (forecast_window_seconds
+                # per step, 30 s), as model_adapter does; this asked +2..+10 s.
+                _fs = float(_CONTRACT.forecast_window_seconds)
+                t_future_tensor = (torch.arange(1, K + 1, device=self.device, dtype=torch.float32)
+                                   * _fs).expand(B, K)
                 h_future = self.wdt.rollout(h_hist_tensor, K=K, delta_t_step=window_size_sec,
-                                            t_history=t_hist_tensor)  # [B, K, d_latent]
+                                            t_history=t_hist_tensor,
+                                            t_future=t_future_tensor)  # [B, K, d_latent]
                 step_risks, cumul_risks = self.risk_head.forward_trajectory(h_future)  # [B, K], [B]
                 step_risks_np = step_risks.cpu().numpy()  # [B, K]
                 # Which aggregation is correct depends on what the head was
@@ -255,6 +280,7 @@ class AttackTrajectoryAssembler:
                 pred_tokens, decoded_names, _attack_p, step_token_probs = (
                     self.deepop.forecast_sequence(
                         h_future, max_steps=K, observed_token=obs_t_tensor,
+                        observed_sequence=obs_seq_tensor,
                         return_probs=True,
                     )
                 )
@@ -288,7 +314,7 @@ class AttackTrajectoryAssembler:
                         TrajectoryEntry(
                             host_ip=host_ip,
                             window_idx=last_win + k + 1,
-                            timestamp=last_t + (k + 1) * window_size_sec,
+                            timestamp=last_t + (k + 1) * _fs,
                             provenance=Provenance.FORECAST.value,
                             coarse_category=coarse,
                             # An empty technique means the decoder emitted a

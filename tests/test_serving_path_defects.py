@@ -281,7 +281,9 @@ class TestAssemblerHonoursTheContract:
         spacing = (
             traj.forecast_entries[1].timestamp - traj.forecast_entries[0].timestamp
         )
-        assert spacing == pytest.approx(CONTRACT.window_seconds)
+        # the forecast grid: forecast_window_seconds per step (30 s under the
+        # multi-scale contract), the grid serving and the hazard horizon use
+        assert spacing == pytest.approx(CONTRACT.forecast_window_seconds)
 
     def test_forecast_confidence_comes_from_the_decoder(self, assembler):
         """It was `max(0.4, 0.9 - 0.1 * k)`: a fixed decay that never consulted
