@@ -639,6 +639,10 @@ class DeepOPTokenScorer:
         V = self.V
         self._conf_tf = torch.zeros(V * V, device=device, dtype=torch.long)
         self._conf_free = torch.zeros(V * V, device=device, dtype=torch.long)
+        # free-running predictions at TRANSITIONS only: positions whose target
+        # differs from the last observed token. Persistence scores 0 there by
+        # construction, so this is the progression forecast itself.
+        self._conf_trans = torch.zeros(V * V, device=device, dtype=torch.long)
         self._hit_tf = torch.zeros((), device=device, dtype=torch.long)
         self._hit_free = torch.zeros((), device=device, dtype=torch.long)
         self._hit_persist_free = torch.zeros((), device=device, dtype=torch.long)
@@ -675,12 +679,14 @@ class DeepOPTokenScorer:
             pf = pred_tf.reshape(-1)
             self._hit_tf += (pf == t).sum()
             self._conf_tf += device_hist(t * V + pf, V * V)
+        obs = obs_token.reshape(-1)
         if pred_free is not None:
             pr = pred_free.reshape(-1)
             self._hit_free += (pr == t).sum()
             self._conf_free += device_hist(t * V + pr, V * V)
+            changed = (target != obs.unsqueeze(1).expand_as(target)).reshape(-1)
+            self._conf_trans += device_hist(t * V + pr, V * V, changed.long())
 
-        obs = obs_token.reshape(-1)
         # free-running persistence: one observation, held for the whole horizon
         self._hit_persist_free += (obs.unsqueeze(1).expand_as(target) == target).sum()
         # information-matched persistence: repeat whatever teacher forcing fed.
@@ -730,6 +736,12 @@ class DeepOPTokenScorer:
             out["acc_free"] = float(self._hit_free.item()) / n
             out["macro_f1_free"] = mf1_free
             out["classes_predicted_free"] = int((pred_free_n > 0).sum())
+            mf1_tr, _, sup_tr, _, _ = self._macro_f1(self._conf_trans, self.V)
+            n_tr = int(sup_tr.sum())
+            out["n_transitions"] = n_tr
+            out["macro_f1_transitions"] = mf1_tr if n_tr else float("nan")
+            out["acc_transitions"] = (float(np.trace(self._conf_trans.reshape(self.V, self.V)
+                                                      .cpu().numpy())) / n_tr if n_tr else float("nan"))
         # The two comparisons that are actually like-for-like.
         out["lift_teacher_forced"] = out["acc_teacher_forced"] - max(
             out["acc_persistence_fed"], out["acc_majority"])

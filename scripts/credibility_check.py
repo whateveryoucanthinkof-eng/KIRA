@@ -54,8 +54,8 @@ def evaluate_samples(train_samples: Sequence[Dict[str, Any]],
         out[f"{name}_positive_rate"] = pos
         out[f"{name}_technique_classes"] = int(len(set(tech.tolist()))) if n else 0
         out[f"{name}_gradation_hist"] = dict(Counter(grad.tolist())) if n else {}
-        out[f"{name}_risk_mean"] = float(risk.mean()) if n else 0.0
-        out[f"{name}_risk_std"] = float(risk.std()) if n else 0.0
+        out[f"{name}_risk_mean"] = float(np.nanmean(risk)) if n and np.isfinite(risk).any() else 0.0
+        out[f"{name}_risk_std"] = float(np.nanstd(risk)) if n and np.isfinite(risk).any() else 0.0
         return pos
 
     split_stats(train_samples, "train")
@@ -101,7 +101,7 @@ def evaluate_store(train_store, val_store) -> Dict[str, Any]:
         out[f"{name}_positive_rate"] = float(np.mean(store.is_attack))
         out[f"{name}_technique_classes"] = int(len(store.techniques))
         out[f"{name}_categories"] = list(store.categories)
-        out[f"{name}_risk_mean"] = float(np.mean(store.risk_score))
+        out[f"{name}_risk_mean"] = float(np.nanmean(store.risk_score)) if np.isfinite(store.risk_score).any() else 0.0
 
     stats(train_store, "train")
     stats(val_store, "val")

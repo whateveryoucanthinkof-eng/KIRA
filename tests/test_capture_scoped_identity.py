@@ -82,7 +82,10 @@ def test_the_hazard_target_does_not_reach_across_captures():
     st = b.finalize()
     h = st.hazard_risk(tau_seconds=10.0)
     clean_rows = st._rows_by_host["10.0.0.9@A"]
-    assert np.all(h[clean_rows] == 0.0), "capture B's attack leaked into capture A"
+    # 0, or NaN (censored: within ~4.6 tau of the end of capture A, its future
+    # is unobserved) -- never a positive pulled in from capture B
+    assert not np.any(h[clean_rows] > 0.0), "capture B's attack leaked into capture A"
+    assert np.all((h[clean_rows] == 0.0) | np.isnan(h[clean_rows]))
 
 
 def test_capture_namespace_distinguishes_ctu13_scenarios():

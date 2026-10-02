@@ -2229,7 +2229,11 @@ def main():
                         "window_size_sec": _c.window_seconds,  # v3 key, kept readable
                         "history_steps": _c.history_steps,
                         "forecast_steps": _c.forecast_steps,
-                        "feature_dim": _cfg.state_dim,
+                        # seconds per FORECAST step; serving fell back to the
+                        # 2 s input window without it (see model_adapter)
+                        "forecast_window_seconds": _c.forecast_window_seconds,
+                        "hazard_tau_seconds": hazard_tau,
+                        "feature_dim": 12 + extractor.n_temporal_attrs,
                         "sources": [str(x) for x in (args.cic_dir, args.ctu_dir, args.cic2017_dir, args.pcap_root) if x],
                         "split_scheme": args.split_scheme,
                         # What `risk_score` MEANS. Serving reads this to decide

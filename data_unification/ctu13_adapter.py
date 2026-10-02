@@ -161,8 +161,21 @@ class CTU13Adapter:
             src_bytes = pd.to_numeric(chunk[src_bytes_col], errors="coerce")
             fwd_bytes = src_bytes.fillna(pd.Series(tot_bytes // 2, index=chunk.index)).astype(int).to_numpy()
             bwd_bytes = np.maximum(0, tot_bytes - fwd_bytes)
-            fwd_pkts = np.maximum(1, tot_pkts // 2)
-            bwd_pkts = np.maximum(0, tot_pkts - fwd_pkts)
+            # Binetflow has TotPkts but no per-direction packet count. They
+            # were split 50/50, which gave a one-way flow (a scan, an
+            # unanswered beacon: SrcBytes == TotBytes) half its packets as
+            # REPLIES -- inventing responses in the C2 traffic CTU-13 is the
+            # only source of. Split by the known byte direction instead: no
+            # reply bytes -> no reply packets, and at least one packet on each
+            # side that carried bytes.
+            tot_pkts = np.maximum(tot_pkts, 0)
+            frac = np.where(tot_bytes > 0, fwd_bytes / np.maximum(tot_bytes, 1), 1.0)
+            fwd_pkts = np.rint(tot_pkts * frac).astype(int)
+            fwd_pkts = np.where((fwd_bytes > 0) & (tot_pkts > 0), np.maximum(fwd_pkts, 1), fwd_pkts)
+            need_bwd = (bwd_bytes > 0) & (tot_pkts > 1)
+            fwd_pkts = np.where(need_bwd, np.minimum(fwd_pkts, tot_pkts - 1), fwd_pkts)
+            fwd_pkts = np.clip(fwd_pkts, 0, tot_pkts)
+            bwd_pkts = tot_pkts - fwd_pkts
 
             # Proto string to int
             proto_map = {"tcp": 6, "udp": 17, "icmp": 1}

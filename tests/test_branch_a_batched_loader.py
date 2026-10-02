@@ -31,7 +31,10 @@ def _same(a, b):
         if torch.is_tensor(a[k]):
             assert a[k].dtype == b[k].dtype, k
             assert a[k].shape == b[k].shape, k
-            assert torch.equal(a[k], b[k]), k
+            # bit-identical, NaN (a censored hazard target) included
+            assert torch.equal(a[k], b[k]) or (a[k].is_floating_point() and torch.equal(
+                torch.isnan(a[k]), torch.isnan(b[k])) and torch.equal(
+                torch.nan_to_num(a[k]), torch.nan_to_num(b[k]))), k
         else:
             assert a[k] == b[k], k
 
@@ -147,7 +150,7 @@ def test_packed_batches_unpack_to_identical_tensors(store, device):
         if torch.is_tensor(ref[k]):
             assert got[k].device.type == device
             assert got[k].dtype == ref[k].dtype and got[k].shape == ref[k].shape
-            assert torch.equal(got[k].cpu(), ref[k]), k
+            assert torch.equal(torch.nan_to_num(got[k].cpu()), torch.nan_to_num(ref[k])), k
         else:
             assert got[k] == ref[k]
     # and through a real loader with workers and pinning, in the same order
@@ -159,7 +162,7 @@ def test_packed_batches_unpack_to_identical_tensors(store, device):
     for x, y in zip(a, b):
         for k in x:
             if torch.is_tensor(x[k]):
-                assert torch.equal(x[k], y[k].cpu()), k
+                assert torch.equal(torch.nan_to_num(x[k]), torch.nan_to_num(y[k].cpu())), k
             else:
                 assert x[k] == y[k]
 

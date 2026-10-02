@@ -28,7 +28,10 @@ def _same(a, b):
     for k in a:
         if torch.is_tensor(a[k]):
             assert a[k].dtype == b[k].dtype and a[k].shape == b[k].shape, k
-            assert torch.equal(a[k], b[k]), k
+            # bit-identical, NaN (a censored hazard target) included
+            assert torch.equal(a[k], b[k]) or (a[k].is_floating_point() and torch.equal(
+                torch.isnan(a[k]), torch.isnan(b[k])) and torch.equal(
+                torch.nan_to_num(a[k]), torch.nan_to_num(b[k]))), k
         else:
             assert a[k] == b[k], k
 

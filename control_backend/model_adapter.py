@@ -8,6 +8,7 @@ runs TGNE-TA → Branch A / Branch B (WDT) / DeepOP CWA, and emits PredictionEve
 
 from datetime import datetime, timezone
 import logging
+import math
 import os
 import threading
 import time
@@ -211,9 +212,17 @@ class AntigravityModelAdapter:
         sys.path.insert(0, bita)
         if repo not in sys.path:
             sys.path.insert(0, repo)
-        for k in list(sys.modules):
-            if k == "model" or k.startswith("model."):
-                del sys.modules[k]
+        # Evict a FOREIGN `model` package only. Purging bita's own as well left
+        # two copies of its classes in the process (modules.* kept references
+        # to the old ones), so an encoder built earlier no longer pickled --
+        # "not the same object as model.temporal_attention...".
+        _m = sys.modules.get("model")
+        _paths = list(getattr(_m, "__path__", []) or []) + [getattr(_m, "__file__", "") or ""]
+        if _m is not None and not any(
+                p and os.path.abspath(p).startswith(os.path.abspath(bita)) for p in _paths):
+            for k in list(sys.modules):
+                if k == "model" or k.startswith("model."):
+                    del sys.modules[k]
 
         from branch_a_gnn_lstm.lstm_multitask import MultiTaskLSTM
         from branch_a_gnn_lstm.sequence_dataset import TECHNIQUE_VOCAB
@@ -734,8 +743,15 @@ class AntigravityModelAdapter:
         feature_history.append(
             torch.from_numpy(feature_vector).float().to(self.device)
         )
+        # The window's position on the window grid, as training measures it
+        # (t_history = window_idx difference x window_seconds, exact multiples
+        # of the window). The max END time of the flows drifted with whatever
+        # long flow was in the batch, so the model was told its steps were
+        # unevenly spaced when they were not.
+        _w = float(self.window_seconds)
         h_time_history.append(
-            float(max(r.end_time for r in flows)) if flows else float(time.time()))
+            math.floor(max(r.start_time for r in flows) / _w) * _w if flows
+            else math.floor(time.time() / _w) * _w)
         if len(feature_history) > self.history_steps:
             feature_history.pop(0)
             h_time_history.pop(0)

@@ -82,8 +82,13 @@ def test_hazard_is_one_during_an_attack_and_decays_before_it():
 
 
 def test_hazard_is_zero_for_a_host_never_attacked():
-    st = _store({"10.0.0.9": [0, 0, 0]})
-    assert np.all(st.hazard_risk(10.0) == 0.0)
+    # wherever its future was observed; the last ~4.6 tau of the capture is
+    # unobserved and censored (NaN), see TrajectoryStore._censor_unknown
+    st = _store({"10.0.0.9": [0] * 100})
+    h = st.hazard_risk(10.0)
+    t = 2.0 * np.arange(100)
+    observed = (t[-1] + 2.0) - t >= 10.0 * np.log(1 / st.CENSOR_EPS)
+    assert np.all(h[observed] == 0.0) and np.isnan(h[~observed]).all()
 
 
 def test_hazard_is_continuous_not_bimodal():

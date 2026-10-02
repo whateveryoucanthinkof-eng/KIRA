@@ -37,15 +37,15 @@ def test_intervals_merge():
 
 def test_windows_before_an_unknown_span_are_censored_not_negative():
     tau = 10.0
-    st = _store(unknown=[[60.0, 80.0]])          # windows 30..40 dropped as UNKNOWN
+    st = _store(unknown=[[60.0, 80.0]], n=200)   # windows 30..40 dropped as UNKNOWN
     h = st.hazard_risk(tau)
-    t = 2.0 * np.arange(60)
+    t = 2.0 * np.arange(200)
     # right before the span: unknown, not 0
     assert np.isnan(h[(t >= 30) & (t < 60)]).all()
     # far before it (> 4.6 tau): the target is ~0 whatever happened there -> kept
     assert (h[t < 10] == 0).all()
-    # after the span with no later attack: genuinely 0
-    assert (h[t > 80] == 0).all()
+    # after the span with no later attack, and far from the capture's end: 0
+    assert (h[(t > 80) & (t < 300)] == 0).all()
 
 
 def test_a_known_attack_before_the_span_is_kept():
@@ -56,10 +56,26 @@ def test_a_known_attack_before_the_span_is_kept():
 
 
 def test_other_captures_are_not_censored():
-    st = _store(unknown=None)
-    st2 = _store(unknown=[[60.0, 80.0]], ns="other")
-    assert np.isfinite(st.hazard_risk(10.0)).all()
-    assert np.isnan(st2.hazard_risk(10.0)).any()
+    st = _store(unknown=None, n=200)
+    st2 = _store(unknown=[[60.0, 80.0]], ns="other", n=200)
+    t = 2.0 * np.arange(200)
+    assert np.isfinite(st.hazard_risk(10.0)[t < 300]).all()
+    assert np.isnan(st2.hazard_risk(10.0)[t < 300]).any()
+
+
+def test_the_end_of_a_capture_is_unobserved_not_benign():
+    """The last windows of a capture have no observed future: within ~4.6 tau
+    of the end, with no later attack, the target is unknown, not 0."""
+    tau = 10.0
+    st = _store(n=200)
+    h = st.hazard_risk(tau)
+    t = 2.0 * np.arange(200)
+    end = t[-1] + 2.0
+    near = end - t < tau * np.log(1 / st.CENSOR_EPS)
+    assert np.isnan(h[near]).all() and (h[~near] == 0).all()
+    # an attack inside the capture makes the windows before it known
+    st2 = _store(attack_windows=(198,), n=200)
+    assert np.isfinite(st2.hazard_risk(tau)[190:199]).all()
 
 
 def test_branch_a_loss_ignores_censored_targets():
@@ -92,3 +108,15 @@ def test_column_load_records_when_unknown_traffic_was_dropped(tmp_path):
     cols = cc.CaptureColumns.load(tmp_path / "c", drop_unresolved=True)
     assert len(cols) == 2
     assert cols.meta["unknown_intervals"] == [[100.0, 101.5]]
+
+
+def test_every_trainer_records_the_forecast_step():
+    """Serving takes seconds-per-forecast-step from the checkpoints and fell
+    back to the 2 s input window when none recorded it -- all of them -- so new
+    checkpoints would have been served on a 2 s grid against a 150 s target."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    a = (root / "scripts" / "retrain_branch_a_live.py").read_text()
+    b = (root / "scripts" / "retrain_future_models_live.py").read_text()
+    assert '"forecast_window_seconds": _c.forecast_window_seconds' in a
+    assert b.count('"forecast_window_seconds":_c.forecast_window_seconds') == 2
