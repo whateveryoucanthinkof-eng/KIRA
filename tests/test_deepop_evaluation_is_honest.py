@@ -350,3 +350,23 @@ def test_evaluate_forecast_rigor_reports_both_modes_and_both_baselines():
     r2 = evaluate_forecast_rigor(d, h, tgt, observed_tokens=obs, batch_size=512)
     assert r["acc_free"] == pytest.approx(r2["acc_free"])
     assert r["acc_teacher_forced"] == pytest.approx(r2["acc_teacher_forced"])
+
+
+def test_a_copier_scores_zero_on_transitions():
+    """Transitions (target != last observed token) are the progression forecast
+    itself; repeating the present gets none of them, however high its overall F1."""
+    import torch
+    from deepop_decoder.forecast_decoder import DeepOPTokenScorer
+    V = 5
+    sc = DeepOPTokenScorer(V)
+    obs = torch.tensor([1, 1, 2, 2])
+    target = torch.tensor([[1, 1, 1], [1, 3, 3], [2, 2, 2], [4, 4, 2]])
+    inp = torch.zeros_like(target)
+    copier = obs.unsqueeze(1).expand_as(target)
+    sc.update_device(target, inp, obs, pred_tf=copier, pred_free=copier)
+    sc._n += target.numel()
+    sc._have_free = True
+    r = sc.result()
+    assert r["n_transitions"] == 4
+    assert r["acc_transitions"] == 0.0 and r["macro_f1_transitions"] == 0.0
+    assert r["macro_f1_free"] > 0.3

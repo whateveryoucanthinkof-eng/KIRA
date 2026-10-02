@@ -440,7 +440,7 @@ class _ScorerView:
             setattr(self, k, acc["sc" + k])
 
 
-_SCORER_KEYS = ("_tgt_hist", "_hit_tf", "_conf_tf", "_hit_free", "_conf_free",
+_SCORER_KEYS = ("_tgt_hist", "_hit_tf", "_conf_tf", "_hit_free", "_conf_free", "_conf_trans",
                 "_hit_persist_free", "_hit_persist_fed")
 
 
@@ -1283,8 +1283,21 @@ def train_deepop_live(train_traj, val_traj, output, epochs, device, wdt=None, nu
         # (negated, since this is maximised) if the scorer is unavailable.
         _sel = None
         if _scorer is not None:
-            _sel = _scorer.result().get("macro_f1_free")
-        _sel_metric = "macro_f1_free" if _sel is not None else "neg_val_ce"
+            _r = _scorer.result()
+            _sel = _r.get("macro_f1_free")
+            _tr = _r.get("macro_f1_transitions", float("nan"))
+            print(f"  DeepOP transitions (target != last observed token): n={_r.get('n_transitions')} "
+                  f"macro_f1={_tr:.4f} acc={_r.get('acc_transitions', float('nan')):.4f} "
+                  f"(persistence: 0 by construction)", flush=True)
+            _sel_metric = "macro_f1_free"
+            if _sel is not None and _tr == _tr:
+                # Harmonic mean with the transition F1: the overall token F1 is
+                # dominated by continuations, which repeating the last observed
+                # token already gets right -- a copier would win on it alone.
+                _sel = 0.0 if _sel + _tr <= 0 else 2.0 * _sel * _tr / (_sel + _tr)
+                _sel_metric = "hm(macro_f1_free, macro_f1_transitions)"
+        if _sel is None:
+            _sel_metric = "neg_val_ce"
         if _sel is None:
             _sel = -score
         _history[-1]["selection_metric"] = _sel_metric
