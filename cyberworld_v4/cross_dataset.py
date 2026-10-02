@@ -172,6 +172,7 @@ def deepop_on_store(decoder, wdt, store, vocab, device, train_token_counts, T: i
     V = vocab.vocab_size
     cm = np.zeros((V, V), dtype=np.int64)
     hit_persist = total = 0
+    n_trans = hit_trans = 0
     decoder.eval(); wdt.eval()
     with torch.no_grad():
         for b in DataLoader(ds, batch_size=batch_size):
@@ -186,10 +187,17 @@ def deepop_on_store(decoder, wdt, store, vocab, device, train_token_counts, T: i
                 decode_names=False)
             tgt = b["target_tokens"].to(device)
             np.add.at(cm, (tgt.reshape(-1).cpu().numpy(), pred.reshape(-1).cpu().numpy()), 1)
-            hit_persist += int((obs.unsqueeze(1).expand_as(tgt) == tgt).sum())
+            same = obs.unsqueeze(1).expand_as(tgt) == tgt
+            hit_persist += int(same.sum())
             total += int(tgt.numel())
+            # transitions: the progression forecast persistence cannot make
+            ch = (~same).reshape(-1)
+            n_trans += int(ch.sum())
+            hit_trans += int((pred.reshape(-1)[ch] == tgt.reshape(-1)[ch]).sum())
     names = {i: ".".join(x for x in vocab.decode(i) if x) for i in range(V)}
     rep = unseen_class_report(train_token_counts, cm, names)
     rep["acc_persistence"] = hit_persist / max(total, 1)
     rep["n"] = total
+    rep["n_transitions"] = n_trans
+    rep["acc_transitions"] = hit_trans / n_trans if n_trans else float("nan")
     return rep
