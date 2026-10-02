@@ -239,7 +239,11 @@ class LivePCAPEngine:
                     ports_per_ip[d_ip] = set()
                 ports_per_ip[d_ip].add(d_port)
             max_ports_single_ip = max(len(p_set) for p_set in ports_per_ip.values())
-            vertical_scan_score = float(max_ports_single_ip / max(unique_dst_ports, 1.0))
+            # A COUNT, not max/unique: the ratio was 1.0 for any host talking to
+            # one port on one server (most benign clients) and for a
+            # 10,000-port vertical scan alike. Ports probed on the single
+            # most-probed destination is the vertical-scan signature.
+            vertical_scan_score = float(max_ports_single_ip)
         else:
             vertical_scan_score = 0.0
 
@@ -251,7 +255,9 @@ class LivePCAPEngine:
                     ips_per_port[d_port] = set()
                 ips_per_port[d_port].add(d_ip)
             max_ips_single_port = max(len(ip_set) for ip_set in ips_per_port.values())
-            horizontal_scan_score = float(max_ips_single_port / max(unique_dst_ips, 1.0))
+            # destinations hit on the single most-hit port: the horizontal
+            # sweep signature (a count, for the same reason as above)
+            horizontal_scan_score = float(max_ips_single_port)
         else:
             horizontal_scan_score = 0.0
 

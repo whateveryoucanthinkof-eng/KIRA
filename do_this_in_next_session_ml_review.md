@@ -102,6 +102,15 @@ a warm reboot; cold boot needed) so verification was on CPU:**
 Ninth pass: clean. Remaining failures are the two split-manager tests that read the real
 dataset under the user's home (environment, not code).
 
+**Tenth pass (GPU back after a cold boot):** full suite on CUDA: 1,296 passed,
+0 failed (7 skips need retrained checkpoints). Verified on GPU: NaN-censored targets
+inside the CUDA-graphed Branch A/B/DeepOP steps (0 skipped steps, finite losses),
+validation graphs intact, the `--packet-features` path end to end (57-D everywhere).
+Fixed: packet `vertical/horizontal_scan_score` were max/unique ratios, 1.0 for a
+single-connection client and a 10,000-port scan alike -> counts, log-scaled (Python
+and Rust together); the dry-run fixture's 90 s captures censored every negative at
+tau=150 s -> dry run uses `--hazard-tau 4` (downstream trainer gained the flag).
+
 Reviewed and left as is (by design or pinned by tests): guard gives one epoch after a
 step-back; BiTA cross-edge context; TGN attention/neighbour finder (strictly before t);
 DeepOP repetition penalty/continuity bonus (off for paper checkpoints).

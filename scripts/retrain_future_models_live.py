@@ -1488,6 +1488,9 @@ def main():
                         help="Append the 30 PCAP packet-level host attributes (TTL, IAT, TCP "
                              "window, retransmissions, SYN/scan signatures): state 27-D -> 57-D. "
                              "Needs PCAP-derived train AND test captures.")
+    parser.add_argument("--hazard-tau", type=float, default=None,
+                        help="Decay scale of the hazard target in seconds; default the contract's "
+                             "forecast horizon. Must match Branch A's --hazard-tau.")
     parser.add_argument("--spill-dir",type=Path,default=None,help="Write the bulk trajectory feature block here instead of RAM (np.memmap)")
     parser.add_argument("--epochs",type=int,default=12,
                         help="Upper bound; the training guard stops each model once "
@@ -1545,6 +1548,8 @@ def main():
                         help="DataLoader worker processes; 0 loads in the main "
                              "process and serialises loading with GPU compute.")
     args=parser.parse_args()
+    global _HAZARD_TAU_OVERRIDE
+    _HAZARD_TAU_OVERRIDE = args.hazard_tau
     global LEGACY_LOADER
     LEGACY_LOADER = bool(args.legacy_loader)
     random.seed(42); np.random.seed(42); torch.manual_seed(42)
@@ -1769,9 +1774,15 @@ def main():
     dp_resume.clear()
 
 
+_HAZARD_TAU_OVERRIDE = None
+
+
 def hazard_tau_seconds() -> float:
     """The hazard target's decay scale: the contract's forecast horizon
-    (forecast_steps x forecast_window_seconds), the same as Branch A's."""
+    (forecast_steps x forecast_window_seconds), the same as Branch A's, unless
+    --hazard-tau overrides it (as Branch A's flag does)."""
+    if _HAZARD_TAU_OVERRIDE is not None:
+        return float(_HAZARD_TAU_OVERRIDE)
     return float(get_contract().forecast_seconds)
 
 

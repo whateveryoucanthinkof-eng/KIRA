@@ -654,9 +654,9 @@ fn extract_features(pk: &[Pkt]) -> [f64; 30] {
     let unique_dst_ips = ports_per_ip.len() as f64;
     let unique_dst_ports = dst_port_set.len() as f64;
     let max_ports = ports_per_ip.values().map(|s| s.len()).max().unwrap_or(0) as f64;
-    let vertical = if unique_dst_ports > 0.0 { max_ports / unique_dst_ports.max(1.0) } else { 0.0 };
+    let vertical = if unique_dst_ports > 0.0 { max_ports } else { 0.0 }; // count: see pcap_engine.py
     let max_ips = ips_per_port.values().map(|s| s.len()).max().unwrap_or(0) as f64;
-    let horizontal = if unique_dst_ips > 0.0 { max_ips / unique_dst_ips.max(1.0) } else { 0.0 };
+    let horizontal = if unique_dst_ips > 0.0 { max_ips } else { 0.0 }; // count: see pcap_engine.py
 
     let mut int_order: Vec<Ip> = Vec::new();
     let mut int_counts: FxMap<Ip, u64> = FxMap::default();

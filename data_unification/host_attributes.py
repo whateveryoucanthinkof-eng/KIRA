@@ -174,8 +174,8 @@ PACKET_ATTRIBUTE_SCALING: Dict[str, Tuple[str, float]] = {
     "payload_size_std":                  ("div", 750.0),
     "payload_zero_ratio":                ("ratio", 1.0),
     "unique_dst_ips_pcap":               ("log", PEER_COUNT_LOG_SCALE),
-    "vertical_scan_score":               ("ratio", 1.0),
-    "horizontal_scan_score":             ("ratio", 1.0),
+    "vertical_scan_score":               ("log", PORT_COUNT_LOG_SCALE),  # ports on one destination
+    "horizontal_scan_score":             ("log", PEER_COUNT_LOG_SCALE),  # destinations on one port
     "syn_only_ratio":                    ("ratio", 1.0),
     "syn_ack_response_ratio":            ("ratio", 1.0),
     "syn_no_response_ratio":             ("ratio", 1.0),

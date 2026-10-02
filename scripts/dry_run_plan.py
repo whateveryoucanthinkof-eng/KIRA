@@ -264,6 +264,8 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=None, help="work directory (default: a temp dir)")
     ap.add_argument("--keep", action="store_true", help="keep the corpus and outputs")
     ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--packet-features", action="store_true",
+                    help="run Branch A and the downstream models with --packet-features (57-D state)")
     ap.add_argument("--stages", default="preflight,warm,train,summary")
     a = ap.parse_args()
 
@@ -285,10 +287,14 @@ def main() -> int:
         # the dry run exercises the same ingest path; ours come last and win.
         "PLAN_ENCODER_EXTRA": (os.environ.get("PLAN_ENCODER_EXTRA", "")
                                + f" --n_epoch {a.epochs} --batch_size 200").strip(),
-        "PLAN_BRANCH_A_EXTRA": f"--epochs {a.epochs}",
+        # --hazard-tau 4: these captures are 90 s long, shorter than the
+        # ~4.6 tau the hazard target looks ahead at the contract's 150 s, so
+        # every negative would be censored and no threshold could be fitted.
+        "PLAN_BRANCH_A_EXTRA": f"--epochs {a.epochs} --hazard-tau 4" + (" --packet-features" if a.packet_features else ""),
         # DeepOP must run even though Branch B cannot beat persistence on
         # synthetic traffic, or its code path would go untested.
-        "PLAN_DOWNSTREAM_EXTRA": f"--epochs {a.epochs} --allow-noncredible-branch-b",
+        "PLAN_DOWNSTREAM_EXTRA": f"--epochs {a.epochs} --allow-noncredible-branch-b --hazard-tau 4"
+                                 + (" --packet-features" if a.packet_features else ""),
         "MIN_FREE_GB": "1",
         # Its own cache: synthetic captures must never land in the real one.
         "INGEST_CACHE": (out / ".ingest_cache").as_posix(),

@@ -147,7 +147,7 @@ def test_packet_features_travel_on_the_record_metadata():
 
 
 def test_the_wide_vector_survives_a_full_extraction():
-    pf = {"vertical_scan_score": 1.0, "syn_no_response_ratio": 0.95}
+    pf = {"vertical_scan_score": 65535.0, "syn_no_response_ratio": 0.95}
     shared = {"source": "pcap", "packet_features": pf}
     recs = [_rec(t=0.0, metadata=shared), _rec(t=0.5, metadata=shared)]
     ex = HostTrajectoryExtractor(tgne_ta_model=_StubTGN(), window_size_sec=2.0,
@@ -269,3 +269,13 @@ def test_explanations_name_the_packet_attributes():
     exec(compile(src.split("class AntigravityModelAdapter")[0], "ma", "exec"), ns)
     groups = {ns["FEATURE_GROUP_MAP"][n] for n in PACKET_ATTRIBUTES}
     assert "Packet: TCP flags" in groups and "Packet: Scan signature" in groups
+
+
+def test_scan_scores_separate_a_scan_from_a_single_connection():
+    """They were max/unique ratios: 1.0 for a host on one port of one server and
+    for a 10,000-port sweep alike. Now counts, log-scaled."""
+    from data_unification.host_attributes import normalize_packet_features, PACKET_ATTRIBUTE_INDEX
+    i = PACKET_ATTRIBUTE_INDEX["vertical_scan_score"]
+    client = normalize_packet_features({"vertical_scan_score": 1.0})[i]
+    scan = normalize_packet_features({"vertical_scan_score": 10000.0})[i]
+    assert scan > 0.8 and client < 0.1
