@@ -108,11 +108,3 @@ def test_report_survives_a_json_round_trip(cal_test):
     back = json.loads(json.dumps(rep, default=float))
     assert back["coverage_by_group"].keys() == rep["coverage_by_group"].keys()
     assert back["label_conditional"]["coverage_by_class"]["1"]["n"] == int((yt == 1).sum())
-
-
-def test_the_benchmark_reports_and_gates_per_label_coverage():
-    src = (REPO / "scripts" / "train_v4.py").read_text(encoding="utf-8")
-    assert "groups=y_fut.ravel().astype(int)" in src, "interval coverage is not split by label"
-    assert "LabelConditionalConformal(alpha=args.conformal_alpha)" in src
-    assert "worst_group_coverage" in src and "worst_class_coverage" in src, (
-        "the credibility gate does not look at the worst label")

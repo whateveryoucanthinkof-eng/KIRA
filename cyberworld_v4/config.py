@@ -38,8 +38,8 @@ FORECAST_STEPS: int = 5
 #: takes minutes to hours, so over ten seconds "nothing changes" is almost
 #: always the right answer. That is not a modelling failure, it is the task
 #: being trivial: results/v4_benchmark.json shows a persistence baseline at
-#: Brier 0.00067 and PR-AUC 0.9997 at every step, and the credibility gate in
-#: scripts/train_v4.py fires DEGENERATE TASK on exactly this.
+#: Brier 0.00067 and PR-AUC 0.9997 at every step (a run of the since-removed
+#: v4 trainer), and scripts/credibility_check.py fires DEGENERATE TASK on it.
 #:
 #: Raising it instead of raising FORECAST_STEPS is deliberate. K=150 at a 2s
 #: step would give the same 5-minute horizon, but Branch B rolls out

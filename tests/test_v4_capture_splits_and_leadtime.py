@@ -227,32 +227,3 @@ def test_hosts_do_not_share_episodes():
     assert rep["episodes"] == 2
     assert rep["detected"] == 1, "one host warned, the other did not"
     assert rep["hosts"] == 2
-
-
-def test_the_trainer_actually_calls_it():
-    """The metric existed and was tested for a whole version with no caller."""
-    import ast
-    import pathlib
-
-    tree = ast.parse(
-        (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "train_v4.py")
-        .read_text(encoding="utf-8")
-    )
-    called = {
-        n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", "")
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-    }
-    for fn in ("lead_time_from_samples", "SplitConformal", "frozen_capture_split",
-               "drop_unresolved"):
-        assert fn in called, f"train_v4 never calls {fn}"
-
-    # Host identity must not be collapsed. Checked against CALLS, not source
-    # text, so the comment explaining the old defect does not trip it.
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "offline_host":
-            literals = [a.value for a in n.args if isinstance(a, ast.Constant)]
-            assert "mixed" not in literals, (
-                "host identity is still collapsed to 'mixed'; the dataset, scenario "
-                "and capture are what stop two corpora sharing a private address"
-            )

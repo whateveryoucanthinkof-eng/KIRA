@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Credibility gate for the three-branch pipeline.
 
-scripts/train_v4.py refuses to present a run whose numbers cannot mean anything,
-and that gate is the only reason three earlier runs reporting PR-AUC 0.9998 were
+The v4 trainer (scripts/train_v4.py, since removed as a duplicate of Branch A/B)
+refused to present a run whose numbers cannot mean anything, and that gate is the only reason three earlier runs reporting PR-AUC 0.9998 were
 caught and discarded. The Branch A / Branch B / DeepOP trainers never adopted it
 (they import cyberworld_v4.config for the contract but not its splits, metrics or
 gate), so their numbers have always gone unchecked. This applies the same tests to

@@ -99,7 +99,7 @@ def test_the_filter_is_actually_wired_into_the_trainers():
     import pathlib
 
     repo = pathlib.Path(__file__).resolve().parent.parent
-    for script in ("scripts/train_v4.py", "data_unification/training_sources.py"):
+    for script in ("data_unification/training_sources.py",):
         src = (repo / script).read_text(encoding="utf-8")
         assert "drop_unresolved" in src, f"{script} still trains on UNKNOWN as benign"
     # Branch A reads every capture through training_sources.read_capture.
